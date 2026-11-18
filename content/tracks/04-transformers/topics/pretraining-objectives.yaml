@@ -1,0 +1,1443 @@
+id: pretraining-objectives
+slug: pretraining-objectives
+title: "Pretraining Objectives: LM, MLM, and Prefix LM"
+summary: >-
+  A base model is trained by one scalar: the mean negative log-probability of
+  the next token over a packed stream of tokens, and every decision around it -
+  packing, tokeniser, vocabulary, data mix, model size - only changes which
+  tokens that mean is taken over. This topic derives that loss, measures the
+  same text at 4.2157 nats per word-token and 1.7076 nats per byte-token with
+  perplexities of 67.74 and 5.52 that rank the two models in the opposite order
+  to bits per character, and prices causal LM against masked and prefix LM on
+  25,398 identical held-out targets.
+kind: lesson
+difficulty: expert
+position: 9
+estMinutes: 29
+prerequisites: [transformer-block, decoding-strategies]
+phase: "pretraining"
+tags:
+  - pretraining
+  - causal-lm
+  - masked-lm
+  - prefix-lm
+  - cross-entropy
+  - perplexity
+  - packing
+  - scaling-laws
+  - chinchilla
+  - data-mixture
+  - tokeniser
+
+body:
+  big_idea: >-
+    A base model is trained by one scalar — mean next-token cross-entropy over
+    a packed stream — and every choice about documents, tokeniser, vocabulary
+    and size decides which tokens that mean counts.
+
+  problem:
+    - >-
+      Your script prints "loss: 3.42" and you cannot say whether it is good:
+      the baseline is $\ln V$ and the denominator is not printed.
+    - >-
+      A vendor reports perplexity 1.9 on Hindi and 18.7 on English and
+      concludes Hindi is better; their tokeniser spends 12.6 tokens on a word.
+    - >-
+      You pack documents into 2,048-token windows and validation rises a tenth
+      of a nat, because the first token now follows an unrelated document.
+
+  analogy: |
+    A proofreader paid by the word. Every text is read one word at a time with
+    the rest covered, and they are paid for the average guess — so a 629-word
+    document contributes 629 guesses and a 26-word one contributes 26, and the
+    long document outvotes the short one 24 to 1. Nobody decided that; it fell
+    out of paying per word.
+
+  concept_points:
+    - >-
+      **The loss is a sum over positions divided by the number of positions, and the denominator is the whole story.**
+      A document of length $T$ contributes $T$ times: the token-weighted mean
+      is **4.2157** nats and the average of per-document means **4.3228** —
+      67.74 against 75.40 perplexity from nothing but the choice of average.
+      The longest 10% of documents hold **22.70%** of the tokens.
+    - >-
+      **Per-token loss only means something next to the tokeniser that produced the tokens.**
+      Same prose, one architecture family: word-level (V = 2,000) gives 4.2157
+      nats and ppl 67.74, character-level (V = 136) gives 1.6302 and **5.11**,
+      byte-level (V = 257) gives 1.7076 and 5.52. Perplexity spans **13.27x**
+      while bits per character spans **1.74x**.
+    - >-
+      **Perplexity is a compression ratio, so across languages it measures fertility.**
+      Since $\operatorname{ppl} = 2^{b}$ and bits per token is bits per
+      character times characters per token, a tokeniser emitting 12.6 tokens
+      per word reports a tiny number for identical information. At 2.474
+      bits/character, a byte tokeniser reports 5.56, English BPE at 4.55
+      chars/token reports **2,447**, and Hindi BPE at 0.38 reports **1.92**.
+    - >-
+      **The three objectives are one measurement apart, and the numbers are not comparable.**
+      Same architecture (435,473 parameters, six context slots), corpus, 6,000
+      steps and 25,398 held-out targets: causal **4.2632** nats (ppl 71.04),
+      15%-masked **3.5296** (ppl 34.11), 50%-prefix **4.1342** (ppl 62.44).
+      The masked model is a factor of 2.08 better in perplexity without being
+      better — two of its six context slots are to the *right* of the target.
+    - >-
+      **Masking trades labels for passes at a fixed exchange rate of 1/0.15.**
+      A causal pass over a 2,048-token window yields **2,047** predictions
+      (the shift drops one); a 15%-masked pass yields **307** — 245.8 with a
+      mask token, 30.7 random and 30.7 left alone under the 80/10/10 rule.
+      Equal gradient signals therefore cost **6.67** masked passes per causal
+      pass, and that ratio, not the loss, is the honest comparison.
+    - >-
+      **Packing removes the padding and pays in document boundaries.** One
+      document per 2,048-token sequence wastes **95.74%** of every batch as
+      padding; packing the same 3,063 documents into 131 windows wastes
+      **0.41%** but puts 23.4 documents in each window. The cost: a document's
+      first token scores 3.3024 nats with its own start token in front and
+      **6.2664** with the previous document's last three.
+
+  definitions:
+    - term: "Causal language modelling"
+      meaning: >-
+        Predicting each token from the tokens before it only, so the joint
+        probability factorises as a product of conditionals and one pass over a
+        document yields T-1 training targets. It is the only objective of the
+        three that can be sampled from directly, which is why it became the
+        default the moment models were asked to generate.
+    - term: "Teacher forcing"
+      meaning: >-
+        Conditioning each prediction on the *true* previous tokens rather than
+        the model's own, which is what makes the T-1 targets computable in one
+        parallel pass. It creates the train/test mismatch that decoding has to
+        live with: at generation time the model conditions on its own output,
+        and an error at position 3 is not in the training distribution at
+        position 4.
+    - term: "Negative log-likelihood (NLL)"
+      meaning: >-
+        $-\log p_\theta(x_t \mid x_{<t})$, the loss for one position, in nats
+        because the log is natural. It is zero for a perfect prediction with
+        probability 1 and unbounded for a confident mistake, and the mean of it
+        over positions is the training loss.
+    - term: "Perplexity"
+      meaning: >-
+        $\exp$ of the mean NLL per token, interpreted as the effective number of
+        equally likely choices at each position. It is a compression ratio, not
+        a quality score: ppl 67.74 means 6.08 bits per token, and how impressive
+        that is depends entirely on how many characters a token carries.
+    - term: "Bits per character (BPC)"
+      meaning: >-
+        Bits per token divided by characters per token. It is the only
+        tokeniser-independent version of the loss on a fixed text, and the only
+        one that can be compared across languages reasonably - not perfectly,
+        because the byte content of a character differs by script.
+    - term: "Fertility"
+      meaning: >-
+        Tokens per word for a given tokeniser and language. Measured elsewhere
+        in this track as 1.19 for English and 12.58 for Hindi with the same
+        English-trained vocabulary, which is a 10.6x difference in how many
+        predictions the same content costs.
+    - term: "Packing"
+      meaning: >-
+        Concatenating documents end to end and cutting the stream into fixed
+        windows, so that no position is padding. It removes 95.74% waste at a
+        2,048-token window and creates document boundaries inside windows -
+        23.4 per window here - which is why the end-of-document token is part of
+        the objective rather than a formatting detail.
+    - term: "Document boundary (EOS)"
+      meaning: >-
+        The token that separates two documents in a packed stream. Without it
+        the first token of a document is conditioned on the previous document,
+        measured here as 2.964 nats of damage on exactly the positions where it
+        matters most.
+    - term: "Masked language modelling (MLM)"
+      meaning: >-
+        Replacing a fraction of tokens with a mask and predicting them from both
+        sides. The 80/10/10 rule uses a mask token 80% of the time, a random
+        token 10% and the true token 10%, so that the model cannot learn to
+        ignore the mask symbol; at 15% and a 2,048-token window that is 245.8
+        masked, 30.7 random and 30.7 unchanged positions per pass.
+    - term: "Prefix LM"
+      meaning: >-
+        A causal model whose first $p$ positions attend bidirectionally and
+        whose remaining positions attend causally, so the objective can be
+        conditioned on a long prompt and still generate. It costs the clean
+        factorisation - the bidirectional half is not a valid likelihood - which
+        is why it survives mainly in encoder-decoder and infilling systems.
+    - term: "Tokens per parameter"
+      meaning: >-
+        $D/N$, the single number that says whether a run is data-limited or
+        parameter-limited. Everything published is 20-2,000; this topic's toy
+        model is 0.52, which is why its fitted exponents are 2.8x and 4.4x
+        steeper than the published 0.28 and 0.34.
+
+  diagrams:
+    - type: pipeline
+      title: "One pretraining step, and where each number in this topic enters"
+      nodes:
+        - label: "Corpus of documents"
+          note: "3,063 paragraphs, 267,194 tokens, 1.12M characters"
+          detail: "The unit is a document, because the objective is per token but the data arrives per document. Everything downstream - packing, filtering, mixture weights - is a decision about how those two units are reconciled."
+        - label: "Filter and deduplicate"
+          note: "44.24% of documents are under 64 tokens"
+          detail: "A length filter is a reweighting, not a cleanup: those small documents are a quarter of the tokens. Deduplication removes repeated tokens from the denominator, which changes the average every other token is compared against."
+        - label: "Tokenise"
+          note: "V = 2,000 words, or 136 characters, or 257 bytes"
+          detail: "The vocabulary sets the number of predictions per document, the uniform baseline ln V, and 7.52% of targets land on the unknown token at V = 2,000."
+        - label: "Pack into windows"
+          note: "131 windows of 2,048, 23.4 documents each"
+          detail: "Packing removes the 95.74% padding that one-document-per-sequence would waste. It also creates the boundaries that the end-of-document token exists to mark."
+        - label: "Shift by one and score"
+          note: "T-1 predictions per window"
+          detail: "Logits at position t score token t+1. Getting this shift wrong - scoring a token against itself - gives a loss that looks excellent and a model that learns to copy, which is the single most common silent bug in a from-scratch implementation."
+        - label: "Mean cross-entropy"
+          note: "4.2157 nats per token on held-out documents"
+          detail: "The mean is over every counted position in the batch. Divide by documents instead of tokens and the same weights read 4.3228 - a 0.107-nat difference that no architecture change at this scale would produce."
+        - label: "Backward and update"
+          note: "one step per batch"
+          detail: "The gradient is the mean of per-position gradients, so a document with 629 tokens contributes 24 times the gradient of one with 26. That is the same weighting as the loss, expressed in the update instead of the report."
+      caption: "Every box changes the loss without touching the loss function. That is the topic: the objective is four lines, and the engineering is deciding which tokens it is computed over."
+
+    - type: plot
+      title: "Measured training curve: 410,704 parameters, 1.54M tokens, 6,000 steps"
+      chart: line
+      xLabel: "training tokens seen, millions"
+      yLabel: "nats per token"
+      series:
+        - name: "train (running mean over 250 steps)"
+          points:
+            - { x: 0.064, y: 5.8362 }
+            - { x: 0.128, y: 4.5577 }
+            - { x: 0.192, y: 4.3318 }
+            - { x: 0.256, y: 4.1524 }
+            - { x: 0.320, y: 4.0490 }
+            - { x: 0.384, y: 3.9436 }
+            - { x: 0.448, y: 3.8780 }
+            - { x: 0.512, y: 3.7849 }
+            - { x: 0.576, y: 3.7283 }
+            - { x: 0.640, y: 3.6930 }
+            - { x: 0.704, y: 3.6371 }
+            - { x: 0.768, y: 3.5908 }
+            - { x: 0.832, y: 3.5383 }
+            - { x: 0.896, y: 3.5207 }
+            - { x: 0.960, y: 3.4900 }
+            - { x: 1.024, y: 3.4558 }
+            - { x: 1.088, y: 3.4650 }
+            - { x: 1.152, y: 3.4271 }
+            - { x: 1.216, y: 3.3980 }
+            - { x: 1.280, y: 3.4193 }
+            - { x: 1.344, y: 3.3979 }
+            - { x: 1.408, y: 3.3965 }
+            - { x: 1.472, y: 3.3810 }
+            - { x: 1.536, y: 3.3791 }
+        - name: "validation, full 25,691-token split"
+          points:
+            - { x: 0.064, y: 4.8499 }
+            - { x: 0.128, y: 4.5235 }
+            - { x: 0.192, y: 4.4001 }
+            - { x: 0.256, y: 4.3439 }
+            - { x: 0.320, y: 4.2948 }
+            - { x: 0.384, y: 4.2687 }
+            - { x: 0.448, y: 4.2453 }
+            - { x: 0.512, y: 4.2302 }
+            - { x: 0.576, y: 4.2202 }
+            - { x: 0.640, y: 4.2148 }
+            - { x: 0.704, y: 4.2006 }
+            - { x: 0.768, y: 4.2007 }
+            - { x: 0.832, y: 4.1902 }
+            - { x: 0.896, y: 4.1865 }
+            - { x: 0.960, y: 4.1864 }
+            - { x: 1.024, y: 4.1764 }
+            - { x: 1.088, y: 4.1693 }
+            - { x: 1.152, y: 4.1681 }
+            - { x: 1.216, y: 4.1650 }
+            - { x: 1.280, y: 4.1641 }
+            - { x: 1.344, y: 4.1613 }
+            - { x: 1.408, y: 4.1598 }
+            - { x: 1.472, y: 4.1592 }
+            - { x: 1.536, y: 4.1591 }
+      caption: "The gap between the two curves is overfitting, not a bug: 410,704 parameters against 213,042 training tokens is 0.52 tokens per parameter, thirty-eight times below the 20:1 rule. Validation falls 0.69 nats and then flattens - 0.009 nats over the last 400,000 tokens - while training keeps sliding, which is what a data-limited run looks like."
+
+    - type: plot
+      title: "Perplexity against characters per token, at a fixed 2.474 bits per character"
+      chart: line
+      xLabel: "characters per token"
+      yLabel: "perplexity of one token"
+      series:
+        - name: "computed: ppl = 2^(2.474 x chars per token)"
+          points:
+            - { x: 0.30, y: 1.67 }
+            - { x: 0.50, y: 2.36 }
+            - { x: 0.80, y: 3.94 }
+            - { x: 1.00, y: 5.56 }
+            - { x: 1.50, y: 13.10 }
+            - { x: 2.00, y: 30.87 }
+            - { x: 2.50, y: 72.76 }
+            - { x: 3.00, y: 171.51 }
+            - { x: 3.50, y: 404.27 }
+            - { x: 4.00, y: 952.92 }
+            - { x: 4.55, y: 2447.23 }
+            - { x: 5.00, y: 5294.41 }
+        - name: "measured: byte, character, word models on the same held-out text"
+          points:
+            - { x: 0.996, y: 5.516 }
+            - { x: 1.000, y: 5.105 }
+            - { x: 4.271, y: 67.739 }
+      caption: "The curve is exponential in characters per token, so a tokeniser with a third of a character per token reports a perplexity near 2 no matter how good the model is. The three measured points sit below the curve because each model does better than 2.474 bits/character - the word model reaches 1.424 - which is exactly why perplexity cannot rank them: 67.74 is the best model in the table and the worst number on the axis."
+
+    - type: compare
+      title: "Causal, masked, and prefix: the same 435,473 parameters, corpus, and held-out targets"
+      left_label: "Causal (predict x_t from the 6 tokens before it)"
+      left_points:
+        - "Test loss 4.2632 nats per token, ppl 71.04, 6.15 bits per token"
+        - "One pass over T tokens yields T-1 labels: 2,047 per 2,048-token window"
+        - "Defines a normalised likelihood, so the loss is a valid model of the data"
+        - "Samples directly: the same forward pass that scores also generates"
+        - "The only objective of the three whose number can be compared to a paper's, if the tokeniser matches"
+      right_label: "Masked 15% (predict from 3 left and 2 right) and 50% prefix"
+      right_points:
+        - "Masked 3.5296 nats, ppl 34.11; prefix 4.1342 nats, ppl 62.44"
+        - "Masked 15% yields 307 labels per 2,048 tokens: 6.67x the passes per label"
+        - "Bidirectional context is why it wins - 2 of 6 slots see the future"
+        - "Prefix buys 0.1291 nats over causal on the half of positions that are bidirectional"
+        - "Neither number is comparable to a causal loss: different information, different denominator"
+      caption: "All three runs share the vocabulary, the parameter count, the 6,000 steps and the 25,398 evaluation targets, so the differences are the objective and nothing else. Masked is 17% lower in nats and 52% lower in perplexity because it is asked a strictly easier question."
+
+    - type: plot
+      title: "Loss against tokens per parameter at a fixed 5.88e23 FLOPs, from Chinchilla's fitted surface"
+      chart: line
+      xLabel: "tokens per parameter"
+      yLabel: "loss, nats per token"
+      series:
+        - name: "computed from L(N,D) = 1.69 + 406.4/N^0.34 + 410.7/D^0.28, with 6ND = C fixed"
+          points:
+            - { x: 1, y: 1.98834 }
+            - { x: 2, y: 1.97167 }
+            - { x: 5, y: 1.95406 }
+            - { x: 10, y: 1.94399 }
+            - { x: 20, y: 1.93665 }
+            - { x: 40, y: 1.93200 }
+            - { x: 100, y: 1.93000 }
+            - { x: 200, y: 1.93168 }
+            - { x: 500, y: 1.93827 }
+      caption: "The minimum is at 92.8 tokens per parameter, not 20: at 20 the fit is 0.0067 nats worse, and the whole 1-to-500 range spans 0.058 nats. That flatness is the real result - the ratio hardly matters, which is why the field can train at 20 and at 1,875 and both work."
+
+  markdown: |
+    ## The objective is four lines
+
+    A decoder-only transformer outputs one row of logits per position. The
+    pretraining objective compares row $t$ with token $t+1$:
+
+    $$\log p_\theta(x_{1:T}) = \sum_{t=1}^{T}\log p_\theta(x_t \mid x_{<t}),
+      \qquad
+      \mathcal{L}(\theta) = -\frac{1}{N}\sum_{i=1}^{N}
+      \log p_\theta\!\left(x^{(i)}_{t} \mid x^{(i)}_{<t}\right),$$
+
+    where the sum runs over every counted position in the batch, not over
+    documents. That shift - logits at $t$ score the token at $t+1$ - is the
+    whole of teacher forcing and the whole of the most common silent bug in a
+    from-scratch implementation: score a token against itself and the loss drops
+    to the copy loss while the model learns nothing that generalises.
+
+    Nothing in the objective mentions documents, quality, or truth: it says make
+    the observed next token probable, and every other property a base model has
+    is either a consequence of that or was added later by fine-tuning.
+
+    ## What a measured curve looks like
+
+    A 410,704-parameter model with three words of context, trained on 213,042
+    tokens from this corpus, 6,000 steps of batch 256 (1.54M tokens seen):
+
+    | tokens seen | train | validation | ppl (val) |
+    |---|---|---|---|
+    | 64,000 | 5.8362 | 4.8499 | 127.7 |
+    | 256,000 | 4.1524 | 4.3439 | 77.0 |
+    | 768,000 | 3.5908 | 4.2007 | 66.7 |
+    | 1,536,000 | 3.3791 | 4.1591 | 64.0 |
+
+    The uniform baseline is $\ln 2000 = 7.6009$, so the first 64,000 tokens buy
+    2.75 nats and the next 1.47M buy 0.69. The final train/validation gap (3.379
+    against 4.159) is what 0.52 tokens per parameter looks like: the model is
+    memorising a corpus it has seen seven times.
+
+    ## The denominator decides what the loss is about
+
+    For a batch of documents, $N = \sum_d T_d$, so the objective is a
+    *token-weighted* mean: a 629-token document contributes 629 terms and a
+    26-token document contributes 26. Measured on 306 held-out documents:
+
+    | aggregation | value | perplexity |
+    |---|---|---|
+    | sum of NLL / sum of tokens (the objective) | 4.2157 | 67.74 |
+    | mean of per-document means | 4.3228 | 75.40 |
+
+    The two differ by 0.107 nats. The longest 10% of documents hold 22.70% of
+    the tokens and 22.11% of the loss; the single longest holds 1.280% of the
+    total loss against the median document's 0.264%. None of that was chosen -
+    it is what "per token" means.
+
+    The same lever is what data filtering pulls. In this corpus 44.24% of
+    documents are under 64 tokens, and they carry 24.25% of the tokens. A length
+    filter removes half the documents and a quarter of the signal, and the
+    mixture weights are the same arithmetic with a different denominator:
+    upweighting code by 2x is upweighting its tokens by 2x, and the loss has no
+    way to know you meant "more code" rather than "more of these particular
+    tokens".
+
+    ## Perplexity is a compression ratio
+
+    $$\operatorname{ppl} = \exp(\mathcal{L}) = 2^{b},
+      \qquad b = \frac{\mathcal{L}}{\ln 2}
+      = \text{bpc} \times \frac{\text{characters}}{\text{token}}.$$
+
+    Same text, three tokenisations, three models of one architecture family:
+
+    | tokenisation | V | nats/token | ppl | bits/char |
+    |---|---|---|---|---|
+    | word | 2,000 | 4.2157 | 67.74 | 1.424 |
+    | character | 136 | 1.6302 | 5.11 | 2.352 |
+    | byte | 257 | 1.7076 | 5.52 | 2.474 |
+
+    Perplexity spans 13.27x and bits per character spans 1.74x, and the ordering
+    is *reversed*: the word model has the worst perplexity and the best
+    compression. At 2.474 bits/character, a tokeniser at 4.55
+    characters per token reports 2,447 and one at 0.38 reports 1.92 - a factor
+    of 1,275 for identical information.
+
+    ## Three objectives, one measurement
+
+    Same 435,473 parameters, six context slots, corpus, 6,000 steps, and the
+    same 25,398 held-out targets:
+
+    | objective | context | test nats | ppl |
+    |---|---|---|---|
+    | causal | 6 left | 4.2632 | 71.04 |
+    | masked 15% | 3 left + mask + 2 right | 3.5296 | 34.11 |
+    | prefix 50% | bidirectional first half | 4.1342 | 62.44 |
+
+    Masked wins by 0.7336 nats and loses the ability to be sampled from; the
+    number is lower because the question is easier, not because the
+    representation is better. But the cost is not only conceptual: at 15%
+    masking a 2,048-token window yields 307 labels against 2,047 for causal, so
+    matching labels per token costs $1/0.15 = 6.67$ passes. The run above is
+    label-matched (7.2 labels per token for both), which is the only fair way to
+    compare them.
+
+    Prefix LM is the honest middle: 50% of positions see both directions, and
+    the measured gain over causal is 0.1291 nats. It gives up the normalised
+    likelihood on the bidirectional half, so it cannot score documents by
+    probability - the price that has kept it out of pure-text pretraining.
+
+    ## Packing
+
+    | scheme, 2,048-token window | padding | documents per window |
+    |---|---|---|
+    | one document per sequence | 95.74% | 1.0 |
+    | packed | 0.41% | 23.4 |
+
+    Packing is not free: the first token of a document scores 3.3024 nats with
+    its own start token and 6.2664 with the previous document's tail - a
+    2.964-nat penalty across 3,060 interior boundaries. The end-of-document token
+    is doing real work in the objective: it is the only signal that says the
+    context is about to become irrelevant.
+
+    ## Scaling
+
+    With $C \approx 6ND$ and $L(N,D) = E + A/N^\alpha + B/D^\beta$:
+
+    | C (FLOPs) | N* | D* | D/N | loss |
+    |---|---|---|---|---|
+    | $10^{20}$ | 644.9M | 25.8B | 40.1 | 2.5999 |
+    | $10^{22}$ | 5.16B | 323.0B | 62.6 | 2.1386 |
+    | $5.88\times10^{23}$ | 32.5B | 3.02T | 92.8 | 1.9300 |
+    | $10^{25}$ | 116.8B | 14.3T | 122.1 | 1.8453 |
+
+    The ratio is not a constant: it rises as $C^{0.096}$ under this fit, and at
+    the budget where the literature quotes "20 tokens per parameter" the fitted
+    surface puts the optimum at 92.8 and prices the 70B/1.4T point only 0.0067
+    nats worse. Both statements are true, and the flatness is the useful part:
+    between 40 and 200 tokens per parameter the loss moves by at most 0.002
+    nats, so the choice is made by inference cost, not by the pretraining
+    optimum. Llama 3 8B - 15T tokens, 1,875 per parameter - is that logic taken
+    to its conclusion.
+
+    Fitted on this topic's own runs, the data exponent is -0.770 and the
+    parameter exponent is -1.495: much steeper than the published 0.28 and 0.34,
+    because a 410K-parameter model at 0.52 tokens per parameter is nowhere near
+    the frontier. The practical reading is the local slope, not the global
+    exponent: at this operating point the last data step (2.17x) buys 0.3550
+    nats and the last parameter step (1.68x) buys 0.0133 - 17.9x apart per
+    e-fold. Measure both before you spend the budget.
+
+    ## Where this leaves you
+
+    The objective you will implement is the four lines at the top of this topic
+    plus an ignore-index, an end-of-document token, and a division by counted
+    tokens; everything else in pretraining decides which tokens are counted. Two
+    links back: the logits come from *The Full Transformer Block*, and causality
+    exists because *Decoding* needs $p(x_t \mid x_{<t})$ to be a distribution it
+    can sample from.
+
+    ## The longer version
+
+    A base model is trained by one scalar - the mean next-token cross-entropy
+    over a packed stream of tokens - and every choice you make about documents,
+    tokeniser, vocabulary, and model size is a choice about which tokens get
+    counted in that mean, not a change to the objective.
+
+    A proofreader paid by the word rather than by the document. Every text is
+    read to them one word at a time with the rest covered; they guess the next
+    word; at the end of the day they are paid for the average guess. A 629-word
+    document therefore contributes 629 guesses and a 26-word one contributes 26,
+    so the long document outvotes the short one 24 to 1 - and nobody decided
+    that, it fell out of paying per word.
+
+    Two things follow. The proofreader never learns what a document is *for*;
+    the only signal is which word tends to follow which, so a corpus of error
+    messages and a corpus of poetry teach the same kind of thing. And the
+    average is over words, so a document that is 90% boilerplate counts 90% as
+    boilerplate.
+
+    The analogy breaks in two places. A proofreader already knows the language
+    and can be wrong in ways that mean something; the model's only ground truth
+    is the corpus, so "correct" means "what this corpus does next", which is why
+    the objective cannot distinguish fluent nonsense from fluent fact. And a
+    proofreader starts each document fresh, while a packed training stream does
+    not: the model's first guess for a new document is conditioned on the
+    previous document's last words unless an end-of-document token tells it
+    otherwise.
+
+    ### What goes wrong
+
+    - Your training script prints "loss: 3.42" and you cannot say whether that
+      is good. Good compared to what? The uniform baseline is ln V, the
+      tokeniser's own floor is something else, and the number your colleague
+      quotes from a paper was measured on a different vocabulary. You cannot
+      answer without knowing what the denominator was, and the script does not
+      print it.
+    - A vendor reports perplexity 1.9 on Hindi and 18.7 on English and
+      concludes the Hindi model is better. The Hindi tokeniser spends 12.6
+      tokens on a word the English one spends 1.2 on, so a token carries a
+      third of a character and the perplexity is small for a reason that has
+      nothing to do with the model.
+    - You pack documents into 2,048-token windows so that a batch is not 96%
+      padding, and the validation loss goes up by a tenth of a nat. Nothing is
+      broken: you have put 23 documents in each window, and the model now has
+      to predict the first token of a document from the last words of an
+      unrelated one - a mistake that measured 2.96 nats on the 306 documents
+      where you can check it.
+    - You are asked whether to pretrain with 15% masking or next-token
+      prediction, and the only evidence anyone has is two papers' perplexities
+      on two corpora with two tokenisers. The masked number is lower by a
+      factor of two, and it is lower for a reason that has nothing to do with
+      which model is better.
+    - Somebody asks how much data the next run needs. You have a loss curve, a
+      GPU-hour budget, and no idea whether you are data-limited or
+      parameter-limited - and in this topic's own measurements the two answers
+      differ by 17.9x per e-fold.
+
+    ### The full treatment
+
+    **The loss is a sum over positions divided by the number of positions, and
+    the denominator is the whole story.** For a document of length $T$ the
+    objective is $-\frac{1}{T}\sum_t \log p_\theta(x_t \mid x_{<t})$, so a
+    token contributes once and a document contributes $T$ times. Measured on
+    306 held-out documents (25,398 tokens): the token-weighted mean is 4.2157
+    nats and the average of per-document means is 4.3228 - a 0.107-nat gap,
+    or 67.74 against 75.40 in perplexity, from nothing but the choice of
+    average. The longest 10% of documents hold 22.70% of the tokens and 22.11%
+    of the loss; the longest document alone is 1.280% of the total loss
+    against the median document's 0.264%, a 4.8x weight that no one chose. The
+    trap is that "average loss" is ambiguous by more than most architecture
+    changes are worth, so a run that reports it without saying which average
+    is not reporting a comparable number.
+
+    **Per-token loss is only meaningful next to the tokeniser that produced the
+    tokens, because the same text becomes a different number of predictions.**
+    The same held-out prose through three tokenisations of one architecture
+    family: word-level (V = 2,000) gives 4.2157 nats/token and ppl 67.74,
+    character-level (V = 136) gives 1.6302 and ppl 5.11, byte-level (V = 257)
+    gives 1.7076 and ppl 5.52. Perplexity spans 13.27x; bits per character
+    spans 1.74x (1.424, 2.352, 2.474). The trap is that the word model has
+    the highest perplexity and the lowest bits per character: the ranking by
+    perplexity is the exact opposite of the ranking by information, so a
+    perplexity table across tokenisers is a table of vocabularies.
+
+    **Perplexity is a compression ratio, so across languages it measures
+    fertility.** Since $\operatorname{ppl} = 2^{b}$ with $b$ the bits per
+    token, and bits per token is bits per character times characters per
+    token, a tokeniser that emits 12.6 tokens per word reports a far smaller
+    number for identical information. At this topic's measured 2.474
+    bits/character: a byte tokeniser (1.0 chars/token) reports 5.56, English
+    BPE at 4.55 chars/token reports 2,447, and Hindi BPE at 0.38 chars/token
+    reports 1.92. A Hindi model that is *worse* per character - 3.0 bits
+    against 2.474 - still reports 2.20, which is 1,110x lower than the English
+    model's 2,447. The trap is quoting a cross-lingual perplexity table as
+    evidence about models; the only comparable number is bits per character,
+    and even that is only comparable on the same text.
+
+    **The three objectives are one measurement apart, and the numbers are not
+    comparable.** Same architecture (435,473 parameters, six context slots),
+    same corpus, same 6,000 steps, and the same 25,398 held-out targets:
+    causal scores 4.2632 nats (ppl 71.04), 15%-masked scores 3.5296 (ppl
+    34.11), and a 50%-prefix model scores 4.1342 (ppl 62.44). The masked model
+    is 0.7336 nats and a factor of 2.08 better in perplexity without being a
+    better model - it is answering an easier question, because two of its six
+    context slots are to the *right* of the target. Prefix LM lands between
+    the two by construction: half its positions are bidirectional and half are
+    causal, and it buys 0.1291 nats over the causal run. The trap is reading
+    the masked number as an improvement; a bidirectional objective and a
+    causal one do not produce commensurable losses, which is why BERT's 3.4
+    and a causal LM's 20 were never on the same axis.
+
+    **Masking trades labels for passes at a fixed exchange rate of 1/0.15.** A
+    causal pass over a 2,048-token window yields 2,047 predictions (the shift
+    drops one); a 15%-masked pass yields 307 (245.8 with a mask token, 30.7
+    replaced by a random token and 30.7 left alone under the 80/10/10 rule).
+    Giving every token the same number of gradient signals therefore costs
+    6.67 masked passes per causal pass, and that ratio - not the loss -
+    is the honest comparison. This topic's masked run is *label-matched*
+    instead: 6,000 steps of batch 256 is 1.54M masked predictions over a
+    213,042-token corpus, or 7.2 labels per token, the same as the causal run.
+    The trap is comparing a masked model trained for one epoch of its corpus
+    against a causal model trained for seven and attributing the difference to
+    the objective.
+
+    **A validation number is a measurement of a split, and a slice of a split
+    is not a measurement.** The final checkpoint reads 4.1591 nats on the full
+    25,691-token validation split and 4.1785 on a 4,052-token prefix of it -
+    0.019 nats apart, which sounds like noise until you price the noise: the
+    per-document mean loss has a standard deviation of 0.677 nats, so the
+    standard error is 0.1236 over 30 documents and 0.0387 over the full 306.
+    A 59-document slice can therefore read 0.17 nats away from the truth at
+    95% confidence with nothing wrong, and two runs compared on 30 documents
+    each need a 0.35-nat gap before the difference is real. The trap is
+    quoting a number to four decimals from a slice of one split; report the
+    split, its token count, and its document count, or the number is not a
+    measurement.
+
+    **Packing removes the padding and pays in document boundaries.** One
+    document per 2,048-token sequence wastes 95.74% of every batch as padding,
+    because the median document in this corpus is 69 tokens; packing the same
+    3,063 documents into 131 windows wastes 0.41% (1,094 tokens in total) but
+    puts 23.4 documents in each window. The measured cost of a boundary is not
+    the boundary itself but the context it inherits: the first token of a
+    document scores 3.3024 nats with its own start token in front of it and
+    6.2664 with the previous document's last three tokens instead - 2.964 nats
+    on 306 held-out documents. At a 512-token window the same trade is 82.97%
+    padding against 0.026% packed, with 5.87 documents per window and 1.146% of
+    tokens sitting immediately after a boundary. The trap is thinking packing
+    is free because the padding is gone: an end-of-document token is what makes
+    it nearly free, and a packer without one trains the model on sentences that
+    begin mid-sentence.
+
+    **The vocabulary is a hyperparameter of the objective, and the loss pays
+    for it twice.** A 2,000-entry word vocabulary leaves 7.52% of held-out
+    targets as out-of-vocabulary, and those targets are the *cheapest*
+    predictions in the run - 2.3360 nats against 4.3686 for in-vocabulary
+    tokens - because the model spreads probability over a diffuse unknown
+    bucket exactly where it should be most uncertain. They carry 4.17% of the
+    total loss while being 7.52% of the targets, so the loss understates the
+    damage that a small vocabulary does. The second payment is arithmetic: the
+    uniform baseline is $\ln V$ (7.6009 here, 10.8249 for a 50,257-entry
+    vocabulary), the softmax costs $Vd$ multiply-adds per position, and the
+    embedding costs $Vd$ parameters, so the vocabulary sets the floor, the
+    compute, and the parameter bill at once. The trap is treating the
+    tokeniser as preprocessing; it decides what a token *is*, and the loss is
+    measured in tokens.
+
+    **Scaling laws are fits, and "the exponent" is three different numbers.**
+    Chinchilla's published constants ($E = 1.69$, $A = 406.4$,
+    $\alpha = 0.34$, $B = 410.7$, $\beta = 0.28$) put the optimum at 32.5B
+    parameters and 3.02T tokens - 92.8 tokens per parameter - at
+    $5.88\times10^{23}$ FLOPs, and give 1.9300 nats there against 1.9366 at the
+    70B/1.4T point that everyone summarises as "20 tokens per parameter":
+    0.0067 nats apart, inside the fit's own error. Fitted on this topic's own
+    runs, the data exponent is -0.770 over 23,195 to 213,042 tokens and the
+    parameter exponent is -1.495 over 200,176 to 691,408 parameters - both far
+    steeper than 0.34 because these models are nowhere near the frontier, at
+    0.52 tokens per parameter, where data is worth 17.9x more per e-fold than
+    parameters. And "the loss falls as a power of compute" is itself three
+    numbers: the reducible part falls as
+    $C^{-\alpha\beta/(\alpha+\beta)} = C^{-0.154}$, the *total* falls as
+    $d\ln L/d\ln C$, which is -0.0537 at $10^{20}$ FLOPs and -0.0191 at
+    $5.88\times10^{23}$ because 1.69 of the 1.93 nats is irreducible, and
+    Kaplan et al. report about -0.05 for the total in their range. The trap is
+    quoting one without its definition and its range: 0.154 used as a
+    total-loss exponent predicts a 0.58-nat gain from another 10x of compute
+    where the fitted surface gives 0.072.
+
+    **The data mixture enters through the denominator, so a filter is a
+    reweighting and deduplication is a change of what the loss is an average
+    of.** In this corpus 44.24% of documents are under 64 tokens and hold only
+    24.25% of the tokens, so a length filter at 64 tokens deletes nearly half
+    the documents and a quarter of the training signal; score the result by
+    document average instead of token average and the same model looks 0.107
+    nats better without a single weight changing. Llama 3 8B was trained on
+    15T tokens - 1,875 per parameter, 94x the 20:1 rule - because the mixture
+    and the token budget are chosen against inference cost, not against the
+    pretraining optimum. The trap is treating mixture and quality work as
+    preprocessing that cannot change the metric: they change exactly which
+    tokens the mean is over, and that is the metric.
+
+
+  derivations:
+    - title: "The loss is a sum over positions, so the mean is a weighted mean"
+      latex: |
+        Factorise the document and take logs:
+
+        $$\log p_\theta(x_{1:T}) = \sum_{t=1}^{T}\log p_\theta(x_t \mid x_{<t}),
+          \qquad
+          \mathcal{L} = -\frac{1}{N}\sum_{t=1}^{N}\log p_\theta(x_t \mid x_{<t}) .$$
+
+        For a batch of documents with lengths $T_d$, $N = \sum_d T_d$, so
+
+        $$\mathcal{L} = \sum_d \frac{T_d}{N}\,\mathcal{L}_d,
+          \qquad \mathcal{L}_d = -\frac{1}{T_d}\sum_{t\in d}\log p_\theta(x_t\mid x_{<t}),$$
+
+        which is a weighted mean of per-document losses with weights proportional
+        to length. The gradient inherits the same weights, because
+        differentiation is linear:
+
+        $$\nabla_\theta \mathcal{L}
+          = \sum_d \frac{T_d}{N}\,\nabla_\theta \mathcal{L}_d .$$
+
+        Measured on 306 held-out documents: $\mathcal{L} = 4.2157$ nats,
+        $\frac{1}{|\mathcal{D}|}\sum_d \mathcal{L}_d = 4.3228$ nats, a gap of
+        $0.1072$. The
+        longest document is 629 tokens against a median of 69, so it carries
+        9.1x the weight of a median document in both the loss and the update.
+      prose: >-
+        The denominator is not a detail. "Per-token" and "per-document" are
+        different objectives with different gradients, and the difference here -
+        0.1072 nats - is larger than most architecture changes are worth at this
+        scale. It also explains why a length filter and a mixture weight are the
+        same kind of intervention: both change $T_d/N$.
+
+    - title: "Perplexity is exp of the mean NLL, and it scales with fertility"
+      latex: |
+        By definition $\operatorname{ppl} = \exp(\mathcal{L})$, and
+        $\mathcal{L} = b\ln 2$ with $b$ the bits per token, so
+
+        $$\operatorname{ppl} = 2^{b}, \qquad
+          b = \text{bpc}\times c, \qquad c = \frac{\text{characters}}{\text{token}},$$
+
+        where bpc is bits per character and $c$ is the tokeniser's compression.
+        Holding the information fixed at bpc $= 2.474$ (measured), the perplexity
+        of one token is a pure function of $c$:
+
+        $$c = 1.00 \Rightarrow 5.56, \qquad c = 4.55 \Rightarrow 2{,}447,
+          \qquad c = 0.38 \Rightarrow 1.92 .$$
+
+        The ratio between the English and Hindi tokenisations is therefore
+
+        $$\frac{\operatorname{ppl}_{\text{EN}}}{\operatorname{ppl}_{\text{HI}}}
+          = 2^{\,\text{bpc}\,(c_{\text{EN}} - c_{\text{HI}})}
+          = 2^{\,2.474 \times 4.17} = 1{,}275,$$
+
+        before any difference in model quality is considered. A Hindi model that
+        is worse per character - 3.0 bpc - reports
+        $2^{3.0\times0.38} = 2.20$, which is still 1,110x below the English
+        number.
+      prose: >-
+        Perplexity is an exponent, so a change in the tokeniser's compression
+        enters multiplicatively. That is why cross-lingual perplexity tables are
+        unreadable: fertility differs by 10.6x between English and Hindi with the
+        same vocabulary, and the metric exponentiates the difference. Compare
+        bits per character, on the same text, or do not compare.
+
+    - title: "Chinchilla: the Lagrangian, the closed form, and the ratio"
+      latex: |
+        Minimise the two-term loss subject to the compute constraint:
+
+        $$L(N,D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}},
+          \qquad 6ND = C .$$
+
+        With multiplier $\lambda$,
+
+        $$\frac{\partial}{\partial N}:\;
+            -\alpha A N^{-\alpha-1} + 6\lambda D = 0,
+          \qquad
+          \frac{\partial}{\partial D}:\;
+            -\beta B D^{-\beta-1} + 6\lambda N = 0 .$$
+
+        Dividing eliminates $\lambda$:
+
+        $$\alpha A\,D^{\beta} = \beta B\,N^{\alpha}
+          \;\Longrightarrow\;
+          D = \left(\frac{\beta B}{\alpha A}\right)^{1/\beta} N^{\alpha/\beta}.$$
+
+        Substituting into $6ND = C$ and solving,
+
+        $$N^{\star} = \left(\frac{C}{6k}\right)^{\frac{\beta}{\alpha+\beta}},
+          \qquad k = \left(\frac{\beta B}{\alpha A}\right)^{1/\beta},
+          \qquad D^{\star} = \frac{C}{6N^{\star}} ,$$
+
+        so with $\alpha = 0.34$, $\beta = 0.28$,
+        $A = 406.4$, $B = 410.7$:
+
+        $$N^{\star} \propto C^{0.4516}, \qquad D^{\star} \propto C^{0.5484},
+          \qquad \frac{D^{\star}}{N^{\star}} \propto C^{0.0968}.$$
+
+        At $C = 5.88\times10^{23}$: $N^{\star} = 32.49$B,
+        $D^{\star} = 3.016$T, $D^{\star}/N^{\star} = 92.8$, $L = 1.9300$. At the
+        70B/1.4T point the same surface gives 1.9366, a gap of 0.0067 nats.
+      prose: >-
+        The ratio is not 20 by derivation; 20 is what the empirical frontier fit
+        gives, and the parametric surface fitted to the same runs gives 93 at
+        that budget. Because $D^\star/N^\star$ grows only as $C^{0.0968}$, the
+        two hardly disagree in loss - 0.0067 nats - and both are inside the
+        fit's error. What the derivation buys you is the shape: the exponents sum
+        to one, so a fixed compute budget is split between parameters and tokens,
+        and which side is starved is what a scaling run is trying to tell you.
+
+  implementations:
+    - language: python
+      title: "A correct causal loss, and the packing arithmetic that decides what it averages over"
+      note: >-
+        Correct, and deliberately explicit about the two things that go wrong:
+        the shift (logits at position t score token t+1) and the denominator
+        (counted tokens, not positions, not sequences). It reproduces this
+        topic's numbers on the 3,063-document corpus: 522 windows at 512 tokens,
+        70 tokens of padding, 3,057 interior boundaries and 5.868 documents per
+        window, against 82.97% padding if every document were padded to the
+        window. The one simplification is that the model is an MLP over three
+        words rather than a transformer, which changes the loss and not the
+        arithmetic.
+      code: |
+        import math
+
+
+        def lm_loss(logits, targets, ignore_index=None):
+            """Mean NLL of targets[t+1] under logits[t]; skips ignored targets."""
+            total, count = 0.0, 0
+            for t in range(len(targets) - 1):
+                y = targets[t + 1]
+                if ignore_index is not None and y == ignore_index:
+                    continue
+                row = logits[t]
+                m = max(row)                                  # max-shift, or exp overflows
+                lse = m + math.log(sum(math.exp(z - m) for z in row))
+                total += lse - row[y]
+                count += 1
+            return total / count if count else 0.0
+
+
+        def pack_stats(lengths, budget):
+            total = sum(lengths)
+            windows = (total + budget - 1) // budget
+            padding = windows * budget - total
+            off, boundaries = 0, 0
+            for L in lengths[:-1]:
+                off += L
+                if off % budget != 0:
+                    boundaries += 1
+            return {"windows": windows, "padding": padding,
+                    "boundaries": boundaries,
+                    "docs_per_window": len(lengths) / windows,
+                    "padding_fraction": padding / (windows * budget)}
+
+
+        # measured on the 3,063-document corpus (267,194 tokens):
+        #   512-token windows : 522 windows, 70 padding tokens,
+        #                       3,057 interior boundaries, 5.868 docs/window
+        #   2,048-token windows: 131 windows, 1,094 padding tokens (0.41%)
+        #   one document per sequence: 95.74% padding
+        print(pack_stats([5, 5, 6], 8))    # {'windows': 2, 'padding': 0, ...}
+
+    - language: python
+      title: "The tempting wrong loss: average the per-document means"
+      note: >-
+        Numerically WRONG, and the error is invisible because the function is
+        correct on everything it claims to do. It computes the mean of
+        per-document means - which is a perfectly good statistic and is not the
+        training objective. Measured on the same 306 held-out documents it
+        returns 4.3228 nats where the objective is 4.2157, a 0.1072-nat error
+        (ppl 75.40 against 67.74, 11.3% high), and the gradient is wrong in the
+        same proportion: every document gets the same weight regardless of
+        length, so a 26-token document pushes as hard as a 629-token one. The
+        bug survives review because the number is plausible and because a loss
+        that is 2.5% off does not look broken on a training curve.
+      code: |
+        def doc_mean_loss(doc_nlls):
+            """WRONG as a training objective: mean of per-document means."""
+            return sum(nll / n for nll, n in doc_nlls) / len(doc_nlls)
+
+
+        def token_mean_loss(doc_nlls):
+            """Correct: sum of NLL over sum of tokens (the objective)."""
+            return sum(nll for nll, n in doc_nlls) / sum(n for nll, n in doc_nlls)
+
+
+        # measured on 306 held-out documents:
+        #   doc_mean_loss   -> 4.3228  (ppl 75.40)
+        #   token_mean_loss -> 4.2157  (ppl 67.74)
+        # 0.1072 nats = 11.3% in perplexity, from the choice of denominator only
+
+  checkpoints:
+    - id: cp-ppl-tokeniser
+      question: >-
+        The same model, on the same held-out prose, reports perplexity 67.74
+        with a word-level tokeniser and 5.52 with a byte-level one. Which model
+        is better, and what number would you put in the paper?
+      answerKind: short_text
+      hint: >-
+        Perplexity is exp of the mean NLL per token. Ask how many characters a
+        token carries in each case before comparing the two exponents.
+      solution: >-
+        The word model is better and the byte model looks better because a token
+        carries different amounts of text. Measured: the word model is 4.2157
+        nats/token = 6.0819 bits/token at 4.271 characters per token, which is
+        1.424 bits/character; the byte model is 1.7076 nats/token = 2.4636
+        bits/token at 0.996 characters per token, which is 2.474 bits/character.
+        So the word model compresses the same text in 1.74x fewer bits per
+        character while reporting 12.3x the perplexity. The number for the paper
+        is bits per character (or bits per byte for a byte-level model), with the
+        tokeniser stated; perplexity is only comparable to another perplexity
+        computed with the same vocabulary on the same text.
+    - id: cp-split-noise
+      question: >-
+        Your run evaluates on 30 held-out documents and reports 4.18; a
+        colleague's evaluates on 306 and reports 4.16. Is yours worse, and how
+        would you know?
+      answerKind: short_text
+      hint: >-
+        Examples within a document are correlated, so the effective sample size
+        is documents, not tokens. What is the standard deviation of a
+        per-document mean loss?
+      solution: >-
+        You cannot tell from the numbers, and the reason is quantifiable. The
+        per-document mean loss on held-out documents has a standard deviation of
+        0.677 nats, so the standard error of a mean over 30 documents is 0.1236
+        and over 306 documents it is 0.0387. A 30-document estimate can
+        therefore sit 0.25 nats from the truth at 95% confidence with nothing
+        wrong, and two 30-document runs need a 0.35-nat gap before the difference
+        is real. Measured directly on this corpus: the full 25,691-token
+        validation split reads 4.1591 and a 4,052-token prefix of it reads
+        4.1785 - 0.019 nats, inside the noise. Report the split, the token
+        count, and the document count, and do not compare numbers that do not
+        have all three.
+    - id: cp-mlm-better
+      question: >-
+        A masked model reaches 3.53 nats where your causal model reaches 4.26 on
+        the same held-out targets, same parameters, same data, same steps. Does
+        masking produce a better base model?
+      answerKind: short_text
+      hint: >-
+        Count how many context slots each objective gets, and on which side of
+        the target they sit.
+      solution: >-
+        No - it is asked an easier question. The masked model has 3 left slots,
+        a mask slot, and 2 slots to the *right* of the target; the causal model
+        has 6 slots, all to the left. Seeing two tokens of the future is worth
+        0.7336 nats (ppl 34.11 against 71.04) on identical targets, and that is
+        information, not representation quality. Two further facts make the
+        comparison worse: the masked model needs 6.67 passes to give every token
+        the same number of labels (307 per 2,048-token window against 2,047),
+        and its loss is not a normalised likelihood, so it cannot score or
+        sample a document. Prefix LM is the controlled version of the same
+        experiment: bidirectional on half the positions, and it buys 0.1291
+        nats. The comparison to make is downstream, at equal compute, not at
+        equal loss.
+    - id: cp-packing-boundary
+      question: >-
+        You switch from one document per sequence to packed 2,048-token windows,
+        and validation loss rises by about 0.1 nats. Nothing else changed. What
+        happened, and what do you check first?
+      answerKind: short_text
+      hint: >-
+        Packing puts 23 documents in a window. What does the model see in front
+        of the first token of each document?
+      solution: >-
+        The first token of each document is now conditioned on the previous
+        document's tail instead of on a start token. Measured: the first token of
+        a document scores 3.3024 nats with its own start token and 6.2664 with
+        the previous document's last three tokens - 2.964 nats on 306 held-out
+        documents, and 3,060 such positions in this corpus. Check that an
+        end-of-document token is actually in the stream and actually in the
+        targets: with EOS the boundary is cheap, without it you are training the
+        model to continue a document it has never seen. The second thing to check
+        is the denominator - a packed batch has no padding, so a loss that
+        divides by padded positions instead of real tokens changes scale.
+    - id: cp-cut-compute
+      question: >-
+        The next run has a quarter of the compute. You can shrink the model or
+        the token budget. Which, and what do you measure first?
+      answerKind: short_text
+      hint: >-
+        Compute is 6ND. A quarter of the compute can be half the parameters and
+        half the tokens, or a quarter of one and all of the other - and the right
+        answer depends on which side is currently starved.
+      solution: >-
+        Measure both local slopes before choosing. On this corpus, the last
+        data step (98,229 to 213,042 targets, 2.17x) bought 0.3550 nats - slope
+        -0.4586 per e-fold - while the last parameter step (410,704 to 691,408,
+        1.68x) bought 0.0133, slope -0.0256: data is worth 17.9x more per
+        e-fold, so the answer is to shrink the model and keep the tokens. The
+        general rule from the fitted surface: at $C \approx 6ND$ with the
+        published exponents, N and D both scale roughly as the square root of
+        compute, so a quarter of the budget is half the parameters and half the
+        tokens only if you are at the frontier. If you are at 0.52 tokens per
+        parameter, as this model is, you are nowhere near it and the local
+        measurement is the only thing that transfers.
+    - id: cp-which-exponent
+      question: >-
+        A slide says "loss falls as compute to the -0.34". Is that right, and
+        what would you write instead?
+      answerKind: short_text
+      hint: >-
+        There are three different exponents in play: the parameter exponent, the
+        reducible part along the frontier, and the total loss. Which one is on
+        the slide?
+      solution: >-
+        It is the parameter exponent of a two-term fit being used as a
+        compute exponent. Along a compute-optimal frontier the reducible part
+        falls as $C^{-\alpha\beta/(\alpha+\beta)} = C^{-0.154}$; the total loss
+        falls as $d\ln L/d\ln C$, which is -0.0537 at $10^{20}$ FLOPs and
+        -0.0191 at $5.88\times10^{23}$ because 1.69 of the 1.93 nats is
+        irreducible; and Kaplan et al. report about -0.05 for the total in their
+        range. Write the exponent with its definition and its range: "the
+        reducible loss falls as C^-0.154 along the fitted frontier, so the total
+        falls by 0.019 e-folds per e-fold at Chinchilla's budget". The -0.34
+        figure applied to the total loss predicts 1.93 -> 0.88 over a 10x
+        increase in compute - a 1.05-nat gain - where the fitted surface gives
+        0.072, so it overstates the gain by a factor of fifteen.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Pretraining is one number repeated at every position of every document:
+        how surprised was the model by the token that actually came next. The
+        average of that surprise is the loss. Nothing else is in the objective -
+        no notion of truth, quality, or instruction - so every property of a base
+        model comes from the corpus, and every engineering decision is about
+        which tokens the average is taken over.
+
+        That reframing is the whole topic. A document is not a unit the loss can
+        see: only tokens are. A language is not a unit either: only tokens are.
+        So when two numbers disagree, the first question is never "which model is
+        better" but "which tokens were counted, and how many characters did each
+        one carry".
+      blocks:
+        - kind: checklist
+          body: |
+            - The loss is a mean over counted tokens, not over documents
+            - The shift matters: logits at t score token t+1
+            - Perplexity is exp of the mean NLL per token
+            - A token's information depends on the tokeniser that made it
+            - Packing changes boundaries; padding changes the denominator
+            - Scaling laws are fits with a range, not constants
+      checkpoint: >-
+        Before reading on: if a document is 629 tokens and another is 26, how
+        many times does the long one enter the loss - and did anyone decide that?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        There are three questions and each has its own instrument. "Is this loss
+        any good?" is answered by comparing it to the uniform baseline ln V and
+        to the tokeniser's bits per character, never to a number from a paper
+        with a different vocabulary. "Is this objective comparable to that one?"
+        is answered by counting context slots on each side of the target and by
+        counting labels per pass - if either differs, the losses are not on the
+        same axis. "Should I spend the next GPU-hour on parameters or data?" is
+        answered by two short runs that vary one factor each, and by comparing
+        their local slopes, not by quoting an exponent from a paper.
+
+        Choose by the question, not by the number: aggregation questions get a
+        re-weighted mean, tokeniser questions get bits per character, objective
+        questions get a label-matched comparison, and scaling questions get a
+        local slope measured inside your own range.
+      blocks:
+        - kind: checklist
+          body: |
+            - Compare a loss to ln V and to bits/character, never to another tokeniser's ppl
+            - Count context slots left and right of the target before comparing objectives
+            - Count labels per pass (2,047 causal, 307 masked at 15%) before comparing runs
+            - Compute the standard error over documents, not over tokens
+            - Measure the local slope of loss against data and against parameters
+            - State the denominator whenever you state a loss
+      checkpoint: >-
+        Which instrument tells you whether a 4.2-nat loss is good, and which
+        tells you whether it is comparable to a paper's 3.4?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The objective, the packer, and the two comparisons that decide whether a
+        number means anything.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # the objective, once per batch
+            tokens = pack(documents, window)          # concatenate, EOS between
+            logits = model(tokens[:-1])               # T-1 prediction rows
+            loss = mean over t of -log_softmax(logits[t])[tokens[t+1]]
+                   skipping positions whose target is pad
+
+            # packing, and what it costs
+            windows  = ceil(sum(lengths) / budget)
+            padding  = windows * budget - sum(lengths)
+            boundary = a document start that is not a window start
+            # padding is cheap, boundaries are not: EOS is what makes them cheap
+
+            # is this loss comparable?
+            bits_per_token = loss / ln 2
+            bits_per_char  = bits_per_token / (characters / tokens)
+            labels_per_pass = T - 1              if causal
+                            = 0.15 * T           if masked
+            effective_passes = passes * labels_per_pass / T
+
+            # where to spend compute
+            slope_data = d(loss) / d(ln D)
+            slope_param = d(loss) / d(ln N)
+            spend on whichever slope is steeper, then re-measure
+      checkpoint: >-
+        Two runs both report 4.1 nats. One used 6 causal slots, the other 15%
+        masking with 4 slots each side. What else do you need before you can
+        order them?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three relations carry the topic: the loss is a length-weighted mean, the
+        perplexity is an exponent in the tokeniser's compression, and the
+        compute-optimal ratio is a Lagrangian solution whose exponents sum to
+        one.
+      blocks:
+        - kind: math
+          body: |
+            Weighted mean. With $N = \sum_d T_d$,
+
+            $$\mathcal{L} = \sum_d \frac{T_d}{N}\mathcal{L}_d,
+              \qquad \nabla_\theta\mathcal{L} = \sum_d \frac{T_d}{N}\nabla_\theta\mathcal{L}_d,$$
+
+            measured 4.2157 (token mean) against 4.3228 (document mean), 0.1072
+            apart.
+
+            Perplexity and fertility.
+
+            $$\operatorname{ppl} = 2^{b}, \quad b = \text{bpc}\times c,
+              \qquad \frac{\operatorname{ppl}_{EN}}{\operatorname{ppl}_{HI}}
+              = 2^{\,\text{bpc}(c_{EN}-c_{HI})} = 2^{\,2.474\times4.17} = 1{,}275 .$$
+
+            Chinchilla. Minimising $A/N^\alpha + B/D^\beta$ subject to $6ND = C$:
+
+            $$\alpha A D^\beta = \beta B N^\alpha, \qquad
+              N^\star = \left(\frac{C}{6k}\right)^{\frac{\beta}{\alpha+\beta}},
+              \quad k = \left(\frac{\beta B}{\alpha A}\right)^{1/\beta},$$
+
+            so $N^\star \propto C^{0.4516}$, $D^\star \propto C^{0.5484}$ and
+            $D^\star/N^\star \propto C^{0.0968}$: at
+            $C = 5.88\times10^{23}$, $N^\star = 32.49$B, $D^\star = 3.016$T,
+            $L = 1.9300$.
+      checkpoint: >-
+        The two exponents sum to one because the constraint is a product. What
+        would change if compute scaled as $N^2 D$ instead of $ND$?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A pretraining step that is correct by construction: pack with an EOS,
+        shift once, mask padding, divide by counted tokens, and log the numbers
+        you would need to compare the run to anything else.
+      blocks:
+        - kind: warning
+          body: >-
+            Four silent failures. Scoring logits[t] against tokens[t] instead of
+            tokens[t+1] gives a copy loss that falls beautifully and teaches
+            nothing. Dividing by padded positions instead of counted tokens
+            scales the loss by the fraction of positions that are real tokens -
+            0.043 when 95.74% of them are padding - which looks like a large
+            improvement and is not. Averaging per-document means reports 4.3228
+            where the objective is 4.2157 and changes the gradient weighting
+            with it. And a masked loss reported beside a
+            causal loss is not a comparison: the masked model sees two tokens of
+            the future and its number is 0.7336 nats lower for that reason
+            alone.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+
+            def pretrain_step(model, batch_tokens, pad_id, lr, opt):
+                T = len(batch_tokens)
+                logits = model(batch_tokens[:-1])           # T-1 rows
+                total, count = 0.0, 0
+                for t in range(T - 1):
+                    y = batch_tokens[t + 1]
+                    if y == pad_id:
+                        continue                            # not a real target
+                    row = logits[t]
+                    m = max(row)
+                    lse = m + math.log(sum(math.exp(z - m) for z in row))
+                    total += lse - row[y]
+                    count += 1
+                loss = total / count                        # per counted token
+                opt.step(model.grad(loss), lr)
+                return loss, count
+
+
+            def report(loss, count, chars, tokens, docs):
+                bits = loss / math.log(2)
+                return {"nats_per_token": loss,
+                        "ppl": math.exp(loss),
+                        "bits_per_char": bits / (chars / tokens),
+                        "tokens": tokens, "documents": docs,
+                        "labels": count}
+      checkpoint: >-
+        `report` returns nats/token, perplexity, bits per character, tokens,
+        documents and labels - and only one of those six survives a change of
+        tokeniser. Which entry would you add to make the token budget comparable
+        across model sizes, and why is `labels` in there at all?
+
+  problems:
+    - id: p-lm-loss
+      title: "The causal loss, with the shift and an ignore index"
+      difficulty: medium
+      prompt: >-
+        Implement `lm_loss(logits, targets, ignore_index=None)`. `logits` is a
+        list of T rows, each a list of V floats; `targets` is a list of T
+        integers. Return the mean cross-entropy of `targets[t + 1]` under
+        `logits[t]`, over `t` from 0 to T-2: that is, logits at position t
+        predict the token at t+1, and the last target is never a prediction.
+        Skip any position whose target equals `ignore_index`; if every position
+        is skipped, return 0.0. Use a max-shift inside the log-sum-exp so that a
+        logit of 1000 does not overflow.
+      starter: |
+        import math
+
+        def lm_loss(logits, targets, ignore_index=None):
+            # your implementation here
+            pass
+      language: python
+      entry: lm_loss
+      testCases:
+        - input: '{"logits": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], "targets": [0, 1, 2], "ignore_index": null}'
+          expected: '1.0986122886681098'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [[2.0, 0.0], [0.0, 3.0], [1.0, -1.0]], "targets": [0, 1, 0], "ignore_index": null}'
+          expected: '2.587757681308357'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [[0.0, 1.0], [1.0, 0.0]], "targets": [-100, -100], "ignore_index": -100}'
+          expected: '0.0'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [[0.5, -0.5, 1.0], [1.0, 2.0, -1.0], [-2.0, 0.0, 2.0], [0.0, 0.0, 0.0]], "targets": [0, 1, -100, 2], "ignore_index": -100}'
+          expected: '1.123531116918314'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [[1000.0, 0.0]], "targets": [0, 0], "ignore_index": null}'
+          expected: '0.0'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import math
+
+        def lm_loss(logits, targets, ignore_index=None):
+            total, count = 0.0, 0
+            for t in range(len(targets) - 1):
+                y = targets[t + 1]
+                if ignore_index is not None and y == ignore_index:
+                    continue
+                row = logits[t]
+                m = max(row)
+                lse = m + math.log(sum(math.exp(z - m) for z in row))
+                total += lse - row[y]
+                count += 1
+            return total / count if count else 0.0
+      solutionExplanation: >-
+        The first case is the baseline: three uniform rows over V = 3, two
+        counted positions (t = 0 predicts targets[1] = 1, t = 1 predicts
+        targets[2] = 2), each costing ln 3 = 1.0986122886681098, so the mean is
+        unchanged. The second case is where a wrong shift shows up: at t = 0 the
+        row [2, 0] must score targets[1] = 1, which costs 2.1269 nats; at t = 1
+        the row [0, 3] must score targets[2] = 0, which costs 3.0486; the mean
+        is 2.5878. An implementation that scores row t against targets[t] gets
+        0.1269 and 0.0486, a mean of 0.0878 - 29.5x lower - and trains a model
+        to copy its input. The third case has nothing to predict at all (the only prediction
+        targets targets[1] = -100), so the guard returns 0.0 rather than
+        dividing by zero. The fourth case mixes the two: t = 0 counts, t = 1 is
+        skipped, t = 2 counts, so the mean is over two positions and the last
+        row is unused. The fifth case is the numerical one: logits [1000, 0]
+        give a probability of 1.0 in float, so the loss is exactly 0.0, but only
+        because the max-shift keeps exp(1000) out of the computation - a naive
+        `math.exp(z)` raises OverflowError the moment a logit exceeds 709, and a
+        `sum(exp(z))` without the shift loses all precision long before that.
+      complexity: "O(T V) time, O(1) extra space"
+      tags: [cross-entropy, teacher-forcing, log-sum-exp, ignore-index]
+
+    - id: p-pack-stats
+      title: "Packing arithmetic: windows, padding, and document boundaries"
+      difficulty: easy
+      prompt: >-
+        Implement `pack_stats(lengths, budget)` for a packed stream. Documents
+        are concatenated in order and the stream is cut into consecutive
+        `budget`-token windows. Return a dict with `windows` (the number of
+        windows needed, ceil of total over budget), `padding` (tokens of padding
+        added to the last window), `boundaries` (the number of junctions between
+        consecutive documents that do NOT fall exactly on a window edge, i.e.
+        that land inside a window) and `docs_per_window` (the number of documents
+        divided by the number of windows, as a float). If the total length is
+        zero, return zeros and 0.0.
+      starter: |
+        def pack_stats(lengths, budget):
+            # your implementation here
+            pass
+      language: python
+      entry: pack_stats
+      testCases:
+        - input: '{"lengths": [10, 10, 10], "budget": 8}'
+          expected: '{"windows": 4, "padding": 2, "boundaries": 2, "docs_per_window": 0.75}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"lengths": [4, 4, 4, 4], "budget": 8}'
+          expected: '{"windows": 2, "padding": 0, "boundaries": 2, "docs_per_window": 2.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"lengths": [5], "budget": 8}'
+          expected: '{"windows": 1, "padding": 3, "boundaries": 0, "docs_per_window": 1.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"lengths": [20], "budget": 8}'
+          expected: '{"windows": 3, "padding": 4, "boundaries": 0, "docs_per_window": 0.3333333333333333}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"lengths": [3, 5, 8], "budget": 8}'
+          expected: '{"windows": 2, "padding": 0, "boundaries": 1, "docs_per_window": 1.5}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def pack_stats(lengths, budget):
+            total = sum(lengths)
+            if total <= 0:
+                return {"windows": 0, "padding": 0, "boundaries": 0,
+                        "docs_per_window": 0.0}
+            windows = (total + budget - 1) // budget
+            padding = windows * budget - total
+            off, boundaries = 0, 0
+            for L in lengths[:-1]:
+                off += L
+                if off % budget != 0 and off < total:
+                    boundaries += 1
+            return {"windows": windows, "padding": padding,
+                    "boundaries": boundaries,
+                    "docs_per_window": len(lengths) / windows}
+      solutionExplanation: >-
+        The second case is the one that separates counting boundaries from
+        counting documents: four 4-token documents in 8-token windows have three
+        junctions, at offsets 4, 8 and 12, and only those at 4 and 12 land inside
+        a window - the one at 8 starts a new window and costs nothing. That is
+        the whole point of the metric: a boundary that coincides with a window
+        edge is free. The fifth case is subtler: offsets are 3 and 8, so the
+        junction at 3 is interior and the one at 8 is not, giving 1 boundary and
+        1.5 documents per window. The first case shows the ceiling: 30 tokens in
+        windows of 8 need 4 windows, so 2 positions of padding, and both
+        junctions (at 10 and 20, residues 2 and 4) are interior. The fourth case
+        is a single document longer than the window: it needs 3 windows and 4
+        tokens of padding, and it contributes no *document* boundary at all -
+        because the metric counts junctions between documents, not the internal
+        cuts that splitting a long document creates. That is a deliberate choice
+        and it is why the docstring says "junctions"; a metric that counted
+        splits would call this 2.
+      complexity: "O(len(lengths)) time, O(1) space"
+      tags: [packing, padding, document-boundary, batching]
+
+    - id: p-chinchilla-alloc
+      title: "Compute-optimal allocation from the fitted surface"
+      difficulty: hard
+      prompt: >-
+        Implement `chinchilla_alloc(compute_flops)` returning the allocation that
+        minimises `L(N, D) = E + A/N**alpha + B/D**beta` subject to
+        `6*N*D = C`, with `E = 1.69`, `A = 406.4`, `alpha = 0.34`, `B = 410.7`,
+        `beta = 0.28`. Solve it in closed form rather than by search: dividing
+        the two stationarity conditions gives
+        `alpha*A*D**beta = beta*B*N**alpha`, so
+        `N = (C / (6*k)) ** (beta / (alpha + beta))` with
+        `k = (beta*B / (alpha*A)) ** (1/beta)`, and `D = C / (6*N)`. Return a dict
+        with `params`, `tokens`, `tokens_per_param` and `loss`.
+      starter: |
+        def chinchilla_alloc(compute_flops):
+            # your implementation here
+            pass
+      language: python
+      entry: chinchilla_alloc
+      testCases:
+        - input: '{"compute_flops": 1e20}'
+          expected: '{"params": 644857508.9987316, "tokens": 25845502974.052284, "tokens_per_param": 40.07940143890473, "loss": 2.5998497468543653}'
+          mode: json
+          tolerance: 1e-09
+        - input: '{"compute_flops": 1e22}'
+          expected: '{"params": 5160473684.851609, "tokens": 322967767776.6498, "tokens_per_param": 62.58490741357919, "loss": 2.1386140845028567}'
+          mode: json
+          tolerance: 1e-09
+        - input: '{"compute_flops": 1e23}'
+          expected: '{"params": 14598306275.268364, "tokens": 1141684956624.208, "tokens_per_param": 78.20667241092119, "loss": 2.005010128092831}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        E, A, ALPHA = 1.69, 406.4, 0.34
+        B, BETA = 410.7, 0.28
+
+        def chinchilla_alloc(compute_flops):
+            k = (BETA * B / (ALPHA * A)) ** (1.0 / BETA)
+            N = (compute_flops / (6.0 * k)) ** (BETA / (ALPHA + BETA))
+            D = compute_flops / (6.0 * N)
+            L = E + A / N ** ALPHA + B / D ** BETA
+            return {"params": N, "tokens": D,
+                    "tokens_per_param": D / N, "loss": L}
+      solutionExplanation: >-
+        The exponents are the thing to read off the answer: 0.28/0.62 = 0.4516
+        on parameters and 0.5484 on tokens, so at 1e20 FLOPs the optimum is a
+        645M-parameter model on 25.8B tokens - 40.1 tokens per parameter - and at
+        1e23 it has moved to 78.2, not stayed at 40. The ratio is not a constant,
+        which is the misconception the topic is aimed at: it grows as C^0.0968.
+        Two arithmetic traps. First, the constant k must be raised to 1/beta, not
+        to beta: (0.8322)^(1/0.28) = 0.5192, and using 0.8322 directly shrinks N
+        by 19%. Second, `D = C/(6N)` uses the *same* C; solving
+        `D` by putting `N` back into `A/N^alpha = B/D^beta` gives a different
+        answer because that equation fixes the ratio, not the budget. The loss
+        column is the reality check: 2.5998 at 1e20 and 2.0050 at 1e23, a
+        difference of 0.59 nats for a thousandfold increase in compute, which is
+        what an effective exponent near -0.05 looks like.
+      complexity: "O(1) time and space"
+      tags: [scaling-laws, chinchilla, optimisation, compute-budget]
+
+
+  try_it: >-
+    Compute $\ln V$ for your tokenizer's vocabulary and compare it with the loss your training
+    script prints. If the number is close to $\ln V$ the model has learned the unigram
+    distribution and nothing else — that is the only baseline the loss itself provides.
+  interview_questions:
+    - question: 'Why is a per-token loss meaningless without the tokenizer that produced the tokens?'
+      level: mid
+      key_points:
+        - 'The loss is a sum over positions divided by the number of positions, so the denominator is the tokenizer.'
+        - 'The same held-out prose gives 4.2157 nats per word-token at V = 2,000 and 1.7076 nats per byte-token, with perplexities 67.74 and 5.52.'
+        - 'Those two perplexities rank the models in the opposite order to bits per character, which is the comparison that is actually comparable.'
+        - 'So a cross-tokenizer comparison is measuring the vocabulary, not the model.'
+    - question: 'Causal, 15%-masked and prefix LM were trained on the same corpus for the same steps. The masked number is lowest. Which model is better?'
+      level: senior
+      key_points:
+        - 'The numbers are not comparable: causal scores 4.2632 nats (ppl 71.04) and 15%-masked 3.5296 (ppl 34.11) on 25,398 identical held-out targets.'
+        - 'The masked model saw both directions, so it is answering an easier question with strictly more information.'
+        - 'It also makes far fewer predictions per pass: a causal pass over 2,048 tokens yields 2,047 predictions and a 15%-masked pass yields 307.'
+        - 'Masking trades labels for passes at a fixed exchange rate of 1/0.15, so the comparison is of objectives, not of learned quality.'
+      follow_up: 'If you had to choose between causal and masked for a model that will be prompted rather than fine-tuned, which measurement would settle it?'
+    - question: 'What does packing cost and what does it buy?'
+      level: mid
+      key_points:
+        - 'One document per 2,048-token sequence wastes 95.74% of every batch as padding, because the median document in this corpus is 69 tokens.'
+        - 'Packing 3,063 documents into 131 windows wastes 0.41%, 1,094 tokens in total.'
+        - 'The price is document boundaries inside a window, which means attention crosses documents that have nothing to do with each other.'
+        - 'The decision is whether cross-document attention is noise or a useful prior for your data, not whether packing is more efficient.'
+  common_mistakes:
+    - 'Comparing losses across tokenizers: 4.2157 nats per word-token against 1.7076 nats per byte-token is not a like-for-like number.'
+    - 'Reading the masked-LM loss as a better model than the causal one, when it saw both directions and made a different number of predictions.'
+    - 'Measuring validation loss on a 4,052-token prefix and calling it the split number, when the full 25,691-token split reads 0.019 nats lower.'
+  further_reading:
+    - label: "Hoffmann, Borgeaud, Mensch, Buchatskaya, Cai, Rutherford, de Las Casas, Hendricks, Welbl & Clark, Training Compute-Optimal Large Language Models (NeurIPS 2022)"
+    - label: "Devlin, Chang, Lee & Toutanova, BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding (NAACL 2019)"

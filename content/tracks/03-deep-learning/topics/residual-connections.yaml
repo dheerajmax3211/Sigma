@@ -1,0 +1,1619 @@
+id: residual-connections
+slug: residual-connections
+title: "Residual Connections and the Depth Problem"
+summary: >-
+  Measure the degradation problem — training error that rises as you add layers
+  to the same task — and remove it with the identity path: read a block's
+  Jacobian as I + J, count what the skip buys per block, and choose pre-norm,
+  post-norm, and a projection shortcut from the arithmetic instead of the
+  folklore.
+kind: lesson
+difficulty: hard
+position: 7
+estMinutes: 30
+prerequisites: [batchnorm-layernorm, gradient-stability]
+phase: deep-learning-foundations
+tags: [residual-connections, degradation-problem, identity-path, jacobian, pre-norm, post-norm, projection-shortcut, resnet, depth]
+
+body:
+  big_idea: >-
+    Depth is free only when the identity is free: a residual block makes the
+    identity the zero of its parameterisation, and every useful fact about it
+    follows from that one algebraic choice.
+
+  problem:
+    - >-
+      You add sixteen blocks and the training loss, on the same 512 examples,
+      gets worse; every suggestion you get targets overfitting or step size.
+    - >-
+      You paste `out = x + f(x)` and conclude "residuals help gradients flow",
+      which predicts nothing about why depth 100 still falls over.
+    - >-
+      You inherit a ResNet whose shortcut `conv2d` is followed by BatchNorm:
+      the "identity" path now changes its input by 3.17 per layer instead of
+      0.0.
+
+  analogy: |
+    A document passed through a chain of photocopiers: each station re-copies
+    the sheet it received, so the fifth generation is grainier and the
+    fiftieth unreadable, though every station could make a perfect copy. The
+    residual fix is to pass the original down the line as well, letting each
+    station add its own annotations, so station fifty still has a clean
+    original.
+
+  concept_points:
+    - >-
+      **The degradation problem is a training-error problem, which is why overfitting is the wrong diagnosis.**
+      On the identity task with 512 examples, training MSE is **0.172** at
+      depth 2, **0.337** at 8, **0.451** at 20, **0.936** at 56 — a factor of
+      **5.45** on data it was trained on — while the residual arm at the same
+      depth reaches **0.020**. More data, dropout and early stopping leave
+      this number untouched.
+    - >-
+      **The test is whether the block can be the identity, and a plain block fails it before training starts.**
+      A plain pre-norm block computes $\varphi(\mathrm{LN}(h)W)$, which always
+      carries the scale of $W$: measured, it changes its input by **4.22**. A
+      residual block makes the identity the default — zero the branch's output
+      matrix and $\max|y - x| = 0.0$ exactly — so its function class literally
+      contains the shallower net's.
+    - >-
+      **A residual block's Jacobian is $I + J_f$, so the backward product has a term that is exactly the identity at every depth.**
+      The product over $L$ blocks expands into $2^L$ terms —
+      $2^{50} = 1.13\times10^{15}$ — of which one is the identity with
+      coefficient 1. With $\|J_f\|_2 = 0.1$ and $d = 64$: the plain product
+      has norm **$1.85\times10^{-64}$**, the residual product **1.645** —
+      **63.9 decades** from one addition.
+    - >-
+      **The identity is a route, not a floor: an anti-aligned branch still decays.**
+      With $J_f = cI$ the per-block gain is exactly $|1+c|$, so fifty blocks
+      give $1.1^{50} = 117.4$ at $c = +0.1$, $1.0$ at $c = 0$,
+      $0.9^{50} = 5.15\times10^{-3}$ at $c = -0.1$ and
+      $0.5^{50} = 8.9\times10^{-16}$ at $c = -0.5$. The exponent moved from
+      $\log_{10}c$ to $\log_{10}|1+c|$; it did not become zero.
+    - >-
+      **Where the normaliser sits decides whether the "identity" path is still an identity.**
+      Post-norm computes $y = \mathrm{LN}(x + f(x))$; pre-norm computes
+      $y = x + f(\mathrm{LN}(x))$. With a zero branch, the pre-norm block
+      returns its input unchanged( $\max|y-x| = 0.0$); the post-norm block
+      returns $\mathrm{LN}(x)$, differing by $\max|y-x| = \mathbf{0.417}$ and
+      pinning the standard deviation to **0.999995**.
+    - >-
+      **Post-norm multiplies the skip route by LN's Jacobian, and the factor is $1/\sqrt{1+c^2}$ per block.**
+      The stream entering block $l+1$ has norm $\sqrt{1+c^2}$ times the
+      previous, so the skip over $L$ blocks is $(1+c^2)^{-L/2}$:
+      **$2.98\times10^{-8}$** at $c=1$, $L=50$; **0.780** at $c=0.1$.
+      Pre-norm's skip route is exactly 1 at every depth. Measured on 50
+      blocks, the post-norm gradient *grows* by **103x** while its skip route
+      is $3\times10^{-8}$.
+
+  definitions:
+    - term: "Residual connection"
+      meaning: >-
+        A path that adds a block's input to its output, $y = x + f(x)$, so the
+        block computes a *residual* $f$ rather than the whole map. Its defining
+        property is that $f = 0$ gives the identity exactly, which makes the
+        identity reachable in one step from any initialisation.
+    - term: "Shortcut / skip connection"
+      meaning: >-
+        The edge that carries $x$ past the branch. It has no parameters when
+        the width is unchanged, and one linear map (a $1\times1$ convolution or
+        a `Linear`, plus a norm in the original ResNet) when it is not. What it
+        carries into the backward pass is exactly 1 per block, or $W_s^\top$
+        when the width changes.
+    - term: "Residual branch"
+      meaning: >-
+        The function $f$ inside the skip, usually two or three weighted layers.
+        Everything learnable in a residual block is here; the skip itself is
+        parameter-free, which is why it cannot decay.
+    - term: "Residual stream"
+      meaning: >-
+        The tensor $h$ that the skips carry, and to which every block adds.
+        Its norm grows with depth — like $\sqrt{1+Lc^2}$ per block for a branch
+        of relative gain $c$ — so in a pre-norm transformer the stream is the
+        widest thing in the model and the thing that needs a final norm.
+    - term: "Identity path"
+      meaning: >-
+        The route through a stack that takes the skip at every block. It
+        contributes the leading $I$ term of the product expansion with
+        coefficient exactly 1 at any depth. It is one of $2^L$ paths, so it is
+        not a lower bound on the norm — only a guaranteed non-zero route.
+    - term: "Degradation problem"
+      meaning: >-
+        Training error that increases as layers are added to a network whose
+        shallower version already fits. It is not overfitting (train error
+        rises, so there is no gap to blame) and not a parameter shortage (the
+        deeper net has more weights, and a residual net of the same size drives
+        its training error far lower). He et al. (2016) demonstrated it on
+        CIFAR-10 with 20- and 56-layer plain nets and introduced the residual
+        block as the fix.
+    - term: "Pre-norm (pre-LN)"
+      meaning: >-
+        $y = x + f(\mathrm{LN}(x))$: normalisation inside the branch, so the
+        skip route is untouched and the block is exactly the identity when $f$
+        is zero. Standard in every transformer since GPT-2, at the cost of a
+        stream whose norm grows with depth and a final norm before the head.
+    - term: "Post-norm (post-LN)"
+      meaning: >-
+        $y = \mathrm{LN}(x + f(x))$: normalisation after the addition, so the
+        skip route is multiplied by LN's Jacobian at every block — a factor of
+        $1/\sqrt{1+c^2}$ where $c$ is the branch-to-stream ratio. The original
+        transformer and the original ResNet v1 arrangement; trainable, but it
+        needs a small branch and a warmup, and it destroys the identity at
+        initialisation.
+    - term: "Projection shortcut"
+      meaning: >-
+        The $W_s$ used when the skip changes width or stride, $y = W_s x +
+        f(x)$. It is a linear map, not an identity, so the route's gain is
+        $\sigma_{\max}(W_s)$: 2.40 for a default-init $64\to128$ map,
+        exactly 1.0 for a semi-orthogonal one, and 0.0 if you zero it.
+    - term: "Zero-init residual"
+      meaning: >-
+        Initialising a block's final weight matrix (usually the last norm's
+        gain, or the output projection) to zero so the block starts as the
+        identity. Every block then contributes nothing at initialisation, and
+        the deep stack starts as its own head; depth is grown by gradient
+        descent. Zero the branch, never the shortcut.
+    - term: "Residual (branch) scaling"
+      meaning: >-
+        A constant multiplying the branch output, typically
+        $1/\sqrt{2L}$ for $L$ blocks (GPT-2), or $1/\sqrt{L}$. It keeps the
+        branch-to-stream ratio $c$ small, which bounds the stream's growth as
+        $\sqrt{1+Lc^2}$ and, in a post-norm net, keeps the skip route's
+        $(1+c^2)^{-L/2}$ decay near 1.
+    - term: "Block Jacobian"
+      meaning: >-
+        $\partial y/\partial x$ for one block: $I + J_f$ in a residual block,
+        $J$ in a plain one, and $S(I + J_f)$ or $I + J_f S$ depending on where
+        the norm sits. Its spectrum is what depth multiplies; for a residual
+        block $\sigma_{\max} \ge 1$ always, because $J_f$ cannot change the
+        directions LN deleted.
+
+  diagrams:
+    - type: architecture
+      title: "The identity path through one pre-norm residual block"
+      nodes:
+        - id: x
+          x: 0
+          y: 1
+          label: "x"
+          kind: client
+          detail: >-
+            The residual stream entering the block. It is also the thing the
+            skip carries forward untouched, which is why the block's Jacobian
+            has an I in it.
+        - id: ln
+          x: 1
+          y: 0
+          label: "LayerNorm"
+          kind: worker
+          detail: >-
+            Inside the branch, not on the skip. Its Jacobian removes the mean
+            direction and scales by 1/sigma; putting it here means that
+            projection applies to the branch only. Move it after the addition
+            and it applies to the identity route too, which is the whole
+            difference between pre-norm and post-norm.
+        - id: w
+          x: 2
+          y: 0
+          label: "W and activation"
+          kind: model
+          detail: >-
+            The learnable part. Zero this matrix and the branch outputs zero,
+            so the block is exactly y = x at initialisation, measured
+            max|y - x| = 0.0. That single property is what makes 56 blocks
+            trainable where 56 plain blocks are not.
+        - id: add
+          x: 3
+          y: 1
+          label: "+ (fan-in of two paths)"
+          kind: server
+          detail: >-
+            Forward: the two paths add. Backward: the two cotangents add, and
+            that sum is the identity route. The gradient arriving here leaves
+            along the skip with factor exactly 1, and along the branch with
+            factor J. Nothing else in the block can attenuate the first term.
+        - id: out
+          x: 3
+          y: 2
+          label: "y = x + f(x)"
+          kind: client
+          detail: >-
+            Same width, same scale, same meaning as the input plus a
+            correction. Stack fifty of these and the stream grows by about
+            sqrt(1 + 50 c^2) rather than decaying by c^50.
+      edges:
+        - { from: x, to: ln, label: "branch input" }
+        - { from: ln, to: w, label: "normalised" }
+        - { from: w, to: add, label: "f(x)" }
+        - { from: x, to: add, label: "skip, gain 1" }
+        - { from: add, to: out, label: "add" }
+      caption: >-
+        The skip is the only edge with no parameters, no activation and no
+        norm, which is precisely why its contribution to the backward pass is
+        exactly 1 at any depth. Every property this topic derives is a
+        consequence of that edge existing.
+
+    - type: plot
+      title: "Training error rises with depth, and the skip removes it"
+      chart: line
+      xLabel: "depth (blocks)"
+      yLabel: "training MSE on the identity task"
+      series:
+        - name: "plain blocks: h = relu(LN(h) W)"
+          points:
+            - { x: 1, y: 0.1957 }
+            - { x: 2, y: 0.1718 }
+            - { x: 4, y: 0.3093 }
+            - { x: 8, y: 0.3366 }
+            - { x: 20, y: 0.4510 }
+            - { x: 56, y: 0.9358 }
+        - name: "residual blocks: h = h + relu(LN(h) W)"
+          points:
+            - { x: 1, y: 0.0419 }
+            - { x: 2, y: 0.0439 }
+            - { x: 4, y: 0.0366 }
+            - { x: 8, y: 0.0438 }
+            - { x: 20, y: 0.0233 }
+            - { x: 56, y: 0.0197 }
+      caption: >-
+        Same width, same initialisation, same optimiser, same 3000 steps, same
+        512 training examples: the only difference is the addition. The plain
+        arm costs 5.45x more training error at depth 56 than at depth 2, on the
+        data it was fit on, so no test set is needed to rule out overfitting.
+
+    - type: plot
+      title: "Gradient norm through 50 blocks with every block Jacobian at 0.1"
+      chart: line
+      xLabel: "number of blocks traversed"
+      yLabel: "log10 of the gradient norm at the input"
+      series:
+        - name: "plain product of J"
+          points:
+            - { x: 1, y: -1.0 }
+            - { x: 5, y: -5.9134 }
+            - { x: 10, y: -12.2472 }
+            - { x: 20, y: -25.0327 }
+            - { x: 30, y: -37.8059 }
+            - { x: 40, y: -50.6979 }
+            - { x: 50, y: -63.7333 }
+        - name: "residual product of I + J"
+          points:
+            - { x: 1, y: 0.0295 }
+            - { x: 5, y: 0.0674 }
+            - { x: 10, y: 0.0922 }
+            - { x: 20, y: 0.1311 }
+            - { x: 30, y: 0.1642 }
+            - { x: 40, y: 0.1905 }
+            - { x: 50, y: 0.2163 }
+      caption: >-
+        Median of 20 draws at d = 64, every J normalised to spectral norm 0.1.
+        The plain arm loses 1.27 decades per block; the residual arm gains
+        0.004. The gap at 50 blocks is 63.9 decades, and it is one addition
+        wide.
+
+    - type: compare
+      title: "Pre-norm vs post-norm: what the skip actually carries"
+      left_label: "Pre-norm: y = x + f(LN(x))"
+      left_points:
+        - "Block is exactly the identity when the branch is zero: max |y - x| = 0.0 measured"
+        - "Skip route gain is exactly 1 at every depth; the branch is a correction"
+        - "Stream grows like sqrt(1 + L c^2): 28.5x over 50 blocks at c = 1, 5.8x at c = 0.2"
+        - "Gradient at block 1 grows with depth instead of decaying: 8.05x at 50 blocks, 14.8x at 100"
+        - "No warmup needed at depth 100, but a final norm before the head is mandatory"
+      right_label: "Post-norm: y = LN(x + f(x))"
+      right_points:
+        - "Block with a zero branch computes LN(x): max |y - x| = 0.417, std pinned to 0.99999"
+        - "Skip route multiplied by 1/sqrt(1 + c^2) per block: 2.98e-8 over 50 blocks at c = 1, 0.78 at c = 0.1"
+        - "Stream norm is pinned to sqrt(d) every block, so depth is invisible in the activations"
+        - "Total gradient can grow while the skip route dies: 103x growth at 50 blocks, carried by branch paths"
+        - "Trains at depth 50 only if the branch is scaled down: 0.0036 either way with 1/sqrt(2L)"
+
+    - type: architecture
+      title: "The projection shortcut when the width changes"
+      nodes:
+        - id: x
+          x: 0
+          y: 1
+          label: "x (64)"
+          kind: client
+          detail: >-
+            The stream at 64 features. The branch below will produce 128, so
+            the skip must change width too: an addition needs matching shapes.
+        - id: proj
+          x: 1
+          y: 0
+          label: "W_s (128x64)"
+          kind: model
+          detail: >-
+            The projection. Default init gives spectral norm 2.401 and condition
+            5.30, so this route is a 5.3-conditioned linear map, not an
+            identity. Semi-orthogonal init gives gain exactly 1.0. Zero-init
+            gives 0.0 and deletes the route.
+        - id: branch
+          x: 1
+          y: 2
+          label: "branch to 128"
+          kind: worker
+          detail: >-
+            The learnable function. Its output is a residual correction, so it
+            should be the thing you shrink or zero at initialisation - not the
+            projection, which is the route.
+        - id: add
+          x: 2
+          y: 1
+          label: "+"
+          kind: server
+          detail: >-
+            Both inputs are now 128 wide. Backward, the skip contributes
+            W_s^T g, whose gain is 0.687 for a semi-orthogonal 128x64 map - it
+            shrinks a random cotangent by sqrt(64/128), and cannot do better
+            because the map is rank 64.
+        - id: out
+          x: 3
+          y: 1
+          label: "y (128)"
+          kind: client
+          detail: >-
+            The stream is now 128 wide and every later block is square again,
+            so the projection is a one-off cost at each resolution change.
+      edges:
+        - { from: x, to: proj, label: "skip" }
+        - { from: x, to: branch, label: "branch" }
+        - { from: proj, to: add, label: "W_s x" }
+        - { from: branch, to: add, label: "f(x)" }
+        - { from: add, to: out, label: "add" }
+      caption: >-
+        A width change is the one place a residual block cannot have a
+        parameter-free skip. It is also the one place where the "identity"
+        route is a learned linear map, which is why the initialisation of this
+        matrix - and not of the branch - decides whether the route survives.
+
+  markdown: |
+    ## Depth should be free, and it is not
+
+    Adding layers to a network can only help if the extra layers are allowed to
+    compute the identity. They are not, in a plain stack. Train the same task at
+    several depths and the *training* error gets worse:
+
+    | depth | plain block | residual block |
+    |---|---|---|
+    | 1 | 0.196 | 0.042 |
+    | 2 | 0.172 | 0.044 |
+    | 4 | 0.309 | 0.037 |
+    | 8 | 0.337 | 0.044 |
+    | 20 | 0.451 | 0.023 |
+    | 56 | 0.936 | 0.020 |
+
+    Identity target, 512 examples, $d = 32$, full-batch Adam at
+    $3\times10^{-3}$ for 3000 steps, mean of three seeds, identical
+    initialisation and parameter count in both arms. The plain net's training
+    error rises by a factor of 5.45 between depth 2 and depth 56. Overfitting
+    cannot produce that (it needs training error to fall), and neither can a
+    shortage of weights: the plain-56 net has 36 more weight matrices than the
+    plain-20, and the residual arm at the same depth and width drives its
+    training error to 0.020 on the same examples. What the plain arm lacks is an
+    identity setting — a pre-norm plain block re-normalises its input and can
+    never pass $h$ through — so its extra blocks cannot be switched off. This is
+    the **degradation problem**, and it is a failure of the parameterisation.
+
+    Read the table for the ordering, not the absolute values. At width 32 and 56
+    blocks the model has ~57k weights for 512 examples, so both arms are in the
+    interpolation regime: a measured residual depth-20 model scores 1.17 MSE on
+    fresh data, i.e. it memorised the batch. These are training errors, the
+    right quantity for a degradation diagnosis, and they say nothing about
+    generalisation.
+
+    ## The identity is what a block has to be able to compute
+
+    One plain block computes $h \mapsto \varphi(\mathrm{LN}(h)W)$. There is no
+    $W$ that makes this the identity: $\mathrm{LN}(h)$ has unit variance by
+    construction, so the block's output always has the scale of $W$ rather than
+    the scale of its input. Measured on one random He-initialised block, it
+    changes its input by 4.22 in max-abs — the opposite of identity — and fifty
+    of them compose fifty such changes.
+
+    A residual block computes
+
+    $$y = x + f(x),$$
+
+    so the identity is the *zero* of the parameterisation: set the branch's
+    output matrix to zero and the block is exactly $y = x$ (measured
+    $\max|y - x| = 0.0$). That is the entire mechanism. Nothing about the
+    forward pass is approximated, nothing about the initialisation has to be
+    lucky, and every block can start switched off.
+
+    ## What the skip does to the Jacobian
+
+    Differentiate one block:
+
+    $$\frac{\partial y}{\partial x} = I + J_f, \qquad J_f = \frac{\partial f}{\partial x}.$$
+
+    Stack $L$ of them and the product expands into $2^L$ terms:
+
+    $$\prod_{l=1}^{L}(I + J_{f_l}) = I + \sum_{l=1}^{L} J_{f_l} + \sum_{l<l'} J_{f_l}J_{f_{l'}} + \cdots + \prod_{l=1}^{L} J_{f_l}.$$
+
+    For fifty blocks that is $2^{50} = 1.13\times10^{15}$ paths, and exactly one
+    of them — take the skip at every block — is the identity, with coefficient
+    1. Measured with every $\|J_{f_l}\|_2 = 0.1$ at $d = 64$ (median of 20
+    draws):
+
+    | | norm | $\log_{10}$ |
+    |---|---|---|
+    | plain $\prod J$ | $1.85\times10^{-64}$ | $-63.73$ |
+    | residual $\prod (I+J)$ | 1.645 | $+0.216$ |
+    | typical vector through the residual product | 1.072 | $+0.030$ |
+
+    Sixty-four decades, from one `+`. Note what the identity term is *not*: it
+    is one term among $10^{15}$, so it does not bound the norm. Measured,
+    $\|\prod(I+J) - I\|_2 = 0.799$ while the crude bound $(1.1)^{50} - 1$ is
+    116 — the bound is 146x loose because random Jacobians rotate the signal
+    away from each other's top directions. And the identity route can still
+    decay: with an anti-aligned branch $J_f = cI$ the per-block gain is
+    $|1+c|$, so $c = -0.1$ gives $0.9^{50} = 5.15\times10^{-3}$ and
+    $c = -0.5$ gives $8.9\times10^{-16}$.
+
+    ## Where the norm sits
+
+    A residual block has two orderings, and they are not interchangeable:
+
+    | | forward | skip route over $L$ blocks | identity at init |
+    |---|---|---|---|
+    | pre-norm | $x + f(\mathrm{LN}(x))$ | $1$ exactly | yes, 0.0 |
+    | post-norm | $\mathrm{LN}(x + f(x))$ | $(1+c^2)^{-L/2}$ | no, 0.417 |
+
+    The post-norm row follows from where LN's Jacobian lands. Writing
+    $S = \partial\,\mathrm{LN}/\partial z$ with $\|S\| = 1/\sigma_z$ and
+    $z = x + f(x)$:
+
+    $$\text{pre: } J = I + J_f S, \qquad \text{post: } J = S\,(I + J_f).$$
+
+    In the pre-norm case $S$ multiplies the branch only, so the skip's
+    contribution is untouched. In the post-norm case $S$ multiplies both, and
+    the stream's norm grows by $\sqrt{1+c^2}$ per block before each norm, so
+    the skip route is multiplied by $1/\sqrt{1+c^2}$ at every block. At
+    $c = 1$ and $L = 50$ that is $2^{-25} = 2.98\times10^{-8}$; at $c = 0.1$ it
+    is $0.780$. Which one you get is a decision about how big you let the
+    branch be, not a decision about depth.
+
+    Post-norm is not broken. Measured with the branch scaled by
+    $1/\sqrt{2L}$, both orderings reach training MSE 0.0036 at depth 50. What
+    pre-norm removes is the *requirement* that $c \ll 1$ and that the first few
+    hundred steps be small — the warmup post-LN transformers needed. That is why
+    the modern default is pre-norm with a final norm before the head.
+
+    ## When the width changes
+
+    A skip can only add, so a block that changes width needs a projection:
+
+    $$y = W_s x + f(x), \qquad W_s \in \mathbb{R}^{128\times64}.$$
+
+    This route is a linear map, so its gain is $\sigma_{\max}(W_s)$ and its
+    backward gain is governed by $W_s^\top$. Measured for $64\to128$: default
+    init gives forward 1.328, backward 0.990, $\sigma_{\max} = 2.401$,
+    $\sigma_{\min} = 0.453$, condition 5.30. Semi-orthogonal gives forward
+    exactly 1.0 and backward 0.687. Zero-init gives 0.0 and 0.0.
+
+    So: project to fix the shape, initialise the projection so its singular
+    values are near 1, and never zero it. Zero the *branch's* last matrix
+    instead — that is the one whose zero means "identity".
+
+    ## What residuals do not fix
+
+    - **The stream grows.** $\|h_L\| \approx \sqrt{1+Lc^2}\|h_0\|$: 28.5x over
+      50 blocks at $c = 1$. The head sees a depth-dependent scale, which is why
+      pre-norm stacks end in a norm and why residual scaling exists.
+    - **The spectrum is better, not flat.** The residual product's condition
+      number at 50 blocks is 2.80 against $8.4\times10^{17}$ for the plain
+      product — seventeen orders of magnitude, and still not 1.
+    - **Low precision eats small corrections.** At $\|h\| = 28$ the float32
+      spacing is $1.9\times10^{-6}$, and a measured branch of norm $10^{-8}$
+      added to that stream leaves it bit-identical. bf16 keeps 8 mantissa bits,
+      a relative precision of $2^{-8} = 0.4\%$, so at that magnitude a
+      correction below $28 \times 0.004 = 0.11$ is rounded away.
+    - **Memory.** Every block's activations are needed for the backward pass,
+      and the stream is carried at full width through all of them.
+
+    ## What to measure
+
+    Three numbers, in this order. Training error at depth 20 and depth 56 with
+    everything else held fixed — if it rises, you have degradation and no
+    amount of data will help. The per-block gradient norm with the skip removed
+    and restored — at fifty blocks and $c = 0.1$ the ratio is $10^{-64}$, and
+    anything below $10^{-12}$ means the skip is carrying the backward pass
+    alone. And the skip route's own gain: exactly 1 for
+    pre-norm with matched widths, $(1+c^2)^{-L/2}$ for post-norm,
+    $\sigma_{\max}(W_s)$ for a projection. That last number is the one that
+    tells you whether the depth you paid for is actually connected.
+
+    ## The longer version
+
+    Depth is free only when the identity is free: a residual block makes the
+    identity the *zero* of its parameterisation, and the useful facts — the
+    Jacobian $I + J_f$, the gradient that keeps a route to layer 1, the
+    ordering rules for normalisation — are all consequences of that one
+    algebraic choice rather than separate tricks.
+
+    A document passed through a chain of photocopiers. Each station re-copies
+    the sheet it received, so the fifth generation is grainier than the first
+    and the fiftieth is unreadable — even though every station is capable of
+    making a perfect copy. The failure is not that a copier is bad. It is that
+    each one is asked to reproduce an already-degraded input, and small losses
+    compound multiplicatively.
+
+    The residual fix is the obvious office procedure: pass the *original* down
+    the line as well, and let each station add its own annotations to it. Now
+    station 50 still has the original, and the annotations are the only thing
+    that accumulates.
+
+    Where it breaks: paper does not change. In a network the "original" is the
+    residual stream, and every block *adds* to it, so the stream is the
+    original plus fifty annotations — measured, its norm grows 28.5x over 50
+    blocks. The analogy also suggests the original is pristine, when in fact
+    the forward pass rewrites it: the stream is the thing being learned, not a
+    preserved input. And a photocopier that inverts its input would still ruin
+    the copy no matter how many originals you hand out, which is the
+    anti-aligned-$J$ case below.
+
+    ### What goes wrong
+
+    - You add sixteen blocks to a model that was training fine and the
+      **training** loss gets worse. Not the validation loss — the training
+      loss, measured on the same 512 examples you fit on. Every suggestion you
+      get (more data, dropout, a bigger model, a lower learning rate) is aimed
+      at overfitting or at step size, and this is neither.
+    - You paste `out = x + f(x)` into the block because the paper did, the
+      model trains a little better, and you conclude "residuals help gradients
+      flow". That sentence predicts nothing: it does not tell you why depth
+      100 still falls over, why zeroing the branch of a post-norm block does
+      not give you an identity, or what to do when the skip has to change
+      width.
+    - You inherit a ResNet whose shortcut `conv2d` is followed by a BatchNorm.
+      The "identity" path now rescales and re-centres every block, the block
+      changes its input by 3.17 per layer instead of 0.0, and the property you
+      added the skip for is gone. Nothing raises, and the loss curve looks
+      normal until depth 30.
+    - An interviewer asks why every transformer since GPT-2 is pre-norm, and
+      "it trains better" is not an answer. The answer is a factor of
+      $1/\sqrt{1+c^2}$ applied to the skip route at every block, where $c$ is
+      the branch-to-stream ratio — 0.78 over 50 blocks at $c = 0.1$ and
+      $2.98\times10^{-8}$ at $c = 1$.
+    - You zero-init the branch output to "start at the identity", and the loss
+      does not move for two hundred steps, because you also zeroed the
+      *projection* in the shortcut and deleted the only path that had a
+      gradient. Two `zeros_` calls, one word apart, opposite effects.
+
+    ### The full treatment
+
+    **The degradation problem is a training-error problem, which is why
+    overfitting is the wrong diagnosis.** Take a fixed task — regress the
+    identity on 512 examples in 32 dimensions — and train stacks of blocks
+    that differ only in count. Measured, mean of three seeds, full-batch Adam
+    at $3\times10^{-3}$ for 3000 steps: training MSE is **0.172** at depth 2,
+    **0.337** at depth 8, **0.451** at depth 20 and **0.936** at depth 56 —
+    a factor of **5.45** between the 2-block and the 56-block net, on data it
+    was trained on. Overfitting has the opposite signature (train down, test
+    up), and a shortage of parameters is not the story either: the plain-56
+    net has 36 more weight matrices than the plain-20, and the residual arm at
+    the same depth and width drives its training error to **0.020** on the
+    same 512 examples. What the plain arm lacks is an identity setting — a
+    pre-norm plain block computes $\varphi(\mathrm{LN}(h)W)$, which
+    re-normalises its input and can never pass $h$ through — so its 56 blocks
+    cannot even represent the 20-block solution. The trap is that
+    every tool aimed at overfitting — more data, dropout, early stopping —
+    leaves this number untouched, and the run looks like a hyperparameter
+    problem forever.
+
+    **The test is whether the block can be the identity, and a plain block
+    fails it before training starts.** A 56-block net would match a 20-block
+    net if its 36 extra blocks did nothing; a pre-norm plain block has no such
+    setting, because its output $\varphi(\mathrm{LN}(h)W)$ is a re-normalised,
+    rescaled function of $h$ — it always carries the scale of $W$, never the
+    scale of its input. Measured on one block with random He-initialised
+    weights, it changes its input by **4.22** in max-abs (relative change
+    0.95), and stacking fifty of them composes fifty such changes. A
+    residual block makes the identity the *default*: set the branch's output
+    matrix to zero and the block is $y = x$, measured $\max|y - x| = 0.0$
+    exactly, and the 56-block net's function class then literally contains the
+    20-block net's. The trap is to read the skip as a gradient device. It is a
+    parameterisation device: it makes one specific function — the identity —
+    reachable in a single step from any initialisation, and gradient flow is
+    the consequence.
+
+    **A residual block's Jacobian is $I + J_f$, so the backward product has a
+    term that is exactly the identity at every depth.** For $y = x + f(x)$,
+    $\partial y/\partial x = I + J_f$, and the product over $L$ blocks is
+    $I + \sum_l J_{f_l} + \sum_{l<l'} J_{f_l}J_{f_{l'}} + \cdots$ — $2^L$
+    terms, $2^{50} = 1.13\times10^{15}$ of them for fifty blocks, of which
+    exactly one is the identity, with coefficient 1. Measured with every
+    block's Jacobian normalised to $\|J_f\|_2 = 0.1$, $d = 64$, median of 20
+    draws: the plain product has norm **$1.85\times10^{-64}$**
+    ($\log_{10} = -63.73$) and the residual product **1.645**
+    ($\log_{10} = +0.216$) — **63.9 decades** from one addition. The trap is
+    reading the identity term as a floor on the norm: it is one term of
+    $10^{15}$, and the others can be larger than it (measured,
+    $\|\prod(I+J) - I\|_2 = 0.799$ against the bound $(1.1)^{50} - 1 = 116$).
+
+    **The identity is a route, not a floor: an anti-aligned branch still
+    decays.** With a scalar-aligned branch $J_f = cI$ the per-block gain is
+    exactly $|1 + c|$, so fifty blocks give $1.1^{50} = 117.4$ at $c = +0.1$,
+    $1.0$ at $c = 0$, $0.9^{50} = 5.15\times10^{-3}$ at $c = -0.1$ and
+    $0.5^{50} = 8.9\times10^{-16}$ at $c = -0.5$. The exponent moved from
+    $\log_{10} c$ to $\log_{10}|1+c|$; it did not become zero. This is why a
+    residual net with a badly scaled branch — one whose linear part is
+    negative-definite, or whose output scale is large enough that
+    $c \approx -1$ in some direction — still loses its early layers, and why
+    "residuals fix vanishing gradients" is a claim about typical random $J$,
+    not a theorem. The trap is the corollary: at $c$ near $-1$ the block is
+    almost exactly annihilating, and the cheapest-looking fix (shrinking the
+    branch by a large negative factor) is the worst one.
+
+    **Where the normaliser sits decides whether the "identity" path is still
+    an identity.** Post-norm computes $y = \mathrm{LN}(x + f(x))$; pre-norm
+    computes $y = x + f(\mathrm{LN}(x))$. Measured on one block with a
+    zero branch, $d = 64$, input standard deviation 1.0097: the pre-norm
+    block returns its input unchanged ($\max|y-x| = 0.0$, std 1.0097), while
+    the post-norm block returns $\mathrm{LN}(x)$, which differs by
+    $\max|y-x| = \mathbf{0.417}$ (relative 0.123) and pins the standard
+    deviation to **0.999995**. That is not a rounding difference, and it is
+    the same measurement *Batch Normalisation and Layer Normalisation* made
+    for a BatchNorm after the addition (3.17 per layer there, 0.417 for one
+    LayerNorm block here): the post-norm block's forward map is a projection
+    plus a rescale, so a stack
+    of them cannot carry the input forward unchanged even with every branch
+    at zero. The trap is that the block still trains, so this survives review;
+    what you have lost is the reason you added depth.
+
+    **Post-norm multiplies the skip route by LN's Jacobian, and the factor is
+    $1/\sqrt{1+c^2}$ per block.** Differentiating $y = \mathrm{LN}(z)$ with
+    $z = x + f(x)$ puts $S = \partial\,\mathrm{LN}/\partial z$ on the *left*
+    of $(I + J_f)$, and $S$ has norm $1/\sigma_z$. The stream entering block
+    $l+1$ has norm $\sqrt{1+c^2}$ times the norm entering block $l$ — the
+    branch adds $c^2$ — so the skip route over $L$ blocks is
+    $(1+c^2)^{-L/2}$: **$2.98\times10^{-8}$** at $c = 1$ and $L = 50$,
+    **$3.78\times10^{-3}$** at $c = 0.5$, **0.375** at $c = 0.2$, **0.780** at
+    $c = 0.1$. Pre-norm's skip route is exactly 1 at every depth. The trap is
+    the total gradient norm: measured on a 50-block stack, the post-norm
+    gradient *grows* by **103x** relative to depth 1 while its skip route is
+    $3\times10^{-8}$ — the norm is carried by branch paths, and the identity
+    route is gone. A healthy-looking gradient norm says nothing about which
+    route is alive; that is the same lesson *Gradient Stability* drew about
+    condition number.
+
+    **Pre-norm is standard because it removes a constraint, not because
+    post-norm cannot train.** With the branch scaled by $1/\sqrt{2L}$ — the
+    GPT-2 residual scaling, which keeps $c$ small — both orderings train
+    equally well: measured at depth 12 and depth 50 on the identity task,
+    pre-norm reaches training MSE **0.00380** and **0.00359**, post-norm
+    **0.00359** and **0.00362**. Post-norm is fine when $c \ll 1$ and you warm
+    up; what pre-norm buys is that you no longer have to. That is the actual
+    historical argument: post-LN transformers needed warmup and a small
+    residual branch to stay stable at depth, and pre-LN ones did not, so
+    depth stopped being a tuning problem. The price is a stream whose norm
+    grows like $\sqrt{L}$ — measured **28.5x** over 50 blocks at branch gain
+    1.0 and **5.8x** at 0.2 — which is why a pre-norm stack needs a final
+    norm before the head and why very deep pre-LN runs still want a small
+    learning rate. The trap is treating pre-norm as free: it trades a
+    contraction for a growth.
+
+    **The projection shortcut is not an identity, and its initialisation
+    decides whether the route survives.** When the block changes width, the
+    skip becomes $y = W_s x + f(x)$ with $W_s$ of shape $d_{\text{out}} \times
+    d_{\text{in}}$. Measured for $64 \to 128$: PyTorch's default linear init
+    gives a forward gain of **1.328** and a backward gain of **0.990** with
+    $\sigma_{\max} = 2.401$, $\sigma_{\min} = 0.453$ and condition number
+    **5.30** — so the "identity" route already stretches some directions
+    2.4x and squashes others to 0.45. A semi-orthogonal $W_s$ gives forward
+    gain exactly **1.0** and backward gain 0.687 (it is a $128\times64$ map,
+    so $W_s^\top$ shrinks a random cotangent by $\sqrt{64/128}$). Zero-init
+    gives **0.0** in both directions: you have deleted the route and left the
+    branch as the only path, which is a plain network with extra steps. The
+    trap is that the code for "zero the branch" and "zero the shortcut" is
+    the same two tokens, and one of them is the whole idea.
+
+    **Zeroing the branch makes the whole deep net start as a shallow linear
+    model, and that is the point.** With every block's output matrix at zero,
+    the 56-block stack computes $y = W_{\text{head}} x$ at initialisation:
+    measured block-level $\max|y - x| = 0.0$, so the composition of 56
+    identities is the identity and only the head is trained on step one. As
+    the branch weights leave zero, depth is *grown* by gradient descent
+    rather than imposed at initialisation — which is why 1000-layer ResNets
+    train at all, and why the zero-init is not a trick but the mechanism. The
+    trap is the neighbourhood: zero-init the branch's last layer only. If the
+    block has a bias after the branch, or a norm after the addition, the
+    initial function is not the identity (measured 0.417 for post-norm), and
+    if you zero the head as well, every gradient on step one is exactly zero
+    and nothing grows.
+
+    **Residuals do not remove the depth budget; they move it.** Three things
+    still bite. The stream: $\|h_L\| \approx \sqrt{1 + Lc^2}\,\|h_0\|$, so at
+    $c = 1$ the norm is 28.5x after 50 blocks and the head sees an input
+    whose scale depends on depth. The spectrum: the residual product's
+    condition number is **2.80** where the plain product's is
+    **$8.4\times10^{17}$** — better by seventeen orders of magnitude, and
+    still not 1, so a residual net can be badly conditioned without being
+    singular. The precision: a float32 addition at $\|h\| = 28$ has a spacing
+    of $1.9\times10^{-6}$, and a measured branch of norm $10^{-8}$ added to
+    such a stream leaves it **bit-identical** (`h + 1e-8*delta == h`), so the
+    branch's forward contribution is silently dropped; bf16's relative
+    precision is $2^{-8}$, so the same thing happens there to a correction of
+    about 0.11.
+    The trap is believing the skip makes depth safe. It makes depth
+    *trainable*, and leaves you a norm budget to manage.
+
+
+  derivations:
+    - title: "The block Jacobian is I + J_f, so the product has an identity term at every depth"
+      latex: |
+        For one block $y = x + f(x)$ with $f$ differentiable at $x$,
+
+        $$\frac{\partial y}{\partial x} = I + \frac{\partial f}{\partial x} = I + J_f(x).$$
+
+        Stacking $L$ blocks and applying the chain rule,
+
+        $$\frac{\partial h_L}{\partial h_0} = \prod_{l=1}^{L}\left(I + J_{f_l}\right)
+          = I + \sum_{l=1}^{L} J_{f_l} + \sum_{l<l'} J_{f_l}J_{f_{l'}} + \cdots
+          + \prod_{l=1}^{L} J_{f_l},$$
+
+        which has $2^L$ terms; at $L = 50$ that is $2^{50} = 1.13\times10^{15}$,
+        and exactly one term — the product of the identities — is $I$, with
+        coefficient 1 at any depth. Bounding the two extremes,
+
+        $$\left\|\prod_l J_{f_l}\right\| \le c^{L}, \qquad
+          \left\|\prod_l (I + J_{f_l})\right\| \le (1+c)^{L},
+          \qquad c = \max_l \|J_{f_l}\|_2.$$
+
+        Measured at $c = 0.1$, $L = 50$, $d = 64$, median of 20 draws: plain
+        $1.85\times10^{-64}$ ($\log_{10} = -63.73$), residual $1.645$
+        ($\log_{10} = +0.216$), typical vector gain $1.072$, and
+        $\|\prod(I+J) - I\|_2 = 0.799$ against the bound $116.4$.
+      prose: >-
+        The identity term is the only one that does not involve a product of the
+        branch's Jacobians, which is why it survives when everything else
+        decays — and why the fix is structural rather than a matter of scale.
+        The bound is 146x loose in the measured case because random Jacobians
+        rotate the signal away from each other's top singular directions, so
+        quote the measured product, not the bound. The same expansion also says
+        what a residual connection does *not* buy: the identity is one term of
+        $10^{15}$, so it guarantees a route to layer 1 and guarantees nothing
+        about its size relative to the branch terms.
+
+    - title: "The exponent moves from log c to log |1 + c|, and it is not always an improvement"
+      latex: |
+        Take the scalar-aligned case $J_{f_l} = cI$ for every block — the model
+        of a branch whose linear part acts along one direction, which is the
+        worst case a residual connection has to survive. Then
+
+        $$\prod_{l=1}^{L}(I + J_{f_l}) = (1+c)^{L} I, \qquad
+          \left\|\prod_{l=1}^{L} J_{f_l}\right\| = |c|^{L},$$
+
+        so the per-block exponent is $\log_{10}|1+c|$ instead of
+        $\log_{10}|c|$, and over fifty blocks
+
+        $$c = +0.1:\ 1.1^{50} = 117.4, \quad c = 0:\ 1.0, \quad
+          c = -0.1:\ 0.9^{50} = 5.15\times10^{-3}, \quad
+          c = -0.5:\ 0.5^{50} = 8.9\times10^{-16}.$$
+
+        For a matrix $J$ that does not commute with $I$ the growth is bounded
+        by $(1+\|J\|)^L$ above and by $(1-\|J\|)^L$ below, and the realised
+        value depends on the alignment of $J$'s top singular direction with the
+        gradient — measured, random $J$ at $\|J\| = 0.1$ gives $1.072$ over 50
+        blocks while $J = -0.1I$ gives $0.00515$.
+      prose: >-
+        This is the derivation that stops "residuals fix vanishing gradients"
+        from being a slogan. The residual connection changes the exponent; it
+        does not set it to zero. At $c > 0$ the identity route grows, at
+        $c = 0$ it is neutral, and for $-1 < c < 0$ it decays — slowly at first
+        (0.995 per block at $c = -0.01$) and then catastrophically as $c \to
+        -1$, where the block is nearly annihilating and the whole product
+        collapses to zero at a rate set by how close to $-1$ you are. In
+        practice $c$ is the branch's linear response along the gradient
+        direction, so a branch whose weights have a large negative component
+        along the stream is the dangerous case — the same regime that makes a
+        post-norm block contract.
+
+    - title: "Pre-norm and post-norm differ by which side LN's Jacobian lands on"
+      latex: |
+        For $\mathrm{LN}(z)$ over $d$ features with $\sigma = \sqrt{\operatorname{var}(z) + \varepsilon}$,
+
+        $$S \;=\; \frac{\partial\,\mathrm{LN}}{\partial z}
+          \;=\; \frac{1}{d\sigma}\left(dI - \mathbf{1}\mathbf{1}^\top
+          - \hat z \hat z^\top\right), \qquad \|S\|_2 = \frac{1}{\sigma},$$
+
+        because the two subtracted terms are orthogonal projections onto
+        $\mathbf{1}$ and onto $\hat z$, and $\|\hat z\|^2 = d$. A pre-norm block
+        $y = x + f(\mathrm{LN}(x))$ has
+
+        $$J_{\text{pre}} = I + J_f S,$$
+
+        so the skip route is $I$ and the branch is modified. A post-norm block
+        $y = \mathrm{LN}(x + f(x))$ has
+
+        $$J_{\text{post}} = S\,(I + J_f),$$
+
+        so both routes are multiplied by $S$. If the branch has relative gain
+        $c$ then $\|z\| = \sqrt{1+c^2}\,\|x\|$ before each norm, hence
+        $\|S\| = (1+c^2)^{-1/2}$ and the skip route over $L$ blocks is
+
+        $$\left\|\prod_{l=1}^{L} S_l\right\| = (1+c^2)^{-L/2}:
+          \quad c=1 \Rightarrow 2.98\times10^{-8}, \quad
+          c=0.5 \Rightarrow 3.78\times10^{-3}, \quad
+          c=0.1 \Rightarrow 0.780.$$
+      prose: >-
+        Two facts fall out that are easy to conflate. The forward pass of a
+        post-norm block with a zero branch is $\mathrm{LN}(x)$, not $x$ —
+        measured $\max|y - x| = 0.417$ and a standard deviation pinned to
+        0.99999 — so the identity is not reachable by zeroing the branch. And
+        the skip route decays geometrically in a post-norm stack, at a rate set
+        by the branch-to-stream ratio: 0.78 over 50 blocks when the branch is a
+        tenth of the stream, $3\times10^{-8}$ when it is the same size. That is
+        the quantitative form of "post-norm needs a small branch and a warmup,
+        pre-norm does not". The total gradient norm does not show this, because
+        it is dominated by the branch paths — measured, the post-norm gradient
+        grows 103x from depth 1 to depth 50 while its skip route is
+        $3\times10^{-8}$.
+
+  implementations:
+    - language: python
+      title: "A pre-norm block that is exactly the identity at init, and a post-norm twin that is not"
+      note: >-
+        Numerically WRONG in three specific ways, all measured at the bottom of
+        the block. (1) `backward` differentiates the block as if LayerNorm's
+        Jacobian were the identity, using `dx = g + g @ W.T`; the true term is
+        `g + (g @ W.T) @ S` with $S$ the LN Jacobian, and the omission is a
+        relative error of **21.4%** in Frobenius norm on a random cotangent at
+        $d = 32$. It still trains — the missing term is a projection, so the
+        error is a systematic bias rather than a divergence — which is exactly
+        why this bug ships. (2) The stream is accumulated in float32, where the
+        spacing at $\|h\| = 28$ is $1.9\times10^{-6}$: a branch of norm
+        $10^{-8}$ added to that stream leaves it **bit-identical** (verified
+        with `==`), so the branch's forward contribution vanishes and only its
+        gradient survives. (3) `order` defaults to `"post"`, so calling
+        `ResidualBlock(d, zero_init=True)` without reading the signature gives
+        a block that is *not* the identity — measured `max|out - in| = 0.417`
+        and an output std pinned to 1.0 — while the variable name says
+        `zero_init`.
+      code: |
+        import numpy as np
+
+        EPS = 1e-5
+
+        def layernorm(x, eps=EPS):
+            mu = x.mean(axis=-1, keepdims=True)
+            var = x.var(axis=-1, keepdims=True)
+            return (x - mu) / np.sqrt(var + eps)
+
+        class ResidualBlock:
+            """y = x + relu(LN(x) @ W)   (pre)   or   LN(x + relu(x @ W))   (post)."""
+
+            def __init__(self, d, order="post", zero_init=True, seed=0):
+                rng = np.random.default_rng(seed)
+                self.order = order
+                self.W = rng.normal(0, np.sqrt(2.0 / d), (d, d))
+                if zero_init:
+                    self.W = np.zeros_like(self.W)   # identity at init, pre-norm only
+                self.cache = None
+
+            def forward(self, x):
+                if self.order == "pre":
+                    c = layernorm(x)
+                    pre = c @ self.W
+                    self.cache = (c, x, pre > 0)
+                    return x + np.maximum(pre, 0.0)
+                pre = x @ self.W
+                z = x + np.maximum(pre, 0.0)
+                self.cache = (layernorm(z), x, pre > 0)
+                return layernorm(z)
+
+            def backward(self, g):
+                c, x, mask = self.cache
+                if self.order == "pre":
+                    # BUG 1: the LN Jacobian is dropped entirely. The true term is
+                    # g + ln_bwd((g * mask) @ W.T, cache); measured 21.4% off.
+                    return g + (g * mask) @ self.W.T, c.T @ (g * mask)
+                # Same omission on the post-norm path: g is treated as though it
+                # had already passed through LN, and nothing here applies it.
+                dpre = g * mask
+                return g + dpre @ self.W.T, x.T @ dpre
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            d, n = 64, 8
+            x = rng.normal(size=(n, d))
+            for order in ("pre", "post"):
+                blk = ResidualBlock(d, order=order, zero_init=True)
+                out = blk.forward(x)
+                print(order, "max|out - in| =", float(np.abs(out - x).max()),
+                      "out std =", float(out.std()))
+
+            # BUG 3: the default is post-norm, so this is not an identity.
+            blk = ResidualBlock(d, zero_init=True)
+            print("default order:", blk.order,
+                  float(np.abs(blk.forward(x) - x).max()))
+
+            # BUG 2: at stream norm 28, a 1e-8 branch is not representable.
+            h = rng.normal(size=d); h = (h / np.linalg.norm(h) * 28).astype(np.float32)
+            delta = rng.normal(size=d); delta = (1e-8 * delta / np.linalg.norm(delta)).astype(np.float32)
+            print("h + delta == h:", bool((h + delta == h).all()))
+            print("spacing at 28:", np.spacing(np.float32(28)))
+    - language: python
+      title: "The depth sweep that measures degradation — and the three ways to get it wrong"
+      note: >-
+        This is the harness behind the depth sweep in this topic, and it is
+        WRONG as an instrument in three ways that each change the conclusion.
+        (1) It draws a new initialisation for every depth, so
+        the comparison is unpaired; measured, depth 2 ranges over 0.169 to 0.175
+        across three seeds and depth 56 over 0.871 to 0.970 — the 5.45x gap
+        survives that easily — but depth 20 ranges over 0.391 to 0.573, so a
+        single seed there can overlap depth 56's low end and the conclusion
+        needs a mean, not one run. (2) It reports the loss at the final step
+        rather than a mean
+        over the last hundred, so a single spike can invert the ordering. (3)
+        The final LayerNorm makes the network exactly invariant to the mean of
+        its input — it subtracts it — so on the population an identity target
+        cannot be fit below $\mathbb{E}[\operatorname{mean}(x)^2] = 1/d = 0.031$.
+        The residual arm's 0.020 at depth 56 is below that, which is the tell:
+        with 57k weights and 512 examples it is interpolating the batch, not
+        learning the identity (measured, 1.17 MSE on fresh data). So the residual
+        column cannot resolve depth at all, and only the plain arm's rise is
+        interpretable. A fourth, quantitative caveat: it runs
+        in float64, where a branch of norm $10^{-8}$ added to a stream of norm
+        28 is still representable; in float32 it is not (measured, `h + delta ==
+        h` is true), so the real thing loses small branch contributions that
+        this harness keeps.
+      code: |
+        import numpy as np
+
+        EPS = 1e-5
+
+        def ln_forward(x):
+            mu = x.mean(1, keepdims=True)
+            inv = 1.0 / np.sqrt(x.var(1, keepdims=True) + EPS)
+            xhat = (x - mu) * inv
+            return xhat, (xhat, inv, x.shape[1])
+
+        def ln_backward(dy, cache):
+            xhat, inv, d = cache
+            return (inv / d) * (d * dy - dy.sum(1, keepdims=True)
+                                - xhat * (dy * xhat).sum(1, keepdims=True))
+
+        def forward(x, Ws, Wo, residual):
+            hs, lns, masks = [], [], []
+            h = x
+            for W in Ws:
+                c, cache = ln_forward(h)
+                pre = c @ W
+                a = np.maximum(pre, 0.0)
+                hs.append(h); lns.append((c, cache)); masks.append(pre > 0)
+                h = h + a if residual else a
+            cL, cacheL = ln_forward(h)
+            return cL @ Wo, (hs, lns, masks, cacheL)
+
+        def accuracy(depth, d=32, n=512, steps=3000, lr=3e-3, residual=False, seed=0):
+            rng = np.random.default_rng(seed)
+            x = rng.normal(size=(n, d)); y = x.copy()
+            Ws = [rng.normal(0, np.sqrt(2.0 / d), (d, d)) for _ in range(depth)]
+            Wo = rng.normal(0, 1.0 / np.sqrt(d), (d, d))
+            params = Ws + [Wo]
+            m = [np.zeros_like(p) for p in params]
+            v = [np.zeros_like(p) for p in params]
+            for t in range(1, steps + 1):
+                out, (hs, lns, masks, cacheL) = forward(x, Ws, Wo, residual)
+                g = 2.0 * (out - y) / out.size
+                gWo = cacheL[0].T @ g
+                gh = ln_backward(g @ Wo.T, cacheL)
+                gWs = [None] * len(Ws)
+                for l in range(len(Ws) - 1, -1, -1):
+                    c, cache = lns[l]
+                    dpre = gh * masks[l]
+                    gWs[l] = c.T @ dpre                      # branch input is LN(h)
+                    gbranch = dpre @ Ws[l].T
+                    gh = gh + ln_backward(gbranch, cache) if residual else ln_backward(gbranch, cache)
+                for i, p in enumerate(params):
+                    gp = (gWs + [gWo])[i]
+                    m[i] = 0.9 * m[i] + 0.1 * gp
+                    v[i] = 0.999 * v[i] + 0.001 * gp ** 2
+                    p -= lr * (m[i] / (1 - 0.9 ** t)) / (np.sqrt(v[i] / (1 - 0.999 ** t)) + 1e-8)
+            out, _ = forward(x, Ws, Wo, residual)
+            return float(np.mean((out - y) ** 2))
+
+        if __name__ == "__main__":
+            for depth in (2, 20, 56):
+                plain = [accuracy(depth, residual=False, seed=s) for s in range(3)]
+                res = [accuracy(depth, residual=True, seed=s) for s in range(3)]
+                print(depth, "plain", [round(p, 4) for p in plain],
+                      "residual", [round(p, 4) for p in res])
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A 56-layer plain net has higher training error than its own 20-layer
+        version. Name the two explanations that are usually offered and say why
+        each is ruled out by that single sentence.
+      answerKind: short_text
+      hint: >-
+        One explanation predicts a gap between two numbers; the other predicts
+        something about which functions a deeper net can represent.
+      solution: >-
+        Overfitting is ruled out because overfitting is *defined* by a gap —
+        training error falling while held-out error rises. Here the training
+        error itself rises (measured 0.936 at depth 56 against 0.172 at depth
+        2, on the same 512 examples), so there is no gap to blame and no amount
+        of extra data will move the number. Capacity is not the explanation
+        either: the plain-56 net has 36 more weight matrices, and the residual
+        arm at the same depth and width reaches 0.020 training error on the same
+        examples. What the plain arm lacks is an identity setting — a pre-norm
+        plain block computes $\varphi(\mathrm{LN}(h)W)$, which re-normalises its
+        input and never passes $h$ through — so its 36 extra blocks cannot be
+        switched off, and the deeper net cannot even represent the shallower
+        one's solution. Residual connections make the identity the *zero* of the
+        parameterisation, so the 56-block function class contains the 20-block
+        one and the identity is reachable in one step.
+    - id: cp-2
+      question: >-
+        A residual block's branch Jacobian has spectral norm 0.1, and you stack
+        50 blocks. Give the gradient norm at the input for the plain and the
+        residual version, and explain which single term is responsible for the
+        difference.
+      answerKind: short_text
+      hint: >-
+        Multiply 0.1 fifty times, then multiply the leading term of
+        $\prod(I + J)$ fifty times — the leading term is the only one that does
+        not contain a $J$.
+      solution: >-
+        Plain: $0.1^{50} = 10^{-50}$ in the aligned scalar case, and measured
+        $1.85\times10^{-64}$ for random $J$ at $d = 64$ (median of 20 draws),
+        because a random matrix's typical gain is below its spectral norm.
+        Residual: $\|(I + J)^{50}\|$ is bounded by $1.1^{50} = 117.4$ and
+        measured at **1.645**, with a typical vector gain of 1.072. The term
+        responsible is the leading $I$ in the expansion of
+        $\prod(I + J_l)$: it is the only one of the $2^{50}$ terms with no $J$
+        in it, so it has coefficient exactly 1 at every depth. Everything else
+        carries a product of branch Jacobians and decays like $0.1^k$. Note
+        that the identity term is one term among $10^{15}$, so it guarantees a
+        route and does not bound the norm — measured,
+        $\|\prod(I+J) - I\| = 0.799$, not 0.
+    - id: cp-3
+      question: >-
+        You set a block's branch output matrix to zero. What does the block
+        compute under pre-norm, and under post-norm? Give the measured numbers.
+      answerKind: short_text
+      hint: >-
+        Write both forward passes with $f = 0$ and look at what is left.
+      solution: >-
+        Pre-norm: $y = x + f(\mathrm{LN}(x)) = x$, so the block is the identity
+        — measured $\max|y - x| = 0.0$ exactly, with the output standard
+        deviation equal to the input's (1.0097). Post-norm:
+        $y = \mathrm{LN}(x + f(x)) = \mathrm{LN}(x)$, which is a projection plus
+        a rescale — measured $\max|y - x| = 0.417$, relative change 0.123, and
+        the output standard deviation pinned to 0.999995 regardless of the
+        input's. So zeroing the branch buys you the identity only if the norm
+        is inside the branch. This is why pre-activation ResNets and pre-LN
+        transformers put the norm there, and why a post-norm block still trains
+        while being the wrong block.
+    - id: cp-4
+      question: >-
+        A transformer block changes width from 64 to 128 and you use a
+        projection on the skip. What is the skip route's gain in the forward and
+        backward directions for (a) default init, (b) semi-orthogonal init, (c)
+        zero init — and which of the three is a bug?
+      answerKind: short_text
+      hint: >-
+        The route is $W_s$, so its gain is $\sigma_{\max}(W_s)$; backward it is
+        $W_s^\top$, and $W_s$ is $128\times64$.
+      solution: >-
+        (a) Default init ($\sigma = 1/\sqrt{64}$): forward gain 1.328, backward
+        0.990, $\sigma_{\max} = 2.401$, $\sigma_{\min} = 0.453$, condition 5.30
+        — the "identity" route is a 5.3-conditioned linear map that stretches
+        some directions 2.4x. (b) Semi-orthogonal: forward exactly 1.0,
+        backward 0.687, because $W_s^\top$ maps a random 128-vector into 64
+        dimensions and shrinks it by $\sqrt{64/128}$ — unavoidable, and the
+        reason a width change is a one-off cost. (c) Zero init: 0.0 forward and
+        0.0 backward — the route is gone and the block is a plain block. Zero
+        init on the *branch* is the good move; zero init on the *shortcut* is
+        the bug, and the two calls differ by one argument.
+    - id: cp-5
+      question: >-
+        You have a residual net where every skip goes through a $1\times1$
+        convolution followed by a BatchNorm. What is the block's Jacobian, and
+        what does it do to the reason you added the skip?
+      answerKind: short_text
+      hint: >-
+        Write the block as $y = \mathrm{BN}(W_s x) + f(x)$ and differentiate.
+      solution: >-
+        $J = B W_s + J_f$, where $B$ is the BatchNorm Jacobian: a diagonal
+        rescale by $\gamma/\sigma$ plus the two projections that remove the
+        batch mean and the batch scale. It is not the identity, so the leading
+        term of the product expansion is no longer $I$ — it is
+        $\prod B_l W_{s_l}$, a product of conditioned linear maps that can decay
+        or explode like any other product. This is the ResNet v1 arrangement,
+        and it is why the v2 / pre-activation block moved the norm inside the
+        branch: with $y = x + f(\mathrm{BN}(x))$ the Jacobian is $I + J_f B$ and
+        the identity route is untouched. It is not a rounding effect either —
+        the measured block changes its input by 3.17 per layer rather than 0.0,
+        and trains anyway, which is why the mistake survives review.
+    - id: cp-6
+      question: >-
+        Why does zero-initialising every block's branch make a 56-block network
+        start as a linear model, and why is that a good thing rather than a
+        waste of 55 blocks?
+      answerKind: short_text
+      hint: >-
+        Compose 56 identity maps and see what is left.
+      solution: >-
+        With every branch output at zero, each block computes $y = x$ (measured
+        $\max|y-x| = 0.0$), so the composition of 56 blocks is the identity and
+        the network is exactly its head — a linear map. That is a good start
+        because the alternative is a random deep function whose training error
+        is 0.936, and because the branch weights then leave zero under gradient
+        descent: the gradient at each branch is non-zero from step one (the skip
+        supplies it), so depth is *grown* into the model rather than imposed at
+        initialisation. What matters is that only the branch is zeroed. Zero the
+        shortcut projection as well and the identity route has no gradient
+        either, so every parameter before the head is stuck at its initial
+        value.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A deep network is not automatically at least as good as a shallow one,
+        because "at least as good" requires the extra layers to be able to do
+        nothing. Ask whether your block can compute the identity, and how hard
+        it is to get there: in a plain block the identity is not a setting the
+        parameterisation offers, and in a residual block it is the zero of one
+        matrix. Everything
+        else in this topic — the Jacobian, the ordering of the norm, the
+        projection — is bookkeeping around that question.
+      blocks:
+        - kind: checklist
+          body: |
+            Four questions, in this order:
+            - Does my training error get *worse* when I add layers, on the same data?
+            - Can my block be the identity, and what value of which parameter makes it so?
+            - What does one block's Jacobian look like, and which term of the product does not decay?
+            - Is the normaliser inside the branch or on the skip?
+        - kind: warning
+          body: >-
+            Tier 1 contains no formulas on purpose. Before reading on, commit to
+            an answer: if you add 40 blocks to a 20-block net and every added
+            block is the identity, is the 60-block net better, equal, or worse
+            than the 20-block one — and can gradient descent find that setting?
+      checkpoint: >-
+        Your block can be made the identity by zeroing one matrix. What does
+        that cost per block, and what would it cost if you had to reach the
+        identity by tuning every weight instead — and which of the two can
+        gradient descent actually find?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Measure the depth effect before choosing a fix, and measure it on
+        training error. Then work on the parameterisation, not the optimiser:
+        the identity has to become the default, and that means an additive skip
+        and a branch whose zero is the identity. Once the skip exists, the next
+        two decisions are where the norm sits and what the skip does when the
+        width changes — and both are decided by which side of the addition the
+        normaliser's Jacobian lands on.
+      blocks:
+        - kind: checklist
+          body: |
+            - Training error rises with depth → degradation; fix the block, not the data.
+            - Training error flat but early layers dead → gradient route; check the skip's gain.
+            - Identity-at-init test fails → the norm is after the addition, or there is a bias in the skip.
+            - Width changes → the skip is a projection; its singular values are the route's gain.
+            - Depth 100 still unstable → the stream is growing; scale the branch or add a final norm.
+      checkpoint: >-
+        Why is training error the right measurement here, and what would a
+        train/test gap tell you instead?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Two loops and one assertion. The loop measures; the assertion is the
+        property you are buying.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. the degradation measurement
+            for depth in [2, 8, 20, 56]:
+                for seed in range(3):
+                    train a stack of `depth` blocks on the same data
+                    record TRAINING error at the last step (or mean of last 100)
+            # if error grows with depth: degradation, not overfitting
+
+            # 2. the block, with the identity as the default
+            y = x + branch(norm(x))          # norm inside the branch
+            zero_init(branch.output_matrix)  # zero the BRANCH, never the skip
+            if width changes:
+                y = project(x) + branch(x)   # project with singular values near 1
+
+            # 3. the assertion that catches a mis-placed norm
+            with branch.output_matrix = 0:
+                assert max(abs(block(x) - x)) == 0
+        - kind: math
+          body: |
+            The two numbers to carry around:
+
+            $$\frac{\partial y}{\partial x} = I + J_f, \qquad
+              \left\|\prod_{l=1}^{L}(I + J_{f_l})\right\| \approx \sqrt{1 + Lc^2}$$
+
+            for a random branch of relative gain $c$, against $c^{L}$ without
+            the skip.
+      checkpoint: >-
+        In the assertion, why must the branch output be exactly zero rather
+        than merely small, and what would a tolerance of `1e-6` hide?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three products: one for the block, one for the stack, one for each
+        ordering of the norm.
+      blocks:
+        - kind: math
+          body: |
+            Block and stack, with $2^L$ terms and one identity:
+
+            $$J_{\text{block}} = I + J_f, \qquad
+              \prod_{l=1}^{L}(I + J_{f_l}) = I + \sum_l J_{f_l}
+              + \sum_{l<l'} J_{f_l}J_{f_{l'}} + \cdots + \prod_l J_{f_l}$$
+
+            $$\left\|\prod_l J_{f_l}\right\| \le c^{L}, \qquad
+              \left\|\prod_l (I + J_{f_l})\right\| \le (1+c)^{L}$$
+
+            LayerNorm's Jacobian, and the two orderings:
+
+            $$S = \frac{1}{d\sigma}\left(dI - \mathbf{1}\mathbf{1}^\top
+              - \hat z\hat z^\top\right), \qquad \|S\| = \frac{1}{\sigma}$$
+
+            $$J_{\text{pre}} = I + J_f S, \qquad
+              J_{\text{post}} = S\,(I + J_f), \qquad
+              \left\|\prod_l S_l\right\| = (1+c^2)^{-L/2}$$
+
+            Measured at $c = 0.1$, $L = 50$, $d = 64$: plain
+            $1.85\times10^{-64}$, residual $1.645$, typical vector gain $1.072$.
+      checkpoint: >-
+        In the post-norm product, why does the stream's norm before each norm
+        equal $\sqrt{1+c^2}$ times the previous block's input, and what happens
+        to the exponent if the branch is scaled by $1/\sqrt{L}$?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A block you can trust, a measurement that decides whether depth is
+        helping, and the two initialisation rules that keep the route alive.
+      blocks:
+        - kind: warning
+          body: >-
+            Write your own version before reading this one. The numbers in the
+            assertions are the test; the code is only notation.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            EPS = 1e-5
+
+            def ln(x, eps=EPS):
+                mu = x.mean(-1, keepdims=True)
+                return (x - mu) / np.sqrt(x.var(-1, keepdims=True) + eps)
+
+            def ln_jacobian(x, eps=EPS):
+                """Full LN Jacobian for one vector, d x d."""
+                d = x.shape[0]
+                sigma = np.sqrt(x.var() + eps)
+                xhat = (x - x.mean()) / sigma
+                return (np.eye(d) - np.ones((d, d)) / d
+                        - np.outer(xhat, xhat) / d) / sigma
+
+            class Block:
+                def __init__(self, d, d_out=None, seed=0, zero_branch=True):
+                    rng = np.random.default_rng(seed)
+                    self.d, self.d_out = d, d_out or d
+                    self.W = rng.normal(0, np.sqrt(2.0 / d), (d, self.d_out))
+                    if zero_branch:
+                        self.W *= 0.0
+                    if self.d_out != d:
+                        # semi-orthogonal projection: all singular values 1
+                        a = rng.normal(size=(max(d, self.d_out), min(d, self.d_out)))
+                        q, r = np.linalg.qr(a)
+                        q = q * np.sign(np.diag(r))
+                        self.Ws = q.T[: self.d_out, :] if self.d_out > d else q[: self.d_out, :]
+                    else:
+                        self.Ws = None
+
+                def forward(self, x):
+                    self.x = x
+                    y = x @ self.Ws if self.Ws is not None else x
+                    return y + np.maximum(ln(x) @ self.W, 0.0)
+
+                def jacobian(self, x):
+                    d = x.shape[0]
+                    Jf = np.diag((ln(x) @ self.W > 0).astype(float)) @ self.W.T @ ln_jacobian(x)
+                    skip = self.Ws if self.Ws is not None else np.eye(d)
+                    return skip + Jf
+
+            if __name__ == "__main__":
+                rng = np.random.default_rng(0)
+                x = rng.normal(size=64)
+                blk = Block(64)
+                print("identity at init:", np.abs(blk.forward(x) - x).max())   # 0.0
+                blk.W = rng.normal(0, np.sqrt(2 / 64), (64, 64))
+                J = blk.jacobian(x)
+                s = np.linalg.svd(J, compute_uv=False)
+                print("sigma_max >= 1:", s.max(), "sigma_min <=", s.min())
+      checkpoint: >-
+        The assertion `sigma_max >= 1` holds for any residual block, whatever
+        the branch — why, and which two directions make it exact?
+
+  problems:
+    - id: p-residual-gradient
+      title: "The gradient through a stack, with and without the skip"
+      difficulty: medium
+      prompt: >-
+        Implement `residual_gradient(g, js)`. `g` is a length-$d$ cotangent at
+        the output of a stack of blocks; `js` is the list of block Jacobians
+        $J_l$, in forward order, so `js[0]` is the first block and `js[-1]` is
+        the last. A block maps $g_{l-1} = g_l J_l$ (row-vector convention), and
+        a residual block maps $g_{l-1} = g_l (I + J_l)$. Return a dict with
+        exactly two keys: `norm_plain`, the Euclidean norm of the gradient that
+        reaches the input through the plain stack, and `norm_residual`, the same
+        for the residual stack. Both floats. Walk the list backwards, and do not
+        assume the matrices commute — they do not, and multiplying in forward
+        order gives a different answer for any stack of three or more.
+      starter: |
+        import numpy as np
+
+        def residual_gradient(g, js):
+            # your implementation here
+            pass
+      language: python
+      entry: residual_gradient
+      testCases:
+        - input: '[[1.0, 2.0], [[[0.5, 0.0], [0.0, 0.5]], [[0.0, -1.0], [1.0, 0.0]]]]'
+          expected: '{"norm_plain": 1.118033988749895, "norm_residual": 4.743416490252569}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[1.0, 0.0, 0.0], [[[0.0, 0.1, 0.0], [-0.1, 0.0, 0.0], [0.0, 0.0, 0.1]], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]]'
+          expected: '{"norm_plain": 0.0, "norm_residual": 1.004987562112089}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[1.0, -2.0, 0.5], [[[0.3, 0.0, 0.0], [0.0, 0.3, 0.0], [0.0, 0.0, 0.3]], [[0.0, 0.6, 0.0], [-0.6, 0.0, 0.0], [0.0, 0.0, 0.6]], [[0.2, 0.0, 0.0], [0.0, 0.2, 0.0], [0.0, 0.0, 0.2]]]]'
+          expected: '{"norm_plain": 0.08248636250920512, "norm_residual": 4.255112689459587}'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+
+        def residual_gradient(g, js):
+            g = np.asarray(g, dtype=float)
+            d = g.shape[0]
+            I = np.eye(d)
+            plain, res = g.copy(), g.copy()
+            for J in reversed([np.asarray(J, dtype=float) for J in js]):
+                plain = plain @ J
+                res = res @ (I + J)
+            return {"norm_plain": float(np.linalg.norm(plain)),
+                    "norm_residual": float(np.linalg.norm(res))}
+      solutionExplanation: >-
+        The order is the whole problem. A block's cotangent is
+        $g_{l-1} = g_l J_l$, so the gradient at the input is
+        $g (I + J_{L})\cdots(I + J_{1})$ — the last block's Jacobian acts
+        first, which is why the loop runs over `reversed(js)`. Multiplying in
+        forward order transposes the composition and gives a different answer
+        for non-commuting matrices. The second case is the one to look at: the
+        last block's Jacobian is exactly zero, so the plain product is exactly
+        **0.0** while the residual product is **1.005** — a single dead block
+        annihilates a plain stack and costs a residual one almost nothing,
+        because the identity term of that block survives. The third case is
+        three commuting scalar blocks, where the two answers differ by the
+        factor $(1.3)(1.6)(1.2)$ against $(0.3)(0.6)(0.2)$ — 2.496 against
+        0.036 — and the residual norm is 54.9x the plain one with only three
+        blocks. Note that this function never forms the product matrix when a
+        single vector will do: the cost is $O(Ld^2)$ either way, but the
+        vector form is $L$ matrix-vector products and never materialises a
+        $d\times d$ intermediate. The third case is three blocks that happen to
+        commute: $0.3I$, a $0.6$ rotation in the first two coordinates with a
+        $0.6$ scale in the third, and $0.2I$. The plain norm is **0.0825** and
+        the residual norm **4.255** — a ratio of 51.6x. That ratio is not the
+        product of the scalar factors $(1.3)(1.6)(1.2)/0.036 = 69.3$, because
+        $I + 0.6R$ for a rotation $R$ has singular values
+        $\sqrt{1+0.6^2} = 1.166$, not $1.6$; the same reason a random $J$
+        behaves better than its spectral norm suggests.
+      complexity: "O(L·d²) time, O(d²) space"
+      tags: [residual-connections, jacobian, backpropagation, numpy]
+
+    - id: p-block-jacobian
+      title: "The Jacobian of one pre-norm residual block"
+      difficulty: hard
+      prompt: >-
+        Implement `block_jacobian(W, x, eps)` for the block
+        $y = x + W\,\mathrm{LN}(x)$ acting on a single vector $x$ of length
+        $d$, where $\mathrm{LN}$ normalises over all $d$ features with the
+        **biased** variance and no affine:
+        $\mathrm{LN}(x) = (x-\mu)/\sqrt{\sigma^2+\varepsilon}$ with
+        $\mu = \frac{1}{d}\sum_i x_i$ and
+        $\sigma^2 = \frac{1}{d}\sum_i (x_i-\mu)^2$. Return a dict with three
+        keys: `jacobian` (the $d\times d$ Jacobian
+        $\partial y/\partial x$ as a list of rows), `sigma_max` and `sigma_min`
+        (its largest and smallest singular values, floats). Compute the
+        Jacobian in closed form — finite differences will not survive the
+        tolerance — and note that $W$ here is $d\times d$ and multiplies the
+        normalised vector on the left.
+      starter: |
+        import numpy as np
+
+        def block_jacobian(W, x, eps):
+            # your implementation here
+            pass
+      language: python
+      entry: block_jacobian
+      testCases:
+        - input: '[[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], [1.0, 2.0, 4.0], 0.0]'
+          expected: '{"jacobian": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], "sigma_max": 1.0, "sigma_min": 1.0}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.5]], [1.0, 2.0, 4.0], 1e-5]'
+          expected: '{"jacobian": [[1.1145411458504841, -0.1718100006843098, 0.057268854833825725], [-0.1718100006843098, 1.2577154305493188, -0.08590542986500896], [0.057268854833825725, -0.08590542986500896, 1.0286365750311834]], "sigma_max": 1.4008905742938615, "sigma_min": 0.9999999999999998}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[0.0, 0.2, -0.1], [0.1, 0.0, 0.3], [-0.2, 0.1, 0.0]], [0.5, -1.5, 2.0], 1e-5]'
+          expected: '{"jacobian": [[0.9868043052757534, 0.005655814790324259, 0.007539879933922419], [-0.03298906715313872, 1.0141376707435532, 0.018851396409585636], [-0.1121630092886482, 0.048070071175821925, 1.0640929381128263]], "sigma_max": 1.1068287612308545, "sigma_min": 0.9622404046915106}'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+
+        def block_jacobian(W, x, eps):
+            W = np.asarray(W, dtype=float)
+            x = np.asarray(x, dtype=float)
+            d = x.shape[0]
+            sigma = np.sqrt(x.var() + eps)          # biased variance
+            xhat = (x - x.mean()) / sigma
+            S = (np.eye(d) - np.ones((d, d)) / d - np.outer(xhat, xhat) / d) / sigma
+            J = np.eye(d) + W @ S
+            s = np.linalg.svd(J, compute_uv=False)
+            return {"jacobian": J.tolist(), "sigma_max": float(s.max()),
+                    "sigma_min": float(s.min())}
+      solutionExplanation: >-
+        LayerNorm's Jacobian is
+        $S = \frac{1}{d\sigma}(dI - \mathbf{1}\mathbf{1}^\top - \hat x\hat x^\top)$,
+        and the block's is $I + WS$ — the identity plus a rank-two correction
+        pushed through $W$. The consequences are visible in the numbers. With
+        $W = 0$ the Jacobian is exactly $I$ and both singular values are 1.0.
+        With $W = 0.5I$ and $x = [1,2,4]$, $\sigma_{\max} = 1.4009$ — a
+        $\|W\|_2$ of 0.5 produced a 40% expansion — while $\sigma_{\min}$ is
+        **exactly 1.0**, because $S$ annihilates the all-ones direction and the
+        component of $x$ along $\hat x$: along those two directions the block is
+        the identity and $W$ cannot touch them. That is the general statement
+        $\sigma_{\max}(J) \ge 1$ for a residual block, and it is why a residual
+        block cannot be uniformly contractive. The third case has an
+        antisymmetric $W$ and gives $\sigma_{\max} = 1.1068$,
+        $\sigma_{\min} = 0.9622$: a single block *can* contract a direction,
+        just not all of them. A finite-difference Jacobian with a step of
+        $10^{-6}$ gets about 6 digits, which fails the 1e-9 tolerance on the
+        singular values — the closed form is the only version that passes.
+      complexity: "O(d²) time, O(d²) space"
+      tags: [residual-connections, jacobian, layernorm, numpy]
+
+    - id: p-identity-gap
+      title: "Pre-norm vs post-norm: the identity gap"
+      difficulty: easy
+      prompt: >-
+        Implement `block_gap(x, eps)` for a batch `x` of shape `(n, d)`. The
+        block has a branch whose output is exactly zero, so the two orderings
+        compute `pre(x) = x + 0 = x` and `post(x) = LN(x + 0) = LN(x)`. Return a
+        dict with three keys: `pre_maxabs` (the maximum absolute difference
+        between the pre-norm block's output and its input — a float, and it
+        should be exactly 0.0), `post_maxabs` (the same for the post-norm
+        block), and `post_std` (the population standard deviation of the
+        post-norm output over all `n*d` entries, as a float). `LN` is the
+        per-row normalisation with the biased variance and no affine:
+        $\mathrm{LN}(x_i) = (x_i - \mu_i)/\sqrt{\sigma_i^2 + \varepsilon}$,
+        with $\mu_i,\sigma_i^2$ taken over that row's `d` features.
+      starter: |
+        import numpy as np
+
+        def block_gap(x, eps):
+            # your implementation here
+            pass
+      language: python
+      entry: block_gap
+      testCases:
+        - input: '[[[1.0, 2.0], [3.0, 4.0]], 1e-5]'
+          expected: '{"pre_maxabs": 0.0, "post_maxabs": 3.99998000059998, "post_std": 0.9999800005999799}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[0.5, -1.0, 2.0, 0.0]], 1e-5]'
+          expected: '{"pre_maxabs": 0.0, "post_maxabs": 0.49889570480496914, "post_std": 0.9999957333606398}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[3.0, 3.0], [3.0, 3.0]], 1e-5]'
+          expected: '{"pre_maxabs": 0.0, "post_maxabs": 3.0, "post_std": 0.0}'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+
+        def block_gap(x, eps):
+            x = np.asarray(x, dtype=float)
+            mu = x.mean(axis=1, keepdims=True)
+            var = x.var(axis=1, keepdims=True)          # biased
+            post = (x - mu) / np.sqrt(var + eps)
+            return {"pre_maxabs": float(np.abs(x - x).max()),
+                    "post_maxabs": float(np.abs(post - x).max()),
+                    "post_std": float(np.std(post))}
+      solutionExplanation: >-
+        The pre-norm block with a zero branch is the identity, exactly and by
+        construction, so `pre_maxabs` is `0.0` and not a small number — that is
+        the property the whole architecture rests on. The post-norm block
+        computes `LN(x)`, which is a different function: on a 2x2 batch the
+        first row `[1, 2]` has mean 1.5 and variance 0.25, so
+        $\hat x = \pm 1/0.500005$ and the row `[3, 4]` becomes
+        `[-0.99999, 0.99999]` — hence a max-abs difference of 3.99999, from
+        the input value 3 that came back as $-0.99999$. Note also that
+        `post_std` is 0.99999 for *any* input, and
+        exactly 0.0 when a row is constant: a constant row has zero variance,
+        so `LN` maps it to zeros and the block's output for that row is `0`, not
+        a rescaled copy of the input. Two different failure modes from one
+        misplaced normaliser, and neither raises.
+      complexity: "O(n·d) time, O(n·d) space"
+      tags: [residual-connections, pre-norm, post-norm, layernorm]
+
+  visualizers:
+    - id: vs-depth-degradation
+      kind: loss_surface
+      title: "Add blocks and watch training error, with and without the skip"
+      description: >-
+        Drag the depth from 1 to 56 with the block type fixed and the training
+        error is read off the measured curve: the plain arm climbs from 0.172 at
+        depth 2 to 0.936 at depth 56, while the residual arm stays between 0.020
+        and 0.044. Switch to the Jacobian view and the same depth rescales the
+        gradient by $c^{L}$ or by $\sqrt{1+Lc^2}$, with $c$ on a slider — at
+        $c = 0.1$ and $L = 50$ the two differ by 63.9 decades.
+      params:
+        minDepth: 1
+        maxDepth: 56
+        minBranchGain: 0.02
+        maxBranchGain: 1.0
+        modes: ["training-error", "jacobian-product"]
+
+  try_it: >-
+    Fit the identity on 512 examples in 32 dimensions with 20 blocks and again with 56 blocks,
+    no skip connection, and record the training loss for both — the deeper one is worse. Then
+    add the residual and re-run: the 56-block loss must fall below the 20-block one.
+  interview_questions:
+    - question: 'What is the degradation problem, and why is overfitting the wrong diagnosis?'
+      level: mid
+      key_points:
+        - 'It is a training-error problem: on the same 512 examples, adding blocks makes the loss worse, so the extra capacity is not being used.'
+        - 'Validation is not involved, which rules out the entire overfitting toolkit — more data, dropout, a smaller model.'
+        - 'A plain block cannot represent the identity, because its output is a re-normalised function of its input; 36 extra blocks must at least be able to do nothing.'
+        - 'Measured on the same task, the deeper plain stack has higher training loss, which is what makes it an optimisation failure rather than a statistics one.'
+    - question: 'Walk through why a residual block trains at depth 50, and then say exactly where the argument breaks.'
+      level: senior
+      key_points:
+        - 'For y = x + f(x) the Jacobian is I + J_f, so the product over L blocks expands into 2^L terms, one of which is the identity at every depth.'
+        - 'The identity is a route, not a floor: with an aligned branch J_f = cI the per-block gain is exactly |1 + c|, so c = -0.1 gives 0.9^50 = 5.15e-3, which still vanishes.'
+        - 'Post-norm puts LN Jacobian on the left of (I + J_f), multiplying the skip route by 1/sqrt(1 + c^2) per block; pre-norm keeps the path exact.'
+        - 'The stream itself still grows: ||h_L|| is about sqrt(1 + L c^2) ||h_0||, which is 28.5x after fifty blocks at c = 1, so the head sees a depth-dependent scale.'
+      follow_up: 'If the identity path guarantees a route but not a floor, what does that imply about how you should initialise the branch scale in a 50-block stack?'
+    - question: 'Pre-norm or post-norm: what actually differs, and why did pre-norm become standard?'
+      level: mid
+      key_points:
+        - 'Pre-norm computes y = x + f(LN(x)); post-norm computes y = LN(x + f(x)). Only the first leaves the skip path untouched.'
+        - 'Zero the branch output and the pre-norm block returns its input: measured max|out - in| = 0.0, with a gradient ratio of 1.000000.'
+        - 'Post-norm multiplies the skip route by the LayerNorm Jacobian S, whose norm is 1/sigma_z, so the factor is 1/sqrt(1 + c^2) per block.'
+        - 'Pre-norm is standard because it removes a constraint, not because post-norm cannot train: with the branch scaled by 1/sqrt(2L) both orderings train equally well at depth 12 and 50.'
+      follow_up: 'What does pre-norm force you to add at the end of the stack, and why?'
+  common_mistakes:
+    - 'Zero-initialising the projection inside the shortcut as well as the branch, which deletes the only path that had a gradient and stalls training for hundreds of steps.'
+    - 'Diagnosing a training loss that rises with depth as overfitting, then reaching for more data or dropout, neither of which can help.'
+    - 'Assuming the identity guarantees gradient flow, when an anti-aligned branch gives 0.9^50 = 5.15e-3 over fifty blocks.'
+  further_reading:
+    - label: "He, Zhang, Ren & Sun, Deep Residual Learning for Image Recognition (CVPR 2016)"
+    - label: "He, Zhang, Ren & Sun, Identity Mappings in Deep Residual Networks (ECCV 2016)"

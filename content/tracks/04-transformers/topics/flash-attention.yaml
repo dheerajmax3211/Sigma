@@ -1,0 +1,1604 @@
+id: flash-attention
+slug: flash-attention
+title: "FlashAttention: IO-Aware Exact Attention"
+summary: >-
+  Attention materialises an n-by-n score matrix in HBM and then reads it back
+  four times, which makes the kernel memory-bound at every context length.
+  FlashAttention computes the identical function in tiles small enough for
+  SRAM, using a running max and a running sum, and recomputes rather than
+  stores in the backward pass. This topic derives the traffic win as a ratio of
+  tile width to head width, prices the score matrix at 4k, 32k and 128k, and
+  separates what FlashAttention-1, -2 and -3 each actually changed.
+kind: lesson
+difficulty: expert
+position: 12
+estMinutes: 28
+prerequisites: [multi-head-attention, kv-cache]
+phase: attention-core
+tags: [flash-attention, attention, io-awareness, sram, hbm, online-softmax, tiling, roofline, arithmetic-intensity, kernel-fusion, hopper, fp8]
+
+body:
+  big_idea: >-
+    Attention is slow not for arithmetic but because it writes an $n\times n$
+    intermediate to HBM and reads it back; keeping a tile in SRAM with an
+    incremental softmax is exact and makes memory $O(n)$.
+
+  problem:
+    - >-
+      Attention is 40% of a 4k forward pass's wall clock and 15% of its FLOPs,
+      and the kernel waits on a matrix it just wrote.
+    - >-
+      You extend to 128k and the forward pass OOMs: not the weights, not the
+      cache, but one layer's score matrix at 32 GiB per head.
+    - >-
+      You swap in a fused kernel and get 2x, while a paper claims 10x — is
+      your port bad, or the head dimension different?
+
+  analogy: |
+    A cook with a very small bench: the pantry holds the whole meal, but the
+    bench holds one chopping board's worth. The naive cook lays all four
+    thousand ingredients on the floor and walks to it at every step; the good
+    cook works in batches that fit, keeps a running tally in a notebook, and
+    never walks anywhere.
+
+  concept_points:
+    - >-
+      **Attention's problem is the $n \times n$ matrix it insists on building, not the FLOPs it spends.**
+      For one head at $d = 128$ the score matrix is 32 MiB at 4k and
+      **32 GiB at 128k**; across 32 heads and 32 layers that is 32 TiB.
+      Untiled, one 4k forward pass moves **128 GiB of HBM traffic**, 9.8x the
+      14 GB of weights it just read.
+    - >-
+      **Naive attention runs at $d/2$ FLOP/byte at every context length, which is why the fix is a constant factor.**
+      The FLOPs are $4n^2d$ and the bytes at least $8n^2$, so intensity is
+      $d/2 = 64$ at $d=128$ — 2.3x below the H100 ridge of 148. Modelled: 8.80
+      TFLOP is 17.8 ms at 494 TFLOP/s, while 128 GiB is 41.0 ms at 3.35 TB/s.
+    - >-
+      **Tiling works because a softmax row needs one maximum and one sum, and both accumulate.**
+      Keep a running max $m$, normaliser $l$ and unnormalised accumulator $O$;
+      when a block's maximum exceeds $m$, decay the partials by
+      $\alpha = e^{m-m'}$. Measured at $n=4096$, $d=128$: **2.17e-15**
+      relative against a float64 reference, peak state $O(nd)$ — 32 MiB per
+      head at 128k instead of 32 GiB.
+    - >-
+      **The rescale is the whole trick, and both obvious ways to skip it return confident garbage.**
+      Dropping the decay on the normaliser gives a relative error of
+      **7.9050**, 790%. Using each block's own maximum instead of the running
+      maximum gives **0.4597**, 46% off. Neither raises, neither NaNs, and
+      both return a correctly shaped matrix whose softmax sums to one.
+    - >-
+      **The speedup is $2B_q/d$ — tile width over head width — so it is largest where head dimensions are smallest.**
+      Measured: $d=128$, $B_q=128$ gives **1.88x** at 4k; $d=64$, $B_q=256$
+      gives **7.11x**; $d=256$, $B_q=64$ gives **0.48x**, i.e. the tiled
+      kernel is twice as slow, because SRAM forced a tile narrower than the
+      head. At $d=128$, $B_q \le 227$ is the cap.
+    - >-
+      **Recomputation in the backward pass is cheaper than storage because the trade prices at $d/4$ FLOP/byte.**
+      Rebuilding $S = QK^\top$ costs $2n^2d$ extra FLOPs and saves at least
+      $8n^2$ bytes of S and P traffic — a ratio of $d/4$. At $d=128$ that is
+      **32 FLOP/byte, 4.6x below 148**, so recomputing wins; the crossover is
+      $d^\star = 4 \cdot 148 = 592$.
+
+  definitions:
+    - term: "HBM"
+      meaning: >-
+        High-bandwidth memory: the 80 GiB off-chip pool an H100 exposes at
+        3.35 TB/s. Everything that does not fit in SRAM lives here, including
+        every intermediate tensor a framework materialises. Its capacity is
+        enormous and its latency is roughly 500 cycles, which is why the byte
+        count, not the operation count, sets the pace.
+    - term: "SRAM (shared memory)"
+      meaning: >-
+        The 227 KiB per SM that a thread block can address directly, at roughly
+        ten times HBM's bandwidth and tens of cycles of latency. It is the only
+        memory fast enough to hold an attention tile, and it is 144x too small
+        for a 4k score matrix at $d = 128$.
+    - term: "Tiling"
+      meaning: >-
+        Restructuring a computation so that each intermediate lives in SRAM for
+        as long as it is used, and only the inputs and the final output touch
+        HBM. For attention that means a Q block of $B_q$ rows against K/V blocks
+        of $B_c$, with the $B_q \times B_c$ score tile never leaving the chip.
+    - term: "Online softmax"
+      meaning: >-
+        A softmax computed in one pass over blocks, maintaining a running
+        maximum $m$, a running sum $l$ and an unnormalised accumulator $O$, and
+        rescaling all three by $e^{m - m'}$ whenever the maximum grows. It
+        produces exactly the same result as the two-pass version; it only
+        changes which values are alive at once.
+    - term: "Running max and running normaliser"
+      meaning: >-
+        The $m$ and $l$ of the online recurrence, one scalar each per row of the
+        output. Together they are the log-sum-exp, the only per-row state the
+        backward pass needs to rebuild the softmax without ever storing it —
+        $2n$ floats per head instead of $n^2$.
+    - term: "Recomputation (activation checkpointing for attention)"
+      meaning: >-
+        Storing $O$ and the log-sum-exp instead of $S$ and $P$, then rebuilding
+        the tiles from Q, K and V inside the backward pass. It costs $2n^2d$
+        extra FLOPs and saves $8n^2$ bytes, which is a good trade whenever
+        $d/4$ is below the machine's ridge point.
+    - term: "Arithmetic intensity"
+      meaning: >-
+        FLOPs performed per byte moved from HBM. Naive attention sits at $d/2$
+        (64 at $d = 128$); tiled attention sits at roughly $B_q$ (120.5 measured
+        at $B_q = 128$), because the tile is reused $B_q$ times before it is
+        evicted.
+    - term: "Ridge point"
+      meaning: >-
+        $P / \text{BW}$, the intensity at which a kernel stops being
+        bandwidth-bound. 494 TFLOP/s of dense fp16 over 3.35 TB/s is 147.5,
+        quoted as 148. Halve the FLOP number and you get 74; double it and you
+        get 295. Every margin in this topic is a factor of two or more, so the
+        conclusions survive the choice of convention.
+    - term: "IO-aware kernel"
+      meaning: >-
+        A kernel written against a specific memory hierarchy — explicit tile
+        sizes, explicit loads, no reliance on the cache — rather than against the
+        arithmetic alone. FlashAttention is the canonical example: the algorithm
+        is unchanged, the schedule is the contribution.
+    - term: "Causal block skipping"
+      meaning: >-
+        Exploiting the mask at the granularity of tiles: for a Q block at
+        position $i$, only K/V blocks up to $i$ are read, and only the diagonal
+        block needs a mask applied at all. At 4k with 128-wide tiles this visits
+        528 of 1,024 blocks, 51.6% of the work.
+    - term: "Warp specialisation (Hopper)"
+      meaning: >-
+        Assigning different warps different jobs — some issue TMA loads, others
+        run WGMMA — so that data movement and arithmetic overlap instead of
+        alternating. It is the mechanism behind FlashAttention-3's 1.5-2x over
+        FA2 on H100, and it is a property of the chip, not of the algorithm.
+
+  diagrams:
+    - type: stack
+      title: "Where the score matrix has to live"
+      layers:
+        - "Registers: 256 KiB per SM, about 1 cycle"
+        - "Shared memory (SRAM): 227 KiB per SM, about 30 cycles"
+        - "L2: 50 MiB, about 200 cycles"
+        - "HBM: 80 GiB at 3.35 TB/s, about 500 cycles"
+        - "One 4k score matrix: 32 MiB per head, 144x all of SRAM"
+        - "One 128k score matrix: 32 GiB per head, 148,000x all of SRAM"
+
+    - type: architecture
+      title: "The tiled datapath: HBM to SRAM to tensor cores and back"
+      nodes:
+        - id: q
+          x: 0
+          y: 0
+          label: "HBM: Q, K, V"
+          kind: storage
+          detail: "Three tensors of n x d per head, fp16. At 128k and d=128 that is 96 MiB per head and it is the only thing that has to fit anywhere. Every tile is a strided slice of these."
+        - id: tile
+          x: 1
+          y: 0
+          label: "SRAM tile: 128 x 128 fp16"
+          kind: cache
+          detail: "32 KiB per tile. Four of them (Q, K, V, score) is 128 KiB, inside the 227 KiB an H100 SM can address. This budget is the reason Bq is 128 and not 1,024."
+        - id: mma
+          x: 2
+          y: 1
+          label: "Tensor cores: S, then P times V"
+          kind: gpu
+          detail: "Two matmuls per tile with the softmax in registers between them, so the 128 x 128 score tile is born and consumed without a round trip to HBM."
+        - id: state
+          x: 3
+          y: 1
+          label: "Running m, l, O"
+          kind: worker
+          detail: "Per row of the Q tile: one max, one sum, one d-wide accumulator. About 2.3 KiB for the whole block, which is why the state is O(n d) rather than O(n squared)."
+        - id: out
+          x: 3
+          y: 3
+          label: "HBM: O and log-sum-exp"
+          kind: storage
+          detail: "Written once per Q block. The log-sum-exp pair is what the backward pass reloads to rebuild the softmax instead of reading a stored matrix."
+      edges:
+        - { from: q, to: tile, label: "async copy" }
+        - { from: tile, to: mma, label: "Q, K, V tiles" }
+        - { from: mma, to: state, label: "S, then P" }
+        - { from: state, to: mma, label: "alpha rescale", style: async }
+        - { from: state, to: out, label: "once per block" }
+      caption: "Every arrow that crosses a column boundary is a memory transaction. The only one that carries an n-squared tensor is the tile load, and it is 32 KiB."
+
+    - type: cycle
+      title: "The online-softmax recurrence, once per K/V block"
+      steps:
+        - "Load the next K, V block into SRAM"
+        - "S = Q tile times K block transpose, scaled by 1/sqrt(d)"
+        - "m_new = max(m, rowmax(S))"
+        - "alpha = exp(m - m_new); m = m_new"
+        - "l = alpha * l + rowsum(exp(S - m_new))"
+        - "O = alpha * O + exp(S - m_new) times V block"
+        - "Last block? Divide O by l and store, else loop"
+
+    - type: compare
+      title: "One 4k forward pass, 32 heads x 32 layers, d = 128, fp16"
+      left_label: "Materialised: build the n x n matrix"
+      left_points:
+        - "Score matrix is 32 MiB per head, 1 GiB per layer, 32 GiB for the model"
+        - "Traffic is at least 4n^2 elements: S written and read, P written and read"
+        - "128 GiB of HBM traffic, 9.8x the 14 GB of weights"
+        - "Intensity 64 FLOP/byte, 2.3x below the 148 ridge point"
+        - "41.0 ms of traffic against 17.8 ms of arithmetic"
+        - "Memory is O(n^2): at 128k one head needs 32 GiB"
+      right_label: "Tiled: keep a 128 x 128 tile in SRAM"
+      right_points:
+        - "Score tile is 32 KiB and is the only n-squared object that ever exists"
+        - "Traffic is 2n^2 d / Bq elements: K and V re-read n / Bq times"
+        - "68.0 GiB of HBM traffic, 1.88x less"
+        - "Intensity 120.5 FLOP/byte, 0.81 of the ridge point"
+        - "21.8 ms of traffic against the same 17.8 ms of arithmetic"
+        - "Memory is O(n d): at 128k one head needs 32 MiB"
+
+    - type: plot
+      title: "Traffic ratio against head dimension, for three tile widths"
+      chart: line
+      xLabel: "head dimension d"
+      yLabel: "naive bytes / tiled bytes  (above 1 means tiling wins)"
+      series:
+        - name: "Bq = 64 (fits at d = 256)"
+          points:
+            - { x: 32, y: 4.0 }
+            - { x: 64, y: 2.0 }
+            - { x: 128, y: 1.0 }
+            - { x: 256, y: 0.5 }
+            - { x: 512, y: 0.25 }
+        - name: "Bq = 128 (the usual choice)"
+          points:
+            - { x: 32, y: 8.0 }
+            - { x: 64, y: 4.0 }
+            - { x: 128, y: 2.0 }
+            - { x: 256, y: 1.0 }
+            - { x: 512, y: 0.5 }
+        - name: "Bq = 256 (only at small d)"
+          points:
+            - { x: 32, y: 16.0 }
+            - { x: 64, y: 8.0 }
+            - { x: 128, y: 4.0 }
+            - { x: 256, y: 2.0 }
+            - { x: 512, y: 1.0 }
+        - name: "break-even"
+          points:
+            - { x: 32, y: 1.0 }
+            - { x: 512, y: 1.0 }
+
+    - type: pipeline
+      title: "Three generations, three different bottlenecks"
+      nodes:
+        - label: "FlashAttention-1: tile, accumulate, recompute"
+          note: "Attacks bandwidth. 2-4x, 5-20x less memory"
+          detail: "The algorithm: online softmax in SRAM, backward pass rebuilds S and P from Q, K, V. It leaves 25-40% of peak on the table because the schedule is naive — 4 warps per block splitting K/V, which needs a cross-warp reduction through shared memory."
+        - label: "FlashAttention-2: partition, split the causal grid, cut non-matmul FLOPs"
+          note: "Attacks occupancy. About 2x FA1, 50-73% of peak"
+          detail: "Same algorithm. 8 warps per block with Q split across them, so K/V loads are shared and the output needs no reduction; the causal mask becomes a block-level skip of the upper triangle; the accumulator is rescaled only when the maximum actually changes."
+        - label: "FlashAttention-3: TMA, WGMMA, warp specialisation, FP8"
+          note: "Attacks idle tensor cores. 1.5-2x FA2, about 75% of peak"
+          detail: "Hopper only. Producer warps issue async bulk copies while consumer warpgroups run WGMMA, and two warpgroups ping-pong so one tile's softmax overlaps the other's matmul. FP8 with per-block scaling doubles the tensor-core rate again."
+      caption: "Read the speedup column as cumulative against the same materialised baseline: roughly 2-4x for FA1, 4-8x for FA2, and 6-12x for FA3 in the best case. Each generation is a different answer to the question 'what is the kernel waiting on now?'"
+
+  markdown: |
+    ## The matrix nobody wanted
+
+    A GPU has two memories that matter. HBM is 80 GiB at 3.35 TB/s. Shared
+    memory is 227 KiB per SM at roughly an order of magnitude more bandwidth.
+    Attention's natural implementation puts an $n \times n$ matrix in the first
+    one, because it is the only place it fits, and then reads it back four
+    times.
+
+    At $n = 4096$ and $d = 128$ that matrix is 32 MiB per head. At 32k it is
+    2 GiB. At 128k it is 32 GiB — per head, and there are 32 of them.
+
+    | context | per head | per layer (32 heads) | whole model (32 layers) |
+    |---|---|---|---|
+    | 4,096 | 32 MiB | 1 GiB | 32 GiB |
+    | 32,768 | 2 GiB | 64 GiB | 2 TiB |
+    | 131,072 | 32 GiB | 1 TiB | 32 TiB |
+
+    Multiply by four for the traffic. An unfused stack writes S, reads it to
+    apply the mask, writes it back, reads it for the softmax, writes P, and
+    reads P for the value product. That is $4n^2$ elements — 128 GiB, 8 TiB and
+    128 TiB of HBM traffic for a single forward pass of one 32-layer model,
+    against 14 GB of weights. At 4k the traffic alone is 41.0 ms at 3.35 TB/s,
+    and the arithmetic it is feeding is 8.80 TFLOP, or 17.8 ms.
+
+    FlashAttention's claim is narrow and total: compute exactly the same
+    function, and never materialise the matrix.
+
+    ## What the roofline says before any code
+
+    Attention performs $4n^2d$ FLOPs and moves at least $8n^2$ bytes per head
+    per layer, so
+
+    $$I_{\text{naive}} = \frac{4n^2d}{8n^2} = \frac{d}{2} = 64
+      \quad \text{FLOP/byte at } d = 128 .$$
+
+    Against a ridge point of 148 that is 2.3x memory-bound. Both the numerator
+    and the denominator are quadratic in $n$, so the ratio does not change with
+    context length:
+
+    | context | attention FLOPs | at 494 TFLOP/s | traffic | at 3.35 TB/s | intensity |
+    |---|---|---|---|---|---|
+    | 4,096 | 8.80 TFLOP | 17.8 ms | 128.0 GiB | 41.0 ms | 64.0 |
+    | 32,768 | 562.9 TFLOP | 1,139.6 ms | 8,192 GiB | 2,625.7 ms | 64.0 |
+    | 131,072 | 9,007.2 TFLOP | 18,233.2 ms | 131,072 GiB | 42,011.2 ms | 64.0 |
+
+    This is the single most important consequence in the topic, and it cuts both
+    ways. FlashAttention is not a long-context algorithm: it does not reduce the
+    $O(n^2)$ FLOPs by one operation, and at 128k a forward pass is still 9.0
+    PFLOP of attention arithmetic. What it reduces is the byte count — to
+    $2n^2d/B_q$ elements, because K and V are each re-read $n/B_q$ times instead
+    of S and P being written and read four times:
+
+    $$\text{ratio} = \frac{4n^2}{2n^2 d / B_q} = \frac{2B_q}{d}.$$
+
+    That is a constant. It is 1.88x at $d = 128$ with a 128-wide tile, 7.11x at
+    $d = 64$ with a 256-wide tile, and 0.48x at $d = 256$ with a 64-wide tile —
+    a loss. The speedup is a property of the ratio between your tile and your
+    head dimension, not of the idea.
+
+    ## The recurrence, and why it is exact
+
+    Split Q into row blocks of $B_q$ and iterate K/V in blocks of $B_c$. For one
+    Q block, keep three things: the running maximum $m$, the running sum $l$,
+    and the unnormalised output $O$. When a new block's maximum $m'$ exceeds
+    $m$:
+
+    $$\alpha = e^{m - m'}, \qquad
+      l \leftarrow \alpha\, l + \sum_k e^{S_k - m'}, \qquad
+      O \leftarrow \alpha\, O + \sum_k e^{S_k - m'} V_k .$$
+
+    At the end, $P = O / l$. The reason it is exact is a one-liner: scaling
+    numerator and denominator by the same factor $e^{m' - m}$ leaves the ratio
+    unchanged, so the partial sums computed under an older, smaller maximum are
+    still usable — they simply have to be decayed by exactly the amount the
+    maximum grew.
+
+    Measured: 2.17e-15 relative agreement with a float64 materialised reference
+    at $n = 4096$, $d = 128$, block 128. Every published claim of "exact" for
+    FlashAttention means this, and nothing weaker.
+
+    ## The two ways to get it wrong
+
+    Both are worth memorising because neither is visible from the outside.
+
+    Forgetting to decay the normaliser — writing `l = l + P.sum()` while
+    correctly writing `acc = acc * alpha + P @ v` — gives 7.9050 relative error,
+    790%. Using the block's own maximum instead of the running one, and skipping
+    the decay entirely, gives 0.4597, 46%. In both cases the output has the
+    right shape, contains no NaN, and the softmax weights sum to one; they are
+    simply weights for the wrong denominator. The only defence is a numerical
+    comparison against a materialised reference on a sequence long enough to
+    cross several blocks.
+
+    ## Why recomputation beats storage
+
+    The backward pass needs S and P. Storing them costs $2n^2$ elements per head
+    and reading them back costs the same again, so the store-and-reload strategy
+    moves $4n^2$ elements — $8n^2$ bytes at fp16. Rebuilding them costs one extra
+    $QK^\top$, which is $2n^2d$ FLOPs. The trade prices at
+
+    $$\frac{2n^2d}{8n^2} = \frac{d}{4} = 32 \quad \text{FLOP/byte at } d = 128,$$
+
+    which is 4.6x below the ridge point. Recomputation wins, and it keeps
+    winning until $d = 4 \times 148 = 592$. What it buys on the other side is
+    the memory: the backward pass stores $O$ and the log-sum-exp, $n(d+2)$
+    floats per head, instead of $2n^2$.
+
+    ## Three generations
+
+    | | contribution | bottleneck attacked | reported |
+    |---|---|---|---|
+    | FA1 (2022) | tiling, online softmax, backward recomputation | bandwidth | 2-4x, 5-20x less memory |
+    | FA2 (2023) | Q split across 8 warps, causal block skip, fewer non-matmul FLOPs | occupancy | about 2x FA1, 50-73% of peak |
+    | FA3 (2024) | TMA, WGMMA, warp specialisation, FP8 | idle tensor cores | 1.5-2x FA2, about 75% of peak |
+
+    The causal split is worth stating separately because it is arithmetic, not
+    hardware. At 4k with 128-wide tiles the grid is 1,024 blocks and a causal
+    kernel visits 528 of them — 51.6%, against 50.01% of elements in the exact
+    triangle. An implementation that computes the upper triangle and masks it
+    throws that half away; FA2 skips the blocks.
+
+    ## What it does not fix
+
+    **The FLOPs.** At 128k, attention is 9.0 PFLOP per forward pass. Tiling
+    makes that affordable; it does not make it smaller. Everything that actually
+    reduces the exponent — sliding windows, sparsity, linear attention — is a
+    different topic with a different quality trade.
+
+    **Decode.** With a KV cache, a decode step's score matrix is $1 \times n$,
+    not $n \times n$. There is no $n^2$ intermediate to eliminate, so the
+    tiling argument has almost nothing to bite on; decode is bound by the cache
+    bytes, which is the subject of *The KV Cache*.
+
+    **Amdahl.** If attention is 15% of a prefill step's FLOPs, a 3x kernel
+    improvement on that 15% buys 1.14x end to end. The 2-4x figures are per
+    kernel, measured against an attention-only baseline, and they are the right
+    number to quote only when attention is the thing you are measuring.
+
+    ## The longer version
+
+    Attention is not slow because it does too much arithmetic; it is slow
+    because it writes an $n \times n$ intermediate to HBM and reads it back,
+    and the fix is to keep a tile of that intermediate in SRAM and rebuild the
+    softmax incrementally around a running maximum — which is exact, halves the
+    bytes, and turns the memory footprint from $O(n^2)$ into $O(n)$.
+
+    A cook with a very small bench. The pantry holds every ingredient for the
+    whole meal — eighty gigabytes of it — but the bench holds one chopping
+    board's worth. The naive cook tries to lay out all four thousand
+    ingredients at once: they fit, barely, on the floor, and then every step of
+    the recipe means walking to the floor and back. The good cook works through
+    the ingredients in batches that fit on the bench, keeps a running tally in a
+    notebook, and never walks anywhere.
+
+    The mapping is exact. The bench is the 227 KiB of shared memory on one SM;
+    the pantry is the 80 GiB of HBM at 3.35 TB/s; the walking is the memory bus,
+    and it is the only thing either cook is actually waiting on. The notebook is
+    the running maximum and running sum, and it is small — two numbers per row
+    of the output.
+
+    It breaks in three places. A cook can always re-chop an onion, and it costs
+    nothing but time; a GPU can only recompute cheaply if the recomputation
+    prices below the machine's ridge point, and at a head dimension of 592 it
+    stops being cheap. A cook can leave the bench messy between steps; SRAM has
+    no allocator and no page faults, so the tile size has to be decided at
+    compile time and every buffer counted before the kernel launches. And the
+    pantry does not care what order you take things out in, while HBM cares
+    enormously: the whole win comes from the ratio of tile width to head width,
+    so a cook with a narrower bench than the ingredient is wide would be better
+    off walking.
+
+    ### What goes wrong
+
+    - You profile a 4k-token forward pass and attention is 40% of the wall
+      clock while contributing 15% of the FLOPs. Nothing is wrong with the
+      arithmetic; the kernel is waiting on a matrix it just wrote.
+    - You try to extend to 128k context and the forward pass OOMs on a card
+      that holds the weights four times over. The tensor that does not fit is
+      not the model and not the KV cache — it is one layer's score matrix, at
+      32 GiB per head.
+    - You swap in a fused attention kernel and get 2x, then read a paper
+      claiming 10x and cannot tell whether your port is bad or the claim is
+      about a different head dimension.
+    - Your training run needs the attention matrix for the backward pass, and
+      storing it costs more memory than the activations of every other layer
+      combined. Someone suggests recomputing it and you assume that must be
+      slower, because recomputation always is.
+    - You have to choose between FlashAttention-1, -2 and -3 for a deployment
+      and the three papers read like three algorithms. Two of them are the
+      same algorithm and one of them only works on one generation of hardware.
+
+    ### The full treatment
+
+    **Attention's problem is the $n \times n$ matrix it insists on building,
+    not the FLOPs it spends.** For one head at $d = 128$ the score matrix is
+    32 MiB at 4k, 2 GiB at 32k and 32 GiB at 128k; across 32 heads and 32
+    layers that is 32 GiB, 2 TiB and 32 TiB. An H100 SM has 227 KiB of shared
+    memory, so the matrix is 144x too large for the fast memory at 4k and
+    148,000x too large at 128k. Measured cost of not tiling: an unfused stack
+    writes S, reads it to mask, writes it again, reads it to softmax, writes P
+    and reads P for the value product — at least $4n^2$ elements, which is
+    **128 GiB of HBM traffic for one 4k forward pass** of a 32-layer, 32-head
+    model, 9.8x the 14 GB of weights it just read. The trap is profiling
+    attention and seeing a respectable FLOP count: the FLOPs are fine, the
+    bytes are not.
+
+    **Naive attention runs at $d/2$ FLOP/byte at every context length, which
+    is why the fix is a constant factor and not an asymptotic one.** The FLOPs
+    are $4n^2d$ and the bytes are at least $8n^2$, so the intensity is
+    $d/2 = 64$ at $d = 128$ — 2.3x below the H100 ridge point of 148 — and it
+    is 64 at 4k, at 32k and at 128k, because both terms are quadratic in $n$
+    and the ratio cannot move. Modelled: 8.80 TFLOP of attention arithmetic is
+    17.8 ms at 494 TFLOP/s, while 128 GiB of traffic is 41.0 ms at 3.35 TB/s,
+    so the kernel takes 2.3x longer than its own FLOPs. The trap is expecting
+    long context to become compute-bound. It does not, and that is exactly why
+    the published speedup is 2-4x and does not grow with $n$.
+
+    **Tiling works because a softmax row needs one maximum and one sum, and
+    both can be accumulated.** Split Q into row blocks of $B_q$ and iterate
+    over K/V in blocks of $B_c$; keep a running max $m$, a running normaliser
+    $l$ and an unnormalised accumulator $O$, and when a new block's maximum
+    exceeds $m$, decay the old partials by $\alpha = e^{m - m'}$ before adding
+    the new ones. Measured: at $n = 4096$, $d = 128$, block 128, the tiled
+    pass matches a float64 materialised reference to **2.17e-15 relative** —
+    round-off, not approximation — while never holding more than a
+    $128 \times 128$ tile. Peak state falls from $O(n^2)$ to $O(nd)$: 32 MiB
+    per head at 128k instead of 32 GiB. The trap is believing the maximum must
+    be known before you exponentiate: it must not, you can rescale afterwards,
+    and that single observation is the algorithm.
+
+    **The rescale is the whole trick, and both obvious ways to skip it return
+    confident garbage.** Dropping the decay on the normaliser — rescaling the
+    accumulator but dividing by the last block's sum — gives a relative error
+    of **7.9050**, 790%, on a 256-token, 64-wide test. Using each block's own
+    maximum instead of the running maximum gives **0.4597**, 46% off. Neither
+    raises, neither produces a NaN, and both return a correctly shaped matrix;
+    the softmax still sums to one, it just sums the wrong things. The trap is
+    that a tiled kernel missing one `alpha` factor passes every shape check
+    and every "is it finite" check you would think to write.
+
+    **FlashAttention is exact, which is why it is a drop-in and not a quality
+    trade.** There is no low-rank sketch, no sparsity pattern, no block-sparse
+    approximation: the only difference from the reference is the order of the
+    floating-point reductions, measured at 2.17e-15 relative at 4k. It is also
+    *more* stable than the code it replaces. With three scores near -1131 at
+    $d = 2$, a naive `exp` underflows to exactly zero and the softmax divides
+    0 by 0 and returns `[nan, nan, nan]`, while the running-max version
+    returns the correct uniform mixture `[0.667, 0.667]` on the same input.
+    The trap is assuming "fast kernel" means "approximate" and either refusing
+    it for evals or checking it against a slower path that is itself the less
+    stable one.
+
+    **The speedup is $2 B_q / d$ — a ratio of tile width to head width — so it
+    is largest exactly where head dimensions are smallest.** Naive traffic is
+    $4n^2$ elements; tiled traffic is $2n^2d/B_q$ elements, because K and V are
+    each re-read $n/B_q$ times, so the byte ratio is $2B_q/d$. Measured on the
+    model: $d = 128$, $B_q = 128$ gives **1.88x** at 4k; $d = 64$,
+    $B_q = 256$ gives **7.11x**; $d = 256$, $B_q = 64$ gives **0.48x**, i.e.
+    the tiled kernel is twice as slow, because the SRAM budget forced a tile
+    narrower than the head. $B_q$ is capped by four fp16 tiles of
+    $B_q \times d$ fitting in 227 KiB, which is $B_q \le 227$ at $d = 128$.
+    The trap is quoting one speedup number for all models: it is a function of
+    head dimension and tile size, and it inverts for wide heads.
+
+    **Recomputation in the backward pass is cheaper than storage because the
+    trade prices at $d/4$ FLOP/byte, and $d/4$ is below the ridge.** Rebuilding
+    $S = QK^\top$ costs $2n^2d$ extra FLOPs and saves at least $4n^2$ elements
+    of S and P traffic, which is $8n^2$ bytes at fp16 — a ratio of $d/4$.
+    At $d = 128$ that is **32 FLOP/byte, 4.6x below 148**, so recomputing wins
+    by 4.6x on the roofline, and it still wins at $d = 256$ (64 FLOP/byte). The
+    crossover is $d^\star = 4 \cdot 148 = 592$ and no production head comes
+    within a factor of two of it. The other half of the trade is memory: the
+    backward pass needs $O(n)$ state — the output plus one log-sum-exp pair per
+    row — instead of $O(n^2)$.
+
+    **The three papers are not three algorithms: they are an algorithm, a
+    schedule, and a hardware exploit.** FlashAttention-1 (2022) contributes
+    the tiling, the online softmax and the backward recomputation — reported
+    2-4x over the best previous kernels with 5-20x less memory.
+    FlashAttention-2 (2023) keeps the algorithm and fixes the schedule: it
+    parallelises across Q blocks *and* splits a Q block across 8 warps so K/V
+    loads are shared and the output needs no cross-warp reduction, splits the
+    causal grid into unmasked full blocks and masked diagonal blocks, and cuts
+    non-matmul FLOPs by not rescaling the accumulator on every iteration —
+    reported about 2x FA1, at 50-73% of peak against FA1's 25-40%.
+    FlashAttention-3 (2024) keeps the schedule and exploits Hopper: TMA for
+    async bulk copies, WGMMA for warpgroup-wide matmuls, warp specialisation
+    with producer warps and consumer warpgroups, and ping-pong scheduling so
+    one tile's softmax overlaps another's GEMM — reported 1.5-2x FA2, at about
+    75% of peak. The trap is reading the three titles as three independent
+    ideas.
+
+    **Causal masking halves the arithmetic, and collecting that half is a
+    scheduling decision rather than a hardware one.** At 4k with 128-wide tiles
+    the grid is $32 \times 32 = 1{,}024$ blocks; a causal kernel visits
+    $\sum_{i=1}^{32} i = 528$ of them, **51.6%**, and the exact triangle is
+    50.01% of the elements. FA1 computed the upper triangle and masked it
+    afterwards; FA2 skips those blocks, which is why the causal path costs
+    roughly half the non-causal path per token rather than the same. The trap
+    is benchmarking a bidirectional workload and applying the number to a
+    decoder: a decoder's kernel does half the block-matmuls, so the same wall
+    clock buys twice the tokens.
+
+    **The control experiment: in NumPy the same algorithm is about 1.1x
+    slower, and that is the most instructive number here.** At $n = 1024$,
+    $d = 64$, block 128, the tiled pass takes 7.1 ms against 6.1 ms for the
+    materialised one — 1.15x on the run shown, 1.05-1.20x across runs. It does
+    strictly more arithmetic, two rescales of a $B_q \times d$ accumulator per
+    K/V block, and NumPy has no SRAM for the tile to live in, so all tiling
+    bought was a Python loop and an extra multiply. The GPU win comes entirely
+    from the hierarchy: 227 KiB of shared memory at roughly an order of
+    magnitude more bandwidth than 80 GiB of HBM at 3.35 TB/s, and a capacity
+    ratio of $10^5$. The trap is benchmarking an IO-aware algorithm on a
+    machine whose memory hierarchy you did not model.
+
+
+  derivations:
+    - title: "The online-softmax update is exact"
+      latex: |
+        A softmax over a row of scores needs two statistics: the maximum, for
+        stability, and the sum of exponentials, for normalisation. Neither
+        requires the whole row at once. Suppose blocks $1 \ldots j-1$ have been
+        consumed and produced a running maximum $m_{j-1}$, a running sum
+        $l_{j-1}$ and an unnormalised accumulator $O_{j-1}$. Block $j$ arrives
+        with scores $S_{jk}$ and values $V_k$. Define
+
+        $$m_j = \max\left(m_{j-1},\ \max_k S_{jk}\right), \qquad
+          \alpha_j = e^{\,m_{j-1} - m_j} \le 1 .$$
+
+        Then
+
+        $$l_j = \alpha_j\, l_{j-1} + \sum_k e^{\,S_{jk} - m_j}, \qquad
+          O_j = \alpha_j\, O_{j-1} + \sum_k e^{\,S_{jk} - m_j} V_k ,$$
+
+        and the final answer is $P = O_J / l_J$. Exactness follows from one
+        identity: for any $c$,
+
+        $$\frac{\sum_k e^{S_k - m}}{e^{-m}\sum_k e^{S_k}}
+          = \frac{\sum_k e^{S_k - c}}{e^{-c}\sum_k e^{S_k}} ,$$
+
+        so rescaling numerator and denominator by the same $e^{m_j - m_{j-1}}$
+        cannot change the quotient. The recursion is a change of variable, not an
+        approximation. Numerically it agrees with a float64 two-pass softmax to
+        2.17e-15 at $n = 4096$, which is the round-off floor, and it is
+        *better* conditioned than the naive version because every exponent it
+        evaluates is non-positive.
+      prose: >-
+        This is the whole of FlashAttention. Everything else in the paper is
+        bookkeeping about which tile is in SRAM and which is not. The reason the
+        recurrence is not obvious is that a softmax looks like a global
+        operation — you need the maximum before you can exponentiate safely —
+        and the trick is to notice that you can exponentiate under a provisional
+        maximum and correct afterwards, as long as you correct both the numerator
+        and the denominator. Get one of the two corrections wrong and the result
+        is a valid probability distribution over the wrong thing.
+
+    - title: "HBM traffic: why the win is 2 Bq / d and not asymptotic in n"
+      latex: |
+        Count elements moved, per head, per layer, at fp16.
+
+        The materialised path writes the $n \times n$ score matrix, reads it to
+        apply the mask, writes it back, reads it for the softmax, writes $P$, and
+        reads $P$ for the value product. That is four $n^2$ transfers plus the
+        Q, K, V reads and the output write:
+
+        $$B_{\text{naive}} = 4n^2 + 4nd \quad \text{elements}.$$
+
+        The tiled path loads Q once, loads K and V once per Q block — so
+        $n/B_q$ times each — and writes the output once:
+
+        $$B_{\text{tiled}} = \frac{2n^2 d}{B_q} + 4nd \quad \text{elements}.$$
+
+        Their ratio, for $n \gg d$,
+
+        $$\frac{B_{\text{naive}}}{B_{\text{tiled}}}
+          \;\longrightarrow\; \frac{4n^2}{2n^2 d / B_q} = \frac{2 B_q}{d},$$
+
+        which contains no $n$. Substituting the numbers at 4k, $d = 128$,
+        $B_q = 128$: 128.0 GiB against 68.0 GiB, ratio 1.88x. At $d = 64$ with
+        $B_q = 256$: 7.11x. At $d = 256$ with $B_q = 64$: 0.48x.
+
+        The same substitution gives the intensities, $4n^2d / B$:
+
+        $$I_{\text{naive}} \to \frac{d}{2} = 64, \qquad
+          I_{\text{tiled}} \to B_q = 128,$$
+
+        against a ridge point of 148. So the tiled kernel lands at 0.81 of the
+        ridge — nearly balanced — while the naive one sits at 0.43.
+      prose: >-
+        Two things follow, and both are easy to get wrong. First, the win is not
+        asymptotic: it is a constant set by how wide a tile you can hold, so
+        every claim of the form "FlashAttention is O(n) faster" is false. Second,
+        the constant can be below one. The tile width is capped by SRAM — four
+        fp16 tiles of $B_q \times d$ must fit in 227 KiB, so $B_q \le 227$ at
+        $d = 128$ — and when the head is wider than the tile the tiled kernel
+        moves more bytes than the materialised one. That is why the published
+        speedups cluster at 2-4x for $d = 128$ and reach 5-10x only for $d = 64$.
+
+    - title: "Recompute versus store: the d/4 rule"
+      latex: |
+        The backward pass needs the softmax probabilities $P$, which it can
+        either reload or rebuild. Reloading requires having stored both $S$ and
+        $P$ in the forward pass and reading them back:
+
+        $$B_{\text{store}} = \underbrace{2n^2}_{\text{write } S, P}
+          + \underbrace{2n^2}_{\text{read } S, P} = 4n^2 \text{ elements}
+          = 8n^2 \text{ bytes at fp16}.$$
+
+        Rebuilding requires one extra matrix product, $S = QK^\top$:
+
+        $$F_{\text{recompute}} = 2n^2 d \quad \text{FLOPs}.$$
+
+        The trade therefore prices at
+
+        $$\frac{F_{\text{recompute}}}{B_{\text{store}}}
+          = \frac{2n^2 d}{8n^2} = \frac{d}{4}
+          \quad \text{FLOP/byte},$$
+
+        which at $d = 128$ is 32 — 4.6x below the 148 ridge point. The
+        recomputation is cheaper than the round trip for as long as
+
+        $$\frac{d}{4} < \frac{P}{\text{BW}} \quad\Longleftrightarrow\quad
+          d < 4 \cdot 148 = 592 .$$
+
+        And the memory it saves is the difference between $O(n^2)$ and $O(n)$:
+        at 128k and $d = 128$, 32 GiB per head against 32 MiB.
+      prose: >-
+        The instinct that recomputation must be slower comes from a model where
+        arithmetic is the scarce resource. On a modern accelerator it is not:
+        the machine can do 148 floating-point operations in the time it takes to
+        fetch one byte, so any trade that spends fewer than 148 FLOPs per byte
+        saved is a trade worth making. The same arithmetic explains activation
+        checkpointing in general, and it explains why the crossover sits at a
+        head dimension no production model uses. Note what the inequality is
+        *not* saying: it does not say recomputation is free. It says the extra
+        FLOPs are cheap relative to the bytes they replace, which is exactly the
+        sentence "IO-aware" is shorthand for.
+
+  implementations:
+    - language: python
+      title: "Tiled attention with a running max, and the two ways the rescale goes wrong"
+      note: >-
+        `flash` is correct: it agrees with the materialised reference to
+        **2.17e-15 relative** at $n = 4096$, $d = 128$, block 128, and to
+        4.03e-16 at the smallest size, which is the float64 round-off floor. It
+        is also stable where the reference is not — with three scores near
+        -1131, `np.exp` underflows to exactly zero, the naive softmax divides
+        0 by 0 and returns `[nan, nan, nan]`, and the tiled version returns
+        `[0.667, 0.667]` because it never exponentiates a positive number.
+        The next two functions are **numerically WRONG**. `flash_no_l` applies
+        the decay to the accumulator but divides by the last block's sum instead
+        of the running one: 7.9050 relative error, 790%. `flash_block_max` uses
+        each block's own maximum and never decays anything: 0.4597, 46% off.
+        Neither raises, both return finite arrays of the right shape, and both
+        produce a softmax that sums to one — over the wrong denominator. If you
+        take one thing from this file, take the shape of that failure.
+        The last block is the control experiment. In NumPy the tiled pass is
+        *slower* — 7.1 ms against 6.1 ms, 1.15x on the run shown and 1.05-1.20x
+        across runs — because it does strictly more arithmetic and NumPy has no
+        SRAM for the tile to live in. Tiling is not free; it is free only when
+        the alternative is an HBM round trip.
+      code: |
+        import numpy as np, time
+
+        def naive(Q, K, V):
+            """Materialise the n x n score matrix, the way an unfused stack does."""
+            d = Q.shape[-1]
+            S = Q @ K.T / np.sqrt(d)
+            S = S - S.max(-1, keepdims=True)
+            P = np.exp(S)
+            P /= P.sum(-1, keepdims=True)
+            return P @ V
+
+        def flash(Q, K, V, block):
+            """Identical output, O(n) memory: the softmax is accumulated in K/V blocks."""
+            n, nk, d = Q.shape[0], K.shape[0], Q.shape[-1]
+            scale = d ** -0.5
+            out = np.zeros((n, d))
+            for s in range(0, n, block):
+                q = Q[s:s + block]
+                rows = len(q)
+                m = np.full(rows, -np.inf)       # running max, one per row
+                l = np.zeros(rows)               # running normaliser, one per row
+                acc = np.zeros((rows, d))        # running unnormalised output
+                for t in range(0, nk, block):
+                    kb, vb = K[t:t + block], V[t:t + block]
+                    S = (q @ kb.T) * scale
+                    m_new = np.maximum(m, S.max(axis=1))
+                    alpha = np.exp(m - m_new)    # how fast the old partial sums decay
+                    P = np.exp(S - m_new[:, None])   # exponent <= 0, cannot overflow
+                    l = l * alpha + P.sum(axis=1)
+                    acc = acc * alpha[:, None] + P @ vb
+                    m = m_new
+                out[s:s + rows] = acc / l[:, None]
+            return out
+
+        rng = np.random.default_rng(0)
+        for n, d, blk in [(64, 32, 16), (384, 64, 64), (1000, 64, 128), (4096, 128, 128)]:
+            Q, K, V = (rng.standard_normal((n, d)) for _ in range(3))
+            A, B = naive(Q, K, V), flash(Q, K, V, blk)
+            print("n=%4d d=%3d blk=%3d  rel %.2e  max abs %.2e" %
+                  (n, d, blk, np.linalg.norm(A - B) / np.linalg.norm(A), np.abs(A - B).max()))
+
+        def flash_no_l(Q, K, V, block):
+            n, d = Q.shape
+            out = np.zeros((n, d))
+            for s in range(0, n, block):
+                q = Q[s:s + block]
+                acc, lb = np.zeros((block, d)), np.zeros(block)
+                mb = np.full(block, -np.inf)
+                for t in range(0, n, block):
+                    S = (q @ K[t:t + block].T) * d ** -0.5
+                    mn = np.maximum(mb, S.max(-1))
+                    a = np.exp(mb - mn)
+                    P = np.exp(S - mn[:, None])
+                    lb = lb * a + P.sum(-1)
+                    acc = acc * a[:, None] + P @ V[t:t + block]
+                    mb = mn
+                out[s:s + block] = acc / P.sum(-1, keepdims=True)   # BUG: last block's sum only
+            return out
+
+        def flash_block_max(Q, K, V, block):
+            n, d = Q.shape
+            out = np.zeros((n, d))
+            for s in range(0, n, block):
+                q = Q[s:s + block]
+                acc, lb = np.zeros((block, d)), np.zeros(block)
+                for t in range(0, n, block):
+                    S = (q @ K[t:t + block].T) * d ** -0.5
+                    P = np.exp(S - S.max(-1)[:, None])   # BUG: this block's max, not the running one
+                    lb = lb + P.sum(-1)                  # BUG: no decay applied to the partials
+                    acc = acc + P @ V[t:t + block]
+                out[s:s + block] = acc / lb[:, None]
+            return out
+
+        n, d = 256, 64
+        Q, K, V = (rng.standard_normal((n, d)) for _ in range(3))
+        A = naive(Q, K, V)
+        for name, f in [("no-l-rescale", flash_no_l), ("block-max", flash_block_max)]:
+            B = f(Q, K, V, 32)
+            print("WRONG %-12s rel %.4f  max abs %.3f" %
+                  (name, np.linalg.norm(A - B) / np.linalg.norm(A), np.abs(A - B).max()))
+
+        # Three scores of -1131: exp underflows to exactly 0, and 0/0 is nan.
+        Q = np.array([[40.0, 0.0]])
+        K = np.tile(np.array([[-40.0, 0.0]]), (3, 1))
+        V = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        raw = np.exp(Q @ K.T / np.sqrt(2.0))
+        print("no max subtraction ->", raw.ravel(), (raw / raw.sum(-1, keepdims=True)).ravel())
+        print("flash, same input  ->", flash(Q, K, V, 2).ravel())
+
+        def bench(f, reps=5):
+            best = 1e9
+            for _ in range(reps):
+                t = time.perf_counter()
+                for _ in range(20):
+                    f()
+                best = min(best, (time.perf_counter() - t) / 20)
+            return best
+
+        n, d = 1024, 64
+        Q, K, V = (rng.standard_normal((n, d)) for _ in range(3))
+        tn, tf = bench(lambda: naive(Q, K, V)), bench(lambda: flash(Q, K, V, 128))
+        print("numpy: naive %.1f ms  tiled %.1f ms  -> tiled is %.2fx slower" % (tn * 1e3, tf * 1e3, tf / tn))
+
+        # n=  64 d= 32 blk= 16  rel 4.03e-16  max abs 5.55e-16
+        # n= 384 d= 64 blk= 64  rel 7.13e-16  max abs 4.44e-16
+        # n=1000 d= 64 blk=128  rel 1.12e-15  max abs 5.69e-16
+        # n=4096 d=128 blk=128  rel 2.17e-15  max abs 7.36e-16
+        # WRONG no-l-rescale rel 7.9050  max abs 7.406
+        # WRONG block-max    rel 0.4597  max abs 0.431
+        # no max subtraction -> [0. 0. 0.] [nan nan nan]
+        # flash, same input  -> [0.66666667 0.66666667]
+        # numpy: naive 6.1 ms  tiled 7.1 ms  -> tiled is 1.15x slower
+
+    - language: python
+      title: "The IO model: what the tiling actually removes"
+      note: >-
+        Everything here is arithmetic on the model, not a GPU measurement, and
+        the distinction matters: the byte counts are exact given the assumptions
+        (fp16, four S/P transfers, K and V re-read once per Q block), while the
+        milliseconds are a roofline estimate at 494 TFLOP/s and 3.35 TB/s with
+        no allowance for occupancy, launch overhead or L2 hits. Treat the times
+        as an upper bound on what a perfect kernel achieves, and the byte counts
+        as exact.
+        The three-row table is the whole argument. Per-head size grows 1,024x
+        from 4k to 128k while the intensity does not move at all — 64.0 FLOP/byte
+        at every length — because both the FLOPs and the bytes are quadratic.
+        The tiled intensity converges to $B_q$ rather than to $d/2$, so the
+        ratio of the two is $2B_q/d$ and the modelled speedup converges to the
+        same number: 1.88x, 1.98x, 2.00x.
+        The second table is the caveat that makes the first one honest: at
+        $d = 256$ the SRAM budget forces $B_q = 64$ and the ratio inverts to
+        0.48x. The tiled kernel moves twice as many bytes as the materialised
+        one. Anyone who has ported FlashAttention to a model with wide heads has
+        met this.
+      code: |
+        BW, PEAK, RIDGE = 3.35e12, 494e12, 148.0     # H100 SXM: HBM, dense fp16, ridge point
+        H, L, D = 32, 32, 128                        # heads, layers, head dim
+        GIB, MIB = 2 ** 30, 2 ** 20
+
+        def attn_io(seq, block, d=D, heads=H, layers=L, b=2):
+            sq = seq * seq
+            score = heads * layers * sq * b          # every head's n x n matrix, materialised
+            naive = 4 * score                        # S write+read, P write+read
+            flash = heads * layers * b * (2 * sq * d / block + 4 * seq * d)   # K,V re-read n/block times
+            flops = heads * layers * 4 * sq * d
+            t_c = flops / PEAK
+            return dict(per_head=sq * b, per_layer=heads * sq * b, total=score,
+                        naive=naive, flash=flash, i_n=flops / naive, i_f=flops / flash,
+                        t_c=t_c, t_n=naive / BW, t_f=flash / BW)
+
+        for seq in (4096, 32768, 131072):
+            r = attn_io(seq, 128)
+            print("n=%6d  per head %6.1f MiB  per layer %7.1f GiB  model %7.1f GiB" %
+                  (seq, r["per_head"] / MIB, r["per_layer"] / GIB, r["total"] / GIB))
+            print("        naive %8.1f GiB  flash %8.1f GiB  ratio %.2fx  intensity %5.1f -> %5.1f" %
+                  (r["naive"] / GIB, r["flash"] / GIB, r["naive"] / r["flash"], r["i_n"], r["i_f"]))
+            print("        compute %7.1f ms  traffic %7.1f ms  tiled %7.1f ms  modelled speedup %.2fx" %
+                  (r["t_c"] * 1e3, r["t_n"] * 1e3, r["t_f"] * 1e3,
+                   max(r["t_n"], r["t_c"]) / max(r["t_f"], r["t_c"])))
+
+        print("\nthe win is 2 * block / d:")
+        for d, block in ((64, 256), (128, 128), (256, 64)):
+            r = attn_io(4096, block, d)
+            print("  d=%3d block=%3d  intensity %6.1f -> %6.1f  ratio %4.2fx" %
+                  (d, block, r["i_n"], r["i_f"], r["naive"] / r["flash"]))
+
+        print("\nrecompute in backward: 2 n^2 d FLOPs against 8 n^2 bytes of S/P traffic")
+        for d in (64, 128, 256, 592):
+            print("  d=%3d -> %5.1f FLOP/byte  ->  %s" %
+                  (d, d / 4, "recompute" if d / 4 < RIDGE else "store"))
+
+        # n=  4096  per head   32.0 MiB  per layer     1.0 GiB  model    32.0 GiB
+        #         naive    128.0 GiB  flash     68.0 GiB  ratio 1.88x  intensity  64.0 -> 120.5
+        #         compute    17.8 ms  traffic    41.0 ms  tiled    21.8 ms  modelled speedup 1.88x
+        # n= 32768  per head 2048.0 MiB  per layer    64.0 GiB  model  2048.0 GiB
+        #         naive   8192.0 GiB  flash   4128.0 GiB  ratio 1.98x  intensity  64.0 -> 127.0
+        #         compute  1139.6 ms  traffic  2625.7 ms  tiled  1323.1 ms  modelled speedup 1.98x
+        # n=131072  per head 32768.0 MiB  per layer  1024.0 GiB  model 32768.0 GiB
+        #         naive 131072.0 GiB  flash  65664.0 GiB  ratio 2.00x  intensity  64.0 -> 127.8
+        #         compute 18233.2 ms  traffic 42011.2 ms  tiled 21046.6 ms  modelled speedup 2.00x
+        #
+        # the win is 2 * block / d:
+        #   d= 64 block=256  intensity   32.0 ->  227.6  ratio 7.11x
+        #   d=128 block=128  intensity   64.0 ->  120.5  ratio 1.88x
+        #   d=256 block= 64  intensity  128.0 ->   62.1  ratio 0.48x
+        #
+        # recompute in backward: 2 n^2 d FLOPs against 8 n^2 bytes of S/P traffic
+        #   d= 64 ->  16.0 FLOP/byte  ->  recompute
+        #   d=128 ->  32.0 FLOP/byte  ->  recompute
+        #   d=256 ->  64.0 FLOP/byte  ->  recompute
+        #   d=592 -> 148.0 FLOP/byte  ->  store
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        Naive attention's arithmetic intensity is 64 FLOP/byte at 4k and 64
+        FLOP/byte at 128k. Why does it not degrade as the sequence grows, and
+        what does that imply about the size of the win FlashAttention can offer?
+      answerKind: short_text
+      hint: >-
+        Write the FLOP count and the byte count as functions of n. Divide one by
+        the other before substituting any numbers.
+      solution: >-
+        FLOPs are $4n^2d$ and bytes are at least $8n^2$, so the ratio is $d/2$
+        with no $n$ in it: both quantities are quadratic in sequence length,
+        which means growing the context multiplies the work and the traffic by
+        the same factor. The implication is that tiling cannot change the
+        asymptotics of either — it can only change the constant in the byte
+        count, from $4n^2$ elements to $2n^2d/B_q$. So the win is a constant
+        factor, capped by $2B_q/d$, and the published 2-4x is the whole story
+        rather than a measurement that will improve with longer sequences.
+        What *does* change asymptotically is memory: $O(n^2)$ live elements
+        become $O(nd)$, which is why 128k context is impossible without tiling
+        and merely expensive with it.
+    - id: cp-2
+      question: >-
+        In the online-softmax recurrence, what exactly does the decay factor
+        alpha multiply, and what happens to your output if you apply it to the
+        accumulator but not to the normaliser?
+      answerKind: short_text
+      hint: >-
+        Alpha exists because the running maximum changed, which changes the scale
+        of every exponential computed so far. Which two accumulated quantities
+        were computed at the old scale?
+      solution: >-
+        Alpha multiplies both partial sums that were computed under the old
+        maximum: the denominator $l$ and the numerator $O$. It is
+        $e^{m - m'}$, the factor by which the old exponentials are now too
+        large, so both must be scaled down by it before the new block's terms
+        are added. Applying it only to $O$ leaves the denominator counting the
+        old block at the wrong scale relative to the new one — measured, that is
+        a 7.9050 relative error, 790%, with no exception and no NaN. The output
+        is still a convex combination of the value rows, so it looks like an
+        attention output; it is just weighted by a mixture of two different
+        normalisations.
+    - id: cp-3
+      question: >-
+        A model uses $d_{\text{head}} = 256$ and your kernel can only fit
+        $B_q = 64$ tiles in SRAM at that width. Predict whether FlashAttention
+        helps, and say what you would change.
+      answerKind: short_text
+      hint: >-
+        The ratio is $2B_q/d$. Substitute before reasoning about anything else.
+      solution: >-
+        The ratio is $2 \cdot 64 / 256 = 0.5$: the tiled kernel moves twice as
+        many bytes as the materialised one, so it loses. The mechanism is that
+        K and V are re-read $n/64$ times, which is twice as often as the naive
+        path's four $n^2$ transfers. Modelled intensity is 62.1 FLOP/byte
+        against the naive path's 128.0, and a roofline estimate gives 0.48x.
+        The fix is not a better kernel; it is a smaller head. FA2 handles
+        $d = 256$ by splitting the head dimension across two passes, which
+        halves the effective $d$ per tile and restores $B_q$ to 128 — at the
+        cost of two passes over the output. The alternative is to accept the
+        loss and note that at $d = 256$ the naive kernel was already at 128
+        FLOP/byte, close enough to the ridge point that there was little to win.
+    - id: cp-4
+      question: >-
+        At 4k, the materialised path moves 128 GiB and the tiled path 68 GiB —
+        only 1.88x. The paper claims 5-20x less memory. Are these consistent?
+      answerKind: short_text
+      hint: >-
+        Distinguish "bytes moved" from "bytes resident". One of the two numbers
+        is a bandwidth figure and the other is a capacity figure.
+      solution: >-
+        They measure different things, and both are right. 128 GiB is *traffic*:
+        the accumulation of four $n^2$ transfers over a forward pass, none of
+        which is resident for long. The 5-20x figure is *memory footprint*: the
+        materialised path must hold two $n^2$ tensors per head live at once —
+        32 GiB per head at 128k, 1 TiB for one layer of a 32-head model — while
+        the tiled path holds a 32 KiB tile and $O(nd)$ of output state. At 128k
+        that is a capacity ratio of 1,024x per head, which is where the 5-20x
+        claim comes from: it is a statement about what fits, not about what
+        moves. Quoting the traffic ratio as if it were the memory saving
+        understates the result by three orders of magnitude, and quoting the
+        memory saving as if it were the speedup overstates it by the same.
+    - id: cp-5
+      question: >-
+        FlashAttention-2's changes are reported to give about 2x over
+        FlashAttention-1, and FlashAttention-3's another 1.5-2x. Neither changes
+        the algorithm. What were they actually fixing, and which of the two
+        would help on an A100?
+      answerKind: short_text
+      hint: >-
+        FA1 already eliminated the HBM traffic. If the bytes are gone, what is
+        the kernel waiting on next? Then ask what Hopper has that Ampere does
+        not.
+      solution: >-
+        FA1 removed the $n^2$ traffic but left the schedule naive: four warps
+        per block splitting K/V, which requires a cross-warp reduction through
+        shared memory for every output tile, and a causal path that computes the
+        masked upper triangle before discarding it. FA2 fixes both — eight warps
+        with Q split across them so the output needs no reduction, and the causal
+        grid split into unmasked full blocks and masked diagonal blocks, which
+        visits 528 of 1,024 blocks at 4k. It also stops rescaling the accumulator
+        when the maximum has not changed. Those are occupancy and instruction-count
+        fixes, and they take the kernel from 25-40% of peak to 50-73%; they work
+        on any GPU, so FA2 helps on an A100. FA3 is Hopper-specific: TMA, WGMMA,
+        warp specialisation and FP8 are all hardware features Ampere lacks, so
+        FA3's 1.5-2x simply does not exist on an A100 — you run FA2 there and
+        that is the ceiling.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Attention builds an intermediate that is quadratic in sequence length,
+        and on a GPU the cost of an intermediate is not the arithmetic that
+        produces it but the trip to memory and back. The matrix is far too large
+        for the fast memory next to the arithmetic units, so every unfused
+        implementation writes it to the slow memory and reads it again — four
+        times, for the four operations that consume it.
+
+        The way out is to notice that a softmax does not need the whole row at
+        once. It needs a maximum and a sum, and both can be built up as blocks
+        arrive, provided you keep a running correction. That turns an
+        $n \times n$ object into a tile that fits, and it costs one extra
+        multiplication per block. The result is not an approximation: it is the
+        same number, computed in a different order.
+      blocks:
+        - kind: checklist
+          body: |
+            - The intermediate is n x n; the fast memory is 227 KiB
+            - Four passes over that intermediate, not one
+            - Bytes grow as n squared, same as FLOPs, so intensity is constant
+            - Tiling keeps the tile on chip and streams K and V past it
+            - Running max plus running sum rebuilds the softmax exactly
+            - Backward pass recomputes instead of storing
+      checkpoint: >-
+        Before going on: if the FLOPs and the bytes both grow as the square of
+        the sequence length, can any change to the kernel make the *ratio*
+        between them improve as the sequence gets longer? Say what that implies
+        about the maximum possible speedup.
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in two currencies and never mix them: elements moved, and FLOPs
+        performed. The materialised path moves four $n^2$ tensors per head —
+        score written, score read, probabilities written, probabilities read —
+        and the tiled path moves K and V once per Q block instead. That is the
+        entire accounting; every number in this topic is one of those two counts
+        divided by a hardware constant.
+
+        For the block size, start from SRAM and work backwards. Four fp16 tiles
+        of $B_q \times d$ must fit in 227 KiB, which caps $B_q$ at about 227 for
+        $d = 128$; production kernels pick 128 to leave room for double
+        buffering. Then the win is $2B_q/d$, and you can predict whether to
+        bother before writing a line of code.
+      blocks:
+        - kind: checklist
+          body: |
+            - Count elements, not tensors: 4 n^2 naive, 2 n^2 d / Bq tiled
+            - Divide by 2 for bytes per element, or work in elements throughout
+            - Tile width is capped by SRAM: 4 * Bq * d * 2 <= 227 KiB
+            - Win is 2 * Bq / d; below 1.0 means do not bother
+            - Intensity is d/2 naive and Bq tiled; compare to 148
+            - Backward recompute prices at d/4 FLOP/byte
+      checkpoint: >-
+        Two models, both with 4k context: one has 32 heads of width 128, the
+        other 16 heads of width 256. Same total model width. Which one benefits
+        more from tiling, and by how much?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Two routines and one cost model. The forward pass is a nested loop with
+        three accumulators; the cost model is four multiplications. Write both
+        before you profile anything.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # forward, one Q block at a time
+            for each Q block (rows q):
+                m   = [-inf] * len(q)        # running max
+                l   = [0] * len(q)           # running sum
+                acc = zeros(len(q), d)       # running unnormalised output
+                for each K/V block (cols k):
+                    S = q @ k.T * (1 / sqrt(d))
+                    m_new = maximum(m, rowmax(S))
+                    alpha = exp(m - m_new)   # decay for everything so far
+                    P = exp(S - m_new)       # safe: exponent <= 0
+                    l = l * alpha + rowsum(P)
+                    acc = acc * alpha + P @ v
+                    m = m_new
+                out[q] = acc / l
+
+            # cost model, per head per layer
+            naive_elements = 4 * n^2 + 4 * n * d
+            tiled_elements = 2 * n^2 * d / Bq + 4 * n * d
+            intensity      = 4 * n^2 * d / (bytes_per_element * elements)
+            win            = 2 * Bq / d
+
+            # backward: recompute or store?
+            extra_flops = 2 * n^2 * d
+            saved_bytes = 8 * n^2
+            recompute_wins = extra_flops / saved_bytes < P / BW
+      checkpoint: >-
+        In that pseudocode, `alpha` multiplies two accumulators. Suppose you
+        also wanted the maximum of the output row for logging. Could you
+        maintain it the same way, and what would the decay do to it?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three quantities, in the order they matter: the intensity of the naive
+        path, the intensity of the tiled path, and the crossover head dimension
+        for backward recomputation.
+      blocks:
+        - kind: math
+          body: |
+            Per head per layer, at $b$ bytes per element. The naive path makes
+            four $n^2$ transfers plus the Q, K, V reads and the output write:
+
+            $$B_{\text{naive}} = 4n^2 + 4nd \quad \text{elements}, \qquad
+              F = 4n^2 d \ \text{FLOPs},$$
+
+            so
+
+            $$I_{\text{naive}} = \frac{4n^2d}{b\,(4n^2 + 4nd)}
+              \xrightarrow[n \gg d]{} \frac{d}{2} = 64 \text{ at } d = 128,$$
+
+            against a ridge point of $P/\text{BW} = 494/3.35 = 147.5$, i.e. 2.3x
+            memory-bound.
+
+            The tiled path reads K and V once per Q block and writes the output
+            once:
+
+            $$B_{\text{tiled}} = \frac{2n^2 d}{B_q} + 4nd \quad \text{elements},
+              \qquad I_{\text{tiled}} \xrightarrow[n \gg d]{} B_q ,$$
+
+            and their ratio is
+
+            $$\frac{B_{\text{naive}}}{B_{\text{tiled}}}
+              \to \frac{2B_q}{d} : \quad 1.88 \text{ at } (d,B_q)=(128,128),
+              \quad 7.11 \text{ at } (64,256), \quad 0.48 \text{ at } (256,64).$$
+
+            For the backward pass, recomputing $S = QK^\top$ costs $2n^2d$
+            FLOPs and saves $4n^2$ elements of S/P traffic:
+
+            $$\frac{2n^2d}{8n^2} = \frac{d}{4} < \frac{P}{\text{BW}}
+              \;\Longleftrightarrow\; d < 4 \cdot 148 = 592 .$$
+
+            At $d = 128$ the trade prices at 32 FLOP/byte, 4.6x below the ridge.
+      checkpoint: >-
+        The tiled intensity converges to $B_q$, not to $B_q/2$, and the naive
+        one to $d/2$. Why does the tile width enter the numerator unhalved when
+        the head width enters it halved?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete kernel is eight lines of recurrence and the complete cost
+        model is four multiplications. Here is both, with the numbers filled in
+        and the failure modes named.
+      blocks:
+        - kind: warning
+          body: >-
+            Two mistakes account for almost every broken port. The first is
+            dropping the decay on the normaliser: you must multiply *both* the
+            numerator and the denominator by alpha, or the weights stop being a
+            probability distribution over the right thing — measured, 7.9050
+            relative error. The second is using each block's own maximum: the
+            maximum must be the running one, and the decay must be applied
+            whenever it changes, otherwise the same corruption appears at 0.4597.
+            Neither raises and neither produces a NaN, so the only test that
+            catches them is a numeric comparison against a materialised
+            reference over a sequence spanning several blocks.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def flash_forward(Q, K, V, block):
+                Q, K, V = (np.asarray(a, dtype=float) for a in (Q, K, V))
+                n, nk, d = Q.shape[0], K.shape[0], Q.shape[-1]
+                out = np.zeros((n, d))
+                for s in range(0, n, block):
+                    q = Q[s:s + block]
+                    m = np.full(len(q), -np.inf)
+                    l = np.zeros(len(q))
+                    acc = np.zeros((len(q), d))
+                    for t in range(0, nk, block):
+                        S = (q @ K[t:t + block].T) * d ** -0.5
+                        m_new = np.maximum(m, S.max(axis=1))
+                        alpha = np.exp(m - m_new)
+                        P = np.exp(S - m_new[:, None])
+                        l = l * alpha + P.sum(axis=1)
+                        acc = acc * alpha[:, None] + P @ V[t:t + block]
+                        m = m_new
+                    out[s:s + len(q)] = acc / l[:, None]
+                return out
+
+            def attn_io(n_head, n_layer, seq, d_head, block, b=2):
+                sq = seq * seq
+                score = n_head * n_layer * sq * b
+                naive = 4 * score
+                flash = n_head * n_layer * b * (2 * sq * d_head / block + 4 * seq * d_head)
+                flops = 4 * n_head * n_layer * sq * d_head
+                return {"score_gib": score / 2**30, "naive_gib": naive / 2**30,
+                        "flash_gib": flash / 2**30, "traffic_ratio": naive / flash,
+                        "intensity_naive": flops / naive, "intensity_flash": flops / flash,
+                        "ridge_ratio": (flops / flash) / 148.0}
+        - kind: checklist
+          body: |
+            - 32 MiB / 2 GiB / 32 GiB per head at 4k / 32k / 128k
+            - 4 n^2 elements of traffic: 128 GiB at 4k for 32 heads x 32 layers
+            - Naive intensity is d/2 = 64 at every context length
+            - Tiled intensity converges to Bq = 128
+            - Win is 2 Bq / d: 1.88x at d=128, 7.11x at d=64, 0.48x at d=256
+            - Recompute prices at d/4 = 32 FLOP/byte, crossover d = 592
+            - Exactness at 2.17e-15, and it survives inputs where exp underflows
+      checkpoint: >-
+        `intensity_flash` in that code returns 120.5 at 4k but the asymptote is
+        128. Where did the missing 7.5 go, and would it be more or less at 512
+        tokens?
+
+  problems:
+    - id: p-flash-forward
+      title: "Tiled attention with a running max"
+      difficulty: medium
+      prompt: >-
+        Implement `flash_forward(Q, K, V, block)`.
+
+        `Q` is $n \times d$, `K` and `V` are $n_k \times d$, and `block` is the
+        tile width in both directions. Return the $n \times d$ non-causal
+        attention output as a list of lists: score $S = QK^\top / \sqrt{d}$,
+        softmax each row, multiply by `V`.
+
+        You must produce the same numbers a materialised implementation would,
+        but without ever allocating an $n \times n$ array: iterate over K/V in
+        blocks, keep a running maximum `m`, a running normaliser `l` and an
+        unnormalised accumulator, and decay the two accumulators by
+        `exp(m_old - m_new)` whenever the maximum grows. Divide by `l` once, at
+        the end of each row block.
+
+        `block` may not divide the sequence length, and `block` may exceed it.
+        Handle the ragged final block.
+      starter: |
+        import numpy as np
+
+        def flash_forward(Q, K, V, block):
+            # your implementation here
+            pass
+      language: python
+      entry: flash_forward
+      testCases:
+        - input: '[[[1,0],[0,1]],[[1,0],[0,1]],[[1,2],[3,4]],2]'
+          expected: '[[1.660476901346686,2.6604769013466862],[2.3395230986533138,3.3395230986533138]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0,2.0],[0.5,-1.0],[2.0,0.0]],[[1.0,0.0],[0.0,1.0],[1.0,1.0]],[[1.0,0.0],[0.0,2.0],[3.0,1.0]],2]'
+          expected: '[[1.8679552806894644,1.1439661646978823],[1.3479104326489662,0.6445526519832104],[1.7832330964304126,0.6625751776771902]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0,0.0],[0.0,1.0],[1.0,1.0]],[[1.0,0.0],[0.0,1.0],[1.0,-1.0]],[[2.0,1.0],[0.0,3.0],[1.0,1.0]],1]'
+          expected: '[[1.2033362780393577,1.3955516292808563],[0.708020064525898,2.1519506904307235],[1.0,1.802224185359572]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[40.0,0.0]],[[-40.0,0.0],[-40.0,0.0],[-40.0,0.0]],[[1.0,0.0],[0.0,1.0],[1.0,1.0]],2]'
+          expected: '[[0.6666666666666666,0.6666666666666666]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0,1.0]],[[1.0,1.0],[1.0,1.0]],[[2.0,4.0],[6.0,8.0]],1]'
+          expected: '[[4.0,6.0]]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def flash_forward(Q, K, V, block):
+            Q = np.asarray(Q, dtype=float)
+            K = np.asarray(K, dtype=float)
+            V = np.asarray(V, dtype=float)
+            n, nk, d = Q.shape[0], K.shape[0], Q.shape[-1]
+            scale = d ** -0.5
+            out = np.zeros((n, d))
+            for s in range(0, n, block):
+                q = Q[s:s + block]
+                rows = len(q)
+                m = np.full(rows, -np.inf)
+                l = np.zeros(rows)
+                acc = np.zeros((rows, d))
+                for t in range(0, nk, block):
+                    kb, vb = K[t:t + block], V[t:t + block]
+                    S = (q @ kb.T) * scale
+                    m_new = np.maximum(m, S.max(axis=1))
+                    alpha = np.exp(m - m_new)
+                    P = np.exp(S - m_new[:, None])
+                    l = l * alpha + P.sum(axis=1)
+                    acc = acc * alpha[:, None] + P @ vb
+                    m = m_new
+                out[s:s + rows] = acc / l[:, None]
+            return out
+      solutionExplanation: >-
+        The third case is the one that catches the ragged block: with `block = 1`
+        every K/V block is a single column, so the recurrence runs three times
+        and the final `acc / l` must use the accumulated `l`, not the last
+        block's sum. Getting that wrong is the 7.9-relative-error bug, and it
+        passes every shape check.
+        The fourth case is the stability test. `Q` is `[40, 0]` and every key is
+        `[-40, 0]`, so each score is $-1600/\sqrt{2} = -1131.4$. A materialised
+        implementation that exponentiates before subtracting the row max gets
+        `exp(-1131) = 0` for all three entries, sums them to zero, divides zero
+        by zero, and returns `[nan, nan]`. The tiled version exponentiates
+        `S - m_new`, which is exactly 0 for all three, so each weight is 1 and
+        the answer is the mean of the three value rows, `[2/3, 2/3]`. That case
+        proves the running max is doing real work rather than being decoration.
+        The fifth case is the exactness anchor: a single query, two identical
+        keys, so both weights are 0.5 and the output is the midpoint of
+        `[2, 4]` and `[6, 8]`, which is `[4, 6]` with no rounding at all. If you
+        return `[6, 8]` you kept only the last block; if `[2, 4]`, only the
+        first. The first case is the hand-checkable one: scores are
+        $\pm 0.7071$, so the weights are $(0.6698, 0.3302)$ and $(0.3302,
+        0.6698)$, and the two output rows are the two weighted mixtures of
+        `[1, 2]` and `[3, 4]`.
+      complexity: "O(n^2 d) time, O(block * d) space plus the output"
+      tags: [flash-attention, online-softmax, tiling, numerical-stability]
+
+    - id: p-attn-io
+      title: "Price a forward pass: bytes, intensity, ridge"
+      difficulty: medium
+      prompt: >-
+        Implement `attn_io(n_head, n_layer, seq, d_head, block,
+        dtype_bytes=2, ridge=148.0)` returning the IO model of one attention
+        forward pass over a whole stack.
+
+        With `b = dtype_bytes` and `sq = seq * seq`, the returned dict has
+        exactly these keys:
+
+        - `score_gib` — every head's materialised score matrix, all layers, in
+          GiB: `n_head * n_layer * sq * b / 2**30`.
+        - `naive_gib` — the unfused traffic, with S written and read and P
+          written and read: `4 * score_gib`.
+        - `flash_gib` — the tiled traffic, with K and V each re-read
+          `seq / block` times:
+          `n_head * n_layer * b * (2 * sq * d_head / block + 4 * seq * d_head) / 2**30`.
+        - `traffic_ratio` — `naive_gib / flash_gib`.
+        - `intensity_naive` — per head: `4 * sq * d_head / (b * (4 * sq + 4 * seq * d_head))`.
+        - `intensity_flash` — per head: `4 * sq * d_head / (b * (2 * sq * d_head / block + 4 * seq * d_head))`.
+        - `ridge_ratio` — `intensity_flash / ridge`.
+
+        Return floats throughout; `score_gib` is 32.0 rather than 32 for the
+        standard configuration, so do not round or truncate.
+      starter: |
+        def attn_io(n_head, n_layer, seq, d_head, block, dtype_bytes=2, ridge=148.0):
+            # your implementation here
+            pass
+      language: python
+      entry: attn_io
+      testCases:
+        - input: '[32, 32, 4096, 128, 128]'
+          expected: '{"score_gib":32.0,"naive_gib":128.0,"flash_gib":68.0,"traffic_ratio":1.8823529411764706,"intensity_naive":62.06060606060606,"intensity_flash":120.47058823529412,"ridge_ratio":0.8139904610492845}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[32, 32, 32768, 128, 128]'
+          expected: '{"score_gib":2048.0,"naive_gib":8192.0,"flash_gib":4128.0,"traffic_ratio":1.9844961240310077,"intensity_naive":63.750972762645915,"intensity_flash":127.0077519379845,"ridge_ratio":0.8581604860674628}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[32, 32, 131072, 128, 128]'
+          expected: '{"score_gib":32768.0,"naive_gib":131072.0,"flash_gib":65664.0,"traffic_ratio":1.996101364522417,"intensity_naive":63.937560975609756,"intensity_flash":127.75048732943469,"ridge_ratio":0.8631789684421263}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[32, 32, 4096, 64, 256]'
+          expected: '{"score_gib":32.0,"naive_gib":128.0,"flash_gib":18.0,"traffic_ratio":7.111111111111111,"intensity_naive":31.50769230769231,"intensity_flash":227.55555555555554,"ridge_ratio":1.5375375375375375}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[8, 12, 2048, 64, 128]'
+          expected: '{"score_gib":0.75,"naive_gib":3.0,"flash_gib":0.84375,"traffic_ratio":3.5555555555555554,"intensity_naive":31.03030303030303,"intensity_flash":113.77777777777778,"ridge_ratio":0.7687687687687688}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def attn_io(n_head, n_layer, seq, d_head, block, dtype_bytes=2, ridge=148.0):
+            gib = 2 ** 30
+            b = dtype_bytes
+            sq = seq * seq
+            score = n_head * n_layer * sq * b
+            naive = 4 * score
+            flash = n_head * n_layer * b * (2 * sq * d_head / block + 4 * seq * d_head)
+            flops = 4 * sq * d_head
+            i_naive = flops / (b * (4 * sq + 4 * seq * d_head))
+            i_flash = flops / (b * (2 * sq * d_head / block + 4 * seq * d_head))
+            return {"score_gib": score / gib,
+                    "naive_gib": naive / gib,
+                    "flash_gib": flash / gib,
+                    "traffic_ratio": naive / flash,
+                    "intensity_naive": i_naive,
+                    "intensity_flash": i_flash,
+                    "ridge_ratio": i_flash / ridge}
+      solutionExplanation: >-
+        The first three cases are the same architecture at three context lengths,
+        and the point is how little moves: `traffic_ratio` goes 1.882 to 1.984 to
+        1.996 and `intensity_naive` goes 62.06 to 63.75 to 63.94, converging on
+        `d/2 = 64` from below as the `4nd` term stops mattering. Meanwhile
+        `score_gib` grows by 1,024x per step, from 32 GiB to 2 TiB to 32 TiB.
+        That contrast is the topic: the traffic ratio is a constant, the memory
+        is not.
+        Case 4 is the same 4k sequence with half the head width and twice the
+        tile, and the ratio jumps to 7.111 because the win is `2 * block / d` —
+        4.0 by that formula, and 7.11 once the `4nd` term is included at finite
+        n. Note the intensity: 227.56, above the 148 ridge, so this configuration
+        is compute-bound after tiling. `ridge_ratio` 1.5375 says exactly that,
+        and a value above 1.0 is the only case in the set where the tensor cores
+        are the constraint rather than the bus.
+        Case 5 is a small 8-head, 12-layer model at 2k, where `score_gib` is
+        0.75 — small enough that the traffic ratio of 3.56 buys less wall clock
+        than the intensity gap suggests, because at 113.78 FLOP/byte the tiled
+        kernel is already near the ridge and the remaining win is only 0.77 of
+        it. If your first case returns `naive_gib` of 32.0 you forgot the factor
+        of four; if `score_gib` is 1.0 you divided by the layer count twice.
+      complexity: "O(1) time and space"
+      tags: [roofline, arithmetic-intensity, flash-attention, memory-bandwidth]
+
+    - id: p-causal-blocks
+      title: "How much does causal masking actually save?"
+      difficulty: easy
+      prompt: >-
+        Implement `causal_blocks(seq, block)` returning the block-level work
+        count for causal attention at tile width `block`.
+
+        The Q/K grid has `q_blocks = ceil(seq / block)` rows and the same number
+        of columns, so `full_grid = q_blocks ** 2`. A causal kernel visits only
+        the diagonal and below: block row `i` reads block columns `0..i`, so
+        `causal_blocks = q_blocks * (q_blocks + 1) // 2`. Then
+        `block_fraction = causal_blocks / full_grid` and
+        `element_fraction = (seq * (seq + 1) / 2) / (seq * seq)`.
+
+        Return the dict `{"q_blocks": int, "full_grid": int, "causal_blocks":
+        int, "block_fraction": float, "element_fraction": float}`.
+      starter: |
+        import math
+
+        def causal_blocks(seq, block):
+            # your implementation here
+            pass
+      language: python
+      entry: causal_blocks
+      testCases:
+        - input: '[4096, 128]'
+          expected: '{"q_blocks":32,"full_grid":1024,"causal_blocks":528,"block_fraction":0.515625,"element_fraction":0.5001220703125}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[32768, 128]'
+          expected: '{"q_blocks":256,"full_grid":65536,"causal_blocks":32896,"block_fraction":0.501953125,"element_fraction":0.5000152587890625}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[131072, 128]'
+          expected: '{"q_blocks":1024,"full_grid":1048576,"causal_blocks":524800,"block_fraction":0.50048828125,"element_fraction":0.5000038146972656}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[1000, 64]'
+          expected: '{"q_blocks":16,"full_grid":256,"causal_blocks":136,"block_fraction":0.53125,"element_fraction":0.5005}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[512, 512]'
+          expected: '{"q_blocks":1,"full_grid":1,"causal_blocks":1,"block_fraction":1.0,"element_fraction":0.5009765625}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def causal_blocks(seq, block):
+            q = -(-seq // block)
+            full = q * q
+            causal = q * (q + 1) // 2
+            return {"q_blocks": q,
+                    "full_grid": full,
+                    "causal_blocks": causal,
+                    "block_fraction": causal / full,
+                    "element_fraction": (seq * (seq + 1) / 2) / (seq * seq)}
+      solutionExplanation: >-
+        The gap between the two fractions is the cost of tile granularity, and it
+        shrinks as the sequence grows: at 4k the kernel visits 51.56% of blocks
+        but the exact triangle is 50.01% of elements, so 1.5 percentage points
+        are wasted on the half-empty diagonal blocks; at 128k the gap is 0.05
+        points. That is why a causal kernel is close to a 2x win over a
+        non-causal one and never quite reaches it — the diagonal blocks must be
+        read in full even though only half of each is above the mask.
+        Case 4 is the ragged one: 1,000 tokens with 64-wide tiles gives 16 rows,
+        the last of which is 40/64 full, and the fraction 0.53125 is the worst in
+        the set — small sequences and large tiles waste the most. Case 5 is the
+        degenerate single-tile case, where `block_fraction` is exactly 1.0
+        because there is no block to skip, yet `element_fraction` is still
+        0.501 — the arithmetic is still halved inside the tile, the *block count*
+        is not. An implementation that uses `round` instead of ceiling gets 15
+        rows for case 4 and misses `causal_blocks` by 16.
+      complexity: "O(1) time and space"
+      tags: [flash-attention, causal-masking, tiling, work-partitioning]
+
+  visualizers:
+    - id: vs-sram-budget
+      kind: attention
+      title: "Tile size against the SRAM budget"
+      description: >-
+        Set the head dimension and the number of fp16 buffers the kernel needs,
+        and watch the largest legal tile width fall as the head grows. Four
+        buffers of Bq x d x 2 bytes must fit in 227 KiB, so d = 64 allows a
+        256-wide tile, d = 128 allows 128 to 192, and d = 256 forces 64. The
+        traffic win is 2 * Bq / d, so the same budget that sets the tile sets the
+        speedup — and at d = 256 it falls below 1.0.
+      params:
+        sram_bytes: 232448
+        head_dims: [64, 96, 128, 192, 256]
+        buffers: 4
+        dtype_bytes: 2
+        ridge: 148.0
+    - id: vs-traffic-vs-context
+      kind: computation_graph
+      title: "Bytes and FLOPs as the context grows"
+      description: >-
+        Both the FLOPs and the HBM traffic are quadratic in sequence length, so
+        their ratio does not move: naive attention sits at d/2 = 64 FLOP/byte and
+        tiled attention at roughly Bq = 128, at 4k, at 32k and at 128k. What does
+        move is the footprint — 32 MiB, 2 GiB, 32 GiB per head — which is the
+        only quantity in the picture that tiling changes asymptotically.
+      params:
+        n_head: 32
+        n_layer: 32
+        d_head: 128
+        block: 128
+        contexts: [4096, 32768, 131072]
+        ridge: 148.0
+
+
+  try_it: >-
+    Implement the online softmax on a 256-token, 64-wide attention row, then delete the rescale
+    of the running normaliser and measure the relative error against the reference. You should
+    get 7.9050 — 790% — which is why the recurrence has to rescale the accumulator and the sum
+    together.
+  interview_questions:
+    - question: 'Why is attention memory-bound rather than compute-bound?'
+      level: mid
+      key_points:
+        - 'It insists on materialising an n-by-n score matrix: 32 MiB per head at 4k, 2 GiB at 32k, 32 GiB at 128k.'
+        - 'Intensity is d/2 = 64 FLOP/byte at d = 128 against an H100 ridge point of 148, so the kernel waits on bytes it just wrote.'
+        - 'That ratio is constant across context length, which is why the fix is a constant factor rather than an asymptotic one.'
+        - 'An H100 SM has 227 KiB of shared memory, so a tile of the score matrix fits and the whole matrix does not.'
+    - question: 'Explain the online softmax recurrence and why the result is exact.'
+      level: senior
+      key_points:
+        - 'Keep a running max m, a running normaliser l and an unnormalised accumulator O, block by block over K and V.'
+        - 'When a block maximum exceeds m, rescale O by exp(m - m_new) and l by the same factor before accumulating the new block.'
+        - 'Softmax is shift-invariant, so the final O/l equals the reference exactly up to the order of floating-point reductions: measured 2.17e-15 relative at 4k.'
+        - 'Dropping either rescale is not a small error: rescaling the accumulator but dividing by the last block sum gives 7.9050 relative, and using each block own max is wrong in a different direction.'
+      follow_up: 'FlashAttention-2 changed the work partitioning. Give the tiling change and what it bought.'
+    - question: 'Where does the 2 B_q / d speedup come from, and where is it largest?'
+      level: mid
+      key_points:
+        - 'Naive traffic is 4n^2 elements; the tiled version moves 2n^2 d / B_q because K and V are each re-read n/B_q times.'
+        - 'The byte ratio is therefore 2 B_q / d, a ratio of tile width to head width.'
+        - 'It is largest exactly where head dimensions are smallest and tiles are widest, which is why the kernel matters most for small heads.'
+        - 'Causal masking halves the arithmetic and about 51.6% of the blocks: at 4k with 128-wide tiles the grid is 1,024 blocks and a causal kernel visits 528.'
+  common_mistakes:
+    - 'Rescaling the accumulator but dividing by the last block sum, a relative error of 7.9050 that still returns finite, confident-looking output.'
+    - 'Using each block own maximum instead of the running max, which changes the weights rather than just the scale.'
+    - 'Expecting a speedup in NumPy and measuring 1.15x slower, because the win is HBM traffic and NumPy does not expose the memory hierarchy.'
+  further_reading:
+    - label: "Dao, Fu, Ermon, Rudra & Ré, FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness (NeurIPS 2022)"
+    - label: "Dao, FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning (2023)"

@@ -1,0 +1,1428 @@
+id: multi-head-attention
+slug: multi-head-attention
+title: "Multi-Head Attention and Multi-Query Attention"
+summary: >-
+  Split one attention head into h heads of width d_model/h at no cost in
+  parameters or FLOPs, see exactly what the concatenation and the output
+  projection each do, then cut the key/value heads to 8 or 1 and compute the
+  gigabytes of KV cache that saves at 32k context — and the quality that costs.
+kind: lesson
+difficulty: medium
+position: 2
+estMinutes: 26
+prerequisites: [attention-from-first-principles]
+phase: attention-core
+tags: [attention, multi-head, mqa, gqa, kv-cache, head-splitting, transformers]
+
+body:
+  big_idea: >-
+    Multi-head attention splits one $d_{\text{model}}$ projection into $h$
+    heads of width $d_{\text{model}}/h$: the same parameters and FLOPs, but
+    $h$ independent softmax mixtures over positions that $W_O$ recombines.
+
+  problem:
+    - >-
+      You add heads expecting capacity, get the same parameter count and
+      speed, and OOM at 8k tokens because score-matrix memory went up 32x.
+    - >-
+      You load a checkpoint, every shape matches, and it trains to a worse
+      ceiling: your `reshape` head order disagrees with the checkpoint's `W_O`.
+    - >-
+      You must serve a 7B model at 32k context, where the KV cache alone is 16
+      GiB — more than the fp16 weights.
+
+  analogy: |
+    A hiring panel. One interviewer reads a candidate's file through one lens
+    and writes one note; a panel of eight reads it through eight lenses, and a
+    chair merges the eight notes into one decision. That merger is $W_O$, and
+    it is the only point where the opinions meet — panellists do not confer.
+    Grouped-query attention shares dossiers: thirty-two interviewers, eight
+    packets.
+
+  concept_points:
+    - >-
+      **Splitting $d_{\text{model}}$ into $h$ heads changes neither the parameter count nor the FLOPs.**
+      At $d_{\text{model}} = 768$, one head of width 768 and twelve of width
+      64 both cost exactly **2,359,296** parameters, because
+      $h \cdot d_{\text{model}} \cdot (d_{\text{model}}/h) = d_{\text{model}}^2$.
+      What multiplies is the number of $n \times n$ objects: at $n = 32768$,
+      $h = 32$ that is **128 GiB** of score entries per layer.
+    - >-
+      **A head is a subspace, the concatenation is a stack, and $W_O$ is the only thing that mixes heads.**
+      Each head's output has rank at most $d_k$: measured **64** for every one
+      of eight heads at $d_{\text{model}} = 512$, against **512** for the
+      concatenation. Set $W_O = I$ and output block $j$ is bit-identical to
+      head $j$ (difference exactly **0.0**).
+    - >-
+      **Heads have to differ or $h$ buys nothing, and the failure is silent.**
+      Give all eight heads the same projection and they compute the same
+      function: $\max|C_0 - C_j| = 0.0$, the concatenation has rank **64**
+      instead of 512, and its Frobenius norm is exactly $\sqrt{8} = 2.828427$
+      times one head's — one vector stacked eight times. The layer still runs,
+      still emits a convex combination, and still trains.
+    - >-
+      **$h = 1$ must reproduce scaled dot-product attention bit for bit, and the reshape order is where implementations diverge.**
+      The split must be contiguous: $(n, d) \to (n, h, d_k) \to (h, n, d_k)$
+      (measured difference **0.0**). Split the other way and you get a
+      *different* function — max difference **1.5323**, larger than the norm
+      of the correct answer.
+    - >-
+      **Multi-query attention keeps one key/value head for all query heads.**
+      The cache is $2Ln_{kv}d_{\text{head}}n_{ctx}b$ bytes, so $n_{kv}=1$ at
+      32 layers, $d_{\text{head}}=128$, 32,768 tokens, fp16 is **0.5 GiB**,
+      against **16 GiB** for 32 key/value heads — exactly **32x** less. The
+      cost is rank: stacking 32 key projections gives a **4096** -rank map
+      multi-head and **128** for MQA, so every query expresses its interest
+      through 128 directions.
+    - >-
+      **Grouped-query attention is the interpolation, and the knee is between 1 and 8.**
+      With 8 key/value heads against 32 query heads the cache is **4 GiB** at
+      32k/32-layer/fp16 — exactly 4x less than multi-head — and the stacked
+      key map has rank **1024**. The cache is linear in $n_{kv}$ while quality
+      is not: the GQA paper reports 8 groups tracking multi-head closely.
+
+  definitions:
+    - term: "Head"
+      meaning: >-
+        One independent attention computation at width $d_k$: its own
+        $(W_Q, W_K, W_V)$ slice, its own score matrix, its own softmax, its own
+        output. A head is the unit of *mixture*, not the unit of parameters —
+        the parameters of $h$ heads sum to the same total as one wide head.
+    - term: "Head width (d_head)"
+      meaning: >-
+        $d_{\text{model}}/h$. It sets the rank of what one head can read
+        ($\operatorname{rank}(P_hV_h) \le d_{\text{head}}$) and the sharpness
+        behaviour of its softmax, since the $1/\sqrt{d_k}$ divisor is derived
+        from exactly this width. At $d_{\text{model}} = 4096$ and 32 heads it is
+        128.
+    - term: "Multi-head attention (MHA)"
+      meaning: >-
+        $h$ heads run in parallel on different slices of the same projected
+        input, concatenated back to width $d_{\text{model}}$ and passed through
+        an output projection $W_O$. Same parameters and FLOPs as one wide head;
+        $h$ times the score-matrix memory; $h$ simultaneous mixtures over
+        positions.
+    - term: "Split / merge (reshape-transpose)"
+      meaning: >-
+        The mechanical pair that turns $(n, d_{\text{model}})$ into
+        $(h, n, d_{\text{head}})$ and back. The split must take contiguous
+        blocks of columns — `(n, h, d_k)` then transpose — and the merge must be
+        its exact inverse. Getting the order wrong yields a different function
+        that still passes every shape assertion.
+    - term: "Output projection (W_O)"
+      meaning: >-
+        The $d_{\text{model}} \times d_{\text{model}}$ matrix applied after the
+        concatenation. It is the only operation in the layer where one head's
+        output can influence another's contribution, and it decomposes into $h$
+        blocks of $d_{\text{head}}$ rows, one per head.
+    - term: "Multi-query attention (MQA)"
+      meaning: >-
+        $n_{kv} = 1$: all query heads share a single key head and a single value
+        head. The KV cache falls by the full query-to-key ratio (32x in a
+        32-query-head model), at the cost of forcing every query to match
+        against one 128-dimensional key subspace.
+    - term: "Grouped-query attention (GQA)"
+      meaning: >-
+        $1 < n_{kv} < n_q$: query heads are partitioned into $n_{kv}$ contiguous
+        groups, each group sharing one key/value head. It interpolates between
+        MHA (quality) and MQA (cache), and 8 groups against 32 query heads is
+        the setting most 2024-era open models ship.
+    - term: "KV head count (n_kv)"
+      meaning: >-
+        The number of distinct key and value heads in a layer. It is the single
+        quantity the KV cache is linear in, so it is the knob that trades memory
+        for quality: cache bytes $= 2 L n_{kv} d_{\text{head}} n_{ctx} b$.
+    - term: "Repetition factor (n_rep)"
+      meaning: >-
+        $n_q / n_{kv}$, the number of query heads that share each key/value
+        head. It fixes the broadcast mapping: query head $h$ reads key/value
+        head $h \parallel n_{rep}$. Confusing this with $h \bmod n_{kv}$ is the
+        classic GQA bug.
+    - term: "KV cache"
+      meaning: >-
+        The per-layer store of every past token's key and value vectors, kept so
+        that autoregressive decoding does not recompute them. Its size is
+        independent of how many tokens you generate and linear in context
+        length, which is why it — not the weights — sets the batch size you can
+        serve at long context.
+    - term: "Uptraining"
+      meaning: >-
+        Converting a trained multi-head checkpoint to GQA by mean-pooling each
+        group of key and value heads into one, then continuing pretraining for
+        roughly 5% of the original budget. It is why GQA checkpoints are cheap
+        to produce and why the 8-group setting is well characterised
+        empirically.
+
+  diagrams:
+    - type: architecture
+      title: "Where the heads live, and the two operations that see all of them"
+      nodes:
+        - { id: x, x: 0, y: 1, label: "X  (n, d_model)", kind: client, detail: "One row per token. The same X feeds all h heads; there is no per-head input." }
+        - { id: proj, x: 1, y: 0, label: "W_Q, W_K, W_V", kind: storage, detail: "Three d_model x d_model matrices, 3 x 589,824 = 1,769,472 parameters at d_model=768. Splitting into 12 heads does not change this total by one parameter." }
+        - { id: qkv, x: 1, y: 1, label: "Q, K, V  (h, n, d_head)", kind: model, detail: "reshaped (n, d_model) -> (n, h, d_head) -> (h, n, d_head). Contiguous column blocks, one per head. The order of this reshape is a convention that W_O is trained against." }
+        - { id: s, x: 2, y: 0, label: "S = Q K^T / sqrt(d_head)  (h, n, n)", kind: model, detail: "h separate n x n score matrices. This is the only object whose size grows with the head count: 32 heads at 32k tokens is 128 GiB in fp32 for one layer." }
+        - { id: sm, x: 2, y: 1, label: "P = softmax(S)  (h, n, n)", kind: server, detail: "One softmax per head, so h independent distributions over the same positions. Never mixes across heads." }
+        - { id: c, x: 2, y: 2, label: "C = P V  (h, n, d_head)", kind: model, detail: "rank(C_h) <= d_head = 64 at d_model=512, measured exactly 64 for every head. A head can only ever report a 64-dimensional summary of the sequence." }
+        - { id: cat, x: 3, y: 1, label: "concat -> (n, d_model)", kind: worker, detail: "A stack, not a blend: with W_O = I, output block j is bit-identical to head j (measured max difference 0.0)." }
+        - { id: out, x: 3, y: 2, label: "out = C W_O^T  (n, d_model)", kind: client, detail: "The only cross-head mixer in the layer. W_O splits into h blocks of d_head rows, and out = sum over h of C_h W_O^(h)." }
+      edges:
+        - { from: x, to: proj, label: "one X, three views" }
+        - { from: proj, to: qkv, label: "project, then split" }
+        - { from: qkv, to: s, label: "Q K^T per head" }
+        - { from: s, to: sm, label: "softmax per head" }
+        - { from: sm, to: c, label: "weights x V" }
+        - { from: c, to: cat, label: "stack h blocks" }
+        - { from: cat, to: out, label: "the only mix" }
+
+    - type: pipeline
+      title: "The five tensor ops, and the one order that matches a checkpoint"
+      nodes:
+        - label: "X  (n, d_model)"
+          note: "one row per token"
+          detail: "Everything downstream is a linear map of this. No head sees anything another head does not see."
+        - label: "reshape -> (n, h, d_head)"
+          note: "contiguous column blocks"
+          detail: "Features 0..63 are head 0, 64..127 are head 1. This is a partition, not a stride, and the difference is measurable: the strided partition changes the answer by 1.53 in absolute terms on unit-scale data."
+        - label: "transpose -> (h, n, d_head)"
+          note: "batch the heads"
+          detail: "Now each head is an independent n x d_head attention problem, which is why the whole thing is one batched matmul on a GPU."
+        - label: "softmax(Q K^T / sqrt(d_head)) per head"
+          note: "h separate distributions"
+          detail: "d_head, not d_model, is the width in the divisor — the variance argument from the previous topic applies per head."
+        - label: "transpose -> (n, h, d_head) -> reshape (n, d_model)"
+          note: "must be the exact inverse"
+          detail: "The concat and the split have to be inverses. If they are not, W_O is being applied to a permuted stack and the model is a different function."
+        - label: "W_O  (d_model, d_model)"
+          note: "where heads meet"
+          detail: "h blocks of d_head rows. Dropping this matrix is a real bug: it removes the only cross-head mixing and changes the output by 0.5035 on a unit-scale test."
+
+    - type: compare
+      title: "Same layer, three key/value budgets (32 query heads, 32 layers, d_head=128, fp16)"
+      left_label: "Multi-head: 32 key/value heads"
+      left_points:
+        - "KV cache at 32k tokens: 16 GiB — larger than the 14.75 GiB of fp16 weights"
+        - "KV cache at 128k: 64 GiB, 4.3x the size of the model"
+        - "Per decode step at 32k: 5.13 ms of pure HBM traffic at 3.35 TB/s"
+        - "Stacked key projection has rank 4096: every query gets its own 128-dim key subspace"
+        - "Quality reference point — no compression, no approximation"
+      right_label: "Grouped/multi-query: 8 or 1 key/value head"
+      right_points:
+        - "GQA-8: 4 GiB at 32k (4x less); MQA: 0.5 GiB (32x less)"
+        - "GQA-8: 16 GiB at 128k; MQA: 2 GiB"
+        - "GQA-8: 1.28 ms per step; MQA: 0.16 ms"
+        - "Stacked key projection rank 1024 (GQA-8) or 128 (MQA)"
+        - "GQA-8 tracks MHA quality in the paper's summarisation and translation results; MQA trails"
+
+    - type: plot
+      title: "KV cache for one 32k sequence: linear in the key/value head count"
+      chart: bar
+      xLabel: "key/value heads (32 query heads, 32 layers, d_head=128, fp16)"
+      yLabel: "GiB"
+      series:
+        - name: "KV cache at 32k tokens"
+          points:
+            - { x: 1, y: 0.5 }
+            - { x: 2, y: 1.0 }
+            - { x: 4, y: 2.0 }
+            - { x: 8, y: 4.0 }
+            - { x: 16, y: 8.0 }
+            - { x: 32, y: 16.0 }
+        - name: "fp16 weights of the 7.9B model (14.75 GiB)"
+          points:
+            - { x: 1, y: 14.75 }
+            - { x: 32, y: 14.75 }
+
+    - type: plot
+      title: "The cache grows linearly with context, so the head count decides where the wall is"
+      chart: line
+      xLabel: "context length (tokens)"
+      yLabel: "GiB"
+      series:
+        - name: "MHA (32 kv heads)"
+          points:
+            - { x: 4096, y: 2.0 }
+            - { x: 16384, y: 8.0 }
+            - { x: 32768, y: 16.0 }
+            - { x: 65536, y: 32.0 }
+            - { x: 131072, y: 64.0 }
+        - name: "GQA (8 kv heads)"
+          points:
+            - { x: 4096, y: 0.5 }
+            - { x: 16384, y: 2.0 }
+            - { x: 32768, y: 4.0 }
+            - { x: 65536, y: 8.0 }
+            - { x: 131072, y: 16.0 }
+        - name: "MQA (1 kv head)"
+          points:
+            - { x: 4096, y: 0.0625 }
+            - { x: 16384, y: 0.25 }
+            - { x: 32768, y: 0.5 }
+            - { x: 65536, y: 1.0 }
+            - { x: 131072, y: 2.0 }
+
+  markdown: |
+    ## One softmax is one opinion
+
+    The previous topic ended on a limitation it stated and then set aside: a
+    single inner product measures alignment along *one* direction. A head of
+    width $d_k$ produces one score matrix, one softmax, one convex combination.
+    If a token needs to track its subject, the most recent verb, and whether it
+    is inside a quotation, one distribution has to trade those off — and a
+    distribution that puts $0.5$ on the subject and $0.5$ on the verb serves
+    neither.
+
+    Multi-head attention is the fix, and the surprising part is that it is free:
+
+    $$\operatorname{head}_i = \operatorname{Attn}\!\left(XW_Q^{(i)}, XW_K^{(i)}, XW_V^{(i)}\right),
+      \qquad
+      \operatorname{MHA}(X) = \operatorname{Concat}(\operatorname{head}_1, \dots, \operatorname{head}_h)\,W_O,$$
+
+    with $W_Q^{(i)}, W_K^{(i)}, W_V^{(i)} \in \mathbb{R}^{d_k \times d_{\text{model}}}$,
+    $d_k = d_{\text{model}}/h$, and $W_O \in \mathbb{R}^{d_{\text{model}} \times d_{\text{model}}}$.
+
+    ## Splitting is free in parameters and FLOPs
+
+    The parameter count does not notice the split, because the widths and the
+    head count cancel:
+
+    | $d_{\text{model}}$ | $h$ | $d_k$ | per matrix | total (4 matrices) |
+    |---|---|---|---|---|
+    | 768 | 1 | 768 | 589,824 | 2,359,296 |
+    | 768 | 12 | 64 | 589,824 | 2,359,296 |
+    | 512 | 8 | 64 | 262,144 | 1,048,576 |
+    | 512 | 1 | 512 | 262,144 | 1,048,576 |
+
+    The second row is the model from the previous topic. Twelve heads cost
+    **exactly** what one head of width 768 costs — 2,359,296 parameters, one
+    third of the 4,718,592-parameter MLP beside it — and the same holds for the
+    arithmetic: at $n = 2048$, one 512-wide head and eight 64-wide heads both
+    perform 4,294,967,296 multiply-adds, because
+    $\sum_{i=1}^{h} n^2 d_k = n^2 d_{\text{model}}$.
+
+    What multiplies is the number of $n \times n$ objects, because each head
+    needs its own:
+
+    | $n$ | score entries, 1 head | score entries, 32 heads | fp32, 32 heads |
+    |---|---|---|---|
+    | 2,048 | 4,194,304 | 134,217,728 | 0.50 GiB |
+    | 32,768 | 1,073,741,824 | 34,359,738,368 | 128 GiB |
+
+    So "add heads for more capacity" is a claim about *memory*, not about
+    compute. The compute is identical, which is why a head-count change is
+    usually free at training time and expensive at long context.
+
+    ## What the concatenation does, and what $W_O$ does
+
+    They do different things and only one of them is interesting.
+
+    Concatenation is a stack. Each head's output $C_h = P_hV_h$ has rank at
+    most $d_k$ — measured exactly **64** for every one of eight heads at
+    $d_{\text{model}} = 512$ — while the concatenation has rank **512**. Set
+    $W_O = I$ and output block $j$ is bit-identical to head $j$, with measured
+    max absolute difference **0.0**. Nothing has been combined.
+
+    $W_O$ is the combination. Split it into $h$ blocks of $d_k$ rows,
+    $W_O = [W_O^{(1)}; \dots; W_O^{(h)}]$, and
+
+    $$\operatorname{Concat}(C_1, \dots, C_h)\,W_O^\top = \sum_{i=1}^{h} C_i \left(W_O^{(i)}\right)^\top .$$
+
+    Each term is a rank-$\le d_k$ contribution to a $d_{\text{model}}$-wide
+    output, and the sum of $h$ of them can reach rank $d_{\text{model}}$. With a
+    random $W_O$ at $h = 8$, each head carries a mean **0.3550** of
+    $\|out\|_F$ — the $1/\sqrt{8} = 0.3536$ that independent blocks predict —
+    and the squared shares sum to 1.0091. That is the honest accounting: every
+    head contributes about an eighth of the output, and $W_O$ decides how the
+    eighths are rotated into the residual stream.
+
+    Two consequences people get wrong. First, heads do not communicate inside a
+    layer; a head that attends to the wrong token cannot be corrected by its
+    neighbours until the next block. Second, the *order* of the concatenation is
+    a convention that $W_O$ is trained against. Split with
+    $(n, d) \to (n, d_k, h) \to (h, n, d_k)$ instead of
+    $(n, d) \to (n, h, d_k) \to (h, n, d_k)$ and you get a different function —
+    measured max difference **1.5323**, relative error **1.395** — that passes
+    every shape assertion you own.
+
+    The unit test that catches this class of bug is $h = 1$: with one head the
+    layer must reduce to the scaled dot-product attention you already built,
+    bit for bit (measured difference exactly **0.0**).
+
+    ## Fewer key/value heads
+
+    Everything so far costs nothing. The rest of the topic is about the bill.
+
+    At inference the model stores every past token's key and value so decoding
+    does not recompute them. That store is
+
+    $$\text{bytes} = 2 \cdot L \cdot n_{kv} \cdot d_{\text{head}} \cdot n_{ctx} \cdot b,$$
+
+    where the leading 2 is keys and values, $b$ is bytes per element, and
+    $n_{kv}$ is the number of *key/value* heads — which need not equal the
+    number of query heads. Multi-query attention sets $n_{kv} = 1$; grouped-query
+    attention sets it to something in between.
+
+    | variant | $n_{kv}$ | cache at 32k | cache at 128k | rank of stacked $W_K$ |
+    |---|---|---|---|---|
+    | MHA | 32 | 16 GiB | 64 GiB | 4096 |
+    | GQA-16 | 16 | 8 GiB | 32 GiB | 2048 |
+    | GQA-8 | 8 | 4 GiB | 16 GiB | 1024 |
+    | GQA-4 | 4 | 2 GiB | 8 GiB | 512 |
+    | MQA | 1 | 0.5 GiB | 2 GiB | 128 |
+
+    (32 layers, $d_{\text{head}} = 128$, fp16; the rank column is the rank of the
+    matrix formed by stacking every head's $W_K$ block.)
+
+    That rank column is the quality story in one number. Under multi-head
+    attention the 32 key projections span all 4096 dimensions of
+    $d_{\text{model}}$, so each query has its own 128-dimensional space of
+    things it can match against. Under multi-query attention every query must
+    express its interest through the same 128 directions: a 32x smaller space,
+    which is exactly the compression ratio and therefore exactly what has to be
+    paid for somewhere.
+
+    Grouped-query attention is the observation that the price is not linear.
+    The GQA paper reports 8 groups matching multi-head quality on summarisation
+    and translation while a single group trails, and 8 groups is what Llama-3-8B
+    and Mistral-7B ship — 32 query heads, 8 key/value heads, a 4x cache
+    reduction, and a stacked key rank of 1024 rather than 128. Llama-2-70B makes
+    the same choice at 64 query heads. Converting a trained multi-head model is
+    cheap: mean-pool each group of key and value heads into one and continue
+    pretraining for about 5% of the original budget.
+
+    ## What it costs in parameters, and why that is not the point
+
+    At $d_{\text{model}} = 4096$ and 32 layers, shrinking $W_K$ and $W_V$ from
+    32 heads to 8 saves 25,165,824 parameters per layer — 805,306,368 in total,
+    **10.17%** of a 7.916B model, which becomes 7.110B. Multi-query saves
+    13.14%. Real, and not the reason anyone does it.
+
+    The reason is bandwidth. Decoding one token requires reading the entire
+    cache for every layer, so at 32k tokens a multi-head model moves 16 GiB per
+    generated token: **5.13 ms** at an H100's 3.35 TB/s, before any arithmetic.
+    GQA-8 is **1.28 ms** and MQA **0.16 ms**. That is the difference between a
+    server that batches and one that does not.
+
+    The parameter saving does not substitute for the structural one, incidentally.
+    Quantising the cache to int8 buys 2x and costs precision everywhere; going
+    from 32 key/value heads to 8 buys 4x and costs it only where the groups
+    actually needed to disagree.
+
+    ## The longer version
+
+    Multi-head attention splits one $d_{\text{model}}$-wide projection into $h$
+    heads of width $d_k = d_{\text{model}}/h$ — the same parameters and the same
+    FLOPs, but $h$ independent softmax mixtures over positions instead of one,
+    which $W_O$ recombines — and multi-query and grouped-query attention keep
+    that structure while shrinking the number of key/value heads, which is the
+    only lever that makes a 32k-token KV cache small enough to serve.
+
+    A hiring panel. One interviewer reads a candidate's file through a single
+    lens — say, "has this person shipped a distributed system" — and writes one
+    recommendation. A panel of eight reads the same file through eight
+    different lenses and each writes their own note; a chair then merges the
+    eight notes into one decision. That merger is $W_O$, and it is the only
+    point at which the eight opinions meet: panellists do not confer before
+    writing.
+
+    Grouped-query attention is the same panel with a shared dossier. Thirty-two
+    interviewers, but only eight research packets, so four interviewers read
+    the same packet. The filing cabinet shrinks by 4x, which is the entire
+    point, and nobody notices as long as four adjacent interviewers were going
+    to ask similar questions anyway.
+
+    The analogy breaks in two places, and both matter. First, real panellists
+    can disagree arbitrarily; these heads are linear projections of the *same*
+    input, so a head cannot report anything the concatenation of the others
+    could not in principle represent — the gain is in specialisation, not in
+    new information. Second, the chair's merge is a fixed linear map applied
+    after the fact, so a head that produced useless notes cannot be talked out
+    of them by the other seven; only the next layer can correct it.
+
+    ### What goes wrong
+
+    - You have a working attention layer and a benchmark that says it is the
+      bottleneck. You read that production models use "32 heads" and add heads
+      to your own model, expecting more capacity, and get a layer that is
+      numerically identical in parameter count and about the same speed —
+      while the memory for the score matrices goes up by a factor of 32 and
+      the model OOMs at 8k tokens.
+    - You load a checkpoint into your own implementation, every shape matches,
+      the loss starts at exactly the right value, and it then trains to a
+      slightly worse ceiling than the reference. The head order in your
+      `reshape` disagrees with the head order in the checkpoint's `W_O`, and
+      nothing anywhere raises an error.
+    - You are asked to serve a 7B model at 32k context and the arithmetic says
+      the KV cache alone is 16 GiB — more than the weights in fp16. You have
+      read that "GQA fixes this" but not what it is, how many key/value heads
+      to keep, or what happens to quality if you keep one.
+    - An interviewer asks why multi-head attention is not just one wide head,
+      given that a single head of width $d_{\text{model}}$ has exactly the
+      same parameter count. "More expressive" is not an answer; the answer is
+      a statement about how many distinct mixtures over positions a layer can
+      form, and it comes with a measurable rank.
+    - You implement grouped-query attention, the shapes all line up, the model
+      runs, and quality drops by more than the paper reported. The bug is one
+      function: `np.tile` where you needed `np.repeat`, and it silently sends
+      28 of 32 query heads to the wrong key/value head.
+
+    ### The full treatment
+
+    **Splitting $d_{\text{model}}$ into $h$ heads changes neither the
+    parameter count nor the FLOPs.** At $d_{\text{model}} = 768$, one head of
+    width 768 and twelve heads of width 64 both cost exactly **2,359,296**
+    parameters — four matrices of 589,824 — because
+    $h \cdot d_{\text{model}} \cdot (d_{\text{model}}/h) = d_{\text{model}}^2$
+    term by term. The same cancellation holds for the matmuls: at $n = 2048$,
+    one 512-wide head and eight 64-wide heads both perform exactly
+    **4,294,967,296** multiply-adds. What does *not* cancel is the number of
+    $n \times n$ objects: one per head. At $n = 32768$ and $h = 32$ that is
+    **34,359,738,368** score entries, **128 GiB** in fp32 for a single layer.
+    The trap is the slogan "more heads, more compute" — the compute is flat
+    and the *score-matrix memory* is what multiplies.
+
+    **A head is a subspace, the concatenation is a stack, and $W_O$ is the
+    only thing that mixes heads.** Each head's output $P_hV_h$ has rank at
+    most $d_k$: measured **64** for every one of eight heads at
+    $d_{\text{model}} = 512$, against **512** for the concatenation. Set
+    $W_O = I$ and output block $j$ is bit-identical to head $j$ — measured max
+    absolute difference exactly **0.0** — so `concat` does not blend anything,
+    it stacks. The blend lives entirely in $W_O$, which splits into $h$ blocks
+    of $d_k$ rows and computes $\sum_i C_i W_O^{(i)}$. With a random $W_O$,
+    each head contributes a mean **0.3550** of $\|out\|_F$ against the
+    $1/\sqrt{8} = 0.3536$ you would predict for independent blocks, and the
+    squared shares sum to **1.0091**. The trap is describing multi-head
+    attention as "heads that talk to each other" — within a layer they never
+    do.
+
+    **Heads have to differ or $h$ buys nothing, and the failure is silent.**
+    Give all eight heads the same projection and they compute the same
+    function: max $|C_0 - C_j|$ measured exactly **0.0**, the concatenation
+    has rank **64** instead of 512, and its Frobenius norm is exactly
+    $\sqrt{8} = 2.828427$ times one head's, because it is one vector stacked
+    eight times. The layer still runs, still emits a convex combination, and
+    still trains — the loss curve looks normal. Tying head initialisations,
+    or permuting head blocks relative to $W_O$, reproduces this exactly.
+
+    **$h = 1$ must reproduce the previous topic bit for bit, and the reshape
+    order is where implementations diverge.** With $h = 1$ the answer is
+    scaled dot-product attention: measured max difference **0.0** on
+    $64 \times 512$ inputs. The split must be contiguous,
+    $(n, d) \to (n, h, d_k) \to (h, n, d_k)$. Splitting the other way,
+    $(n, d) \to (n, d_k, h) \to (h, n, d_k)$, takes every $h$-th feature
+    instead of every $d_k$-th block — a *different* function, measured max
+    difference **1.5323** and relative error **1.395**, i.e. larger than the
+    norm of the correct answer. Both versions run, both produce
+    row-stochastic weights, both are legitimate attention; only one matches
+    the checkpoint's $W_O$.
+
+    **Multi-query attention keeps one key/value head for all query heads.**
+    The cache is $2 \cdot L \cdot n_{kv} \cdot d_{\text{head}} \cdot n_{ctx}
+    \cdot b$ bytes, so with $n_{kv} = 1$ at 32 layers, $d_{\text{head}} = 128$,
+    32,768 tokens and fp16 the layer holds **512 bytes** per token, the
+    sequence holds **16 KiB** per token and **536,870,912 bytes = 0.5 GiB**,
+    against 16 GiB for 32 key/value heads — exactly **32x** less. The
+    mechanism is visible as a rank: stack the 32 key projections and
+    multi-head attention gives a **4096**-rank map from $d_{\text{model}}$ to
+    key space, while multi-query gives rank **128**. Every one of the 32
+    queries now has to express its interest through the same 128 directions.
+
+    **Grouped-query attention is the interpolation, and the knee is between 1
+    and 8.** With 8 key/value heads against 32 query heads the cache is
+    **4,294,967,296 bytes = 4 GiB** at the same 32k/32-layer/fp16 setting —
+    exactly 4x less than multi-head — and the stacked key map has rank
+    **1024**. The cache is *linear* in $n_{kv}$ (0.5, 1, 2, 4, 8, 16 GiB at 1,
+    2, 4, 8, 16, 32 heads) while quality is not: the GQA paper reports 8
+    groups tracking multi-head closely on summarisation and translation while
+    a single group trails, which is why Llama-3-8B and Mistral-7B ship 8
+    key/value heads against 32 query heads — and Llama-2-70B ships 8 against
+    64 — rather than 1.
+
+    **The parameter saving is real but it is a side effect; bandwidth is the
+    target.** At $d_{\text{model}} = 4096$, $L = 32$: multi-head pays
+    16,777,216 parameters for $W_K$ and the same for $W_V$; GQA-8 pays
+    4,194,304 each, saving **25,165,824** per layer, or **805,306,368** over
+    the model — **10.17%** of a 7.916B model, which becomes 7.110B. MQA saves
+    13.14%. But decoding re-reads the *whole* cache for every generated token:
+    16 GiB per step at 32k is **5.13 ms** of pure HBM traffic at 3.35 TB/s,
+    against **1.28 ms** for GQA-8 and **0.16 ms** for MQA. The cache is a
+    bandwidth problem before it is a capacity problem.
+
+    **The head-to-key/value-head mapping is $h \parallel n_{rep}$, and the
+    wrong mapping is undetectable by shape checks.** With 32 query heads and
+    8 key/value heads, $n_{rep} = 4$ and query head $h$ must read key/value
+    head $h \parallel 4$ — contiguous groups $\{0,1,2,3\} \to 0$. `np.repeat`
+    produces that; `np.tile` produces $h \bmod 8$, so **28 of 32 heads
+    (87.5%)** read a different key/value head than the checkpoint intends.
+    Nothing raises: the shapes match, the weights are row-stochastic, every
+    output is a valid convex combination. This is the single most common GQA
+    bug, and it silently spends the quality the architecture was chosen to
+    preserve.
+
+    **At 128k the choice stops being a preference.** The same model at
+    131,072 tokens holds **64 GiB** of cache with 32 key/value heads,
+    **16 GiB** with 8, and **2 GiB** with 1 — against **14.75 GiB** for the
+    fp16 weights of the 7.9B model itself. Multi-head attention's cache is
+    4.3x the size of the model it belongs to, which is why $n_{kv}$ is an
+    architectural decision rather than a tuning knob, and why the KV cache
+    gets its own topic later in this track.
+
+    **At initialisation every head is nearly uniform, so head specialisation
+    is learned, not architectural.** With scaled Gaussian weights, each of
+    eight heads attends to between **310.0 and 315.6** of 512 positions (mean
+    **312.9**), and two heads' weight rows differ by a mean total-variation
+    distance of **0.5193** on a scale where 0 is identical and 1 is disjoint.
+    So the heads already disagree about *which* keys they pick while agreeing
+    that they are unsure — diversity of routing exists at step 0, sharpness
+    and role do not. The trap is reading attention maps off an untrained model
+    and concluding anything about what a head "does".
+
+
+  derivations:
+    - title: "Splitting d_model into h heads leaves parameters and FLOPs unchanged"
+      latex: |
+        Let $d = d_{\text{model}}$ and $d_k = d/h$. Head $i$ owns
+
+        $$W_Q^{(i)}, W_K^{(i)}, W_V^{(i)} \in \mathbb{R}^{d_k \times d},
+          \qquad W_O^{(i)} \in \mathbb{R}^{d \times d_k}.$$
+
+        Summing the four families over the $h$ heads:
+
+        $$\#\text{params} = h\left(3\,d_k d + d\,d_k\right)
+          = h \cdot 4 \cdot \frac{d}{h} \cdot d = 4d^2,$$
+
+        which is exactly the count for a single head of width $d$ — no $h$
+        appears in the answer. The measured value at $d = 768$ is
+        **2,359,296** for both $h = 1$ and $h = 12$, in agreement with earlier
+        work on multi-head attention.
+
+        The same cancellation applies to the two matmuls. For one head,
+        $QK^\top$ costs $n^2 d_k$ multiply-adds and $PV$ costs $n^2 d_k$ more:
+
+        $$\text{MACs} = \sum_{i=1}^{h} 2 n^2 d_k
+          = 2 n^2 h \frac{d}{h} = 2n^2 d .$$
+
+        At $n = 2048$ and $d = 512$ this is **4,294,967,296** either way,
+        measured identical for one 512-wide head and for eight 64-wide heads.
+
+        The object that does *not* cancel is the score matrix, because there is
+        one per head:
+
+        $$\#\text{entries}(S) = h\,n^2 \quad\text{against}\quad n^2 .$$
+
+        At $h = 32$ and $n = 32768$ that is $34{,}359{,}738{,}368$ entries,
+        $128$ GiB in fp32 for one layer.
+      prose: >-
+        Every quantity that is linear in the head count is also linear in
+        $d_k = d/h$, so the two cancel and the layer is invariant to the split.
+        The score matrix is the one exception, because it is indexed by
+        $(n, n)$ rather than by width — its size depends on $h$ alone once $n$
+        is fixed. That asymmetry is the whole reason a head-count change is free
+        at training time and expensive at long context, and it is why the
+        efficient-attention literature is about scheduling rather than about
+        arithmetic.
+
+    - title: "The concatenation is a projection: W_O as a sum of h rank-d_k terms"
+      latex: |
+        Write the concatenation as a block matrix and multiply:
+
+        $$C = \begin{bmatrix} C_1 & C_2 & \cdots & C_h \end{bmatrix},
+          \qquad
+          C\,W_O^\top = \sum_{i=1}^{h} C_i \left(W_O^{(i)}\right)^\top,$$
+
+        where $W_O^{(i)} \in \mathbb{R}^{d_k \times d}$ is the $i$-th block of
+        $d_k$ rows of $W_O$. Since
+        $\operatorname{rank}(C_i) \le d_k$ and
+        $\operatorname{rank}(W_O^{(i)}) \le d_k$,
+
+        $$\operatorname{rank}\!\left(C_i (W_O^{(i)})^\top\right) \le d_k,
+          \qquad
+          \operatorname{rank}(C\,W_O^\top) \le \sum_{i=1}^{h} d_k = d .$$
+
+        Two limiting cases pin the meaning down. With $W_O^{(i)} = \mathbf{0}$
+        for $i \ne j$ the output is exactly head $j$'s contribution: the heads
+        do not mix. With $W_O = I$ the block $W_O^{(j)}$ is the selection matrix
+        $[\mathbf{0}; I; \mathbf{0}]$, so output columns
+        $[jd_k, (j+1)d_k)$ equal $C_j$ exactly — measured max absolute
+        difference **0.0** on an eight-head layer.
+
+        If the blocks are independent with zero mean, each head's share of the
+        output energy is
+
+        $$\frac{\mathbb{E}\|C_i (W_O^{(i)})^\top\|_F^2}{\mathbb{E}\|C W_O^\top\|_F^2}
+          \approx \frac{1}{h},$$
+
+        so the *norm* share is $1/\sqrt{h}$: at $h = 8$ that is $0.3536$,
+        measured **0.3550** with squared shares summing to **1.0091**.
+      prose: >-
+        The decomposition says precisely what multi-head attention buys: the
+        output is a sum of $h$ terms, each of which is a rank-$\le d_k$ read of
+        the sequence, and the sum can reach the full width. One wide head also
+        reaches full rank, but it reaches it with a *single* softmax — one
+        distribution, one set of trade-offs. The concatenation contributes
+        nothing on its own (measured: $W_O = I$ reproduces each head exactly),
+        which is why dropping $W_O$ is a real bug rather than an optimisation:
+        it removes the only operation in the layer that lets one head's finding
+        influence another's contribution.
+
+    - title: "The KV cache is linear in the key/value head count"
+      latex: |
+        For $L$ layers, $n_q$ query heads, $n_{kv}$ key/value heads of width
+        $d_{\text{head}}$, a context of $n_{ctx}$ tokens and $b$ bytes per
+        element, the cache holds one key vector and one value vector per
+        key/value head per token per layer:
+
+        $$\text{bytes} = 2 \, L \, n_{kv} \, d_{\text{head}} \, n_{ctx} \, b .$$
+
+        Because the expression is linear in $n_{kv}$ and $n_q$ appears nowhere,
+        the saving relative to multi-head attention is exactly the head ratio:
+
+        $$\frac{\text{bytes}(n_{kv})}{\text{bytes}(n_q)} = \frac{n_{kv}}{n_q},
+          \qquad
+          \text{GQA-8: } \frac{8}{32} = \frac{1}{4},
+          \qquad
+          \text{MQA: } \frac{1}{32}.$$
+
+        Evaluating at $L = 32$, $n_q = 32$, $d_{\text{head}} = 128$,
+        $n_{ctx} = 32768$, $b = 2$:
+
+        $$2 \cdot 32 \cdot 8 \cdot 128 \cdot 32768 \cdot 2
+          = 4{,}294{,}967{,}296 \text{ bytes} = 4 \text{ GiB},$$
+
+        against 17,179,869,184 bytes $= 16$ GiB for $n_{kv} = 32$ and
+        536,870,912 bytes $= 0.5$ GiB for $n_{kv} = 1$. Per token per layer the
+        GQA-8 figure is $2 \cdot 8 \cdot 128 \cdot 2 = 4096$ bytes; across 32
+        layers, 128 KiB per token.
+      prose: >-
+        Two things follow from the formula and neither is obvious from the
+        architecture diagram. First, the cache does not care how many tokens you
+        generate — it is set by context length and head count, which is why
+        long-context serving is a memory-planning problem rather than a compute
+        problem. Second, at decode time the whole cache is re-read for every
+        single token, so the head count is a *bandwidth* lever: 16 GiB per step
+        at 32k is 5.13 ms at 3.35 TB/s, 4 GiB is 1.28 ms, and 0.5 GiB is
+        0.16 ms. That ratio, not the parameter count, is what changes how many
+        users fit on a GPU.
+
+  implementations:
+    - language: python
+      title: "Multi-head attention from scratch, with the two checks that matter"
+      note: >-
+        Correct forward pass, and it prints the three numbers this topic turns
+        on: the per-head rank (64) against the concatenated rank (512), the
+        per-head share of the output, and the $h = 1$ equivalence. It is
+        deliberately incomplete in one way that matters at scale: it
+        materialises all $h$ score matrices at once, so at 32 heads and 32k
+        tokens it wants 128 GiB. The `split` helper is the part to read twice —
+        `(n, h, d_k)` then transpose, never `(n, d_k, h)`.
+      code: |
+        import numpy as np
+
+        def softmax(x):
+            x = x - x.max(axis=-1, keepdims=True)
+            e = np.exp(x)
+            return e / e.sum(axis=-1, keepdims=True)
+
+        def split_heads(x, h):
+            """(n, d) -> (h, n, d_k). Contiguous column blocks, one per head."""
+            n, d = x.shape
+            assert d % h == 0, "d_model must be divisible by the head count"
+            return x.reshape(n, h, d // h).transpose(1, 0, 2)
+
+        def merge_heads(x):
+            """(h, n, d_k) -> (n, d). The exact inverse of split_heads."""
+            h, n, dk = x.shape
+            return x.transpose(1, 0, 2).reshape(n, h * dk)
+
+        def multi_head_attention(X, Wq, Wk, Wv, Wo, h):
+            X, Wq, Wk, Wv, Wo = (np.asarray(a, dtype=np.float64)
+                                for a in (X, Wq, Wk, Wv, Wo))
+            Q, K, V = (split_heads(X @ W.T, h) for W in (Wq, Wk, Wv))
+            S = Q @ np.transpose(K, (0, 2, 1)) / np.sqrt(Q.shape[-1])
+            P = softmax(S)                      # (h, n, n), one per head
+            C = P @ V                           # (h, n, d_k)
+            return merge_heads(C) @ Wo.T, C, P
+
+        def single_head_attention(Q, K, V):
+            S = Q @ K.T / np.sqrt(Q.shape[-1])
+            return softmax(S) @ V
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            n, d, h = 512, 512, 8
+            X = rng.standard_normal((n, d))
+            Wq, Wk, Wv, Wo = (rng.standard_normal((d, d)) / np.sqrt(d)
+                              for _ in range(4))
+
+            out, C, P = multi_head_attention(X, Wq, Wk, Wv, Wo, h)
+            print("per-head rank ", [int(np.linalg.matrix_rank(C[i])) for i in range(h)])
+            print("concat rank   ", int(np.linalg.matrix_rank(merge_heads(C))))
+
+            norm = np.linalg.norm(out)
+            shares = []
+            for j in range(h):
+                Cz = np.zeros_like(C); Cz[j] = C[j]
+                shares.append(np.linalg.norm(merge_heads(Cz) @ Wo.T) / norm)
+            print("head share    ", round(float(np.mean(shares)), 4), " 1/sqrt(h) =",
+                  round(1 / np.sqrt(h), 4))
+
+            # h = 1 must reduce to the single-head attention of the last topic.
+            o1, _, _ = multi_head_attention(X, Wq, Wk, Wv, Wo, 1)
+            ref = single_head_attention(X @ Wq.T, X @ Wk.T, X @ Wv.T) @ Wo.T
+            print("h=1 difference", float(np.abs(o1 - ref).max()))
+            # 64, 512, 0.3550, 0.0
+
+    - language: python
+      title: "Grouped-query attention, and the expansion that is wrong"
+      note: >-
+        `gqa` is correct. `tile_expand` is numerically WRONG and is here so you
+        can reproduce the failure: it maps query head $h$ to key/value head
+        $h \bmod n_{kv}$ instead of $h \parallel n_{rep}$, so with 32 query
+        heads and 8 key/value heads **28 of 32 heads (87.5%)** read the wrong
+        key and value. Nothing raises — shapes match, weights are row-stochastic,
+        every output is a valid convex combination — and the only symptom is a
+        model that lands a little below the quality its architecture promised.
+        Note also that `gqa` with `n_kv == n_q` must reproduce `mha` exactly;
+        that is the regression test that catches this whole family of bugs.
+      code: |
+        import numpy as np
+
+        def softmax(x):
+            x = x - x.max(axis=-1, keepdims=True)
+            e = np.exp(x)
+            return e / e.sum(axis=-1, keepdims=True)
+
+        def repeat_expand(K, n_rep):
+            """CORRECT: query head h reads kv head h // n_rep (contiguous groups)."""
+            return np.repeat(K, n_rep, axis=0)
+
+        def tile_expand(K, n_rep):
+            """WRONG: query head h reads kv head h % n_kv (strided groups)."""
+            return np.tile(K, (n_rep,) + (1,) * (K.ndim - 1))
+
+        def gqa(Q, K, V, n_rep, expand=repeat_expand):
+            """Q: (n_q, n, d) with n_q = n_kv * n_rep.  K, V: (n_kv, n, d)."""
+            Kx, Vx = expand(K, n_rep), expand(V, n_rep)      # (n_q, n, d)
+            S = np.einsum("hnd,hmd->hnm", Q, Kx) / np.sqrt(Q.shape[-1])
+            return np.einsum("hnm,hmd->hnd", softmax(S), Vx)  # (n_q, n, d)
+
+        if __name__ == "__main__":
+            n_q, n_kv, n, d = 32, 8, 64, 16
+            n_rep = n_q // n_kv
+            rng = np.random.default_rng(0)
+            Q = rng.standard_normal((n_q, n, d))
+            K = rng.standard_normal((n_kv, n, d))
+            V = rng.standard_normal((n_kv, n, d))
+
+            print("correct mapping", np.repeat(np.arange(n_kv), n_rep).tolist())
+            print("buggy mapping  ", np.tile(np.arange(n_kv), n_rep).tolist())
+            print("heads wrong    ", int((np.repeat(np.arange(n_kv), n_rep)
+                                          != np.tile(np.arange(n_kv), n_rep)).sum()),
+                  "of", n_q)                                   # 28 of 32
+
+            good = gqa(Q, K, V, n_rep, repeat_expand)
+            bad = gqa(Q, K, V, n_rep, tile_expand)
+            print("relative difference", float(np.linalg.norm(good - bad)
+                                               / np.linalg.norm(good)))  # ~1.29
+
+            # n_kv == n_q (n_rep = 1) must be exactly multi-head attention:
+            # both expansions are the identity, so nothing may move.
+            Qm = rng.standard_normal((n_kv, n, d))
+            same = gqa(Qm, K, V, 1, repeat_expand)
+            print("n_rep=1 is a no-op", float(np.abs(same - gqa(Qm, K, V, 1, tile_expand)).max()))
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        One head of width 768 and twelve heads of width 64 have the same
+        parameter count and the same FLOPs. State the two cancellations that
+        make that true, and then say precisely which quantity does *not* cancel
+        and how it scales.
+      answerKind: short_text
+      hint: >-
+        Write the parameter count as h times (per-head count) and substitute
+        d_k = d_model/h. Do the same for the number of multiply-adds. Then count
+        the n x n objects.
+      solution: >-
+        Parameters: each head owns three d_model x d_k matrices plus a
+        d_k x d_model output block, so the total is
+        h * 4 * d_model * d_k = h * 4 * d_model * (d_model/h) = 4 d_model^2, and
+        h is gone. Measured 2,359,296 for both h = 1 and h = 12 at d_model = 768.
+        FLOPs: the two matmuls cost 2 n^2 d_k per head, so the sum is
+        2 n^2 h d_k = 2 n^2 d_model, again independent of h — measured exactly
+        4,294,967,296 multiply-adds both for one 512-wide head and for eight
+        64-wide heads at n = 2048. What does not cancel is the number of
+        n x n score matrices, which is one per head: h n^2 entries instead of
+        n^2. At h = 32 and n = 32768 that is 34,359,738,368 entries, 128 GiB in
+        fp32 for one layer, against 4 GiB for a single wide head of the same
+        total width.
+    - id: cp-2
+      question: >-
+        Your implementation sets W_O = I to "simplify" the layer during
+        debugging. What is the layer now computing, and what does its output
+        tell you about whether the heads are interacting?
+      answerKind: short_text
+      hint: >-
+        Write the concatenation as a block matrix and multiply by the identity.
+        Which columns of the output depend on which head?
+      solution: >-
+        With W_O = I the output is just the concatenation, so output block j
+        equals head j exactly — measured max absolute difference 0.0 on an
+        eight-head layer. The blocks are independent: perturbing head 0 leaves
+        output columns 64 through 511 unchanged. That is the demonstration that
+        `concat` stacks rather than blends, and that W_O is the only cross-head
+        mixer in the block. It is also why deleting W_O is a real bug rather
+        than an optimisation: you lose the linear combination
+        sum_h C_h W_O^(h) that turns eight rank-64 reads into one rank-512
+        output, and on a unit-scale test the output changes by 0.5035.
+    - id: cp-3
+      question: >-
+        A 7B-class model has 32 query heads, 32 layers, d_head = 128 and is
+        served at 32k context in fp16. Give the KV cache size for 32, 8 and 1
+        key/value heads, and say which of those three you would ship and why.
+      answerKind: short_text
+      hint: >-
+        bytes = 2 * layers * n_kv * d_head * n_ctx * bytes_per_element. Work out
+        the per-token-per-layer figure first, it is a round number.
+      solution: >-
+        Per token per layer: 2 * n_kv * 128 * 2 = 512 * n_kv bytes, so 16 KiB at
+        n_kv = 32, 4 KiB at 8, 512 B at 1. Across 32 layers: 512 KiB, 128 KiB and
+        16 KiB per token. At 32,768 tokens: 17,179,869,184 bytes = 16 GiB,
+        4,294,967,296 = 4 GiB, and 536,870,912 = 0.5 GiB. Ship GQA-8. At 32k its
+        cache is 4 GiB — a quarter of multi-head's 16 GiB, which is larger than
+        the model's own 14.75 GiB of fp16 weights — and the GQA paper reports 8
+        groups tracking multi-head quality while a single group trails. MQA's
+        32x reduction is tempting but its stacked key projection has rank 128
+        against multi-head's 4096, and the quality cost shows up in exactly the
+        tasks where a query needs to match on something the single shared key
+        subspace does not encode.
+    - id: cp-4
+      question: >-
+        You replace `np.repeat(K, n_rep, axis=0)` with `np.tile(K, (n_rep, 1, 1))`
+        in a GQA layer with 32 query heads and 8 key/value heads. Every shape
+        assertion passes and the model trains. What did you change, and how many
+        heads are affected?
+      answerKind: short_text
+      hint: >-
+        Write out both index sequences for n_kv = 8, n_rep = 4 and compare them
+        position by position.
+      solution: >-
+        `repeat` gives query head h the key/value head h // 4 — contiguous
+        groups {0,1,2,3} -> 0, {4,5,6,7} -> 1, and so on. `tile` gives query head
+        h the key/value head h % 8 — strided groups {0,8,16,24} -> 0,
+        {1,9,17,25} -> 1. Comparing the two index sequences position by
+        position, 28 of 32 heads (87.5%) read a different key/value head than
+        the checkpoint intends. Nothing raises, because both mappings produce a
+        valid (32, n, d) tensor, the softmax still normalises, and the output is
+        still a convex combination — the layer is simply computing a different
+        function, and the loss curve shows a small unexplained gap rather than
+        an error. The regression test is n_kv == n_q: with n_rep = 1 both
+        expansions must be the identity.
+    - id: cp-5
+      question: >-
+        At initialisation, every head in an eight-head layer attends to about
+        313 of 512 positions and two heads' weight rows differ by a total
+        variation distance of 0.52. What does that license you to conclude about
+        head specialisation, and what does it not?
+      answerKind: short_text
+      hint: >-
+        Separate "which keys a head picks" from "how sharply it picks them".
+        A near-uniform distribution can still rank keys consistently.
+      solution: >-
+        It licenses the claim that the heads already route differently: total
+        variation 0.52 on a 0-to-1 scale where 1 is disjoint support means two
+        heads put their mass in materially different places, even though both
+        are close to uniform. It does not license any claim about learned roles
+        — "this head does syntax" is a statement about a trained model. Every
+        head sits at 310.0 to 315.6 effective attended positions out of 512,
+        which is the near-uniform regime the previous topic measured at 309.7;
+        the sharpening and the role differentiation both come from training. The
+        practical consequence is that attention-map visualisations from an
+        untrained or barely-trained model are nearly uninformative, and that
+        head pruning at initialisation is meaningless because no head has yet
+        become load-bearing.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        One attention head produces one distribution over positions, and a
+        distribution is a set of trade-offs: mass on the subject is mass not on
+        the verb. Running several heads in parallel gives the layer several
+        simultaneous trade-offs instead of one, and a learned linear map
+        afterwards decides how to combine them into a single output vector.
+
+        The second half of the topic is not about expressiveness at all. At
+        inference the model stores every past token's key and value vector so it
+        never recomputes them, and that store is per *key/value head*. If several
+        query heads are willing to share one key/value head, the store shrinks by
+        exactly the sharing ratio — which is the only reason multi-query and
+        grouped-query attention exist.
+      blocks:
+        - kind: checklist
+          body: |
+            - One softmax is one set of trade-offs; h heads give h of them
+            - The split is a partition of the feature axis, not a stride
+            - Concatenation stacks; a learned matrix is what combines
+            - The KV cache is per key/value head, per layer, per token
+            - Fewer key/value heads means a smaller cache and a smaller space of
+              things any query can match against
+      checkpoint: >-
+        Before reading on: if you doubled the number of heads while keeping
+        d_model fixed, which of these would change — parameter count, FLOPs,
+        score-matrix memory, KV cache size at inference? Be specific about why
+        each one does or does not.
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        For the expressiveness half, work in shapes and let the algebra cancel:
+        write the per-head cost, multiply by the head count, substitute
+        d_k = d_model/h, and watch h disappear. The one quantity that will not
+        cancel is the one indexed by (n, n), because there is one such object per
+        head — that is the whole asymmetry.
+
+        For the cache half, write the byte count as a product of things you can
+        count on your fingers: 2 for keys and values, layers, key/value heads,
+        head width, context, bytes per element. Then notice that the query head
+        count appears nowhere in it, so the saving is exactly the head ratio, and
+        that at decode time the entire cache is re-read for every generated
+        token — which makes it a bandwidth number, not just a capacity number.
+      blocks:
+        - kind: checklist
+          body: |
+            - Parameters and FLOPs: per-head cost x h, then substitute d_k
+            - Score memory: one n x n per head, so it scales with h alone
+            - Rank of a head's output is bounded by d_k, not by d_model
+            - Cache bytes = 2 x layers x kv_heads x d_head x ctx x bytes
+            - Decode re-reads the whole cache once per token
+            - The head-to-kv-head map is h // n_rep, never h % n_kv
+      checkpoint: >-
+        Which of the four quantities in the tier-1 checkpoint is the only one
+        that does not scale with the head count, and why is that the one that
+        hurts?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The forward pass is five tensor operations, and two of them are inverses
+        of each other. Write the shapes down before the code; every bug in this
+        topic is a shape that was right and an order that was wrong.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # multi-head attention, one layer
+            for each of Q, K, V:
+                A = X @ W.T                     # (n, d_model)
+                A = reshape(A, (n, h, d_k))     # contiguous blocks per head
+                A = transpose(A, (1, 0, 2))     # (h, n, d_k)
+
+            S = Q @ K.transpose(0, 2, 1) / sqrt(d_k)     # (h, n, n)
+            P = softmax(S, axis=rows)                    # per head, independently
+            C = P @ V                                    # (h, n, d_k)
+            out = reshape(transpose(C, (1, 0, 2)), (n, d_model)) @ W_O.T
+
+            # grouped-query: same thing with fewer K/V heads
+            n_rep = n_q / n_kv
+            K_expanded[i] = K[i // n_rep]        # NOT K[i % n_kv]
+            V_expanded[i] = V[i // n_rep]
+
+            # cache size, before you write any serving code
+            bytes = 2 * layers * n_kv * d_head * ctx * bytes_per_element
+      checkpoint: >-
+        In the pseudocode, why is `d_k` the divisor rather than `d_model`, and
+        what would go wrong at h = 32 if you used `d_model`?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three cancellations and one that does not cancel.
+      blocks:
+        - kind: math
+          body: |
+            Parameters. Per head, three d x d_k input matrices and one
+            d_k x d output block:
+
+            $$\#\text{params} = h \cdot 4 d\,d_k = h \cdot 4 d \cdot \frac{d}{h} = 4d^2 .$$
+
+            FLOPs. Two matmuls of n^2 d_k per head:
+
+            $$\text{MACs} = \sum_{i=1}^{h} 2 n^2 d_k = 2 n^2 h \frac{d}{h} = 2 n^2 d .$$
+
+            Score entries. One n x n per head, so h does not cancel:
+
+            $$\#\text{entries}(S) = h n^2, \qquad h = 32,\ n = 32768 \Rightarrow 3.44 \times 10^{10}.$$
+
+            Output as a sum of blocks. With W_O split into h blocks of d_k rows,
+            $W_O = [W_O^{(1)}; \dots; W_O^{(h)}]$:
+
+            $$\operatorname{Concat}(C_1,\dots,C_h) W_O^\top
+              = \sum_{i=1}^{h} C_i (W_O^{(i)})^\top,
+              \qquad \operatorname{rank}(C_i) \le d_k .$$
+
+            Cache. Keys and values, per layer, per key/value head, per token:
+
+            $$\text{bytes} = 2 L n_{kv} d_{\text{head}} n_{ctx} b,
+              \qquad \frac{\text{bytes}(n_{kv})}{\text{bytes}(n_q)} = \frac{n_{kv}}{n_q}.$$
+
+            At L = 32, d_head = 128, n_ctx = 32768, b = 2:
+            n_kv = 32 gives 16 GiB, n_kv = 8 gives 4 GiB, n_kv = 1 gives 0.5 GiB.
+      checkpoint: >-
+        The parameter and FLOPs identities both cancel h exactly. Why does the
+        score-entry count not have a matching cancellation, given that it too is
+        a product involving h?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete layer, the four diagnostics that tell you whether it is the
+        layer you think it is, and the GQA expansion that is easy to get wrong.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the diagnostics before the code. Per-head rank should be exactly
+            d_head (64 at d_model = 512); concatenated rank should be d_model;
+            the h = 1 path must match single-head attention bit for bit; and the
+            GQA mapping must be `h // n_rep`. A rank of 64 for the concatenation
+            means every head got the same projection. A non-zero h = 1
+            difference means the split and the merge are not inverses. A GQA
+            quality gap with no error means you used `tile`.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def softmax(x):
+                x = x - x.max(axis=-1, keepdims=True)
+                e = np.exp(x)
+                return e / e.sum(axis=-1, keepdims=True)
+
+            def split_heads(x, h):
+                n, d = x.shape
+                return x.reshape(n, h, d // h).transpose(1, 0, 2)
+
+            def merge_heads(x):
+                h, n, dk = x.shape
+                return x.transpose(1, 0, 2).reshape(n, h * dk)
+
+            def mha(X, Wq, Wk, Wv, Wo, h, use_Wo=True):
+                Q, K, V = (split_heads(X @ W.T, h) for W in (Wq, Wk, Wv))
+                P = softmax(Q @ np.transpose(K, (0, 2, 1)) / np.sqrt(Q.shape[-1]))
+                C = merge_heads(P @ V)
+                return (C @ Wo.T if use_Wo else C), C, P
+
+            def gqa_expand(K, n_rep):
+                """Query head h reads key/value head h // n_rep."""
+                return np.repeat(K, n_rep, axis=0)
+
+            def diagnose(X, Wq, Wk, Wv, Wo, h):
+                out, C, P = mha(X, Wq, Wk, Wv, Wo, h)
+                heads = [C[:, j * (X.shape[1] // h):(j + 1) * (X.shape[1] // h)]
+                         for j in range(h)]
+                o1, _, _ = mha(X, Wq, Wk, Wv, Wo, 1)
+                ref = softmax((X @ Wq.T) @ (X @ Wk.T).T / np.sqrt(X.shape[1])) @ (X @ Wv.T) @ Wo.T
+                return {
+                    "per_head_rank": [int(np.linalg.matrix_rank(c)) for c in heads],
+                    "concat_rank": int(np.linalg.matrix_rank(C)),
+                    "h1_error": float(np.abs(o1 - ref).max()),
+                    "row_sum_error": float(np.abs(P.sum(-1) - 1).max()),
+                }
+
+            if __name__ == "__main__":
+                rng = np.random.default_rng(0)
+                n, d, h = 512, 512, 8
+                X = rng.standard_normal((n, d))
+                Wq, Wk, Wv, Wo = (rng.standard_normal((d, d)) / np.sqrt(d) for _ in range(4))
+                print(diagnose(X, Wq, Wk, Wv, Wo, h))
+                # per_head_rank [64]*8, concat_rank 512, h1_error 0.0, row_sum_error 2.2e-16
+      checkpoint: >-
+        `diagnose` reports per-head rank 64 and concatenated rank 512. If the
+        concatenated rank came back as 64, what are the two most likely causes,
+        and which single line of the forward pass distinguishes them?
+
+  problems:
+    - id: p-multi-head-forward
+      title: "Multi-head attention, end to end"
+      difficulty: medium
+      prompt: >-
+        Implement `mha_forward(X, Wq, Wk, Wv, Wo, n_heads)`, one full
+        multi-head attention layer over a sequence, with no mask. `X` is
+        $(n, d)$, and each of `Wq`, `Wk`, `Wv`, `Wo` is $(d, d)$ with the output
+        feature first, so $Q = XW_q^\top$ and the output is
+        $\operatorname{Concat}(C_1,\dots,C_h)W_O^\top$. Use
+        $d_k = d/h$, divide the scores by $\sqrt{d_k}$, take a numerically
+        stable softmax per head, and return the $(n, d)$ output as nested
+        lists. The head split must be by contiguous blocks of columns, and the
+        merge must be its exact inverse. `n_heads = 1` must reproduce plain
+        scaled dot-product attention.
+      starter: |
+        import numpy as np
+
+        def mha_forward(X, Wq, Wk, Wv, Wo, n_heads):
+            # your implementation here
+            pass
+      language: python
+      entry: mha_forward
+      testCases:
+        - input: '[[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], 2]'
+          expected: "[[0.5034898434845538, 0.2482550782577231, 0.3333333333333333, 0.0], [0.2482550782577231, 0.5034898434845538, 0.3333333333333333, 0.0], [0.3333333333333333, 0.3333333333333333, 0.5034898434845538, 0.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], 1]'
+          expected: "[[0.45186276187760605, 0.274068619061197, 0.274068619061197, 0.0], [0.274068619061197, 0.45186276187760605, 0.274068619061197, 0.0], [0.274068619061197, 0.274068619061197, 0.45186276187760605, 0.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 2]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], 2]'
+          expected: "[[0.2482550782577231, 0.5034898434845538, 0.6666666666666666, 0.0], [0.5034898434845538, 0.2482550782577231, 0.6666666666666666, 0.0], [0.3333333333333333, 0.3333333333333333, 0.6666666666666666, 0.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], 4]'
+          expected: "[[0.5761168847658291, 0.3333333333333333, 0.3333333333333333, 0.0], [0.3333333333333333, 0.5761168847658291, 0.3333333333333333, 0.0], [0.3333333333333333, 0.3333333333333333, 0.5761168847658291, 0.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[2.0, -1.0, 0.5, 3.0]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 2]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], 4]'
+          expected: "[[2.0, -1.0, 1.0, 6.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], [[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], 2]'
+          expected: "[[0.2482550782577231, 0.5034898434845538, 0.0, 0.3333333333333333], [0.5034898434845538, 0.2482550782577231, 0.0, 0.3333333333333333], [0.3333333333333333, 0.3333333333333333, 0.0, 0.5034898434845538]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def mha_forward(X, Wq, Wk, Wv, Wo, n_heads):
+            X = np.asarray(X, dtype=np.float64)
+            Wq, Wk, Wv, Wo = (np.asarray(W, dtype=np.float64)
+                              for W in (Wq, Wk, Wv, Wo))
+
+            n, d = X.shape
+            assert d % n_heads == 0, "d_model must be divisible by n_heads"
+            d_k = d // n_heads
+
+            def split(A):
+                # (n, d) -> (n, h, d_k) -> (h, n, d_k): contiguous column blocks
+                return A.reshape(n, n_heads, d_k).transpose(1, 0, 2)
+
+            Q, K, V = split(X @ Wq.T), split(X @ Wk.T), split(X @ Wv.T)
+
+            S = Q @ np.transpose(K, (0, 2, 1)) / np.sqrt(d_k)   # (h, n, n)
+            S = S - S.max(axis=-1, keepdims=True)
+            P = np.exp(S)
+            P = P / P.sum(axis=-1, keepdims=True)               # per head
+
+            # (h, n, d_k) -> (n, h, d_k) -> (n, d): the exact inverse of split
+            C = (P @ V).transpose(1, 0, 2).reshape(n, d)
+            return (C @ Wo.T).tolist()
+      solutionExplanation: >-
+        Three details decide whether this passes. First, the split is by
+        contiguous blocks: `reshape(n, h, d_k)` puts features 0..d_k-1 in head 0,
+        and only afterwards do you transpose. Writing `reshape(n, d_k, h)` and
+        transposing splits by *stride*, which is a different function — measured
+        max difference 1.5323 and relative error 1.395 on unit-scale data — and
+        it is the test with the swapped key columns and doubled values that
+        catches it, because that is where the two partitions stop coinciding.
+        Second, the divisor is `d_k = d // n_heads`, not `d`: at `n_heads = 2`
+        with `d = 4` that is 2, and using 4 shrinks every logit by a factor of
+        sqrt(2), which softens the distribution into a different answer. Third,
+        the merge must be the exact inverse of the split; otherwise `Wo` is
+        applied to a permuted stack. The last test case is the one that makes
+        the role of `Wo` concrete: the heads are already computed correctly, and
+        only the output projection permutes the two blocks, so dropping `Wo`
+        changes the answer by 0.5035. The single-token case is the sanity check —
+        with `n = 1` every softmax row is exactly 1, so the layer reduces to
+        `X @ Wo.T` and the expected output is the input row scaled by `Wv` then
+        permuted by `Wo`.
+      complexity: "O(h n^2 d_k) = O(n^2 d) time, O(h n^2) space for the weight matrices"
+      tags: [attention, multi-head, reshape, head-split, output-projection]
+
+    - id: p-kv-cache-budget
+      title: "The KV cache budget"
+      difficulty: easy
+      prompt: >-
+        Implement `kv_cache_bytes(n_layers, n_q_heads, n_kv_heads, d_head,
+        n_ctx, bytes_per_elem)`, returning a dict with two keys: `"bytes"`, the
+        size of the KV cache for one sequence, and `"ratio"`, the saving factor
+        relative to full multi-head attention (that is, $n_q / n_{kv}$ as a
+        float). The cache holds one key vector and one value vector per
+        key/value head, per layer, per token, so count keys and values
+        explicitly. Return `"bytes"` as an `int`, not a float.
+      starter: |
+        def kv_cache_bytes(n_layers, n_q_heads, n_kv_heads, d_head, n_ctx, bytes_per_elem):
+            # your implementation here
+            pass
+      language: python
+      entry: kv_cache_bytes
+      testCases:
+        - input: '[32, 32, 8, 128, 32768, 2]'
+          expected: '{"bytes": 4294967296, "ratio": 4.0}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[32, 32, 1, 128, 32768, 2]'
+          expected: '{"bytes": 536870912, "ratio": 32.0}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[32, 32, 32, 128, 32768, 2]'
+          expected: '{"bytes": 17179869184, "ratio": 1.0}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[12, 12, 4, 64, 2048, 2]'
+          expected: '{"bytes": 25165824, "ratio": 3.0}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[80, 64, 8, 128, 4096, 1]'
+          expected: '{"bytes": 671088640, "ratio": 8.0}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[32, 48, 8, 128, 32768, 2]'
+          expected: '{"bytes": 4294967296, "ratio": 6.0}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def kv_cache_bytes(n_layers, n_q_heads, n_kv_heads, d_head, n_ctx, bytes_per_elem):
+            total = 2 * n_layers * n_kv_heads * d_head * n_ctx * bytes_per_elem
+            return {"bytes": int(total), "ratio": float(n_q_heads) / float(n_kv_heads)}
+      solutionExplanation: >-
+        The `2` is keys and values — the single most commonly forgotten factor,
+        and the one that makes every answer exactly half of what it should be.
+        Note that `n_q_heads` appears nowhere in the byte count: the cache is
+        indexed by *key/value* heads, which is the entire point of the
+        architecture. The last two test cases pin this down. The fifth varies
+        `n_q` from 32 to 64 while holding `n_kv` at 8, and the byte count does
+        not move — only the ratio does, from 4 to 8. The sixth does the
+        converse, holding `n_q` at 48 against `n_kv = 8` for a ratio of 6. If
+        your `bytes` changes when `n_q` changes, you have written the multi-head
+        formula. Returning an `int` matters because the largest case is
+        17,179,869,184 — well inside float64's exact-integer range but not
+        inside float32's, and the habit is worth having.
+      complexity: "O(1) time and space"
+      tags: [kv-cache, gqa, mqa, memory-budget, arithmetic]
+
+    - id: p-expand-kv-heads
+      title: "Expanding key/value heads for grouped-query attention"
+      difficulty: easy
+      prompt: >-
+        Implement `expand_kv_heads(K, n_rep)`. `K` has shape
+        $(n_{kv}, n, d)$ — one key matrix per key/value head — and `n_rep` is
+        the number of query heads that share each one. Return shape
+        $(n_{kv} \cdot n_{rep}, n, d)$ as nested lists, where query head $h$
+        reads key/value head $h \parallel n_{rep}$: the first `n_rep` output
+        heads are copies of key head 0, the next `n_rep` are copies of key head
+        1, and so on. `n_rep = 1` must return the input unchanged.
+      starter: |
+        import numpy as np
+
+        def expand_kv_heads(K, n_rep):
+            # your implementation here
+            pass
+      language: python
+      entry: expand_kv_heads
+      testCases:
+        - input: '[[[[1.0]], [[2.0]]], 3]'
+          expected: "[[[1.0]], [[1.0]], [[1.0]], [[2.0]], [[2.0]], [[2.0]]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0], [3.0, 4.0]]], 2]'
+          expected: "[[[1.0, 2.0], [3.0, 4.0]], [[1.0, 2.0], [3.0, 4.0]]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 0.0], [0.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]], [[4.0, 0.0], [0.0, 4.0]]], 2]'
+          expected: "[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]], [[2.0, 2.0], [3.0, 3.0]], [[4.0, 0.0], [0.0, 4.0]], [[4.0, 0.0], [0.0, 4.0]]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, -1.0]], [[2.0, -2.0]], [[3.0, -3.0]], [[4.0, -4.0]]], 1]'
+          expected: "[[[1.0, -1.0]], [[2.0, -2.0]], [[3.0, -3.0]], [[4.0, -4.0]]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 1.0, 0.0]], [[0.0, 1.0, 1.0]]], 2]'
+          expected: "[[[1.0, 1.0, 0.0]], [[1.0, 1.0, 0.0]], [[0.0, 1.0, 1.0]], [[0.0, 1.0, 1.0]]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def expand_kv_heads(K, n_rep):
+            K = np.asarray(K, dtype=np.float64)
+            # repeat along the head axis: [k0, k0, ..., k1, k1, ...]
+            # np.tile(K, (n_rep, 1, 1)) would give [k0, k1, ..., k0, k1, ...] instead.
+            return np.repeat(K, n_rep, axis=0).tolist()
+      solutionExplanation: >-
+        `np.repeat` and `np.tile` both produce a tensor of the right shape from a
+        tensor of the right shape, and they disagree about which query head reads
+        which key head. For `n_kv = 2, n_rep = 2`, `repeat` gives the mapping
+        `[0, 0, 1, 1]` — query heads 0 and 1 share key head 0 — while `tile`
+        gives `[0, 1, 0, 1]`, which is query head 0 and query head 2 sharing key
+        head 0. At 32 query heads and 8 key/value heads the two mappings differ
+        on 28 of 32 heads (87.5%). The third test case is the one that
+        distinguishes them: three distinct key heads with `n_rep = 2`, where
+        `tile` would interleave them. The first case is the smallest version of
+        the same thing, and the fourth pins down `n_rep = 1` as the identity, so
+        a `n_kv == n_q` configuration cannot silently permute anything.
+      complexity: "O(n_kv n_rep n d) time and space for the expanded copy"
+      tags: [gqa, mqa, broadcasting, head-mapping, repeat-vs-tile]
+
+  visualizers:
+    - id: vs-head-split
+      kind: attention
+      title: "One head, eight heads, and the same 512 numbers"
+      description: >-
+        Watch a single weight row over 512 keys get partitioned into eight
+        heads of width 64. Total parameters and FLOPs are unchanged by the
+        split; the score matrices go from one to eight; and with all heads
+        sharing a projection the concatenated output collapses to rank 64
+        instead of 512.
+      params:
+        keys: 512
+        d_model: 512
+        head_counts: [1, 2, 4, 8]
+        show_rank: true
+    - id: vs-kv-cache
+      kind: tensor
+      title: "KV cache versus key/value head count and context"
+      description: >-
+        Scale the key/value head count from 1 to 32 at 8k, 32k and 128k context.
+        Cache bytes are linear in both, so the surface is a plane: 0.5 GiB at
+        one head and 32k, 16 GiB at 32 heads, 64 GiB at 32 heads and 128k —
+        4.3x the size of the 14.75 GiB model itself.
+      params:
+        layers: 32
+        d_head: 128
+        bytes_per_elem: 2
+        contexts: [8192, 32768, 131072]
+        kv_heads: [1, 2, 4, 8, 16, 32]
+
+
+  try_it: >-
+    Give all eight heads of a 512-wide attention layer the same projection and measure the rank
+    of the concatenated output: it is 64, not 512. Then perturb one head's $W_Q$ by 1% and watch
+    the rank recover as the heads stop computing the same function.
+  interview_questions:
+    - question: 'Splitting one 768-wide head into twelve 64-wide heads: what changes and what does not?'
+      level: mid
+      key_points:
+        - 'The parameter count is identical: 2,359,296 either way, four matrices of 589,824, because h * d_model * (d_model/h) is h-independent.'
+        - 'The FLOPs are identical for the same reason, so width was never the thing that changed.'
+        - 'What changes is that there are twelve independent softmax mixtures over positions instead of one.'
+        - 'W_O is the only thing that mixes them afterwards, so the split buys diversity rather than capacity in the parameter sense.'
+    - question: 'You need a 32k context on one 80 GB card. Walk through the KV cache arithmetic for multi-head, GQA-8 and MQA.'
+      level: senior
+      key_points:
+        - 'The cache is 2 * L * n_kv * d_head * n_ctx * bytes; at 131,072 tokens with 32 layers, d_head 128 and fp16, the head count is the only lever.'
+        - '32 KV heads give 64 GiB, 8 give 16 GiB and 1 gives 2 GiB, against 14.75 GiB for the fp16 weights of the 7.9B model.'
+        - 'Multi-head attention cache is therefore 4.3x the size of the model itself at that context, which is why it does not fit.'
+        - 'The quality cost is the other half of the decision: the knee is between 1 and 8 KV heads, and GQA-8 is the interpolation that most models settle on.'
+      follow_up: 'Why does GQA also save parameters when the cache is the real target?'
+    - question: 'You implement grouped-query attention, the shapes all line up, and quality drops by more than the paper reported. What is the likely bug?'
+      level: mid
+      key_points:
+        - 'The mapping is query head h to key/value head h // n_rep: with 32 query and 8 KV heads, contiguous groups {0,1,2,3} go to KV head 0.'
+        - 'np.repeat produces that mapping; np.tile produces a round-robin and sends 28 of the 32 query heads to the wrong head.'
+        - 'No shape check catches it, because both produce a tensor of the correct shape with the correct dtype.'
+        - 'The detection is a unit test that compares GQA with n_rep = 1 against plain MHA, where the outputs must be bit-identical.'
+  common_mistakes:
+    - 'Using np.tile instead of np.repeat for the key/value expansion, which sends 28 of 32 query heads to the wrong head with no shape error.'
+    - 'Adding heads expecting more capacity, when the parameter count and FLOPs are identical and only the number of mixtures changes.'
+    - 'Leaving every head with the same projection, so the concatenation has rank 64 instead of 512 and h buys nothing at all.'
+  further_reading:
+    - label: "Vaswani, Shazeer, Parmar, Uszkoreit, Jones, Gomez, Kaiser & Polosukhin, Attention Is All You Need (NeurIPS 2017)"
+    - label: "Shazeer, Fast Transformer Decoding: One Write-Head is All You Need (2019)"

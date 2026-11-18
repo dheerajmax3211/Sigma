@@ -1,0 +1,996 @@
+id: gradient-descent-variants
+slug: gradient-descent-variants
+title: "Momentum, RMSprop, Adam: One Update Rule, Two Choices"
+summary: >-
+  Read any optimizer in one line of code, predict from the hyperparameters alone
+  whether it will converge, oscillate, or stall — and diagnose the four failure
+  modes that account for almost every "my training diverged" ticket.
+kind: lesson
+difficulty: medium
+position: 9
+estMinutes: 22
+prerequisites: [convexity, matrix-calculus]
+phase: mathematical-foundations
+tags: [optimization, sgd, momentum, rmsprop, adam, adamw, lion, preconditioning, training]
+
+body:
+  big_idea: >-
+    Every optimiser is $\theta \leftarrow \theta-\eta u_t$; the only differences are how
+    $u_t$ averages the past and whether it divides by the gradient's own scale — and
+    momentum buys $\sqrt{\kappa}$, never curvature.
+
+  problem:
+    - "You inherit a script that diverges at step 3,000, and your only opinion is a learning rate someone read in a blog post."
+    - "Adam works on everything until a fine-tune plateaus, an embedding table decays to zero, or one bad batch costs 9,000 steps. One root cause."
+    - "A 7B model in fp32 needs 26.1 GiB for weights, 26.1 for gradients, 52.2 for Adam state — half of that bill is a choice."
+
+  analogy: |
+    Think of a ball rolling down a valley. Plain gradient descent is a ball in
+    thick honey: it moves immediately and stops the moment the slope flattens.
+    Momentum gives the ball mass, so it carries speed through bumps and
+    overshoots narrow valleys; RMSprop gives every axis its own brake, so a
+    steep wall does not launch it sideways. Adam does both.
+
+  concept_points:
+    - "**One line, two knobs.** SGD: $u_t = g_t$. Momentum: $u_t = v_t$, $v_t = \\beta v_{t-1} + g_t$. RMSprop: $u_t = g_t/(\\sqrt{s_t}+\\epsilon)$. Adam: $u_t = \\hat m_t/(\\sqrt{\\hat v_t}+\\epsilon)$. Only two decisions separate them — how much past is averaged, and whether the step divides by the gradient's own scale."
+    - "**Momentum is an EMA with steady-state gain $1/(1-\\beta)$.** A constant gradient $g$ drives $v_t \\to g/(1-\\beta)$, so the step is $\\eta/(1-\\beta)$ — exactly $10\\times$ at $\\beta=0.9$. Add `momentum=0.9` to a working recipe, keep `lr`, and the run blows up. The same average cuts gradient noise by $\\sqrt{(1-\\beta)/(1+\\beta)} = 0.229$, a $4.36\\times$ reduction."
+    - "**Momentum buys $\\sqrt{\\kappa}$, not $\\kappa$.** On $\\tfrac12 x^\\top A x$ with $\\kappa = 10^4$, plain GD contracts by $0.9998$ and needs **69,078** steps; heavy-ball with $\\beta^\\star = 0.9608$ contracts by $0.9802$ and needs **691**. Momentum at $\\kappa = 10^4$ costs what plain GD costs at $\\kappa = 10^2$, for one extra tensor."
+    - "**Adaptive methods turn the step into a length, not a multiple.** Cauchy–Schwarz gives $|\\hat m_i| \\le \\sqrt{\\hat v_i}$, so $|u_i| \\le 1$: each coordinate moves at most $\\eta$ per step. But the step cannot shrink either — as $g \\to 0$ the ratio stays at $\\pm 1$ until $\\epsilon$ takes over, so RMSprop with $\\eta L = 1$ orbits the optimum forever."
+    - "**Bias correction is exactly $1-\\beta^t$, and it only matters at the start.** With $m_0 = 0$, $\\mathbb{E}[m_t] = (1-\\beta^t)\\mathbb{E}[g]$; at $t=1$ the raw step is ten times too small, so Adam's first update is exactly $\\eta\\operatorname{sign}(g)$. The $\\beta_2$ factor is slow: $1-0.999^t$ reaches only $0.632$ at $t=1000$."
+    - "**Decoupled weight decay is not L2, and the difference is a factor of $\\sqrt{\\hat v}$.** Adding $\\lambda\\theta$ to the gradient and dividing by $\\sqrt{\\hat v}$ means a parameter with large historical gradients decays *less*: at $\\lambda = 0.01$ a weight with $|g| = 10^{-3}$ sees decay equal to 100% of its gradient, one at $|g| = 1$ sees 0.1%."
+
+  definitions:
+    - term: "Learning rate ($\\eta$)"
+      meaning: >-
+        The scale of the step. In SGD it multiplies the gradient, so its
+        meaning depends on gradient magnitude. In Adam and Lion it is
+        approximately a distance in parameter space per step, which is why the
+        two are not interchangeable at the same numeric value.
+    - term: "Heavy-ball momentum"
+      meaning: >-
+        Polyak's rule $v_t = \beta v_{t-1} + g_t$, $\theta \leftarrow \theta -
+        \eta v_t$. The gradient is accumulated rather than applied, so the step
+        depends on the recent history of gradients, not just the current one.
+    - term: "Exponential moving average (EMA)"
+      meaning: >-
+        $y_t = \beta y_{t-1} + (1-\beta)x_t$, a running average whose weight on
+        an observation $k$ steps old is $\beta^k$. Its effective memory is
+        $1/(1-\beta)$ steps: 10 at $\beta = 0.9$, 1000 at $\beta = 0.999$.
+    - term: "Second moment"
+      meaning: >-
+        The running average of squared gradients, $s_t = \beta_2 s_{t-1} +
+        (1-\beta_2)g_t^2$, elementwise. Its square root is a per-coordinate
+        estimate of gradient scale, and dividing by it is what makes a method
+        adaptive.
+    - term: "Bias correction"
+      meaning: >-
+        Dividing a zero-initialised EMA by $1-\beta^t$ so that its expectation
+        equals the quantity being averaged. Without it, both of Adam's state
+        variables start at zero and the first several steps are far too small.
+    - term: "Diagonal preconditioner"
+      meaning: >-
+        Any update of the form $\theta \leftarrow \theta - \eta D^{-1} g$ with
+        $D$ diagonal and positive. SGD has $D = I$, RMSprop and Adam have
+        $D = \operatorname{diag}(\sqrt{\hat v}) + \epsilon I$, Lion effectively
+        has $D = \operatorname{diag}(|g|)$. None of them can rotate.
+    - term: "Epsilon ($\\epsilon$)"
+      meaning: >-
+        A numerical floor added to the denominator, $10^{-8}$ by default. It
+        prevents division by zero and, less obviously, caps the maximum possible
+        step: below $|g| \approx \epsilon$ the update scales linearly with the
+        gradient again.
+    - term: "Decoupled weight decay (AdamW)"
+      meaning: >-
+        Subtracting $\eta\lambda\theta$ from the parameter directly instead of
+        adding $\lambda\theta$ to the gradient. The two differ whenever the
+        update is normalised, because the coupled form is divided by
+        $\sqrt{\hat v}$ and the decoupled form is not.
+    - term: "Sign-based optimizer"
+      meaning: >-
+        A method whose update is $\pm\eta$ per coordinate, discarding gradient
+        magnitude entirely (Lion, and signSGD before it). The update is bounded
+        by $\eta$, so it is robust to spikes but cannot settle smoothly.
+    - term: "Update-to-weight ratio"
+      meaning: >-
+        $\\|\\Delta\theta\\| / \\|\\theta\\|$ per layer, the practical diagnostic
+        for whether the learning rate is sane. Healthy values sit near
+        $10^{-3}$; a layer at $10^{-1}$ is about to diverge and one at $10^{-6}$
+        has stopped learning.
+    - term: "Gradient noise scale"
+      meaning: >-
+        $B_{\text{noise}} = \operatorname{tr}(\Sigma)/\\|G\\|^2$ for gradient
+        covariance $\Sigma$ and true gradient $G$: the batch size at which
+        gradient noise equals the signal. Below it, doubling the batch lets you
+        raise the learning rate; above it, you are buying nothing.
+
+  diagrams:
+    - type: compare
+      title: "SGD with momentum vs the adaptive family — choose by what is broken"
+      left_label: "SGD + momentum"
+      left_points:
+        - "Fixed geometry: same scale for every coordinate, forever"
+        - "β = 0.9 gives a 10× effective step and 4.36× less gradient noise"
+        - "Buys √κ: 691 steps instead of 69,078 at κ = 10⁴"
+        - "One state tensor; hyperparameters transfer across widths"
+        - "Best when the loss is well-conditioned and the batch is large"
+      right_label: "Adam / AdamW / Lion"
+      right_points:
+        - "Per-coordinate scale: each parameter gets its own step length"
+        - "Step bounded by η, so a gradient spike cannot blow up the run"
+        - "No √κ guarantee — it neutralises diagonal, not rotated, curvature"
+        - "Two state tensors (one for Lion); 52.2 GiB at 7B in fp32"
+        - "Best for sparse gradients, transformers, and unknown scales"
+    - type: plot
+      title: "Bias correction 1 − βᵗ: why Adam cannot trust its own state early"
+      chart: "line"
+      xLabel: "step t"
+      yLabel: "1 − βᵗ"
+      series:
+        - name: "β₁ = 0.9 (first moment)"
+          points:
+            - { x: 1, y: 0.1 }
+            - { x: 2, y: 0.19 }
+            - { x: 5, y: 0.40951 }
+            - { x: 10, y: 0.651322 }
+            - { x: 20, y: 0.878423 }
+            - { x: 50, y: 0.994846 }
+            - { x: 100, y: 0.999973 }
+            - { x: 200, y: 1.0 }
+            - { x: 500, y: 1.0 }
+            - { x: 1000, y: 1.0 }
+        - name: "β₂ = 0.999 (second moment)"
+          points:
+            - { x: 1, y: 0.001 }
+            - { x: 2, y: 0.001999 }
+            - { x: 5, y: 0.00499 }
+            - { x: 10, y: 0.009955 }
+            - { x: 20, y: 0.019811 }
+            - { x: 50, y: 0.048794 }
+            - { x: 100, y: 0.095208 }
+            - { x: 200, y: 0.181351 }
+            - { x: 500, y: 0.393621 }
+            - { x: 1000, y: 0.632305 }
+    - type: plot
+      title: "Momentum turns κ into √κ: steps to reach 10⁻⁶ on a quadratic"
+      chart: "line"
+      xLabel: "condition number κ"
+      yLabel: "iterations to 10⁻⁶"
+      series:
+        - name: "plain gradient descent"
+          points:
+            - { x: 10, y: 69 }
+            - { x: 100, y: 691 }
+            - { x: 1000, y: 6908 }
+            - { x: 10000, y: 69078 }
+        - name: "heavy-ball, optimally tuned"
+          points:
+            - { x: 10, y: 22 }
+            - { x: 100, y: 69 }
+            - { x: 1000, y: 219 }
+            - { x: 10000, y: 691 }
+    - type: mermaid
+      title: "Where each method came from, and what it changed"
+      code: |
+        flowchart LR
+          SGD["SGD<br/>u = g"] --> MOM["Momentum 1964<br/>+ memory"]
+          SGD --> ADA["AdaGrad 2011<br/>+ per-coord 1/√Σg²"]
+          ADA --> RMS["RMSprop 2012<br/>EMA instead of sum"]
+          MOM --> ADAM["Adam 2014<br/>memory × scale"]
+          RMS --> ADAM
+          ADAM --> AW["AdamW 2017<br/>decoupled decay"]
+          ADAM --> LION["Lion 2023<br/>sign of the EMA"]
+          ADAM --> ADAF["Adafactor / 8-bit<br/>cheaper state"]
+    - type: stack
+      title: "The memory bill for a 7B model in fp32 — and which layers an optimizer owns"
+      layers:
+        - "Activations — the largest term, set by batch size and sequence length (not the optimizer's business)"
+        - "Second moment v — 26.1 GiB, only if the optimizer is adaptive"
+        - "First moment m — 26.1 GiB, only if the optimizer has memory"
+        - "Gradients — 26.1 GiB, unavoidable for any first-order method"
+        - "Parameters — 26.1 GiB, the only layer that is actually the model"
+
+  markdown: |
+    ## The family portrait
+
+    Every optimizer in this lesson is the same statement with a different $u_t$:
+
+    $$\theta_{t+1} = \theta_t - \eta\, u_t$$
+
+    | Optimizer | $u_t$ | State | Where it ships |
+    |---|---|---|---|
+    | SGD | $g_t$ | none | ResNets, large-batch vision |
+    | Momentum | $v_t = \beta v_{t-1} + g_t$ | 1 tensor | most non-adaptive training |
+    | RMSprop | $g_t / (\sqrt{s_t} + \epsilon)$ | 1 tensor | RNNs, per-coordinate scale |
+    | Adam | $\hat m_t / (\sqrt{\hat v_t} + \epsilon)$ | 2 tensors | transformers, sparse gradients |
+    | Lion | $\operatorname{sign}(\beta_1 m_t + (1-\beta_1) g_t)$ | 1 tensor | memory-bound large models |
+
+    Read the table sideways and it collapses into two independent decisions:
+    **how much of the past is averaged** and **whether the step is divided by
+    the gradient's own scale**. SGD does neither. Momentum does the first.
+    RMSprop does the second. Adam does both. Lion does the first and then throws
+    the magnitude away, which is why its learning rate is a different number.
+
+    ## Momentum is a filter, not a preconditioner
+
+    Solve the momentum recursion for a constant gradient:
+
+    $$v_t = g \sum_{k=0}^{t-1} \beta^k = g\,\frac{1-\beta^t}{1-\beta}
+      \;\longrightarrow\; \frac{g}{1-\beta}$$
+
+    At $\beta = 0.9$ the steady-state step is $10\eta$ — the parameter you must
+    retune the moment you add momentum. On a quadratic the improvement is
+    sharper than that constant suggests, because the accumulation changes the
+    *rate*, not just the gain:
+
+    | $\kappa$ | GD steps to $10^{-6}$ | heavy-ball steps | $\beta^\star$ |
+    |---|---|---|---|
+    | 10 | 69 | 22 | 0.270 |
+    | 100 | 691 | 69 | 0.669 |
+    | 1,000 | 6,908 | 219 | 0.881 |
+    | 10,000 | 69,078 | 691 | 0.961 |
+
+    Both columns grow linearly in $\kappa$, which is the point: the *scaling*
+    is unchanged; the constant is squared away. Momentum at $\kappa = 10^4$
+    costs what plain GD costs at $\kappa = 10^2$. This is the practical answer
+    to the $2/L$ and $(\kappa-1)/(\kappa+1)$ results from *Convexity* — you
+    cannot remove the conditioning, but you can stop paying for it twice.
+
+    ## Adaptivity makes the step a length
+
+    Adam's update is bounded because the numerator and denominator are averages
+    of the same quantity. By Cauchy–Schwarz, $|\hat m_i| \le \sqrt{\hat v_i}$,
+    hence
+
+    $$\left|u_i\right| = \frac{|\hat m_i|}{\sqrt{\hat v_i} + \epsilon} \le 1$$
+
+    with equality when the gradient has kept its sign. So a coordinate moves at
+    most $\eta$ per step. This is the single most useful fact about Adam: it
+    means the learning rate is a step size in parameter units, and it means a
+    gradient of $10^{-6}$ and a gradient of $10^{3}$ produce the same step.
+
+    It also explains precisely what Adam can and cannot fix. On a **diagonal**
+    quadratic $f = \tfrac12\sum a_i x_i^2$, the gradient is $g_i = a_i x_i$, so
+    $\sqrt{\hat v_i} \propto a_i|x_i|$ and the update is
+    $\eta\operatorname{sign}(x_i)$: the curvature cancels and every coordinate
+    converges at the same rate. Adam neutralises diagonal ill-conditioning
+    exactly. On a **rotated** quadratic it cannot: the update is
+    $D^{-1} A x$ with $D$ diagonal, and no diagonal matrix undoes a rotation, so
+    the stiff eigen-direction still sets the step ceiling. Adam is a diagonal
+    preconditioner built from gradient magnitude, not from curvature.
+
+    ## What it costs
+
+    Four bills come due.
+
+    **The floor.** Because $u$ does not shrink as $g \to 0$, the method orbits
+    the optimum at radius $\sim\eta$ instead of settling. With $L = 100$ and
+    $\eta = 0.01$, RMSprop hits loss $10^{-6}$ at step 137 and is back above it
+    later. A schedule exists to lower that floor.
+
+    **$\epsilon$.** At $g = 10^{-8}$ the denominator is $2\epsilon$ and the step
+    is halved. In fp16, $g^2$ underflows below $5.96\times10^{-8}$ — any
+    gradient under $2.44\times10^{-4}$ — and the denominator collapses to
+    $\epsilon$, turning a $10^{-8}$ gradient into a $10^{4}\eta$ step.
+
+    **$\beta_2$'s memory.** A 100× gradient spike raises $g^2$ by $10^4$; decay
+    at $0.999$ takes 9,206 steps to undo. One bad batch costs thousands of
+    steps of progress on that coordinate.
+
+    **Memory.** Parameters, gradients, $m$, and $v$ are four tensors of the same
+    size. At 7B parameters in fp32 that is $4 \times 26.1 = 104.3$ GiB before a
+    single activation is stored.
+
+    AdamW fixes a fifth, subtler problem. Coupled L2 adds $\lambda\theta$ to the
+    gradient and then divides by $\sqrt{\hat v}$, so the decay a parameter
+    receives depends on its gradient history — a weight with $|g| = 1$ decays
+    a thousand times less than one with $|g| = 10^{-3}$ at the same $\theta$.
+    Decoupling the decay restores the intended behaviour.
+
+    ## Lion, briefly
+
+    $\operatorname{sign}(\beta_1 m + (1-\beta_1)g)$ is a majority vote between
+    momentum and the current gradient, and the winner takes a full step of size
+    $\eta$. The update is bounded, so spikes are harmless; the update is *also*
+    unable to shrink, so the floor is larger and the schedule matters more.
+    That trade is why the paper's recipe uses $\eta = 10^{-4}$ and weight decay
+    $1.0$ where AdamW uses $10^{-3}$ and $0.1$, and why Lion halves the state.
+
+    ## What no optimizer fixes
+
+    Nothing in this family is curvature-aware. If your Hessian has a large
+    $\kappa$ in a rotated basis, every method here still pays for it in
+    iterations — momentum pays $\sqrt\kappa$, Adam pays something between
+    $\sqrt\kappa$ and $\kappa$ depending on how diagonal the problem is, and
+    both pay in full when the eigenvectors mix coordinates. Second-order methods
+    (Newton, K-FAC, Shampoo) remove the dependence; they cost a matrix per layer
+    and that is the whole trade.
+
+    The practical summary: **choose the optimizer for the geometry you have,
+    then choose the schedule for the floor it leaves you.** The second half is
+    the next topic.
+
+    ## The longer version
+
+    The remaining mechanisms and failure modes, verbatim: $\epsilon$ underflow
+    in fp16, one spike poisoning $\beta_2$ for nine thousand steps, and Lion's
+    tuning constants.
+
+    ### Failure modes, in full
+
+    - You inherit a training script that diverges at step 3,000. The only knob you have an opinion about is the learning rate, and the script sets it to 1e-3 because that is what the blog post said.
+    - Adam appears to work on everything, until a fine-tune plateaus at a loss that will not move, or an embedding table quietly decays to zero, or a single bad batch is followed by 9,000 steps of nothing. None of those is a data bug and all three have the same root cause.
+    - A 7-billion-parameter model in fp32 needs 26.1 GiB for the weights, 26.1 GiB for the gradients, and 52.2 GiB for Adam's state — 104.3 GiB before a single activation is stored. Half of that bill is an implementation detail you can choose.
+    - Interviews ask why Adam needs bias correction, what AdamW changes, and why Lion's learning rate is ten times smaller. Those are not trivia; each one is a different correct answer to 'what is the update actually proportional to?'
+    - The next topic — learning-rate schedules — is unintelligible until you know why these methods have a floor that a schedule exists to lower.
+
+    ### The mechanisms, in full
+
+    - **One line, two knobs.** Every rule in this topic is $\theta \leftarrow \theta - \eta\,u_t$: SGD uses $u_t = g_t$; momentum uses $u_t = v_t$ with $v_t = \beta v_{t-1} + g_t$; RMSprop uses $u_t = g_t/(\sqrt{s_t}+\epsilon)$; Adam uses $u_t = \hat m_t/(\sqrt{\hat v_t}+\epsilon)$; Lion uses $u_t = \operatorname{sign}(\beta_1 m_t + (1-\beta_1)g_t)$. Only two independent decisions separate them — how much of the past is averaged (memory) and whether the step is divided by the gradient's own scale (preconditioning). SGD does neither, momentum does the first, RMSprop the second, Adam both. That is the whole taxonomy; everything else is tuning constants.
+    - **Momentum is an exponential moving average, and its steady-state gain is $1/(1-\beta)$.** Feed it a constant gradient $g$ and $v_t$ converges to $g/(1-\beta)$, so the step is $\eta/(1-\beta)$: exactly $10\times$ at $\beta=0.9$, $100\times$ at $0.99$, $1000\times$ at $0.999$. Adding momentum at a fixed learning rate therefore multiplies your effective step by ten. The trap is universal: someone adds `momentum=0.9` to a working SGD recipe, keeps `lr`, and the run blows up — then blames the data. The fix is to divide $\eta$ by $1/(1-\beta)$ or to warm up. The same average cuts gradient noise by $\sqrt{(1-\beta)/(1+\beta)} = 0.229$ at $\beta=0.9$, a $4.36\times$ reduction in standard deviation, which is the second reason momentum helps and the one nobody mentions.
+    - **Momentum buys $\sqrt{\kappa}$, not $\kappa$.** On $\tfrac12 x^\top A x$ with $\kappa = 10^4$, plain GD contracts by $(\kappa-1)/(\kappa+1) = 0.9998$ per step and needs **69,078** steps to reach $10^{-6}$. Heavy-ball with $\beta^\star = ((\sqrt\kappa-1)/(\sqrt\kappa+1))^2 = 0.9608$ and $\eta = 4/(\sqrt L+\sqrt m)^2$ contracts by $(\sqrt\kappa-1)/(\sqrt\kappa+1) = 0.9802$ and needs **691** — a factor of 100. The pattern is exact: momentum at $\kappa = 10^4$ costs what plain GD costs at $\kappa = 10^2$. This is the same $\kappa$ you met in *Convexity*, where it set the step ceiling $2/L$ and the iteration count; momentum is the cheapest known way to trade it for its square root, and it costs one extra tensor.
+    - **Adaptive methods turn the step into a length, not a multiple of the gradient.** Cauchy–Schwarz on the two running averages gives $|\hat m_i| \le \sqrt{\hat v_i}$, so $|u_i| = |\hat m_i|/(\sqrt{\hat v_i} +\epsilon) \le 1$, with equality for a constant-sign gradient. Every coordinate therefore moves by at most $\eta$ per step regardless of how large the gradient is. With $\eta = 10^{-3}$ a weight initialised at $\sigma = 0.02$ moves at most 5% of its own scale per step: twenty steps to travel one standard deviation. That bound is why an Adam learning rate is interpretable as a step size in parameter units, and why it does *not* transfer across model widths the way an SGD learning rate does.
+    - **Bias correction is exactly $1-\beta^t$, and it only matters at the start.** With $m_0 = 0$ and a stationary gradient, $\mathbb{E}[m_t] = (1-\beta^t)\mathbb{E}[g]$. At $t=1$, $1-0.9 = 0.1$: the raw first step is ten times too small. Dividing by $1-\beta^t$ restores it, so Adam's first update is exactly $\eta\operatorname{sign}(g)$ — which is also why Adam's very first step is the least trustworthy one. The correction factor falls fast for $\beta_1$ ($10\times$, $2.44\times$, $1.54\times$, $1.005\times$ at $t = 1, 5, 10, 50$) but slowly for $\beta_2$: $1-0.999^t$ reaches only $0.632$ at $t = 1000$, so the second moment is still 37% underestimated after a thousand steps.
+    - **The adaptive step cannot shrink, so there is a floor at $\eta L$.** As a gradient goes to zero the ratio $g/\sqrt{v}$ does not: it stays at $\pm 1$ until $\epsilon$ takes over. On a quadratic with $L = 100$ and $\eta = 0.01$, RMSprop reaches loss $10^{-6}$ at step 137 and then bounces back up — the effective step in the stiff coordinate is $\eta L = 1$, so it orbits the optimum in a ball of radius $\eta$ forever. "Adam gets stuck at 1e-4 and will not go lower" is not a bug; it is the floor, and the cure is a decaying schedule, which is the entire content of the next topic.
+    - **$\epsilon$ is a floor on the denominator, and in fp16 it is a cliff.** Adam computes $\sqrt{\hat v} + \epsilon$ with $\epsilon = 10^{-8}$. When $|g| \approx \epsilon$ the denominator is $\approx 2\epsilon$ and the step is halved: with $g = 10^{-8}$ the update is $0.5\eta$, not $\eta$. The dangerous version is mixed precision, where $g^2$ underflows to zero below fp16's smallest subnormal $2^{-24} = 5.96\times10^{-8}$ — that is, any gradient below $2.44\times10^{-4}$. The denominator then collapses to $\epsilon = 10^{-8}$, the update becomes $g/\epsilon \approx 10^4\eta$, and training diverges. This is the mechanism behind "Adam blew up in fp16", and the reason loss scaling exists at all.
+    - **$\beta_2 = 0.999$ is a thousand-step memory, so one spike poisons the denominator for ~9,200 steps.** A batch whose gradient is $100\times$ baseline raises $g^2$ by $10^4$. The second moment decays as $0.999^k$, so returning to baseline takes $\ln(10^4)/\ln(1/0.999) = 9{,}206$ steps, and for that whole window the affected coordinate's steps are $100\times$ smaller. This is routinely misdiagnosed as a data problem, a dead ReLU, or "the model stopped learning"; the tell is that it started at one batch and recovered on its own after a few thousand steps.
+    - **Decoupled weight decay is not L2, and the difference is a factor of $\sqrt{\hat v}$.** Adam with L2 adds $\lambda\theta$ to the gradient and then divides by $\sqrt{\hat v}$, so a parameter with large historical gradients decays *less*. Take two weights at $\theta = 0.1$ with $\lambda = 0.01$: for the one whose gradient is $10^{-3}$ the decay term is 100% of the gradient, and for the one at $|g| = 1$ it is 0.1%. AdamW subtracts $\eta\lambda\theta$ directly, so both decay by exactly $10^{-6}$ per step. That is why AdamW's $\lambda = 0.1$ does what L2's $\lambda = 0.1$ never did, and why porting a recipe between the two changes the regularisation strength silently.
+    - **Lion discards magnitude after smoothing, and that moves every tuning constant.** Its update is $\operatorname{sign}(\beta_1 m + (1-\beta_1)g)$: each coordinate moves exactly $\pm\eta$, so a gradient spike cannot produce a large step — but the step also cannot shrink near the optimum. Hence the paper's ViT recipe uses $\eta = 10^{-4}$ against AdamW's $10^{-3}$ (ten times smaller) and weight decay $1.0$ against $0.1$ (ten times larger). It keeps one state tensor instead of two: for 7B parameters in fp32 that is 26.1 GiB instead of 52.2 GiB, which is the entire reason it exists.
+
+
+  derivations:
+    - title: "Momentum's steady-state gain is 1/(1−β)"
+      latex: |
+        With a constant gradient $g$, unroll the recursion:
+        $$v_t = \beta v_{t-1} + g = g\sum_{k=0}^{t-1}\beta^k
+               = g\,\frac{1-\beta^{t}}{1-\beta}$$
+        so
+        $$\lim_{t\to\infty} v_t = \frac{g}{1-\beta},
+          \qquad \Delta\theta = -\eta\,\frac{g}{1-\beta}.$$
+        The same geometric series gives the noise result: for white gradient
+        noise of variance $\sigma^2$, the EMA output has variance
+        $$\sigma^2\frac{(1-\beta)^2}{1-\beta^2}
+          = \sigma^2\frac{1-\beta}{1+\beta},$$
+        a standard-deviation ratio of $\sqrt{0.1/1.9} = 0.229$ at $\beta = 0.9$.
+      prose: >-
+        The gain and the noise reduction are the same geometric series read two
+        ways. Beta near 1 means a long average: a bigger multiplier on a
+        consistent slope, and a smaller one on noise. Both effects scale as
+        1/(1-beta), which is why the effective learning rate must be divided by
+        that factor when momentum is added.
+    - title: "Why the bias correction is exactly 1 − βᵗ"
+      latex: |
+        Initialize $m_0 = 0$ and let the gradient be stationary with
+        $\mathbb{E}[g_t] = \bar g$. Taking expectations of
+        $m_t = \beta m_{t-1} + (1-\beta) g_t$:
+        $$\mathbb{E}[m_t] = \beta\,\mathbb{E}[m_{t-1}] + (1-\beta)\bar g
+          = (1-\beta)\bar g \sum_{k=0}^{t-1}\beta^k
+          = \left(1-\beta^{t}\right)\bar g.$$
+        Dividing by $1-\beta^{t}$ gives an unbiased estimate,
+        $$\hat m_t = \frac{m_t}{1-\beta^{t}}, \qquad
+          \mathbb{E}[\hat m_t] = \bar g,$$
+        and identically $\hat v_t = v_t/(1-\beta_2^{t})$ for the second moment.
+      prose: >-
+        The bias is not a bug in the recursion, it is the zero initial
+        condition: an average that starts at zero is dragged toward zero for
+        exactly 1/(1-beta) steps. At t=1 the factor is 1-0.9 = 0.1, so the raw
+        first step is ten times too small; dividing by it makes Adam's opening
+        move exactly eta times the sign of the gradient.
+    - title: "Why heavy-ball squares the condition number"
+      latex: |
+        On $f(x) = \tfrac12 a x^2$ the heavy-ball pair
+        $(x_{k+1}, v_{k+1}) = (x_k - \eta(\beta v_k + a x_k),\; \beta v_k + a x_k)$
+        has iteration matrix
+        $$M(a) = \begin{pmatrix} 1-\eta a & -\eta\beta \\ a & \beta \end{pmatrix},
+          \qquad \lambda^2 - (1+\beta-\eta a)\lambda + \beta = 0.$$
+        Choose $\beta = \left(\frac{\sqrt\kappa-1}{\sqrt\kappa+1}\right)^2$ and
+        $\eta = \frac{4}{(\sqrt L + \sqrt m)^2}$. At $a = m$ the discriminant
+        vanishes and
+        $$\lambda = \frac{\sqrt\kappa-1}{\sqrt\kappa+1};$$
+        at $a = L$ the same modulus appears with a negative sign, because
+        $1+\beta-\eta L = -(1+\beta-\eta m)$.
+      prose: >-
+        Both extremes of the spectrum share the eigenvalue modulus
+        (sqrt(kappa)-1)/(sqrt(kappa)+1), so the error contracts at that rate for
+        every direction at once. The negative root at a = L is the oscillation
+        you see in practice: the stiff direction overshoots and comes back, which
+        is why momentum looks like zig-zag rather than smooth descent.
+
+  implementations:
+    - language: python
+      title: "AdamW from scratch, with the bias correction and decay in the right places"
+      note: >-
+        This is numerically correct, but note the two places it is easy to get
+        wrong and still "look trained": epsilon must be added after the square
+        root, not inside it, and the weight decay must be applied to the
+        parameter rather than folded into the gradient. It is also numerically
+        wrong in fp32 when gradients fall below 1e-8, because the epsilon then
+        dominates the denominator and the step becomes linear in g again — which
+        is a floor, not a bug, but it will stop a fine-tune dead.
+      code: |
+        import math
+
+        class AdamW:
+            """Adam with decoupled weight decay. One dict per parameter tensor."""
+
+            def __init__(self, params, lr=1e-3, beta1=0.9, beta2=0.999,
+                         eps=1e-8, weight_decay=0.01):
+                self.lr, self.b1, self.b2 = lr, beta1, beta2
+                self.eps, self.wd = eps, weight_decay
+                self.t = 0
+                self.m = [0.0] * len(params)
+                self.v = [0.0] * len(params)
+                self.p = list(params)
+
+            def step(self, grads):
+                self.t += 1
+                # Bias correction factors, computed once per step.
+                c1 = 1.0 - self.b1 ** self.t
+                c2 = 1.0 - self.b2 ** self.t
+                for i, g in enumerate(grads):
+                    # 1. Smooth the gradient (first moment).
+                    self.m[i] = self.b1 * self.m[i] + (1.0 - self.b1) * g
+                    # 2. Smooth the squared gradient (second moment).
+                    self.v[i] = self.b2 * self.v[i] + (1.0 - self.b2) * g * g
+                    # 3. Correct both, THEN take the ratio.
+                    m_hat = self.m[i] / c1
+                    v_hat = self.v[i] / c2
+                    # 4. eps goes OUTSIDE the sqrt. Inside, the effective
+                    #    epsilon is 1e-4 and small gradients are over-stepped.
+                    update = m_hat / (math.sqrt(v_hat) + self.eps)
+                    # 5. Decoupled decay: applied to the weight, not the gradient.
+                    self.p[i] -= self.lr * (update + self.wd * self.p[i])
+                return self.p
+
+        # Sanity check that the first step is exactly lr * sign(g):
+        #   opt = AdamW([1.0, 2.0], lr=1e-3)
+        #   opt.step([0.1, -0.2])  ->  [0.9990000001, 2.00099999995]
+    - language: python
+      title: "SGD with momentum and Nesterov — and the version that is quietly wrong"
+      note: >-
+        `sgd_wrong` is numerically WRONG in two independent ways, and both are
+        shipped constantly. First, it applies weight decay to the momentum
+        buffer instead of the parameter, so the decay is scaled by the same
+        1/(1-beta) gain as the gradient: at beta=0.9 and lambda=0.01 the
+        effective decay is 0.1, ten times too strong, and it only becomes visible
+        after thousands of steps. Second, it evaluates the Nesterov gradient at
+        the current point rather than at the lookahead point, which silently
+        turns Nesterov back into plain heavy-ball while the config still says
+        `nesterov=True`. Compare the two trajectories on a quadratic and the
+        wrong one overshoots by the momentum gain, not by the lookahead.
+      code: |
+        def sgd_momentum(params, grads, state, lr=0.1, beta=0.9, weight_decay=0.0):
+            """Correct: decay the parameter, accumulate the gradient."""
+            for i, g in enumerate(grads):
+                g = g + weight_decay * params[i]      # L2, coupled on purpose here
+                state[i] = beta * state[i] + g
+                params[i] -= lr * state[i]
+            return params, state
+
+        def sgd_nesterov(params, grads_fn, state, lr=0.1, beta=0.9):
+            """Correct Nesterov: gradient at the lookahead point."""
+            for i in range(len(params)):
+                lookahead = params[i] - lr * beta * state[i]
+                g = grads_fn(i, lookahead)
+                state[i] = beta * state[i] + g
+                params[i] -= lr * state[i]
+            return params, state
+
+        def sgd_wrong(params, grads, state, lr=0.1, beta=0.9, weight_decay=0.01):
+            """WRONG. Both bugs are silent; only the loss curve knows."""
+            for i, g in enumerate(grads):
+                state[i] = beta * state[i] + g
+                # Bug 1: decay inside the buffer -> effective lambda / (1-beta).
+                state[i] += weight_decay * params[i]
+                params[i] -= lr * state[i]
+            return params, state
+
+        def sgd_fake_nesterov(params, grads, state, lr=0.1, beta=0.9):
+            """WRONG. Says Nesterov, computes heavy-ball."""
+            for i, g in enumerate(grads):
+                # Bug 2: g was evaluated at params[i], not at the lookahead.
+                state[i] = beta * state[i] + g
+                params[i] -= lr * (g + beta * state[i])
+            return params, state
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        Adam's first update on a parameter with gradient $10^{-8}$ has magnitude
+        $0.5\eta$, not $\eta$. Where does the factor of two come from, and what
+        would it be with $\epsilon = 10^{-12}$?
+      answerKind: short_text
+      hint: "Write the denominator for $t = 1$: what are $\\hat m$ and $\\sqrt{\\hat v}$?"
+      solution: >-
+        At $t = 1$ the bias correction makes $\hat m = g$ and
+        $\sqrt{\hat v} = |g| = 10^{-8}$. The denominator is
+        $\sqrt{\hat v} + \epsilon = 10^{-8} + 10^{-8} = 2\times10^{-8}$, so the
+        update is $10^{-8}/(2\times10^{-8}) = 0.5$. With $\epsilon = 10^{-12}$
+        the denominator is $1.0001\times10^{-8}$ and the update is $0.9999\eta$
+        — the epsilon has stopped interfering. The lesson is that epsilon is not
+        a safety net, it is a lower bound on the gradient magnitude at which the
+        method still behaves adaptively.
+    - id: cp-2
+      question: >-
+        A run with Adam at $\beta_2 = 0.999$ hits one bad batch at step 5,000,
+        the loss jumps, and then nothing improves for hours before it recovers on
+        its own. What happened, and what would you change?
+      answerKind: short_text
+      hint: "How long does a $0.999$ EMA remember a single observation?"
+      solution: >-
+        The bad batch raised $g^2$ by some factor $c$. The second moment decays
+        as $0.999^k$, so it takes $\ln(c)/\ln(1/0.999) \approx 1000\ln c$ steps
+        to return to baseline — 9,206 steps for a $100\times$ gradient spike. For
+        that entire window the denominator is inflated and the affected
+        coordinates take proportionally smaller steps. That is not divergence, it
+        is a slow recovery, and it looks exactly like a data bug. Options: lower
+        $\beta_2$ to 0.99 (1,000-step horizon), clip gradients before the
+        optimizer sees them so the spike never enters $v$, or skip the batch.
+    - id: cp-3
+      question: >-
+        Why is Lion's learning rate ten times smaller than AdamW's, when both are
+        measured in the same parameter units?
+      answerKind: short_text
+      hint: "What is $|u_i|$ for Lion, and what is it for Adam on a typical noisy gradient?"
+      solution: >-
+        Lion's update is $\operatorname{sign}(\cdot)$, so $|u_i| = 1$ in *every*
+        coordinate, every step — the full $\eta$ always. Adam's is
+        $|\hat m_i|/\sqrt{\hat v_i}$, which on a noisy gradient is well below 1
+        because the mean is small relative to the root-mean-square; the effective
+        step is a fraction of $\eta$. So the same numeric $\eta$ produces a much
+        larger movement under Lion. The paper's recipes compensate with
+        $\eta = 10^{-4}$ against $10^{-3}$, and also need a ten times larger
+        weight decay because the sign update cannot shrink as the parameter
+        approaches zero.
+    - id: cp-4
+      question: >-
+        You add `momentum=0.9` to a working SGD recipe, keep the learning rate,
+        and the loss diverges. Explain the mechanism and give two fixes.
+      answerKind: short_text
+      hint: "What is the steady-state value of $v_t$ for a constant gradient?"
+      solution: >-
+        Momentum accumulates: for a constant gradient $v_t \to g/(1-\beta) =
+        10g$, so the effective step is $10\eta$ — the same as multiplying the
+        learning rate by ten. In the stiff direction that pushes $\eta_{\text{eff}}L$
+        past the $2(1+\beta)/L$ ceiling from *Convexity* and the iteration
+        diverges. Fixes: divide the learning rate by $1/(1-\beta)$ (i.e. use
+        $0.1\eta$), or keep $\eta$ and add a warmup that ramps the effective step
+        up over the first few thousand updates. Reducing $\beta$ also works but
+        changes the noise averaging you presumably wanted.
+    - id: cp-5
+      question: >-
+        Two parameters both sit at $\theta = 0.1$ with weight decay
+        $\lambda = 0.01$. One has $|g| = 10^{-3}$, the other $|g| = 1$. Under
+        Adam + L2, which decays faster, and by how much?
+      answerKind: short_text
+      hint: "The decay term enters the gradient, and the whole gradient is then divided by $\\sqrt{\\hat v}$."
+      solution: >-
+        The decay contributes $\lambda\theta = 10^{-3}$ to the gradient. For the
+        first parameter that is 100% of its gradient ($10^{-3}$ against
+        $10^{-3}$), so the update is roughly doubled and decay proceeds at nearly
+        full strength. For the second it is 0.1% of a gradient of 1, so it
+        vanishes. After normalisation by $\sqrt{\hat v}$ the first decays roughly
+        a thousand times faster in relative terms — which is the opposite of what
+        weight decay is supposed to do, since the small-gradient parameter is
+        usually the one you want to regularise. AdamW subtracts
+        $\eta\lambda\theta = 10^{-6}$ from both directly, so both decay
+        identically.
+    - id: cp-6
+      question: >-
+        Adam appears to solve ill-conditioning. On which problems does it
+        genuinely do so, and on which does it not?
+      answerKind: short_text
+      hint: "Write the update as $D^{-1}g$ and ask what $D$ is allowed to be."
+      solution: >-
+        Adam is a *diagonal* preconditioner whose entries come from gradient
+        magnitude, so it handles diagonal ill-conditioning exactly: for
+        $f = \tfrac12\sum a_i x_i^2$ we have $g_i = a_i x_i$ and
+        $\sqrt{\hat v_i} \propto a_i|x_i|$, so the curvature cancels and every
+        coordinate converges at the same rate. It cannot handle rotated
+        ill-conditioning: the update is $D^{-1}Ax$ with $D$ diagonal, and no
+        diagonal matrix removes the off-diagonal structure of $A$. If the stiff
+        eigenvector mixes coordinates, the step ceiling is still set by
+        $\lambda_{\max}$, and only a method that uses curvature — Newton, K-FAC,
+        Shampoo — changes that.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        An optimizer step is two separate operations that happen to be written on
+        one line: a *filter* that turns a noisy sequence of gradients into a
+        smoother sequence, and a *rescaling* that decides how much of that
+        smoothed value to trust in each coordinate. SGD does neither, which is
+        why its learning rate is entangled with gradient magnitude. Every other
+        method in this topic adds one or both, and the arithmetic of "which
+        average goes into which denominator" is where the bugs live.
+      blocks:
+        - kind: checklist
+          body: |
+            - Filter only: momentum (one state tensor)
+            - Rescale only: RMSprop (one state tensor)
+            - Filter then rescale: Adam (two state tensors)
+            - Filter then discard magnitude: Lion (one state tensor)
+            - Every one of them is `theta -= lr * u`
+      checkpoint: >-
+        If a method filters the gradient and then divides by the filtered
+        gradient's own magnitude, what happens to the size of the step when the
+        gradient doubles?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Write the state update first, then the parameter update, and keep them
+        strictly separate: the state variables are *raw* averages and are stored
+        raw; only the value used in the parameter update is corrected. If you
+        find yourself correcting `m` in place, the next step will double-correct
+        and the run will look fine for a few hundred steps and then drift. For a
+        divergence, do not guess — compute the effective step size. For Adam it
+        is bounded by $\eta$; for momentum it is $\eta/(1-\beta)$. Whichever
+        number is larger than your parameter scale is the one that is wrong.
+      blocks:
+        - kind: checklist
+          body: |
+            - Update m and v from the gradient; store them uncorrected
+            - Correct only inside the parameter update
+            - Compare |Δθ|/|θ| per layer; healthy is around 1e-3
+            - If momentum is involved, check eta/(1-beta) before blaming the data
+      checkpoint: >-
+        Your optimizer state is stored uncorrected, and `t` is incremented at the
+        start of the step rather than the end. What changes in the first update?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The shape of a correct adaptive step, and the order in which the pieces
+        must be combined.
+      blocks:
+        - kind: pseudocode
+          body: |
+            t = t + 1
+            c1 = 1 - beta1^t          # bias correction, both computed once
+            c2 = 1 - beta2^t
+
+            for each coordinate i:
+                m[i] = beta1 * m[i] + (1 - beta1) * g[i]
+                v[i] = beta2 * v[i] + (1 - beta2) * g[i]^2
+
+                m_hat = m[i] / c1
+                v_hat = v[i] / c2
+
+                step = m_hat / (sqrt(v_hat) + eps)    # eps OUTSIDE the sqrt
+                p[i] = p[i] - lr * (step + wd * p[i])
+
+            return p, m_raw, v_raw
+      checkpoint: >-
+        Why is `eps` added after the square root rather than inside it? Compute
+        both forms for $v = 0$ and $\epsilon = 10^{-8}$ and compare.
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Both non-obvious constants fall out of the same geometric series, and
+        both bounds fall out of the same inequality.
+      blocks:
+        - kind: math
+          body: |
+            Momentum, constant gradient:
+            $$v_t = g\sum_{k=0}^{t-1}\beta^k = g\frac{1-\beta^t}{1-\beta}
+              \;\longrightarrow\; \frac{g}{1-\beta}$$
+
+            Bias correction, stationary gradient, $m_0 = 0$:
+            $$\mathbb{E}[m_t] = (1-\beta)\bar g\sum_{k=0}^{t-1}\beta^k
+              = (1-\beta^t)\bar g
+              \quad\Longrightarrow\quad
+              \hat m_t = \frac{m_t}{1-\beta^t}$$
+
+            Step bound, with $w_k$ the (normalised) EMA weights:
+            $$\left|\hat m_i\right| = \left|\sum_k w_k g_k\right|
+              \le \sqrt{\sum_k w_k g_k^2} = \sqrt{\hat v_i}
+              \quad\Longrightarrow\quad
+              \left|\Delta\theta_i\right| \le \eta$$
+
+            Effective step for momentum at $\beta = 0.9$:
+            $$\eta_{\text{eff}} = \frac{\eta}{1-\beta} = 10\eta$$
+      checkpoint: >-
+        The bias correction divides by a number that starts at 0.1 and rises to
+        1. Which of the two moments needs the correction for longer, and what
+        does that imply about the first thousand Adam steps?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete, correct optimizer step plus the diagnostic that tells you
+        which hyperparameter is wrong before you waste a run on it.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the diagnostic first and predict what it will print for your own
+            model. If you cannot predict the order of magnitude of the
+            update-to-weight ratio, the rest of this will be code you copy
+            without understanding.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+            def adam_step(p, g, m, v, t, lr=1e-3, b1=0.9, b2=0.999,
+                          eps=1e-8, wd=0.0):
+                """One AdamW step. State is returned RAW; correction is local."""
+                c1, c2 = 1.0 - b1 ** t, 1.0 - b2 ** t
+                m = [b1 * mi + (1 - b1) * gi for mi, gi in zip(m, g)]
+                v = [b2 * vi + (1 - b2) * gi * gi for vi, gi in zip(v, g)]
+                out = []
+                for pi, mi, vi in zip(p, m, v):
+                    mh, vh = mi / c1, vi / c2
+                    out.append(pi - lr * (mh / (math.sqrt(vh) + eps) + wd * pi))
+                return out, m, v
+
+            def diagnose(p, g, lr=1e-3):
+                """Update-to-weight ratio per coordinate: the number to check first."""
+                rows = []
+                for pi, gi in zip(p, g):
+                    rows.append(abs(lr * gi) / max(abs(pi), 1e-12))
+                return {
+                    "max_ratio": max(rows),
+                    "median_ratio": sorted(rows)[len(rows) // 2],
+                    "verdict": ("diverging" if max(rows) > 1e-1 else
+                                "healthy" if max(rows) > 1e-5 else "stalled"),
+                }
+      checkpoint: >-
+        The diagnostic flags a single layer at ratio 0.4 while every other layer
+        sits at 1e-3. Is the learning rate wrong, or is something about that
+        layer different — and which optimizer would stop the two from being
+        coupled?
+
+  problems:
+    - id: p-adam-step
+      title: "One AdamW step, with bias correction"
+      difficulty: medium
+      prompt: >-
+        Implement `solve(params, grads, m, v, t, lr, beta1, beta2, eps,
+        weight_decay)` returning a dict with the updated `params` and the *raw*
+        (uncorrected) `m` and `v`. Use exactly this order: $m \leftarrow \beta_1
+        m + (1-\beta_1)g$; $v \leftarrow \beta_2 v + (1-\beta_2)g^2$; $\hat m =
+        m/(1-\beta_1^t)$, $\hat v = v/(1-\beta_2^t)$; $\theta \leftarrow \theta
+        - \eta(\hat m/(\sqrt{\hat v}+\epsilon) + \lambda\theta)$. Defaults:
+        `lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0`.
+      starter: |
+        import math
+
+        def solve(params, grads, m, v, t, lr=1e-3, beta1=0.9, beta2=0.999,
+                  eps=1e-8, weight_decay=0.0):
+            # your implementation here
+            pass
+      language: python
+      entry: solve
+      testCases:
+        - input: '{"params": [1.0, 2.0], "grads": [0.1, -0.2], "m": [0.0, 0.0], "v": [0.0, 0.0], "t": 1, "lr": 0.001}'
+          expected: '{"params": [0.9990000001, 2.00099999995], "m": [0.009999999999999998, -0.019999999999999997], "v": [1.0000000000000011e-05, 4.0000000000000044e-05]}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"params": [0.5, -0.25], "grads": [0.4, 0.02], "m": [0.1, -0.3], "v": [0.04, 0.09], "t": 10, "lr": 0.001, "weight_decay": 0.1}'
+          expected: '{"params": [0.49985057612655354, -0.24983808292314275], "m": [0.13, -0.268], "v": [0.04012, 0.08991039999999999]}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"params": [0.0], "grads": [1e-08], "m": [0.0], "v": [0.0], "t": 1, "lr": 0.001}'
+          expected: '{"params": [-0.0005], "m": [9.999999999999999e-10], "v": [1.0000000000000009e-19]}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"params": [1.0], "grads": [0.0], "m": [0.0], "v": [0.0], "t": 1, "lr": 0.001}'
+          expected: '{"params": [1.0], "m": [0.0], "v": [0.0]}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+
+        def solve(params, grads, m, v, t, lr=1e-3, beta1=0.9, beta2=0.999,
+                  eps=1e-8, weight_decay=0.0):
+            p = [float(x) for x in params]
+            g = [float(x) for x in grads]
+            m = [float(x) for x in m]
+            v = [float(x) for x in v]
+
+            c1 = 1.0 - beta1 ** t
+            c2 = 1.0 - beta2 ** t
+
+            new_m = [beta1 * mi + (1.0 - beta1) * gi for mi, gi in zip(m, g)]
+            new_v = [beta2 * vi + (1.0 - beta2) * gi * gi for vi, gi in zip(v, g)]
+
+            new_p = []
+            for pi, mi, vi in zip(p, new_m, new_v):
+                m_hat = mi / c1
+                v_hat = vi / c2
+                # eps is added AFTER the square root: inside, it would act as
+                # an effective epsilon of 1e-4 and over-step small gradients.
+                new_p.append(pi - lr * (m_hat / (math.sqrt(v_hat) + eps)
+                                        + weight_decay * pi))
+
+            return {"params": new_p, "m": new_m, "v": new_v}
+      solutionExplanation: >-
+        Two things make this pass and they are the two things people get wrong.
+        The state is returned raw, so the next call re-corrects from scratch;
+        correcting in place compounds the factor and the second step is wrong by
+        1/(1-beta^t) again. And the correction is applied to both moments before
+        the ratio — at t=1 that turns m=0.1g and v=0.001g^2 into m_hat=g and
+        v_hat=g^2, so the first update is exactly lr*sign(g). The third test case
+        is the one to stare at: with g=1e-8 and eps=1e-8 the denominator is
+        2e-8, so the step is 0.5*lr, not lr. The fourth shows that a zero
+        gradient produces a zero step rather than 0/0, because the numerator
+        vanishes faster than epsilon can matter.
+      complexity: "O(d) time, O(d) space per step"
+      tags: [adam, optimizer, bias-correction, numpy]
+
+    - id: p-lion-step
+      title: "One Lion step: sign, and the beta that is easy to swap"
+      difficulty: medium
+      prompt: >-
+        Implement `solve(params, grads, m, lr, beta1, beta2, weight_decay)`
+        returning the updated `params` and the new momentum `m`. Lion's order is:
+        $u = \operatorname{sign}(\beta_1 m + (1-\beta_1)g)$ using the *old*
+        momentum; $\theta \leftarrow \theta - \eta(u + \lambda\theta)$; then
+        $m \leftarrow \beta_2 m + (1-\beta_2)g$. Define
+        $\operatorname{sign}(0) = 0$. Defaults: `lr=1e-4, beta1=0.9, beta2=0.99,
+        weight_decay=0.0`.
+      starter: |
+        def solve(params, grads, m, lr=1e-4, beta1=0.9, beta2=0.99, weight_decay=0.0):
+            # your implementation here
+            pass
+      language: python
+      entry: solve
+      testCases:
+        - input: '{"params": [1.0, -0.5], "grads": [0.2, -0.01], "m": [0.05, 0.05], "lr": 0.0001, "weight_decay": 0.1}'
+          expected: '{"params": [0.99989, -0.500095], "m": [0.051500000000000004, 0.0494]}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"params": [1.0, -0.5], "grads": [0.2, -0.5], "m": [0.01, 0.01], "lr": 0.001}'
+          expected: '{"params": [0.999, -0.499], "m": [0.011900000000000003, 0.004899999999999996]}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"params": [0.0], "grads": [0.0], "m": [0.0], "lr": 0.001}'
+          expected: '{"params": [0.0], "m": [0.0]}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def solve(params, grads, m, lr=1e-4, beta1=0.9, beta2=0.99, weight_decay=0.0):
+            def sign(x):
+                return 1.0 if x > 0.0 else (-1.0 if x < 0.0 else 0.0)
+
+            p = [float(x) for x in params]
+            g = [float(x) for x in grads]
+            m = [float(x) for x in m]
+
+            # beta1 interpolates momentum against the current gradient, and the
+            # sign of THAT mixture is the update. beta2 is what updates the
+            # momentum afterwards -- swapping them is the classic bug.
+            update = [sign(beta1 * mi + (1.0 - beta1) * gi) for mi, gi in zip(m, g)]
+
+            new_p = [pi - lr * (ui + weight_decay * pi) for pi, ui in zip(p, update)]
+            new_m = [beta2 * mi + (1.0 - beta2) * gi for mi, gi in zip(m, g)]
+
+            return {"params": new_p, "m": new_m}
+      solutionExplanation: >-
+        The first test case is the whole idea: the second coordinate has a
+        *negative* gradient of -0.01, but the momentum term 0.9*0.05 = 0.045
+        outweighs it, so the sign is +1 and the parameter moves down anyway.
+        Lion is a majority vote, not a gradient follower. The second case shows
+        the vote going the other way: a gradient of -0.5 against momentum 0.009
+        flips the sign and the parameter moves up. Note also that beta1 and beta2
+        are not interchangeable — beta1 decides the vote, beta2 decides how fast
+        the memory turns over — and that no magnitude survives into the update,
+        so the step is exactly lr in every coordinate including the third case,
+        where sign(0) = 0 correctly produces no movement.
+      complexity: "O(d) time, O(d) space per step"
+      tags: [lion, optimizer, sign, momentum]
+
+    - id: p-heavy-ball
+      title: "Heavy-ball momentum on a quadratic, step by step"
+      difficulty: easy
+      prompt: >-
+        Implement `solve(x0, lr, beta, n, curvature)` — heavy-ball momentum on
+        $f(x) = \tfrac12 c x^2$, starting from $x_0$, for exactly $n$ steps, using
+        this order: $g = c\,x$; $v \leftarrow \beta v + g$; $x \leftarrow x -
+        \eta v$. The buffer $v$ starts at 0. Return the final $x$.
+      starter: |
+        def solve(x0, lr, beta, n, curvature=1.0):
+            # your implementation here
+            pass
+      language: python
+      entry: solve
+      testCases:
+        - input: '{"x0": 1.0, "lr": 0.1, "beta": 0.9, "n": 0}'
+          expected: '1.0'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"x0": 1.0, "lr": 0.1, "beta": 0.9, "n": 2}'
+          expected: '0.72'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"x0": 1.0, "lr": 0.1, "beta": 0.9, "n": 5}'
+          expected: '-0.029159999999999964'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"x0": 1.0, "lr": 0.1, "beta": 0.9, "n": 50}'
+          expected: '-0.06668023889660835'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"x0": 2.0, "lr": 0.05, "beta": 0.5, "n": 10, "curvature": 4.0}'
+          expected: '-0.06509059319999999'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def solve(x0, lr, beta, n, curvature=1.0):
+            x = float(x0)
+            v = 0.0
+            for _ in range(int(n)):
+                g = curvature * x
+                # The buffer accumulates the GRADIENT, then the step is lr*v.
+                # Writing v = beta*v - lr*g and x += v is the other convention
+                # and produces a different trajectory; this is the one specified.
+                v = beta * v + g
+                x = x - lr * v
+            return x
+      solutionExplanation: >-
+        The trajectory with x0=1, lr=0.1, beta=0.9 is 1.0, 0.9, 0.72, 0.486,
+        0.2268, -0.02916 — and the last term is the point. By step 5 the iterate
+        has crossed zero and is *overshooting*, because v at that point is still
+        2.56 and the step is lr*v = 0.256 against a position of 0.227. That is
+        momentum working as designed: it carries velocity through the flat part
+        near the optimum. The n=50 case then settles into a decaying oscillation
+        and lands at -0.0667, still moving; the geometric decay rate is
+        sqrt(beta) = 0.949 once the roots of the characteristic polynomial go
+        complex, which happens exactly when the effective step exceeds the
+        curvature.
+      complexity: "O(n) time, O(1) space"
+      tags: [momentum, optimizer, quadratic, simulation]
+
+  visualizers:
+    - id: gd-loss-surface
+      kind: loss_surface
+      title: "Where the step ceiling comes from"
+      description: >-
+        A quadratic with condition number $\kappa$. Drag the learning rate past
+        $2/L$ and watch a stable descent become a divergence; raise $\kappa$ and
+        watch the same learning rate start to zig-zag along the flat direction.
+        This is the $2/L$ and $(\kappa-1)/(\kappa+1)$ result from *Convexity*,
+        made draggable.
+      params:
+        kappa: 100
+        lr: 0.01
+
+  try_it: >-
+    Run 200 steps of SGD, momentum with $\beta = 0.9$, and Adam on the same 2-D
+    quadratic from the same start at $\eta = 10^{-2}$, printing each parameter
+    trajectory. Then check the momentum steady-state gain $1/(1-\beta) = 10$
+    against the step length you actually observe.
+  interview_questions:
+    - question: "Why does momentum give you $\\sqrt{\\kappa}$ instead of $\\kappa$?"
+      level: mid
+      key_points:
+        - "Plain gradient descent contracts by $(\\kappa-1)/(\\kappa+1)$ per step, so a $\\kappa = 10^4$ problem needs 69,078 steps to reach $10^{-6}$."
+        - "Heavy-ball with $\\beta^\\star = ((\\sqrt\\kappa-1)/(\\sqrt\\kappa+1))^2 = 0.9608$ turns the effective conditioning into $\\sqrt{\\kappa}$ — $10^4$ behaves like $10^2$."
+        - "The mechanism is that the momentum term cancels the alternating component along the steep direction while accumulating along the slow one."
+        - "It is a rate improvement, not a curvature model: no first-order method removes the dependence on $\\kappa$ entirely, only preconditioning changes the metric."
+      follow_up: "Momentum still stalls on a badly scaled problem. What would you add, and what does it cost per step?"
+    - question: "A fine-tune plateaus, an embedding table decays toward zero, and one bad batch is followed by 9,000 steps of nothing. What is the common cause?"
+      level: senior
+      key_points:
+        - "All three are Adam's per-coordinate normalisation: $|\\hat m_i|/\\sqrt{\\hat v_i} \\le 1$, so the step is a length rather than a multiple of the gradient."
+        - "The step cannot shrink, so as the gradient vanishes the update stays at $\\pm\\eta$ until $\\epsilon$ takes over — a floor at $\\eta L$, which reads as a plateau that bounces."
+        - "Decoupled weight decay differs from L2 by a factor of $\\sqrt{\\hat v}$: L2's shrinkage is divided by the second moment, so high-gradient weights decay less."
+        - "$\\beta_2 = 0.999$ is a thousand-step memory: a $100\\times$ gradient spike raises $g^2$ by $10^4$ and takes $\\ln(10^4)/\\ln(1/0.999) = 9{,}206$ steps to decay."
+      follow_up: "You fix $\\beta_2$ to 0.99. What new failure does that expose, and how do you detect it?"
+    - question: "What does bias correction actually correct, and does it still matter at step 10,000?"
+      level: mid
+      key_points:
+        - "With $m_0 = 0$ the raw EMA satisfies $E[m_t] = (1-\\beta^t)E[g]$, so at $t = 1$ and $\\beta = 0.9$ the first step is ten times too small."
+        - "Dividing by $1-\\beta^t$ restores the scale, which makes Adam's first update exactly $\\eta\\,\\text{sign}(g_1)$ — a full-length step in every coordinate."
+        - "After $t \\gg 1/(1-\\beta)$ the factor is indistinguishable from 1, so it is entirely a start-of-training correction."
+        - "It corrects the first moment only; the variance of $\\hat v$ early in training is untouched, which is precisely what warmup compensates for."
+  common_mistakes:
+    - "Assuming Adam's step shrinks as the gradient vanishes — the ratio $|\\hat m|/\\sqrt{\\hat v}$ stays near 1, so the step floors at $\\eta L$ and the loss bounces instead of settling."
+    - "Using Adam with an L2 penalty and expecting SGD-style shrinkage; the division by $\\sqrt{\\hat v}$ makes the decay depend on each weight's gradient history."
+    - "Setting $\\beta_2 = 0.999$ 'for stability' and then chasing a loss spike for 9,206 steps, which is exactly how long the second moment remembers it."
+  further_reading:
+    - label: "Kingma & Ba, Adam: A Method for Stochastic Optimization (ICLR 2015)"
+    - label: "Sutskever, Martens, Dahl & Hinton, On the importance of initialization and momentum in deep learning (ICML 2013)"

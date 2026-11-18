@@ -1,0 +1,1445 @@
+id: regularisation-in-practice
+slug: regularisation-in-practice
+title: "Regularisation in Practice: Dropout, Weight Decay, Augmentation"
+summary: >-
+  Pick a dropout rate, a weight-decay coefficient and an augmentation set by
+  measurement rather than by copying, and know which of the three your optimiser
+  is actually applying — because `weight_decay=0.01` is two different estimators
+  in `Adam` and `AdamW`, and a decay of 0.01 at lr 3e-4 shrinks a weight by 5.8%
+  over a 20,000-step run.
+kind: lesson
+difficulty: hard
+position: 9
+estMinutes: 27
+prerequisites: [mlp-from-scratch, regularisation]
+phase: deep-learning-foundations
+tags: [dropout, inverted-dropout, weight-decay, adamw, augmentation, ensembles, generalisation, spatial-dropout]
+
+body:
+  big_idea: >-
+    Every regulariser is a constraint the training loss cannot see — dropout
+    forces $2^n$ subnetworks to agree, weight decay shrinks at
+    $\text{lr}\cdot\lambda$, augmentation edits the input distribution — so
+    ask which invariance you assert.
+
+  problem:
+    - >-
+      You add dropout and validation drops four points, add
+      `weight_decay=0.01` to Adam and nothing changes, add random crops and
+      centre-crop validation gets worse.
+    - >-
+      You train with dropout, then `eval()`: the logits are 1024 times larger
+      than the loss saw, accuracy is unchanged, and calibration is destroyed.
+    - >-
+      You set `weight_decay=0.01` at `lr=3e-4` for 20,000 steps, which shrinks
+      an unconstrained weight by 5.8% — a rounding error next to the gradient.
+
+  analogy: |
+    Dropout is a team practising with a random half of its players sent home
+    each session, so nobody builds a move that depends on one colleague; at
+    match time everyone plays. Inverted dropout is the accountant's fix: pay
+    every player who shows up double, so a practice's expected output equals
+    the match's. The identity is exact for a linear map, only first-order
+    through a ReLU.
+
+  concept_points:
+    - >-
+      **Dropout is an ensemble of $2^n$ subnetworks that share one parameter set, and the sharing is the regulariser.**
+      A mask over $n$ units selects one of $2^n$ networks: $n=16$ gives 65,536
+      members, $n=256$ gives $1.16\times10^{77}$. You train all of them at
+      once, and the constraint that they agree on a single $W$ is what stops
+      the net depending on any one unit. The noise is a side effect.
+    - >-
+      **Inverted scaling makes `eval()` a no-op, and the identity is exact only for a linear map.**
+      With keep probability $1-p$, $\mathbb{E}[m/(1-p)] = 1$: measured, the
+      mean is 1.000036. The exactness stops at the nonlinearity. Skip the
+      scaling and the eval pre-activation is $1/(1-p)^L$ too large —
+      $1024\times$ at $L=10$ — which is invisible in argmax but not with
+      biases: **27.0%** of predictions change and max softmax goes 0.173 →
+      0.973.
+    - >-
+      **Dropout multiplies the gradient's variance by $p/(1-p)$ per masked layer — a learning-rate change wearing a mask.**
+      The variance of $mh/(1-p)$ about $h$ is $p/(1-p)\cdot h^2$: **0.25** at
+      $p=0.2$, **1.0** at $p=0.5$, **4.0** at $p=0.8$, reproduced by a
+      200,000-sample Monte Carlo. Adding dropout changes the signal-to-noise
+      ratio of every step, so peak learning rate and step count must move with
+      it.
+    - >-
+      **Weight decay's strength is $\text{lr}\cdot\lambda$, not $\lambda$, and its benefit is a U.**
+      The per-step shrink is $1-\text{lr}\cdot\lambda$, so the half-life is
+      $\ln 2/(\text{lr}\cdot\lambda)$: **69,314 steps** at
+      $\text{lr}=0.1,\lambda=10^{-4}$; **231,049** at
+      $\text{lr}=3\times10^{-4},\lambda=10^{-2}$. Test accuracy goes 0.8772(
+      $\lambda=0$), 0.8965, **0.9008** ($10^{-2}$), 0.8545( $5\times10^{-2}$)
+      while $\|W\|_F$ falls monotonically.
+    - >-
+      **Under Adam, an L2 penalty and a weight decay are different estimators; `AdamW` is the second.**
+      In `Adam(weight_decay=λ)` the term $\lambda w$ is added to the gradient
+      and divided by $\sqrt{\hat v}$, giving equilibrium
+      $w^\star = -g/\lambda$, proportional to the gradient. In `AdamW` decay
+      is applied outside the normalisation, so $|w| \approx 1/\lambda$:
+      measured **$-9.99999$** against **$-9.99001$**, 0.1% apart, where Adam
+      gave $-0.1$ and $-0.0001$.
+    - >-
+      **Augmentation is a prior on the input distribution, and the price is accuracy on the distribution you actually have.**
+      Trained on a $\pm25°$ wedge of a ring and tested on the full circle:
+      without augmentation 0.9400 train, **0.6332** full-circle, 0.5765 on the
+      opposite side; with random rotations 0.9333, **0.9327**, 0.9405. Dropout
+      does not substitute — full-circle accuracy is 0.6332, 0.5950, 0.6392 at
+      $p=0, 0.2, 0.5$.
+
+  definitions:
+    - term: "Dropout"
+      meaning: >-
+        A train-time operation that multiplies each activation by an independent
+        Bernoulli mask with keep probability $1-p$, and rescales by $1/(1-p)$ so
+        the expected activation is unchanged. It is an ensemble method whose
+        members share weights, not a noise injection with a variance knob.
+    - term: "Dropout mask"
+      meaning: >-
+        The 0/1 tensor drawn per example per layer. It is drawn independently
+        for every element (elementwise dropout) or every channel (spatial
+        dropout), and the distinction is the whole difference between the two
+        operations.
+    - term: "Inverted dropout"
+      meaning: >-
+        The convention that divides by $1-p$ during training and does nothing at
+        inference. Since $\mathbb{E}[m/(1-p)] = 1$, the expected pre-activation
+        is preserved and `eval()` is the identity. The alternative — scale by
+        $1-p$ at test time — is mathematically equivalent and numerically
+        fragile, because it makes the eval path depend on a training
+        hyperparameter.
+    - term: "Keep probability"
+      meaning: >-
+        $1-p$, the fraction of units that survive a mask. It is what frameworks
+        actually take in some APIs and what `dropout(p=...)` inverts, which is a
+        reliable source of off-by-one-half bugs when porting code between
+        libraries.
+    - term: "Weight decay"
+      meaning: >-
+        A per-step multiplicative shrink of the parameters, $w \leftarrow
+        w(1-\text{lr}\cdot\lambda)$, applied by the optimiser rather than by the
+        loss. Its strength is the product $\text{lr}\cdot\lambda$, so a
+        coefficient quoted without a learning rate is not a number anyone can
+        act on.
+    - term: "L2 penalty (coupled)"
+      meaning: >-
+        The term $\frac{\lambda}{2}\|w\|^2$ added to the loss, whose gradient
+        $\lambda w$ joins the data gradient. Under plain SGD it is exactly
+        equivalent to weight decay; under Adam or momentum it is not, because
+        the sum is subsequently normalised or accumulated.
+    - term: "Decoupled weight decay (AdamW)"
+      meaning: >-
+        Weight decay applied directly to the parameter, outside the adaptive
+        normalisation: $w \leftarrow w(1-\text{lr}\cdot\lambda) - \text{lr}\cdot
+        \hat m/(\sqrt{\hat v}+\epsilon)$. Its equilibrium is $|w| = 1/\lambda$
+        for any gradient scale, which is what makes the coefficient portable
+        across models.
+    - term: "Effective decay"
+      meaning: >-
+        $\text{lr}\cdot\lambda$, the fraction of a weight removed per step, or
+        equivalently the half-life $\ln 2/(\text{lr}\cdot\lambda)$. This, not
+        $\lambda$, is what you compare between recipes, and it is why the same
+        $0.01$ is aggressive at $\text{lr}=0.1$ and inert at
+        $\text{lr}=10^{-4}$.
+    - term: "Generalisation gap"
+      meaning: >-
+        Train accuracy minus test accuracy on the same distribution. Useful as a
+        diagnosis and useless as an objective: it falls monotonically as you
+        make the model worse in both directions, so a smaller gap can accompany
+        a lower test score.
+    - term: "Data augmentation"
+      meaning: >-
+        A set of label-preserving transformations applied to training inputs.
+        It is a prior on the input distribution — a claim that the label does
+        not change under those transforms — and it is only correct when the test
+        distribution makes the same claim.
+    - term: "Invariance"
+      meaning: >-
+        A transformation under which the label is unchanged. Horizontal flips
+        are an invariance of cat photographs and not of digit recognition;
+        rotations are an invariance of satellite imagery and not of portraits.
+        Augmentation is the act of asserting one.
+    - term: "Spatial (channel) dropout"
+      meaning: >-
+        Dropping entire channels of a feature map instead of individual
+        elements. It removes a feature rather than corrupting it, and it is the
+        only version that behaves like dropout on a fully connected layer, where
+        a "channel" is a unit.
+    - term: "Stochastic depth"
+      meaning: >-
+        Dropping whole residual blocks during training, $2^L$ subnetworks of a
+        deep net with $L$ blocks. The natural generalisation of dropout to
+        depth, and the reason very deep nets can use $p$ near 0.5 without
+        destroying their signal.
+    - term: "Monte Carlo dropout"
+      meaning: >-
+        Leaving dropout on at inference and averaging several stochastic passes
+        to get a predictive distribution. It is a different estimator from the
+        deterministic eval network and needs no retraining, but it costs $k$
+        forward passes and its calibration is only as good as the dropout
+        approximation.
+    - term: "Early stopping"
+      meaning: >-
+        Stopping when validation loss stops improving. It is an implicit
+        regulariser — the parameter norm at the stopping point is bounded by the
+        distance travelled — and it is the cheapest one to add and the easiest
+        to leak on, since peeking at the validation set to choose the step is a
+        hyperparameter fit on the same data.
+
+  diagrams:
+    - type: compare
+      title: "Two readings of dropout, and only one of them tells you how to write the eval path"
+      left_label: "Noise (the 2012 story)"
+      left_points:
+        - "A mask is multiplicative noise: relative variance p/(1-p) per unit, 0.25 at p=0.2 and 4.0 at p=0.8"
+        - "Explains why training accuracy falls; explains nothing about inference"
+        - "Suggests scaling by (1-p) at test time, which makes eval depend on a training knob"
+        - "Has no account of why sharing one W across masks matters"
+        - "Cannot say why p=0.5 works at width 4096 (10^1233 members) and fails at width 16"
+      right_label: "Ensemble of 2^n weight-sharing subnetworks"
+      right_points:
+        - "n=16 gives 65,536 members; n=256 gives 10^77; n=4096 gives 10^1233 — all one parameter set"
+        - "The mean member is the deterministic net, so eval needs no change once training scales by 1/(1-p)"
+        - "The constraint is the regulariser: 2^n functions fitted by n parameters"
+        - "Predicts the p/(1-p) gradient-variance cost, because members must disagree"
+        - "Predicts the failure at large p: the members become too weak individually to be useful"
+    - type: architecture
+      title: "Where each regulariser actually lives in one training step"
+      nodes:
+        - { id: aug, x: 0, y: 1, label: "data loader: augmentation", kind: worker, detail: "Random crops, flips, rotations, colour jitter. Lives here because it is a statement about the input distribution. Whatever you do here must commute with the label — a 90-degree rotation of a digit does not." }
+        - { id: fwd, x: 1, y: 1, label: "forward: dropout masks", kind: model, detail: "Mask and rescale by 1/(1-p) inside the block. Nothing about this exists at eval: same weights, no masks, no correction. If your model has a train/eval flag, this is why." }
+        - { id: loss, x: 2, y: 1, label: "loss", kind: server, detail: "Cross-entropy plus, at most, an L2 term. If you are using AdamW, nothing regularising is here at all — which is why a loss-based L2 term and a decoupled decay are not interchangeable." }
+        - { id: opt, x: 3, y: 1, label: "optimiser: weight decay", kind: server, detail: "w <- w(1 - lr*lambda) before the adaptive step. Strength is lr*lambda: 693-step half-life at lr 0.1, lambda 1e-2; 231,049 steps at lr 3e-4, lambda 1e-2." }
+        - { id: ev, x: 3, y: 3, label: "eval / export", kind: client, detail: "Dropout off, decay frozen, augmentation never applied (except at test-time-augmentation, which is a different and deliberate choice). Any mismatch between this path and the training path is a bug that shows up as calibration, not as accuracy." }
+      edges:
+        - { from: aug, to: fwd, label: "batch" }
+        - { from: fwd, to: loss, label: "logits" }
+        - { from: loss, to: opt, label: "gradients" }
+        - { from: opt, to: aug, label: "next step", style: "async" }
+        - { from: fwd, to: ev, label: "same weights, no mask", style: "async" }
+    - type: plot
+      title: "The gap is not the objective: 60 points, 2-64-64-2, no augmentation"
+      chart: line
+      xLabel: "dropout probability p"
+      yLabel: "accuracy"
+      series:
+        - name: "train accuracy"
+          points:
+            - { x: 0.0, y: 1.0 }
+            - { x: 0.2, y: 1.0 }
+            - { x: 0.5, y: 0.9333 }
+        - name: "test accuracy"
+          points:
+            - { x: 0.0, y: 0.8712 }
+            - { x: 0.2, y: 0.8772 }
+            - { x: 0.5, y: 0.8468 }
+        - name: "gap (train - test)"
+          points:
+            - { x: 0.0, y: 0.1288 }
+            - { x: 0.2, y: 0.1228 }
+            - { x: 0.5, y: 0.0866 }
+    - type: plot
+      title: "Augmentation is a prior you can see: accuracy against the angular position of the test set"
+      chart: line
+      xLabel: "centre of the 50-degree test window (degrees)"
+      yLabel: "accuracy"
+      series:
+        - name: "trained on a +-25 degree wedge, no augmentation"
+          points:
+            - { x: 25, y: 0.946 }
+            - { x: 55, y: 0.872 }
+            - { x: 85, y: 0.587 }
+            - { x: 115, y: 0.486 }
+            - { x: 145, y: 0.487 }
+            - { x: 175, y: 0.543 }
+            - { x: 205, y: 0.647 }
+        - name: "same data with random rotation augmentation"
+          points:
+            - { x: 25, y: 0.946 }
+            - { x: 55, y: 0.944 }
+            - { x: 85, y: 0.942 }
+            - { x: 115, y: 0.95 }
+            - { x: 145, y: 0.932 }
+            - { x: 175, y: 0.937 }
+            - { x: 205, y: 0.943 }
+    - type: pipeline
+      title: "Diagnose before you regularise — four symptoms, four different fixes"
+      nodes:
+        - label: "Train 0.99, validation 0.87, same distribution"
+          note: "variance problem: the model has memorised"
+          detail: "Dropout, weight decay, early stopping and more data all attack this. Pick by cost: early stopping is free, decay is one number, dropout changes the architecture's train/eval paths, augmentation needs an invariance you can name."
+        - label: "Train 0.94, validation 0.63, and the validation set is shifted"
+          note: "prior problem: the model never saw that region"
+          detail: "No amount of dropout fixes this. On the wedge task, p from 0 to 0.5 moves full-circle accuracy 0.6332 to 0.6392 — a 0.6-point change, i.e. nothing. Augmentation is the only one of the three that changes which inputs the function is fitted on."
+        - label: "Train 0.62 and validation 0.61"
+          note: "capacity or optimisation problem, not a regularisation problem"
+          detail: "Regularising further makes both numbers worse and the gap smaller, which flatters the diagnostic. Fix the optimisation first: learning rate, warmup, normalisation, depth."
+        - label: "Validation above train"
+          note: "your validation split is easier or it leaks"
+          detail: "Dropout makes train accuracy artificially low, so a small train-below-validation margin is normal with p=0.5. A large one is a split problem, and no regulariser will fix a split."
+        - label: "Then measure, do not guess"
+          note: "sweep one coefficient at a time on a real validation split"
+          detail: "Report the absolute validation number and the coefficient in its natural units: p, lr*lambda, and the augmentation set described by the invariance it asserts. The gap is an explanation, not a criterion."
+
+  markdown: |
+    ## Three regularisers, three different objects
+
+    They are usually taught as one list, which is why they get tuned as one
+    knob. They act on three different things:
+
+    | | Acts on | Implemented in | Strength is | Fails when |
+    |---|---|---|---|---|
+    | Dropout | the function class | the model, train-time only | $p$, plus the width it needs | $p$ is so high the members are individually useless |
+    | Weight decay | the parameter norm | the optimiser | $\text{lr}\cdot\lambda$ | $\text{lr}\cdot\lambda$ is below $10^{-5}$ per step |
+    | Augmentation | the input distribution | the data loader | the set of transforms | the transform does not preserve the label |
+
+    Getting the third column wrong is the most common bug in the topic: a
+    regulariser is not "something that reduces overfitting", it is a specific
+    constraint applied at a specific point in the step. Weight decay applied to
+    the loss instead of the optimiser is a different estimator. Dropout left on
+    at eval is a different function. Augmentation applied at eval is a different
+    test set.
+
+    ## Dropout: an ensemble you do not have to evaluate
+
+    A mask over $n$ units selects one of $2^n$ subnetworks. For a 4096-unit
+    layer that is $10^{1233}$ members, all sharing one $W$, and the fact that
+    they must share it is the regulariser: you are asking a single parameter
+    vector to support an exponential number of functions, and the only way to do
+    that is to make each function depend on many units rather than a few.
+
+    The arithmetic that makes this practical is one line. With keep probability
+    $1-p$,
+
+    $$\mathbb{E}\left[\frac{m}{1-p}\right] = \frac{1-p}{1-p} = 1,
+      \qquad
+      \operatorname{Var}\left(\frac{m}{1-p}\right) = \frac{p}{1-p},$$
+
+    so scaling at train time leaves the *expected* pre-activation alone and the
+    deterministic eval pass needs no correction at all. The variance is the
+    price: $p/(1-p)$ per masked layer, which is 0.25 at $p=0.2$ and 4.0 at
+    $p=0.8$.
+
+    Measured on 200,000 masks at $p=0.5$, the mean of $m/(1-p)$ is 1.000036 —
+    an error of $3.7\times10^{-5}$, which is the Monte Carlo error and not a
+    bias. The same experiment on the unscaled mask gives 0.5, and compounding
+    that over $L$ layers is the whole failure mode:
+
+    | layers $L$ | $p=0.2$: $1/(1-p)^L$ | $p=0.5$: $1/(1-p)^L$ |
+    |---|---|---|
+    | 3 | 1.95 | 8 |
+    | 10 | 9.31 | 1,024 |
+    | 20 | 86.7 | 1,048,576 |
+
+    What that inflation does depends on what is in the chain. ReLU is positively
+    homogeneous, so a bias-free ReLU stack rescales uniformly and the argmax
+    cannot move — measured on 2,000 inputs at $64\times$, exactly zero
+    predictions changed. Biases are not homogeneous, so with biases the
+    rescaling is not uniform: at the same $64\times$, 27.0% of predictions
+    changed and the mean maximum softmax went from 0.173 to 0.973. Forgetting
+    the scaling is not a scaling bug. It is a different function, and accuracy
+    on a saturated classifier is the last place it shows.
+
+    ## Weight decay: the coefficient is not the strength
+
+    Weight decay is a per-step multiplicative shrink applied by the optimiser:
+
+    $$w \leftarrow w\,(1-\text{lr}\cdot\lambda).$$
+
+    Everything about tuning it follows from that product. The half-life of a
+    weight with no gradient is $\ln 2/(\text{lr}\cdot\lambda)$:
+
+    | $\text{lr}$ | $\lambda=10^{-4}$ | $\lambda=10^{-2}$ |
+    |---|---|---|
+    | $3\times10^{-4}$ | 23.1 million steps | 231,049 steps |
+    | $10^{-2}$ | 693,147 steps | 6,931 steps |
+    | $0.1$ | 69,314 steps | 693 steps |
+
+    A recipe that says "weight decay 0.01" and a recipe that says "weight decay
+    0.01" are not the same recipe if the learning rates differ by 300x, and
+    neither is the same recipe under a cosine schedule, where the relevant
+    quantity is the integral of $\text{lr}$ rather than its peak. The number to
+    report is $\text{lr}\cdot\lambda$, or the half-life.
+
+    The benefit is a U, and the norm does not know where the bottom is. On the
+    60-point ring task with dropout at $p=0.2$:
+
+    | $\lambda$ | train | test | $\|W\|_F$ |
+    |---|---|---|---|
+    | 0 | 1.0000 | 0.8772 | 21.85 |
+    | $10^{-3}$ | 1.0000 | 0.8965 | 10.02 |
+    | $10^{-2}$ | 0.9667 | **0.9008** | 4.81 |
+    | $5\times10^{-2}$ | 0.9333 | 0.8545 | 3.27 |
+
+    Test accuracy turns between $10^{-2}$ and $5\times10^{-2}$; the norm keeps
+    falling. If you select $\lambda$ by watching $\|W\|$, you will keep walking
+    past the optimum, because the thing you are watching is monotone and the
+    thing you want is not.
+
+    ## Adam and AdamW are different estimators
+
+    This is the one that silently changes your model. With an L2 penalty,
+
+    $$g_t = \nabla L + \lambda w,
+      \qquad
+      w \leftarrow w - \text{lr}\,\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon},$$
+
+    the penalty is divided by $\sqrt{\hat v_t}$, which the data gradient
+    dominates. Set the update to zero and the equilibrium is
+
+    $$w^\star = -\frac{g}{\lambda},$$
+
+    so the "regularised" weight is proportional to the gradient it receives. A
+    weight with a gradient of $10^{-5}$ can never be pushed below $10^{-5}/\lambda$
+    no matter how large $\lambda$ is. Measured at $\lambda=0.1$,
+    $\text{lr}=0.01$, over 20,000 steps: $g=10^{-2}$ settles at $-0.100000$,
+    $g=10^{-5}$ at $-0.000100$ — three orders of magnitude apart, from one
+    coefficient.
+
+    AdamW applies the decay to the weight, before and outside the
+    normalisation:
+
+    $$w \leftarrow w\,(1-\text{lr}\cdot\lambda)
+      - \text{lr}\,\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon},$$
+
+    and now the equilibrium is $|w| = 1/\lambda$ for every weight regardless of
+    its gradient: measured $-9.99999$ and $-9.99001$ for the same two cases.
+    That is the property you want from a coefficient you intend to reuse across
+    models — the decay is a rate, not a ratio to the gradient.
+
+    One caveat that costs people runs: $1/\lambda$ is the equilibrium, not the
+    first-step behaviour. The approach is exponential with time constant
+    $1/(\text{lr}\cdot\lambda)$ steps — 100,000 of them at
+    $\text{lr}\cdot\lambda=10^{-5}$ — so a 20,000-step run at $\lambda=0.01$,
+    $\text{lr}=10^{-3}$ reaches $|w| = 17.3$ on its way to 100. Over a horizon
+    that short, both implementations are indistinguishable from no decay at
+    all.
+
+    ## Augmentation: a prior with a price
+
+    Train a 2-64-64-2 net on 300 points drawn from a $\pm25°$ wedge of a ring
+    task — the label is whether the radius exceeds 1.25 — and test it around the
+    circle:
+
+    | | train | same wedge | full circle | opposite side |
+    |---|---|---|---|---|
+    | no augmentation | 0.9400 | 0.9370 | 0.6332 | 0.5765 |
+    | random rotation | 0.9333 | 0.9440 | 0.9327 | 0.9405 |
+
+    The unaugmented model is not broken; it is exactly as good as its data
+    allowed it to be. Inside the wedge the label is almost a function of $x$
+    alone, so it learned "x greater than a threshold", which is a perfect rule
+    where it was trained and a coin flip at 180 degrees. Sweeping a 50-degree
+    test window around the circle gives 0.946, 0.872, 0.587, 0.486, 0.487,
+    0.543, 0.647 — the shape of a rule that only knows one direction. The
+    augmented model is flat at 0.93 to 0.95 everywhere, and it pays for that
+    with 0.7 points of training accuracy, which is the entire price of the
+    prior.
+
+    The rule that follows: augmentation is a claim that the label is invariant
+    under the transform, and the claim is either true of your test distribution
+    or it is a bug. Flips are an invariance of photographs and not of digits;
+    rotations are an invariance of aerial imagery and not of faces; colour jitter
+    is an invariance of shape and not of ripeness. When the claim is wrong, the
+    symptom is a model that is worse than the un-augmented one on clean data —
+    no error, just a quieter regression.
+
+    ## What to report
+
+    Four numbers and one sentence. The dropout rate $p$ **and** the width it was
+    tuned at, because $p=0.5$ means something different at width 64 and width
+    4096. The effective decay $\text{lr}\cdot\lambda$, not $\lambda$. The
+    augmentation set, described by the invariance it asserts rather than by the
+    library call. The absolute validation score, and the gap as an explanation.
+    Then the sentence: "we assume the label is invariant under X", which is the
+    assumption a reviewer is entitled to challenge.
+
+    ## The longer version
+
+    Every regulariser in deep learning is a constraint the training loss cannot
+    see — dropout forces $2^n$ weight-sharing subnetworks to agree on one
+    parameter set, weight decay shrinks each parameter at a rate $\text{lr}\cdot\lambda$
+    that owes nothing to its gradient, and augmentation edits the input
+    distribution — so the only real question is which invariance you are willing
+    to assert and whether the test distribution shares it.
+
+    Dropout is a team that practises with a random half of its players sent home
+    every session. Nobody can build a move that depends on one specific
+    colleague, so the team learns plays that work with whoever turns up — and at
+    match time, when everyone plays, you would expect the team to be twice as
+    strong as an average practice. Inverted dropout is the accountant's fix: pay
+    every player who shows up double, so that the *expected* output of a
+    practice equals the output of the match.
+
+    Where the analogy breaks is exactly where the mathematics gets interesting.
+    A team is not a sum of players: a move that works with half the team does
+    not scale by two when the other half arrives, because the interactions are
+    nonlinear. That is precisely why the identity behind inverted dropout is
+    exact for a linear map and only first-order through a ReLU — the expected
+    *pre-activation* is preserved, the expected *activation* is not.
+
+    ### What goes wrong
+
+    - You add `Dropout(0.5)` to a model that was fine, and validation accuracy
+      drops four points. You add `weight_decay=0.01` to Adam and the loss
+      curve is indistinguishable from before. You add random crops and the
+      model gets worse on the validation set that uses centre crops. Three
+      regularisers, three regressions, and not one warning from the framework.
+    - You train with dropout, switch to `model.eval()`, and the logits are
+      1024 times larger than the ones the loss was computed on. Accuracy is
+      unchanged — you never notice — but your calibration is destroyed, your
+      soft targets are saturated, and the student model you distil from it
+      learns from one-hot labels with extra steps.
+    - You set `weight_decay=0.01` with `lr=3e-4` and 20,000 steps. Weight
+      decay shrinks an unconstrained weight by
+      $(1-\text{lr}\cdot\lambda)^N = 0.9418$ — 5.8%, a rounding error next to
+      the gradient. You conclude that weight decay does not help this model,
+      and you are right about the number and wrong about the conclusion.
+    - You port a recipe from `torch.optim.Adam(weight_decay=0.01)` to
+      `torch.optim.AdamW(weight_decay=0.01)` because "AdamW is the fixed one",
+      and the run behaves completely differently. Nothing in the code changed
+      except which class name was called, because the same number now means a
+      decay that is applied outside the second-moment normalisation instead of
+      inside it.
+    - An interviewer asks whether dropout is noise or an ensemble. Both
+      answers are in the literature and only one of them tells you how to
+      implement the eval path, which is the part that ships.
+
+    ### The full treatment
+
+    **Dropout is an ensemble of $2^n$ subnetworks that share one parameter
+    set, and the sharing is the regulariser.** A mask over a layer of $n$
+    units selects one of $2^n$ networks: $n=16$ gives 65,536 members, $n=256$
+    gives $1.16\times10^{77}$, $n=4096$ gives $10^{1233}$. You never evaluate
+    them — you train all of them at once, one per minibatch — and the
+    constraint that they must all agree on a single $W$ is what stops the
+    network from depending on any one unit. The trap is the word "noise": the
+    noise is real and measurable, but it is a side effect. What the mask does
+    that additive noise cannot is force $2^n$ *different* functions to be
+    consistent with one set of weights, and that consistency requirement is
+    the thing that costs you training accuracy.
+
+    **Inverted scaling is what makes `eval()` a no-op, and the identity is
+    exact only for a linear map.** With a keep probability $1-p$,
+    $\mathbb{E}[m/(1-p)] = 1$: measured over 200,000 masks, the mean is
+    1.000036, an absolute error of $3.7\times10^{-5}$. So the expected
+    pre-activation of every layer equals the eval-mode pre-activation, and the
+    deterministic pass needs no correction at all. That is why `nn.Dropout`
+    divides during training and is the identity in `eval()` mode, while the
+    older convention divides by $(1-p)$ at eval
+    instead. Pick one — doing both divides by $(1-p)^2$ per layer. The
+    exactness stops at the nonlinearity: $\mathbb{E}[\operatorname{ReLU}(z)]
+    \ne \operatorname{ReLU}(\mathbb{E}[z])$, so in a deep ReLU stack the mean
+    member is only approximately the eval network.
+
+    **Forgetting the scaling is not a uniform rescale — it changes the
+    function.** Without it the eval-time pre-activation is $1/(1-p)^L$ times
+    the one training saw: $8\times$ at $L=3$, $1024\times$ at $L=10$,
+    $1.05\times10^{6}$ at $L=20$, all at $p=0.5$. In a bias-free ReLU chain
+    that is a pure positive rescaling, so the argmax cannot move — measured on
+    2,000 inputs, 0 changed, because $\operatorname{ReLU}(cz) =
+    c\operatorname{ReLU}(z)$ for $c>0$. Add the biases that every real layer
+    has and the scaling stops being uniform, because $b$ does not scale with
+    the pre-activation: at the $64\times$ inflation of a 6-layer net at
+    $p=0.5$, **27.0%** of predictions change and the mean maximum softmax goes
+    from 0.173 to 0.973. So "accuracy looked fine" is not evidence that the
+    scaling is right; calibration and distillation are where it shows.
+
+    **Dropout multiplies the gradient's variance by $p/(1-p)$ per masked
+    layer, which is a learning-rate change wearing a mask.** The variance of
+    $m h/(1-p)$ about $h$ is $p/(1-p)\cdot h^2$: **0.25** at $p=0.2$, **1.0**
+    at $p=0.5$, **4.0** at $p=0.8$, and a 200,000-sample Monte Carlo at
+    $p=0.5$ reproduces the predicted $1.0$ to 0.99999. The practical
+    consequence is that adding dropout changes the signal-to-noise ratio of
+    every step, so the step count and often the peak learning rate have to
+    move with it; and at $p=0.8$ you have quadrupled the noise, which is why
+    rates above 0.5 survive only on input layers, where the mask is behaving
+    more like an augmentation than like a regulariser.
+
+    **The generalisation gap is not the objective, and it will lie to you.** On
+    60 points from the ring task below, a 2-64-64-2 net with no augmentation:
+    at $p=0$ train 1.0000 and test 0.8712, a gap of 0.1288; at $p=0.2$ train
+    1.0000 and test 0.8772, gap 0.1228; at $p=0.5$ train 0.9333 and test
+    0.8468, gap 0.0866. The gap falls monotonically with $p$ — it is
+    *smallest* at the setting with the worst test accuracy, because the gap
+    measures overfitting relative to training accuracy and dropout lowered
+    training accuracy faster than it lowered test accuracy. $\|W\|_F$ falls
+    monotonically too (24.30, 21.85, 18.60). Tune on test accuracy; report the
+    gap as an explanation, never as a criterion.
+
+    **Weight decay's strength is $\text{lr}\cdot\lambda$, not $\lambda$, and
+    its benefit is a U.** The per-step shrink is $1-\text{lr}\cdot\lambda$, so
+    the half-life of an unconstrained weight is $\ln 2/(\text{lr}\cdot\lambda)$:
+    **69,314 steps** at $\text{lr}=0.1,\lambda=10^{-4}$; **693 steps** at
+    $\text{lr}=0.1,\lambda=10^{-2}$; **231,049 steps** at
+    $\text{lr}=3\times10^{-4},\lambda=10^{-2}$; and 69 million steps at
+    $\text{lr}=10^{-3},\lambda=10^{-5}$, which is another way of saying never.
+    The benefit is not monotone in $\lambda$: on the same 60-point task at
+    $p=0.2$, test accuracy goes 0.8772 ($\lambda=0$), 0.8965 ($10^{-3}$),
+    **0.9008** ($10^{-2}$), 0.8545 ($5\times10^{-2}$) while $\|W\|_F$ falls
+    monotonically through 21.85, 10.02, 4.81, 3.27. The norm keeps answering a
+    question you stopped asking two rows earlier.
+
+    **Under Adam, an L2 penalty and a weight decay are different estimators;
+    `AdamW` is the second one.** In `Adam(weight_decay=λ)` the term $\lambda w$
+    is added to the gradient and then divided by $\sqrt{\hat v}$, which the
+    data gradient dominates — so the equilibrium is $w^\star = -g/\lambda$,
+    proportional to the gradient. Measured at $\lambda=0.1$,
+    $\text{lr}=0.01$: $g=10^{-2}$ settles at $-0.100000$ and $g=10^{-5}$ at
+    $-0.000100$, a factor of 1000 apart, from the same coefficient. In
+    `AdamW` the decay is applied to $w$ outside the normalisation, so the
+    equilibrium is $|w| = 1/\lambda$ regardless of $g$: $-9.99999$ and
+    $-9.99001$, 0.1% apart. Nothing warns you; the two are one class name
+    apart in the same module.
+
+    **Weight decay on a weight that feeds a BatchNorm is nearly a no-op.** BN
+    divides by the standard deviation of its input, so scaling the incoming
+    $W$ by 3 leaves its output unchanged to **$1.02\times10^{-5}$** relative —
+    that residual is the $\epsilon$ in the denominator, not the weight.
+    The decay still moves $W$, so you pay the optimisation cost and the
+    regularisation you were hoping for does not arrive: the only thing that
+    reaches the function is $\gamma$. This is the standard architecture in
+    every conv net since 2015, which is why "we use weight decay 1e-4 on all
+    conv weights" in a paper usually describes a schedule on the effective
+    scale rather than a capacity constraint.
+
+    **Augmentation is a prior on the input distribution, and the price is
+    accuracy on the distribution you actually have.** Train on a $\pm25°$
+    wedge of a ring task and test on the full circle: without augmentation,
+    train 0.9400, same-wedge 0.9370, full circle 0.6332, opposite side 0.5765;
+    with random rotations, 0.9333, 0.9440, 0.9327, 0.9405. Sweeping the test
+    wedge around the circle makes the shape of the prior visible — 0.946,
+    0.872, 0.587, 0.486, 0.487, 0.543, 0.647 in 50° windows — and the
+    augmented model is flat at 0.93 to 0.95 everywhere. Dropout does not
+    substitute for it: on the same task at $p=0$, 0.2 and 0.5 the full-circle
+    accuracy is 0.6332, 0.5950 and 0.6392. Dropout constrains the function
+    class; only augmentation changes which inputs the function is asked about.
+
+    **Spatial dropout drops features; elementwise dropout drops pixels, and on
+    a feature map those are different operations.** On a $7\times7\times64$ map
+    at $p=0.25$, an elementwise mask leaves a channel *entirely* intact with
+    probability $0.75^{49} = 7.6\times10^{-7}$ and removes one entirely with
+    probability $0.25^{49} = 3.2\times10^{-30}$ — every channel is present,
+    corrupted, and the next convolution can partly reconstruct the damage.
+    `Dropout2d` zeroes 25% of channels outright and leaves the other 75%
+    untouched, which is a statement about features rather than about pixels.
+    The trap is reaching for `nn.Dropout` on a conv stack and believing you
+    regularised channels.
+
+
+  derivations:
+    - title: "Inverted dropout preserves the expected pre-activation and costs p/(1-p) in variance"
+      latex: |
+        Let $m \sim \operatorname{Bernoulli}(1-p)$ independently per unit, and
+        let $h$ be an activation independent of $m$. Then
+
+        $$\mathbb{E}[m] = 1-p, \qquad \operatorname{Var}(m) = p(1-p).$$
+
+        For the scaled mask,
+
+        $$\mathbb{E}\left[\frac{m}{1-p}\right] = 1,
+          \qquad
+          \operatorname{Var}\left(\frac{m}{1-p}\right)
+          = \frac{p(1-p)}{(1-p)^2} = \frac{p}{1-p}.$$
+
+        A pre-activation is $z_j = \sum_i W_{ji} h_i m_i/(1-p)$, so
+
+        $$\mathbb{E}[z_j] = \sum_i W_{ji} h_i,$$
+
+        which is exactly the eval-mode pre-activation, and
+
+        $$\operatorname{Var}(z_j) = \frac{p}{1-p}\sum_i W_{ji}^2 h_i^2,$$
+
+        which is the extra noise the mask injects at that layer. Both statements
+        are per layer and compose by induction over a linear chain, because the
+        expectation of a product of independent masks is the product of the
+        expectations.
+      prose: >-
+        The first moment is free and the second moment is the bill. Because the
+        scaling is inside the expectation, the eval path needs no correction —
+        that is the entire design. And because the variance is
+        p/(1-p) times the squared contribution of each input, doubling p from
+        0.2 to 0.5 quadruples the gradient noise, which is why adding dropout
+        changes the effective learning rate even when nothing else does.
+    - title: "Omitting the scaling inflates eval pre-activations by (1/(1-p))^L"
+      latex: |
+        Write $h_l$ for the activation after layer $l$ in the *mean* training
+        pass — the pass in which every mask is replaced by its expectation — and
+        $\tilde h_l$ for the eval pass, where no mask is applied.
+
+        Base case: $\tilde h_0 = h_0$. Suppose $\tilde h_l = c_l h_l$ with
+        $c_0 = 1$. A linear layer gives
+        $\tilde z_{l+1} = W\tilde h_l = c_l\,W h_l = c_l z_{l+1}$, so
+
+        $$c_{l+1} = c_l \quad\text{(scaled training)}, \qquad
+          c_{l+1} = \frac{c_l}{1-p} \quad\text{(unscaled training)},$$
+
+        because the unscaled mean pass multiplies by $\mathbb{E}[m] = 1-p$
+        while the eval pass multiplies by 1. Hence $c_L = (1-p)^{-L}$.
+
+        For $p=0.5$: $c_3 = 8$, $c_{10} = 1024$, $c_{20} = 1{,}048{,}576$.
+
+        If the activation is positively homogeneous,
+        $\operatorname{ReLU}(cz) = c\operatorname{ReLU}(z)$ for $c>0$, the
+        factor passes through unchanged and the output is a uniform rescaling.
+        A bias breaks it: $c\,(W h) + b \ne c\,(Wh + b)$ unless $b = 0$ or
+        $c = 1$.
+      prose: >-
+        The exponent is the point: forgetting the scaling is a 1.1x error in a
+        three-layer net and a 1024x error in a ten-layer one, which is why it
+        survives testing at depth 3. And the reason it can survive at all is
+        positive homogeneity — a bias-free ReLU stack absorbs a uniform
+        rescaling without changing a single prediction, so the argmax is
+        unchanged while the function you are serving is not the one you trained.
+    - title: "Why AdamW's equilibrium is 1/lambda and Adam's is g/lambda"
+      latex: |
+        **Coupled.** With an L2 term the gradient fed to Adam is
+        $g_t = \nabla L + \lambda w_t$, and the update is
+
+        $$w_{t+1} = w_t - \text{lr}\,\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon}.$$
+
+        A fixed point requires $\hat m_t = 0$, and with a constant data gradient
+        $g$ the momentum average is $g + \lambda w$, so
+
+        $$g + \lambda w^\star = 0 \quad\Longrightarrow\quad w^\star = -\frac{g}{\lambda}.$$
+
+        The normalisation cancels out of the fixed-point condition entirely: it
+        changes how fast you get there, not where you stop.
+
+        **Decoupled.** The update is
+
+        $$w_{t+1} = w_t(1-\text{lr}\,\lambda)
+          - \text{lr}\,\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon}.$$
+
+        With $|\hat m_t/\sqrt{\hat v_t}| \to 1$ for a constant gradient, the
+        fixed point is where the per-step shrink equals the per-step push,
+
+        $$\text{lr}\,\lambda\,|w^\star| = \text{lr} \quad\Longrightarrow\quad |w^\star| = \frac{1}{\lambda},$$
+
+        independent of $g$. The time constant is $1/(\text{lr}\,\lambda)$ steps,
+        so the equilibrium is approached as $e^{-\text{lr}\,\lambda\,t}$.
+      prose: >-
+        Under a coupled penalty the amount of regularisation a weight receives
+        is proportional to its own gradient, because the penalty is one term
+        inside a sum that the second moment then rescales. That is exactly
+        backwards from what a capacity constraint should do: the weights that
+        need shrinking most are the ones in flat directions, and those are the
+        ones the coupled penalty barely touches. Decoupling turns the decay into
+        a rate on the parameter instead of a ratio to the gradient, which is why
+        the coefficient is portable across models and why AdamW became the
+        default for transformers.
+
+  implementations:
+    - language: python
+      title: "Dropout three ways — and the one that is numerically wrong"
+      note: >-
+        `dropout_naive` is NUMERICALLY WRONG and is included because it is the
+        version people write first, and because it does not raise: it silently
+        returns activations whose expectation is $(1-p)$ times the eval-time
+        activation, so a ten-layer net at $p=0.5$ evaluates at 1/1024 of the
+        scale it trained at. `dropout_double` is the other half of the same bug
+        — scaling at train time *and* dividing by $(1-p)$ at eval gives
+        $(1-p)^{-2}$ per layer, 1024 at $p=0.5$ over five layers. One further
+        hazard is real and not demonstrated here: at $p=1.0$ the scale
+        $1/(1-p)$ is a division by zero, which produces `inf` and then `NaN`
+        rather than an exception, so validate $0 \le p < 1$ at construction.
+        The backward pass through the mask is exact — the mask multiplies the
+        incoming cotangent, and the $1/(1-p)$ passes through linearly.
+      code: |
+        import numpy as np
+
+        def dropout_naive(x, p, rng):
+            """WRONG: no scaling, so E[out] = (1-p) * x at every layer."""
+            m = (rng.random(x.shape) >= p).astype(x.dtype)
+            return x * m, m
+
+        def dropout_double(x, p, rng, eval_mode=False):
+            """WRONG: scales at train time and again at eval -> (1-p)^-2 per layer."""
+            if eval_mode:
+                return x / (1.0 - p), None
+            m = (rng.random(x.shape) >= p).astype(x.dtype)
+            return x * m / (1.0 - p), m
+
+        def dropout_inverted(x, p, rng, eval_mode=False):
+            """Correct: mask and rescale at train time; eval is the identity."""
+            if eval_mode or p == 0.0:
+                return x, None
+            if not 0.0 <= p < 1.0:
+                raise ValueError("p must be in [0, 1)")
+            m = (rng.random(x.shape) >= p).astype(x.dtype)
+            return x * m / (1.0 - p), m
+
+        def backward(grad_out, mask, p):
+            """The mask is the derivative: d/dx of (x*m/(1-p)) is m/(1-p)."""
+            if mask is None:
+                return grad_out
+            return grad_out * mask / (1.0 - p)
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            x = np.ones((512, 64))
+            for name, fn in (("naive", dropout_naive), ("inverted", dropout_inverted)):
+                acc = 0.0
+                for _ in range(2000):
+                    out, _ = fn(x, 0.5, rng)
+                    acc += out
+                print(f"{name:9s} mean activation {acc.mean() / 2000:.4f}  (eval wants 1.0)")
+            # naive: 0.5000   inverted: 1.0000 (Monte Carlo error ~7e-4)
+    - language: python
+      title: "Weight decay in three optimisers — two of which are the same algorithm only by accident"
+      note: >-
+        `adam_l2` is NUMERICALLY WRONG as an implementation of weight decay: it
+        is the coupled estimator, and its fixed point is $w = -g/\lambda$ rather
+        than $|w| = 1/\lambda$, so the amount of shrinkage it applies depends on
+        the gradient's magnitude. It is not wrong arithmetic — it minimises
+        $L + \frac{\lambda}{2}\|w\|^2$ correctly — but it is not the estimator
+        most papers mean when they write "weight decay", and at small gradients
+        it under-decays by the ratio of the two fixed points. `sgd_coupled` and
+        `sgd_decoupled` agree exactly for plain SGD, which is why the
+        distinction went unnoticed for years; add momentum and they diverge,
+        because PyTorch's SGD accumulates the decay into the momentum buffer, so
+        the decay itself gets momentum and overshoots.
+      code: |
+        import numpy as np
+
+        def sgd_coupled(w, g, lr, lam):
+            """L2 in the loss. Identical to decoupled SGD when there is no momentum."""
+            return w - lr * (g + lam * w)
+
+        def sgd_decoupled(w, g, lr, lam):
+            return w * (1.0 - lr * lam) - lr * g
+
+        def adam_l2(w, g, m, v, lr, lam, t, b1=0.9, b2=0.999, eps=1e-8):
+            """WRONG as a weight-decay implementation: fixed point is -g/lam."""
+            gt = g + lam * w
+            m = b1 * m + (1 - b1) * gt
+            v = b2 * v + (1 - b2) * gt * gt
+            return w - lr * (m / (1 - b1 ** t)) / (np.sqrt(v / (1 - b2 ** t)) + eps), m, v
+
+        def adamw(w, g, m, v, lr, lam, t, b1=0.9, b2=0.999, eps=1e-8):
+            """Decay the weight first, then take the adaptive step. Fixed point |w| = 1/lam."""
+            w = w * (1.0 - lr * lam)
+            m = b1 * m + (1 - b1) * g
+            v = b2 * v + (1 - b2) * g * g
+            return w - lr * (m / (1 - b1 ** t)) / (np.sqrt(v / (1 - b2 ** t)) + eps), m, v
+
+        if __name__ == "__main__":
+            lam, lr, T = 0.1, 1e-2, 20000
+            for g in (1e-2, 1e-5):
+                a = b = 1.0
+                ma = va = mb = vb = 0.0
+                for t in range(1, T + 1):
+                    a, ma, va = adam_l2(a, g, ma, va, lr, lam, t)
+                    b, mb, vb = adamw(b, g, mb, vb, lr, lam, t)
+                print(f"g={g:.0e}  coupled {a:+.6f} (want -g/lam={-g/lam:+.6f})  "
+                      f"decoupled {b:+.5f} (want -1/lam={-1/lam:+.1f})")
+            # g=1e-02  coupled -0.100000  decoupled -9.99999
+            # g=1e-05  coupled -0.000100  decoupled -9.99001
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        You train a 10-layer ReLU net at $p=0.5$ and forget the inverted
+        scaling. What is the eval-time pre-activation scale relative to what
+        training saw, and why might validation accuracy not move at all?
+      answerKind: short_text
+      hint: >-
+        The mean mask is $(1-p)$, applied once per layer. Then ask what ReLU
+        does to a positive rescaling.
+      solution: >-
+        $1/(1-p)^{10} = 1024$. In a bias-free ReLU chain that is a pure positive
+        rescaling — $\operatorname{ReLU}(cz) = c\operatorname{ReLU}(z)$ — so the
+        argmax cannot change: measured on 2,000 inputs, zero predictions moved.
+        Accuracy is invariant to it, which is why the bug survives. What is not
+        invariant: the softmax temperature (the mean maximum probability goes
+        from 0.173 to 0.973 at $64\times$), calibration, distillation targets,
+        and any layer whose bias does not scale with the pre-activation — with
+        biases in the net, 27.0% of predictions changed at the same factor.
+    - id: cp-2
+      question: >-
+        `Adam(weight_decay=0.01)` and `AdamW(weight_decay=0.01)`, same data,
+        same learning rate. Do they produce the same model? If not, how far
+        apart are they?
+      answerKind: short_text
+      hint: >-
+        Ask where each puts the term, then what the second-moment normalisation
+        does to a term that is inside the gradient.
+      solution: >-
+        No. Adam adds $\lambda w$ to the gradient and then divides by
+        $\sqrt{\hat v}$, so its equilibrium is $w^\star = -g/\lambda$ — the
+        shrinkage is proportional to the gradient. AdamW applies the decay
+        outside the normalisation, so its equilibrium is $|w| = 1/\lambda$
+        regardless of $g$. Measured at $\lambda=0.1$, $\text{lr}=0.01$, 20,000
+        steps: the coupled version settles at $-0.100000$ for $g=10^{-2}$ and
+        $-0.000100$ for $g=10^{-5}$ (a factor of 1000), while the decoupled
+        version settles at $-9.99999$ and $-9.99001$ (0.1% apart). The same
+        coefficient is a different regulariser.
+    - id: cp-3
+      question: >-
+        You run 20,000 steps at $\text{lr}=3\times10^{-4}$ with
+        $\lambda=10^{-2}$. A weight whose gradient is negligible — how much does
+        decay shrink it, and what is its half-life?
+      answerKind: short_text
+      hint: >-
+        The per-step factor is $1-\text{lr}\cdot\lambda$; compound it, then take
+        the log for the half-life.
+      solution: >-
+        $(1-3\times10^{-6})^{20000} = 0.9418$, so 5.8% — indistinguishable from
+        noise next to the gradient. The half-life is
+        $\ln 2/(3\times10^{-6}) = 231{,}049$ steps, an order of magnitude longer
+        than the run. This is not evidence that weight decay does not work; it
+        is evidence that the coefficient was never active. To get a 693-step
+        half-life you need $\text{lr}\cdot\lambda = 10^{-3}$, which at
+        $\text{lr}=3\times10^{-4}$ means $\lambda \approx 3.3$.
+    - id: cp-4
+      question: >-
+        On 60 points, dropout $p=0.5$ gives the smallest generalisation gap of
+        any setting you tried, and a lower test accuracy than $p=0.2$. Which do
+        you tune on, and what do you report?
+      answerKind: short_text
+      hint: >-
+        What does the gap measure, and what happens to it when you damage the
+        model's training accuracy?
+      solution: >-
+        Tune on absolute validation accuracy; report the gap as an explanation.
+        Measured: $p=0$ gives train 1.0000, test 0.8712, gap 0.1288; $p=0.2$
+        gives 1.0000, 0.8772, 0.1228; $p=0.5$ gives 0.9333, 0.8468, 0.0866. The
+        gap falls monotonically because dropout reduces training accuracy faster
+        than test accuracy — a model that is bad at everything has a small gap.
+        Selecting on it would choose $p=0.5$ and cost you 3 points of test
+        accuracy. Report $p$, the absolute validation score, and the gap only as
+        the reason you believed the model was overfitting in the first place.
+    - id: cp-5
+      question: >-
+        A $7\times7$ feature map with 64 channels, dropout at $p=0.25$. What
+        fraction of channels is untouched, under elementwise versus spatial
+        dropout?
+      answerKind: short_text
+      hint: >-
+        A channel is untouched if all 49 of its elements survive.
+      solution: >-
+        Elementwise: $0.75^{49} = 7.6\times10^{-7}$ — essentially no channel
+        survives intact, and no channel is removed outright either
+        ($0.25^{49} = 3.2\times10^{-30}$); every channel is present and
+        corrupted. Spatial (`Dropout2d`): exactly 0.75 of the channels are
+        untouched and 0.25 are zeroed. The two operations regularise different
+        things — pixels versus features — and the elementwise version is
+        partially undone by the next convolution, which can reconstruct a
+        corrupted channel from its neighbours.
+    - id: cp-6
+      question: >-
+        You add rotation augmentation. Accuracy on your shifted test set goes
+        from 0.63 to 0.93 and accuracy on the clean test set goes from 0.94 to
+        0.93. Good trade or bad?
+      answerKind: short_text
+      hint: >-
+        What did the augmentation assert, and is the assertion true of the
+        distribution you care about?
+      solution: >-
+        It depends entirely on which test set you are deploying against, and
+        that is the answer the question is testing. The augmentation asserted
+        "the label is invariant to rotation". On the wedge experiment the
+        unaugmented model scored 0.9400 train / 0.9370 same-wedge / 0.6332 full
+        circle / 0.5765 opposite side; with rotation augmentation, 0.9333 /
+        0.9440 / 0.9327 / 0.9405. If the deployment distribution includes all
+        angles, the 0.7-point clean loss is trivially worth it. If it only
+        contains the wedge, you have paid 0.7 points for a prior you do not
+        need — and if the transform were *wrong* (a 90-degree rotation of a
+        digit), the loss would be far larger and the only signal would be the
+        clean-score drop.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        There are three regularisers on your list and they touch three different
+        parts of the training step. One edits the inputs before the model sees
+        them. One edits the activations inside the model, and only during
+        training. One edits the parameters after the gradients have been
+        computed. Each buys generalisation by forbidding something, and each
+        forbids a different thing: a set of input variations, a dependence on
+        particular units, or a large parameter norm. Before you touch any of
+        them, decide which of those three your model is actually guilty of —
+        because two of the three will do nothing at all for the other two
+        failure modes, and one of them will make things worse.
+      blocks:
+        - kind: checklist
+          body: |
+            - Inputs edited before the forward pass -> a prior on the data distribution
+            - Activations edited during the forward pass, and only during training -> a constraint on which units the function may use
+            - Parameters edited by the optimiser, after the backward pass -> a constraint on the norm
+            - Each has a strength knob, and each knob is in the units of its own mechanism
+            - The eval path must be identical to the training path except for the edits that are supposed to disappear
+      checkpoint: >-
+        If a regulariser changes the model at inference time, is it still a
+        regulariser or has it become part of the architecture? Say which of the
+        three changes the eval path and why that is a design decision rather
+        than an accident.
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Diagnose from the two numbers you already have: training accuracy and
+        validation accuracy on the same distribution. A large gap means the
+        model has memorised, and the cheap fixes are decay and early stopping
+        before dropout, because they do not change the architecture. A model that
+        is fine in-distribution and bad out-of-distribution is not
+        overfitting — it never saw the region — and only augmentation can fix
+        that. A model that is bad on both is underfitting and every regulariser
+        makes it worse. Once you know which, sweep one coefficient at a time on
+        a validation split and report the strength in the units that actually
+        determine its effect: $p$ for dropout, $\text{lr}\cdot\lambda$ for decay,
+        and the transform set for augmentation.
+      blocks:
+        - kind: checklist
+          body: |
+            - Big gap, same distribution -> weight decay first (one number, no architecture change)
+            - Gap still big, and you have width -> add dropout, sweep p, watch test accuracy not the gap
+            - Fine in-distribution, bad out-of-distribution -> augmentation, and check dropout is not the thing you keep tuning
+            - Bad on both -> stop; fix optimisation, not regularisation
+            - Quote lr*lambda, not lambda; quote the invariance, not the transform list
+      checkpoint: >-
+        Your validation set is drawn from the same distribution as training and
+        the gap is 0.03. Which of the three regularisers would you expect to buy
+        the most, and what would you measure to confirm it before committing to
+        a long run?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        One training step with all three, plus the eval path, plus the
+        measurement. The measurement is the part that decides whether any of it
+        was worth doing.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # --- one training step -------------------------------------------------
+            x, y = next(loader)
+            x = augment(x)                     # prior on inputs; must preserve y
+            h = forward(x, masks_on=True)      # each layer: h = relu(z) * m / (1-p)
+            loss = cross_entropy(h, y)         # no L2 term if the optimiser is decoupled
+            grads = backward(loss)
+            for each parameter:
+                if optimiser is AdamW: w = w * (1 - lr * lam)   # outside the normalisation
+                else:                  grads += lam * w          # inside, and therefore scaled by 1/sqrt(v)
+                w = w - lr * adam_update(grads)
+
+            # --- the eval path -----------------------------------------------------
+            h = forward(x, masks_on=False)     # no mask, no 1/(1-p), no augmentation
+
+            # --- the measurement ---------------------------------------------------
+            for p in [0, 0.1, 0.2, 0.5]:
+                train_acc, val_acc = fit_and_score(p=p)
+                record(p, train_acc, val_acc, gap=train_acc - val_acc, norm=||W||)
+            choose p by val_acc; report gap only as the diagnosis
+      checkpoint: >-
+        In the pseudocode, the decay is applied to every parameter. Which
+        parameters should be excluded, and what happens to the model if you
+        exclude the wrong ones?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Two derivations carry the whole topic: why the train-time scaling makes
+        the eval path an identity, and why decoupled decay has a different
+        equilibrium from a coupled penalty.
+      blocks:
+        - kind: math
+          body: |
+            **Dropout, first and second moment.** With
+            $m \sim \operatorname{Bernoulli}(1-p)$ and $h$ independent of $m$:
+
+            $$\mathbb{E}[m] = 1-p, \quad \operatorname{Var}(m) = p(1-p),
+              \quad \mathbb{E}\left[\frac{m}{1-p}\right] = 1
+              \quad \operatorname{Var}\left(\frac{m}{1-p}\right) = \frac{p}{1-p}.$$
+
+            So $\mathbb{E}[z] = \sum_i W_{ji}h_i$ — the eval pre-activation — and
+            $\operatorname{Var}(z) = \frac{p}{1-p}\sum_i W_{ji}^2h_i^2$.
+
+            **Without the scaling**, each layer's mean pass multiplies by
+            $\mathbb{E}[m] = 1-p$ while the eval pass multiplies by 1, so the
+            eval pre-activation is $(1-p)^{-L}$ times the training one: 1024 at
+            $L=10$, $p=0.5$.
+
+            **Adam with an L2 term.** $g_t = \nabla L + \lambda w$ and
+
+            $$w_{t+1} = w_t - \text{lr}\,\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon},$$
+
+            so the fixed point needs $\hat m_t = 0$, i.e.
+            $g + \lambda w^\star = 0$, i.e. $w^\star = -g/\lambda$. The
+            normalisation drops out of the condition.
+
+            **AdamW.** $w_{t+1} = w_t(1-\text{lr}\lambda) - \text{lr}\,\hat m_t/(\sqrt{\hat v_t}+\epsilon)$,
+            and with $|\hat m/\sqrt{\hat v}| \to 1$ the fixed point solves
+            $\text{lr}\lambda|w^\star| = \text{lr}$, so $|w^\star| = 1/\lambda$
+            and the approach is $e^{-\text{lr}\lambda t}$.
+        - kind: warning
+          body: >-
+            The $1/\lambda$ equilibrium is not the first-step behaviour. The
+            approach is exponential with time constant $1/(\text{lr}\cdot\lambda)$
+            steps, so at $\text{lr}\cdot\lambda = 10^{-5}$ you need 100,000
+            steps to get within a factor of $e$ of it and about 460,000 to get
+            within 1%. A 20,000-step run at that effective decay is, for
+            practical purposes, an undecayed run — in both implementations.
+            Before concluding that a coefficient does nothing, check that
+            $\text{lr}\cdot\lambda\cdot N \gtrsim 1$.
+      checkpoint: >-
+        In the coupled case the fixed point is $-g/\lambda$, which means a larger
+        gradient permits a larger weight. Explain why that is backwards for a
+        capacity constraint, and which weights a coupled penalty therefore
+        under-regularises.
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The three reference implementations, plus the diagnostic that decides
+        whether any of them is worth keeping.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the printed numbers before the code. If your own `adam_step`
+            reproduces the coupled and decoupled columns below, the arithmetic
+            is right and the rest is judgement about which one you meant.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+            def dropout_apply(x, p, mask, train=True):
+                """Inverted dropout. x and mask are nested lists of the same shape."""
+                if not train:
+                    return [[float(v) for v in row] for row in x]
+                s = 1.0 / (1.0 - p)
+                return [[float(a) * float(b) * s for a, b in zip(rx, rm)]
+                        for rx, rm in zip(x, mask)]
+
+            def adam_step(w, g, m, v, lr, beta1, beta2, wd, t, decoupled, eps=1e-8):
+                gt = g if decoupled else g + wd * w
+                m2 = beta1 * m + (1.0 - beta1) * gt
+                v2 = beta2 * v + (1.0 - beta2) * gt * gt
+                mh = m2 / (1.0 - beta1 ** t)
+                vh = v2 / (1.0 - beta2 ** t)
+                w2 = w * (1.0 - lr * wd) if decoupled else w
+                w2 = w2 - lr * mh / (math.sqrt(vh) + eps)
+                return [float(w2), float(m2), float(v2)]
+
+            def dropout_ensemble_mean(W1, W2, x, p):
+                """Exact mean and variance over all 2^k masks of a 1-hidden-layer net."""
+                h = [[sum(x[i][a] * W1[c][a] for a in range(len(x[0])))
+                      for c in range(len(W1))] for i in range(len(x))]
+                mean = [[sum(h[i][c] * W2[j][c] for c in range(len(W1)))
+                         for j in range(len(W2))] for i in range(len(x))]
+                f = p / (1.0 - p)
+                var = [[sum((W2[j][c] ** 2) * (h[i][c] ** 2) for c in range(len(W1))) * f
+                        for j in range(len(W2))] for i in range(len(x))]
+                return {"mean": mean, "var": var}
+
+            if __name__ == "__main__":
+                # the two columns that decide whether you used Adam or AdamW
+                for dec in (False, True):
+                    print(dec, [adam_step(1.0, g, 0.0, 0.0, 1e-2, 0.9, 0.999, 0.1, 1, dec)
+                                for g in (1e-2, 1e-5)])
+                # dropout: mean over masks equals the eval forward, exactly
+                print(dropout_ensemble_mean([[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0]],
+                                            [[1.0, 2.0]], 0.5))
+                # {'mean': [[3.0]], 'var': [[5.0]]}
+      checkpoint: >-
+        The ensemble variance is $p/(1-p)\sum_k (W_{2,jk}h_k)^2$. If you evaluated
+        the mean and the variance at the same time, which one does `model.eval()`
+        give you, and which one would you need for an uncertainty estimate?
+
+  problems:
+    - id: p-dropout-apply
+      title: "Inverted dropout, and the eval path that needs no correction"
+      difficulty: medium
+      prompt: >-
+        Implement `dropout_apply(x, p, mask, train=True)`, the forward pass of
+        inverted dropout with an explicit mask. `x` and `mask` are nested lists
+        of the same shape; `mask` holds 0/1 integers and is supplied by the
+        caller so the result is deterministic. When `train` is true, multiply
+        each element by its mask value and by $1/(1-p)$. When `train` is false,
+        return `x` unchanged — that is the whole point of inverted scaling: the
+        eval path must not know that dropout exists. Return nested lists of
+        floats with the same shape as the input.
+
+        The cases include $p=0$ (the scale must be exactly 1.0, not a division
+        that happens to be close) and $p=0.75$ (the scale is 4). Do not
+        special-case the mask: a mask of all zeros must return all zeros, not
+        `x`.
+      starter: |
+        def dropout_apply(x, p, mask, train=True):
+            # your implementation here
+            pass
+      language: python
+      entry: dropout_apply
+      testCases:
+        - input: '{"x": [[1.0, 2.0], [3.0, 4.0]], "p": 0.5, "mask": [[1, 0], [0, 1]], "train": true}'
+          expected: "[[2.0, 0.0], [0.0, 8.0]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"x": [[1.0, -2.0, 3.0]], "p": 0.2, "mask": [[1, 1, 1]], "train": true}'
+          expected: "[[1.25, -2.5, 3.75]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"x": [[1.0, 2.0]], "p": 0.5, "mask": [[0, 0]], "train": true}'
+          expected: "[[0.0, 0.0]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"x": [[1.0, 2.0], [3.0, 4.0]], "p": 0.5, "mask": [[1, 0], [0, 1]], "train": false}'
+          expected: "[[1.0, 2.0], [3.0, 4.0]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"x": [[5.0]], "p": 0.0, "mask": [[1]], "train": true}'
+          expected: "[[5.0]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"x": [[2.0, 4.0]], "p": 0.75, "mask": [[1, 0]], "train": true}'
+          expected: "[[8.0, 0.0]]"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def dropout_apply(x, p, mask, train=True):
+            if not train:
+                return [[float(v) for v in row] for row in x]
+            scale = 1.0 / (1.0 - p)
+            return [[float(xi) * float(mi) * scale for xi, mi in zip(rx, rm)]
+                    for rx, rm in zip(x, mask)]
+      solutionExplanation: >-
+        Two lines, and both of them are a decision you have to defend. The first
+        is that `train=False` returns the input untouched: with inverted
+        scaling, the correction lives in training, so inference is the identity
+        and the served model does not depend on a training hyperparameter. The
+        second is that the scale is $1/(1-p)$ rather than $1-p$: dividing at
+        train time is what makes the expected pre-activation equal the eval
+        pre-activation, since $\mathbb{E}[m/(1-p)] = 1$. If you instead multiply
+        by $1-p$ at eval you get the same expectation by a different route, but
+        you have made the eval path depend on $p$ — and if you ever do both, you
+        divide by $(1-p)^2$ per layer, which at $p=0.5$ over ten layers is a
+        factor of $1{,}048{,}576$ in the wrong direction. Note that the mask is
+        consumed elementwise with no broadcasting: a shape mismatch here would
+        broadcast silently in NumPy and produce a plausible-looking array of the
+        wrong shape, which is why the signature takes an explicit mask rather
+        than generating one.
+      complexity: "O(n) over the elements of x, O(n) space for the result"
+      tags: [dropout, inverted-dropout, inference, train-eval]
+
+    - id: p-adam-step
+      title: "One Adam step, coupled and decoupled, and the equilibrium they imply"
+      difficulty: hard
+      prompt: >-
+        Implement `adam_step(w, g, m, v, lr, beta1, beta2, wd, t, decoupled)`
+        returning `[w_new, m_new, v_new]` for a single scalar parameter. `m` and
+        `v` are the running first and second moment estimates *before* this
+        step; `t` is the 1-based step index, used for bias correction; `wd` is
+        the weight-decay coefficient.
+
+        When `decoupled` is true, apply AdamW: shrink the weight first,
+        $w \leftarrow w(1-\text{lr}\cdot\lambda)$, then take the ordinary Adam
+        step with the raw gradient $g$. When it is false, apply the coupled L2
+        penalty: use $g + \lambda w$ as the gradient *inside* the adaptive
+        update, and do not shrink the weight separately.
+
+        Use $\epsilon = 10^{-8}$ and add it to $\sqrt{\hat v}$ (not to
+        $\hat v$). Bias-correct both moments before the update. The last two
+        cases have $t=100$, where the bias correction is nearly 1 — if you skip
+        it you will be wrong by 0.005% and fail the tolerance, which is the
+        point.
+      starter: |
+        import math
+
+        def adam_step(w, g, m, v, lr, beta1, beta2, wd, t, decoupled):
+            # your implementation here
+            pass
+      language: python
+      entry: adam_step
+      testCases:
+        - input: '{"w": 1.0, "g": 0.5, "m": 0.0, "v": 0.0, "lr": 0.01, "beta1": 0.9, "beta2": 0.999, "wd": 0.1, "t": 1, "decoupled": true}'
+          expected: "[0.9890000002, 0.04999999999999999, 0.0002500000000000002]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"w": 1.0, "g": 0.5, "m": 0.0, "v": 0.0, "lr": 0.01, "beta1": 0.9, "beta2": 0.999, "wd": 0.1, "t": 1, "decoupled": false}'
+          expected: "[0.9900000001666667, 0.059999999999999984, 0.0003600000000000003]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"w": -0.4, "g": 0.02, "m": 0.01, "v": 0.004, "lr": 0.05, "beta1": 0.9, "beta2": 0.999, "wd": 0.01, "t": 7, "decoupled": true}'
+          expected: "[-0.4011931647531384, 0.011000000000000001, 0.003996400000000001]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"w": -0.4, "g": 0.02, "m": 0.01, "v": 0.004, "lr": 0.05, "beta1": 0.9, "beta2": 0.999, "wd": 0.01, "t": 7, "decoupled": false}'
+          expected: "[-0.401342528404158, 0.0106, 0.003996256]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"w": 2.0, "g": -1.0, "m": 0.3, "v": 0.09, "lr": 0.001, "beta1": 0.9, "beta2": 0.999, "wd": 0.05, "t": 100, "decoupled": true}'
+          expected: "[1.999726023331899, 0.17000000000000004, 0.09090999999999999]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"w": 2.0, "g": -1.0, "m": 0.3, "v": 0.09, "lr": 0.001, "beta1": 0.9, "beta2": 0.999, "wd": 0.05, "t": 100, "decoupled": false}'
+          expected: "[1.9998155966098423, 0.18000000000000005, 0.09072]"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import math
+
+        def adam_step(w, g, m, v, lr, beta1, beta2, wd, t, decoupled, eps=1e-8):
+            gt = g if decoupled else g + wd * w
+            m2 = beta1 * m + (1.0 - beta1) * gt
+            v2 = beta2 * v + (1.0 - beta2) * gt * gt
+            mh = m2 / (1.0 - beta1 ** t)
+            vh = v2 / (1.0 - beta2 ** t)
+            w2 = w * (1.0 - lr * wd) if decoupled else w
+            w2 = w2 - lr * mh / (math.sqrt(vh) + eps)
+            return [float(w2), float(m2), float(v2)]
+      solutionExplanation: >-
+        The only difference between the two branches is *where* $\lambda w$ goes,
+        and that difference is the whole point of AdamW. In the coupled branch
+        the penalty joins the gradient before the second moment is formed, so
+        the same $\lambda$ produces a step whose size depends on the ratio of
+        $\lambda w$ to $g$; the momentum buffers also remember the penalty,
+        which is why $m$ and $v$ differ between the two branches on identical
+        inputs. In the decoupled branch the weight is shrunk first and the
+        adaptive step is then computed from the raw gradient only, so the decay
+        never enters $v$ and its rate is $\text{lr}\cdot\lambda$ regardless of
+        the gradient scale. Two details will fail the tests if you get them
+        wrong: the bias correction uses $t$ on both moments and must come before
+        the division, and $\epsilon$ is added to $\sqrt{\hat v}$, not to
+        $\hat v$ — at $t=1$ with $v=0$ the difference is a factor of
+        $\sqrt{10^{-8}} = 10^{-4}$ in the step size. Run the whole thing for
+        20,000 steps and the coupled version converges to $-g/\lambda$ while the
+        decoupled one converges to $-1/\lambda$; that is the behaviour the six
+        cases are checking one step at a time.
+      complexity: "O(1) time and space per step"
+      tags: [adam, adamw, weight-decay, optimiser, bias-correction]
+
+    - id: p-ensemble-mean
+      title: "The dropout ensemble's mean and variance, exactly"
+      difficulty: medium
+      prompt: >-
+        Implement `dropout_ensemble_mean(W1, W2, x, p)` returning
+        `{"mean": ..., "var": ...}` — the exact expectation and variance of a
+        one-hidden-layer linear network over all $2^k$ dropout masks, where $k$
+        is the number of hidden units.
+
+        The network is $h = xW_1^\top$, then a mask is applied with inverted
+        scaling $\tilde h = m \odot h/(1-p)$ with $m$ i.i.d. Bernoulli$(1-p)$,
+        then $\text{out} = \tilde h W_2^\top$. There is no bias and no
+        nonlinearity, so both moments are available in closed form and you
+        should not sample.
+
+        `W1` is $k \times d_{in}$, `W2` is $d_{out} \times k$, `x` is
+        $n \times d_{in}$; `mean` and `var` are both $n \times d_{out}$. The
+        variance is the variance of each *output element* across masks, not
+        across the batch, and it is available in closed form because the masks
+        are independent — derive it from $\operatorname{Var}(m) = p(1-p)$ rather
+        than sampling. At $p=0$ the variance is exactly 0.0, and at $p=0.8$ the
+        per-unit factor is 4.
+      starter: |
+        def dropout_ensemble_mean(W1, W2, x, p):
+            # your implementation here
+            pass
+      language: python
+      entry: dropout_ensemble_mean
+      testCases:
+        - input: '{"W1": [[1.0, 0.0], [0.0, 1.0]], "W2": [[1.0, 1.0]], "x": [[1.0, 2.0]], "p": 0.5}'
+          expected: '{"mean": [[3.0]], "var": [[5.0]]}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"W1": [[1.0, 2.0]], "W2": [[1.0], [0.5]], "x": [[1.0, 1.0]], "p": 0.25}'
+          expected: '{"mean": [[3.0, 1.5]], "var": [[3.0, 0.75]]}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"W1": [[0.5, -1.0], [0.25, 2.0]], "W2": [[1.0, -1.0], [0.0, 3.0]], "x": [[1.0, 4.0], [-2.0, 0.5]], "p": 0.2}'
+          expected: '{"mean": [[-11.75, 24.75], [-2.0, 1.5]], "var": [[20.078125, 153.140625], [0.625, 0.5625]]}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"W1": [[1.0, 2.0]], "W2": [[1.0]], "x": [[3.0, -1.0]], "p": 0.0}'
+          expected: '{"mean": [[1.0]], "var": [[0.0]]}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"W1": [[2.0, 0.0], [0.0, 1.0]], "W2": [[0.5, 2.0]], "x": [[1.0, 3.0]], "p": 0.8}'
+          expected: '{"mean": [[7.0]], "var": [[148.0]]}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def dropout_ensemble_mean(W1, W2, x, p):
+            n, k = len(x), len(W1)
+            h = [[sum(x[i][a] * W1[c][a] for a in range(len(x[0]))) for c in range(k)]
+                 for i in range(n)]
+            mean = [[sum(h[i][c] * W2[j][c] for c in range(k)) for j in range(len(W2))]
+                    for i in range(n)]
+            f = p / (1.0 - p)
+            var = [[sum((W2[j][c] ** 2) * (h[i][c] ** 2) for c in range(k)) * f
+                    for j in range(len(W2))] for i in range(n)]
+            return {"mean": mean, "var": var}
+      solutionExplanation: >-
+        The mean is the punchline of the whole topic: because
+        $\mathbb{E}[m/(1-p)] = 1$, the mean of the ensemble is exactly the
+        deterministic forward pass, which is why `model.eval()` needs no
+        correction and why dropout at inference is free. The variance is what you
+        give up by taking that shortcut: each hidden unit contributes
+        independently, so
+        $\operatorname{Var}(\text{out}_j) = \sum_k W_{2,jk}^2\operatorname{Var}(\tilde h_k)$
+        and $\operatorname{Var}(\tilde h_k) = h_k^2\,\operatorname{Var}(m)/(1-p)^2 = h_k^2\,p/(1-p)$.
+        The cross terms vanish because the masks are independent — that is the
+        only place this would break, and it breaks the moment you tie masks
+        across units, which is exactly what spatial dropout does. At $p=0.5$ the
+        factor is 1, so the ensemble's standard deviation per output is the norm
+        of the weight row times the hidden activation — the same order as the
+        mean itself, which is why a single mask's prediction is a poor estimate
+        of the ensemble and why MC dropout needs many samples.
+      complexity: "O(n·k·(d_in + d_out)) time, O(n·(k + d_out)) space"
+      tags: [dropout, ensembles, expectation, variance, inference]
+
+  visualizers:
+    - id: vs-dropout-scale
+      kind: shape_flow
+      title: "Watch the eval path drift as the scaling is removed"
+      description: >-
+        Push one batch through $L$ layers at $p=0.5$ with the scaling on and off,
+        and watch the per-layer pre-activation scale. With inverted scaling the
+        eval pass matches the mean training pass at every layer; without it the
+        gap compounds by $1/(1-p)$ per layer — $8\times$ at $L=3$, $1024\times$
+        at $L=10$, $1.05\times10^6$ at $L=20$.
+      params:
+        depth: 10
+        width: 128
+        batch: 512
+        p: 0.5
+        modes: ["inverted", "naive", "double-scaled"]
+
+  try_it: >-
+    Train the same small net at dropout 0, 0.2 and 0.5 and record train and test accuracy on
+    the same split. Then delete the $1/(1-p)$ scaling from the eval path and re-measure: at three
+    layers and $p = 0.5$ the eval pre-activations are 8x the ones training saw.
+  interview_questions:
+    - question: 'Why does inverted dropout make eval a no-op, and what breaks if you forget the scaling?'
+      level: mid
+      key_points:
+        - 'With keep probability 1-p, E[m/(1-p)] = 1: measured over 200,000 masks the mean is 1.000036, an absolute error of 3.7e-5.'
+        - 'So the expected pre-activation at train time equals the deterministic one at eval time, and the eval path needs no rescaling.'
+        - 'Without it the eval pre-activation is 1/(1-p)^L times the training one: 8x at L = 3, 1024x at L = 10, about 1.05e6 at L = 20, all at p = 0.5.'
+        - 'In a bias-free ReLU chain that is a pure positive rescale of the logits, which changes the softmax and can saturate it.'
+    - question: 'Adam with weight_decay=0.01 and AdamW with weight_decay=0.01 are different regularisers. Explain the difference and say which you would ship.'
+      level: senior
+      key_points:
+        - 'In Adam the term lambda*w is added to the gradient and then divided by sqrt(v_hat), so the decay is rescaled by the adaptive denominator and the equilibrium is w* = -g/lambda.'
+        - 'In AdamW the decay is applied directly to the parameter, theta <- theta - eta*lambda*theta, independent of gradient magnitude.'
+        - 'The strength of either is lr*lambda, not lambda: the half-life of an unconstrained weight is ln 2 / (lr*lambda), 69,314 steps at lr 0.1 and lambda 1e-4, 693 steps at lr 0.01 and lambda 1e-2.'
+        - 'On a weight that feeds BatchNorm the decay is nearly a no-op anyway, because BN removes the scale: scaling W by 3 leaves the output unchanged to 1.02e-5.'
+      follow_up: 'Why does the AdamW form make the decay a genuine schedule at a constant lambda, while the Adam form does not?'
+    - question: 'Is dropout noise or an ensemble, and does the answer change what you implement?'
+      level: mid
+      key_points:
+        - 'It is an ensemble of 2^n subnetworks sharing one parameter set: 65,536 members at n = 16, 1.16e77 at n = 256, 10^1233 at n = 4096.'
+        - 'The parameter sharing is the regulariser, and the weight scaling is the ensemble-average approximation that makes a single eval pass legal.'
+        - 'The implementation consequence is the eval path: inverted scaling at train time, no scaling at test, or explicit averaging of several masks if you want Monte Carlo uncertainty.'
+        - 'Dropout also multiplies gradient variance by p/(1-p) per masked layer, which is a learning-rate change in disguise: 0.25 at p = 0.2, 1.0 at 0.5, 4.0 at 0.8.'
+      follow_up: 'What is spatial dropout on a 7x7x64 feature map, and why is it not the same operation as elementwise dropout there?'
+  common_mistakes:
+    - 'Comparing runs at different dropout rates without matching the effective step size, when the gradient variance multiplier is 0.25 at p = 0.2, 1.0 at 0.5 and 4.0 at 0.8.'
+    - 'Reading the generalisation gap as the objective: at p = 0 the gap is 0.1288 and at p = 0.2 it is 0.1228, while test accuracy barely moved.'
+    - 'Adding weight decay to a weight that feeds BatchNorm and expecting shrinkage, when scaling W leaves the BN output unchanged to 1.02e-5.'
+  further_reading:
+    - label: "Srivastava, Hinton, Krizhevsky, Sutskever & Salakhutdinov, Dropout: A Simple Way to Prevent Neural Networks from Overfitting (JMLR 2014)"
+    - label: "Loshchilov & Hutter, Decoupled Weight Decay Regularization (ICLR 2019)"

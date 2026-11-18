@@ -1,0 +1,1309 @@
+id: gradient-boosting
+slug: gradient-boosting
+title: "Gradient Boosting Is Gradient Descent With Trees as the Parameter"
+summary: >-
+  Build a boosted ensemble as functional gradient descent — each tree fits the
+  negative gradient of the loss, each leaf is a solved Newton step, and the
+  learning rate decides whether ten thousand small trees beat a hundred big
+  ones.
+kind: lesson
+difficulty: hard
+position: 7
+estMinutes: 26
+prerequisites: [decision-trees, gradient-descent-variants]
+phase: supervised-learning
+tags: [gradient-boosting, xgboost, lightgbm, functional-gradient-descent, newton-method, shrinkage, tabular]
+
+body:
+  big_idea: >-
+    Gradient boosting is gradient descent in function space: each tree fits the negative
+    gradient and each leaf is a solved Newton step, so shrinkage, not tree count,
+    decides whether it generalises.
+
+  problem:
+    - "Your first XGBoost model beats the neural network on tabular data and you cannot say why, so when it loses you have only a grid."
+    - "`learning_rate=0.1, n_estimators=10000` is folklore: on 2,000 rows depth-6 at `eta=0.3` scores 1.2597 test MSE, 1,000 stumps at `eta=0.1` score 1.0229."
+    - "`min_child_weight=1` looks like \"one row per leaf\", but in a logistic model it means 5 rows at the start and 138 by round 300."
+
+  analogy: |
+    A committee correcting a draft. The first draft is the mean and is wrong
+    everywhere. The second reviewer does not rewrite it — they write a note on
+    how the draft is wrong in each region, and the editor merges 10% of that
+    note. The third reads the *revised* draft. The note is the negative
+    gradient, the reviewer is a tree, and the 10% is the learning rate.
+
+  concept_points:
+    - "**Boosting is gradient descent with functions in place of parameters.** The update is $F_m = F_{m-1} + \\nu f_m$, where $f_m$ is fitted to $-g_i = -\\partial L(y_i,F)/\\partial F$. For squared loss $g_i = F_{m-1}(x_i) - y_i$, so the negative gradient *is* the residual: \"fit the residuals\" is the gradient, not a heuristic. Because $f_m$ is a tree, each step is piecewise constant."
+    - "**The leaf value is solved, not chosen: $w^\\star = -G/(H+\\lambda)$.** XGBoost minimises the second-order Taylor expansion inside each leaf, giving a closed form in the summed gradient $G$ and hessian $H$. For squared loss $h_i=1$ and $w^\\star$ is the mean residual; for logistic loss $h_i = p_i(1-p_i)$, a curvature-weighted mean that discounts confident rows."
+    - "**The split gain is the CART criterion with the target swapped for the gradient.** $\\text{gain} = \\tfrac12[\\frac{G_L^2}{H_L+\\lambda} + \\frac{G_R^2}{H_R+\\lambda} - \\frac{G^2}{H+\\lambda}] - \\gamma$. With squared loss, $\\lambda = \\gamma = 0$ this is exactly half the SSE reduction CART maximises — verified over 2,000 random splits to $1.26\\times10^{-13}$. The impurity function did not change; the *target* did."
+    - "**$\\lambda$, $\\gamma$ and `min_child_weight` are three different prices.** $\\gamma$ is charged once per split in gain units, exactly `min_impurity_decrease`; $\\lambda$ is charged continuously per leaf and enters both $w^\\star$ and the gain, so its bite scales as $1/(H+\\lambda)$: a leaf with $G=-5$, $H=3$ gives $w^\\star = 1.667$ at $\\lambda=0$ and 0.049 at $\\lambda=100$. `min_child_weight` is a hessian sum, not a row count."
+    - "**$\\lambda$, $\\gamma$ and `min_child_weight` are three different prices.** $\\gamma$ is charged once per split in gain units — exactly `min_impurity_decrease`. $\\lambda$ is charged per leaf and enters both $w^\\star$ and the gain, so its bite scales as $1/(H+\\lambda)$: a leaf with $G=-5$, $H=3$ gives $w^\\star = 1.667$ at $\\lambda=0$ and 0.049 at $\\lambda=100$. `min_child_weight` is a hessian sum, not a row count."
+    - "**Why 10,000 shallow trees beat 100 deep ones.** On 2,000 rows, 10,000 stumps at $\\nu=0.1$ reach test MSE **1.0990**; 100 depth-6 trees at $\\nu=1.0$ reach **1.9166**, 42.7% worse. The mechanism is variance: a depth-6 tree fits 62 leaves to about 32 rows each. And the failure: on $4x_0x_1 + 3|x_2-x_3|$ the stumps reach **4.9650** against a variance of 4.7364."
+
+  definitions:
+    - term: "Functional gradient descent"
+      meaning: >-
+        Gradient descent in which the variable being optimised is a function
+        rather than a vector of parameters. Each step adds a new basis function
+        (here, a tree) fitted to the negative gradient evaluated at the current
+        function.
+    - term: "Pseudo-residual"
+      meaning: >-
+        The negative gradient $-g_i = -\partial L(y_i, F(x_i))/\partial F$ used
+        as the regression target for the next tree. For squared loss it equals
+        $y_i - F(x_i)$, the ordinary residual; for logistic loss it equals
+        $y_i - p_i$. The name exists because for most losses it is not a residual
+        in the geometric sense.
+    - term: "Shrinkage (learning_rate, eta)"
+      meaning: >-
+        The multiplier $\nu \in (0,1]$ applied to each tree before it is added.
+        It scales the bias correction and the injected variance differently —
+        bias decays as $(1-\nu)^M$, variance grows as $\nu^2 M$ — which is why
+        lowering it requires more rounds and usually lowers the best achievable
+        validation loss.
+    - term: "Newton step / second-order leaf"
+      meaning: >-
+        The leaf value $w^\star = -G/(H+\lambda)$ obtained by minimising the
+        second-order Taylor expansion of the loss inside the leaf. It replaces a
+        chosen step size with a solved one, and it is the single largest
+        difference between XGBoost and textbook residual boosting.
+    - term: "Cover (hessian sum)"
+      meaning: >-
+        $H = \sum_i h_i$ over the rows in a node. It is the node's effective
+        sample size: equal to the row count under squared loss, and at most
+        $n/4$ under logistic loss. It is the quantity `min_child_weight`
+        constrains and the denominator that shrinks each leaf value.
+    - term: "min_child_weight"
+      meaning: >-
+        The minimum hessian sum a child must retain for a split to be accepted.
+        Despite the name it is not a row count except under squared loss; on a
+        converged logistic model one unit of cover can mean more than a hundred
+        rows.
+    - term: 'reg_lambda ($\lambda$)'
+      meaning: >-
+        L2 penalty on leaf weights, default 1 in XGBoost. It enters the
+        denominator of the leaf value and of every gain term, so it shrinks small
+        leaves hard and large leaves barely at all.
+    - term: "gamma (min_split_loss)"
+      meaning: >-
+        The minimum gain a split must produce to be kept, default 0. It is a
+        fixed price per split, structurally identical to `min_impurity_decrease`
+        in scikit-learn's trees, and it is the cheapest way to stop a tree from
+        growing leaves that each explain three rows.
+    - term: "Base score"
+      meaning: >-
+        The constant $F_0$ the ensemble starts from — the mean of $y$ for
+        regression, the log-odds of the base rate for classification. Every
+        subsequent tree is fitted to the gradient at $F_0$, so a wrong base score
+        costs rounds rather than correctness.
+    - term: "Histogram binning"
+      meaning: >-
+        Replacing each feature's values with integer bin indices (255 bins by
+        default in LightGBM, 256 in XGBoost's `hist`) so that split search
+        iterates over bins rather than rows. It is the single biggest speed win
+        in modern boosting and it makes the split grid coarser than the data.
+    - term: "GOSS (Gradient-based One-Side Sampling)"
+      meaning: >-
+        LightGBM's sampling scheme: keep the top $a$ fraction of rows by gradient
+        magnitude, sample a $b$ fraction of the remainder, and reweight the
+        sampled part by $(1-a)/b$ so the gain estimate stays unbiased. Defaults
+        $a = 0.2$, $b = 0.1$, so 30% of rows and a weight of 8.
+    - term: "EFB (Exclusive Feature Bundling)"
+      meaning: >-
+        Bundling sparse features that are almost never non-zero together into a
+        single column, turning an $O(n d)$ histogram build into $O(n d')$ with
+        $d' \ll d$. Exact for mutually exclusive features, approximate otherwise.
+    - term: "Leaf-wise growth"
+      meaning: >-
+        Growing the tree by repeatedly splitting whichever current leaf yields
+        the largest gain, rather than splitting every leaf at a level. For a
+        fixed leaf budget it reduces training loss much further and raises
+        variance much further, and it removes depth as an implicit regulariser.
+    - term: "Early stopping"
+      meaning: >-
+        Choosing the number of rounds by monitoring validation loss and stopping
+        when it has not improved for `early_stopping_rounds`. Because $\nu$ and
+        $M$ trade off, the number of rounds is a real hyperparameter and this is
+        the only honest way to set it.
+
+  diagrams:
+    - type: pipeline
+      title: "One boosting round, in the order the arithmetic happens"
+      nodes:
+        - label: "Compute the gradient"
+          note: "g_i = dL/dF at the current prediction"
+          detail: >-
+            For squared loss this is F − y; for logistic loss it is p − y. This
+            is the only place the choice of loss enters the algorithm, which is
+            why changing the objective requires no change to the tree code.
+        - label: "Grow a tree on (g, h)"
+          note: "splits scored by the regularised gain"
+          detail: >-
+            Every candidate split is scored by
+            0.5[G_L^2/(H_L+lam) + G_R^2/(H_R+lam) - G^2/(H+lam)] - gamma. With
+            h = 1 and lam = 0 this is exactly half the SSE reduction a regression
+            CART maximises.
+        - label: "Solve each leaf value"
+          note: "w* = -G/(H+lam)"
+          detail: >-
+            Not a mean — a curvature-weighted mean. As the model becomes
+            confident, H falls, so w* grows for the same G. That is the mechanism
+            behind both fast convergence and late-training instability.
+        - label: "Shrink and add"
+          note: "F <- F + nu*tree"
+          detail: >-
+            nu = 0.1 means each tree contributes a tenth of what it fitted. Bias
+            decays as (1-nu)^M; variance grows as nu^2*M. The optimum round count
+            scales as 1/nu.
+        - label: "Stop on validation loss"
+          note: "early_stopping_rounds"
+          detail: >-
+            Training loss is monotone in M by construction, so it cannot choose
+            M. The validation curve has a minimum, and that minimum is the model
+            you ship.
+
+    - type: graph
+      title: "The same algorithm, two vocabularies"
+      nodes:
+        - { id: param, label: "Parameter theta" }
+        - { id: func, label: "Function F" }
+        - { id: grad, label: "Gradient of the loss" }
+        - { id: neggrad, label: "Negative gradient -g" }
+        - { id: step, label: "Step eta*u" }
+        - { id: tree, label: "Tree f_m" }
+        - { id: lr, label: "Learning rate eta" }
+        - { id: nu, label: "Shrinkage nu" }
+      edges:
+        - { from: param, to: func, label: "replace the object" }
+        - { from: grad, to: neggrad, label: "flip the sign" }
+        - { from: neggrad, to: tree, label: "fit a tree to it" }
+        - { from: step, to: tree, label: "the step IS the tree" }
+        - { from: lr, to: nu, label: "same role, same arithmetic" }
+        - { from: func, to: neggrad, label: "evaluate here" }
+
+    - type: plot
+      title: "Test MSE against rounds at three learning rates (depth 3, 2,000 rows)"
+      chart: "line"
+      xLabel: "boosting rounds M"
+      yLabel: "test MSE"
+      series:
+        - name: "nu = 1.0 (no shrinkage)"
+          points:
+            - { x: 10, y: 1.3652 }
+            - { x: 25, y: 1.3925 }
+            - { x: 50, y: 1.5193 }
+            - { x: 100, y: 1.6675 }
+            - { x: 200, y: 1.7927 }
+            - { x: 300, y: 1.8277 }
+            - { x: 500, y: 1.8524 }
+            - { x: 1000, y: 1.8554 }
+        - name: "nu = 0.3"
+          points:
+            - { x: 10, y: 1.3291 }
+            - { x: 25, y: 1.1108 }
+            - { x: 50, y: 1.1192 }
+            - { x: 100, y: 1.1436 }
+            - { x: 200, y: 1.2010 }
+            - { x: 300, y: 1.2450 }
+            - { x: 500, y: 1.2961 }
+            - { x: 1000, y: 1.3416 }
+        - name: "nu = 0.1"
+          points:
+            - { x: 10, y: 2.5361 }
+            - { x: 25, y: 1.4899 }
+            - { x: 50, y: 1.1331 }
+            - { x: 100, y: 1.0580 }
+            - { x: 200, y: 1.0779 }
+            - { x: 300, y: 1.0940 }
+            - { x: 500, y: 1.1321 }
+            - { x: 1000, y: 1.2056 }
+
+    - type: compare
+      title: "Depth-wise (XGBoost default) vs leaf-wise (LightGBM default)"
+      left_label: "Depth-wise: max_depth = 6, at most 63 leaves"
+      left_points:
+        - "Every leaf at a level is split, so the tree is balanced and depth bounds the interaction order"
+        - 'Number of leaves is at most $2^{d}$; a depth-6 tree on 2,000 rows grows 62'
+        - "Depth is a real regulariser: it caps variance per leaf"
+        - "Splits that gain almost nothing are taken because a level is being filled"
+      right_label: "Leaf-wise: num_leaves = 31, depth unlimited"
+      right_points:
+        - "Always split the single best leaf, so gain per leaf is much higher"
+        - "31 leaves can be 30 levels deep — the same budget buys far lower training loss"
+        - "No depth bound, so `min_data_in_leaf=20` is the thing preventing one-row leaves"
+        - "Porting a tuned `max_depth` across libraries does not port the model"
+
+    - type: compare
+      title: "Choose the base learner by whether the truth is additive"
+      left_label: "Additive target — shallow wins"
+      left_points:
+        - "10,000 stumps at nu = 0.1: test MSE **1.0990**"
+        - "1,000 stumps: **1.0229**, the best result in the study"
+        - "100 depth-6 trees at nu = 1.0: 1.9166"
+        - 'Target: $3x_0 + 2\sin(4x_1) + 1.5x_2^2$'
+      right_label: "Interaction target — shallow cannot represent it"
+      right_points:
+        - "10,000 stumps: **4.9650**, worse than predicting the mean (variance 4.7364)"
+        - "100 depth-6 trees at nu = 0.1: 1.4419"
+        - "1,000 depth-3 trees: **1.3570**"
+        - 'Target: $4x_0x_1 + 3|x_2 - x_3|$'
+
+  markdown: |
+    ## The correction is a gradient
+
+    Start with the model you already have, $F_{m-1}$, and ask what the loss says
+    about it. The direction that reduces it is the negative derivative
+    $g_i = \partial L(y_i, F(x_i))/\partial F$, so the next tree is fitted to
+    $-g$, not to $y$:
+
+    $$F_m(x) = F_{m-1}(x) + \nu\, f_m(x), \qquad
+      f_m = \arg\min_{f} \sum_i \left(-g_i - f(x_i)\right)^2$$
+
+    For squared loss $g_i = F(x_i) - y_i$, so $-g_i$ is the residual — the "fit
+    the residuals" recipe is the special case everyone learns first. For
+    logistic loss $g_i = p_i - y_i$, large where the model is confidently wrong
+    and near zero where it is right. Nothing else depends on which loss you
+    chose.
+
+    This is the same update as *Gradient Descent Variants* with one substitution:
+    the parameter vector $\theta$ has become the function $F$. Momentum averages
+    past gradients; boosting adds a whole new function each step. So $\nu$ plays
+    the role $\eta$ played there, and the same geometric series reappears: a
+    repeated correction of size $\nu$ absorbs $1-(1-\nu)^M$ of the error, so
+    $\nu = 0.1$ needs 22 rounds to absorb 90% of it.
+
+    ## Why the leaf value is solved rather than chosen
+
+    A tree is piecewise constant, so once the structure is fixed only the leaf
+    values are free. Expand the loss to second order around the current
+    prediction, for the rows in one leaf:
+
+    $$L \approx \sum_{i \in \text{leaf}} \left[ g_i w + \tfrac{1}{2} h_i w^2
+      \right] + \tfrac{1}{2}\lambda w^2$$
+
+    with $h_i$ the second derivative of the loss with respect to the prediction
+    and the last term the L2 penalty. Differentiate and set to zero:
+
+    $$\frac{\partial}{\partial w} = G + (H + \lambda) w = 0
+      \quad\Longrightarrow\quad w^\star = -\frac{G}{H+\lambda}$$
+
+    This is one Newton step per leaf, and it is why there is no step size beyond
+    $\nu$. For squared loss $h_i = 1$ and $w^\star$ is the mean residual. For
+    logistic loss $h_i = p_i(1-p_i)$, so rows the model already gets right
+    contribute almost nothing — the leaf value is a **curvature-weighted** mean.
+    On the 2,000-row classification problem below, the mean hessian at round 1 is
+    0.2003, so the effective sample size is 400.5 rows. An implementation that
+    assumes $h=1$ therefore takes a step 4.99× too large.
+
+    Substituting $w^\star$ back gives the leaf's optimal objective,
+    $-\tfrac{1}{2}G^2/(H+\lambda)$, and the difference between the parent's value
+    and the two children's is the split gain:
+
+    $$\text{gain} = \tfrac{1}{2}\left[\frac{G_L^2}{H_L+\lambda} +
+      \frac{G_R^2}{H_R+\lambda} - \frac{G^2}{H+\lambda}\right] - \gamma$$
+
+    ## The split criterion did not change — the target did
+
+    Set $h_i = 1$, $\lambda = 0$, $\gamma = 0$. Then
+
+    $$\text{gain} = \tfrac{1}{2}\left[\frac{G_L^2}{n_L} +
+      \frac{G_R^2}{n_R} - \frac{G^2}{n}\right]
+      = \tfrac{1}{2}\left(\text{SSE}_{\text{parent}} -
+      \text{SSE}_{\text{children}}\right)$$
+
+    which is the criterion a regression CART maximises. Verified over 2,000
+    random splits: maximum absolute difference $1.26\times10^{-13}$, i.e.
+    floating-point zero.
+
+    | quantity | value |
+    |---|---|
+    | residuals in the node | $[-1, -1, +1, +1]$ |
+    | $G$, $H$ | $0$, $4$ |
+    | $G_L$, $H_L$ | $-2$, $2$ |
+    | $G_R$, $H_R$ | $+2$, $2$ |
+    | XGBoost gain | $\tfrac12(4/2 + 4/2 - 0) = 2$ |
+    | SSE parent to children | $4 \to 0$ |
+    | half the SSE reduction | $2$ |
+
+    So *Decision Trees*' impurity function — Gini as a variance, entropy as a
+    likelihood ratio — is still there; what changed is that the thing being made
+    pure is the gradient, not the label. With logistic loss the hessian enters
+    and the criterion genuinely diverges from Gini: rows are weighted by
+    $p(1-p)$, so a node of 100 confident rows counts as roughly 5 rows, while
+    Gini would charge it 100.
+
+    ## Shrinkage, and why ten thousand trees is not overfitting
+
+    Two forces move in opposite directions as you add rounds. The bias falls
+    geometrically, because each round corrects a fraction $\nu$ of what is left,
+    while the variance rises linearly, because each tree injects its own noise
+    scaled by $\nu$:
+
+    $$\text{bias}_M \approx (1-\nu)^M \text{bias}_0 \approx e^{-\nu M}
+      \text{bias}_0, \qquad \text{variance}_M \approx \nu^2 \sigma^2 M$$
+
+    Minimising the sum over $M$ gives $M^\star \propto 1/\nu$, and the floor
+    falls as $\nu$ falls — the whole reason small learning rates with many rounds
+    win. Measured at depth 3:
+
+    | $\nu$ | best round | test MSE there | test MSE at 1,000 |
+    |---|---|---|---|
+    | 1.0 | 10 | 1.3652 | 1.8554 |
+    | 0.3 | 25 | 1.1108 | 1.3416 |
+    | 0.1 | 100 | **1.0580** | 1.2056 |
+
+    The optimum moved from round 25 to round 100 when $\nu$ fell by 3.3×, and the
+    floor fell by 5%.
+
+    Same 2,000 rows, same loss:
+
+    | model | train MSE | test MSE |
+    |---|---|---|
+    | 10,000 stumps, $\nu = 0.1$ | 0.6652 | **1.0990** |
+    | 1,000 stumps, $\nu = 0.1$ | 0.8256 | **1.0229** |
+    | 100 depth-6, $\nu = 1.0$ | 0.0002 | 1.9166 |
+    | 100 depth-6, $\nu = 0.1$ | 0.2261 | 1.1435 |
+
+    The deep model drives training MSE to 0.0002 against a target variance of
+    5.99, and is 42.7% worse on held-out data than a model with three times as
+    many parameters. Each of its 62 leaves is a mean of 32 rows fitted at full
+    strength, and nothing later can undo it: the gradient at those rows is
+    already zero.
+
+    | interaction target | train MSE | test MSE |
+    |---|---|---|
+    | 10,000 stumps, $\nu = 0.1$ | 3.0815 | 4.9650 |
+    | target variance | — | 4.7364 |
+    | 100 depth-6, $\nu = 0.1$ | 0.1436 | 1.4419 |
+    | 1,000 depth-3, $\nu = 0.1$ | 0.1994 | **1.3570** |
+
+    The stump model is worse than the constant mean. No number of additive
+    axis-aligned steps produces $x_0x_1$; the bias never falls, however much
+    variance you spend. This is the decision rule: **depth is interaction order,
+    and shrinkage is the variance budget you spend on it.**
+
+    ## What LightGBM actually changed
+
+    XGBoost's contribution was the exact second-order objective, at
+    $O(n \log n)$ per node. LightGBM made it affordable at $10^6$ rows and
+    $10^3$ features, and each of its three ideas trades exactness for work.
+
+    **Histogram binning.** Bucket each feature into 255 bins once, then search
+    splits over bins. Candidate thresholds per feature drop from $n-1$ to 254 —
+    at $n = 10^6$ a factor of 3,937 — and the histogram is built in one pass per
+    node rather than a sort.
+
+    **GOSS.** Keep the top 20% of rows by gradient, sample 10% of the rest, and
+    reweight by $(1-0.2)/0.1 = 8$: 30% of the work for a nearly unbiased gain
+    estimate.
+
+    **EFB.** Sparse one-hot features are almost never non-zero together, so they
+    can be packed into one column with no loss.
+
+    The cost is resolution: a split finer than one bin does not exist, and
+    `min_data_in_leaf=20` is doing regularisation that XGBoost's `max_depth=6`
+    does. Leaf-wise growth compounds this — with `num_leaves=31` and
+    `max_depth=-1`, the tree can be 30 levels deep, so the leaf count is the
+    budget and the depth bound is gone.
+
+    ## What to set, in order
+
+    **$\nu$ first, then rounds**: start at 0.05–0.1 and let early stopping pick
+    the count. **Depth by interaction order**: stumps at 2,000 rows, depth 6 at
+    $10^5$. **`min_child_weight` in cover, not rows**, and `reg_lambda` near 1.
+
+    ## The longer version
+
+    The remaining mechanisms, verbatim: how depth sets interaction order and
+    what row count can afford, and the three LightGBM approximations — histogram
+    binning, GOSS, EFB — plus leaf-wise growth.
+
+    ### Failure modes, in full
+
+    - Your first XGBoost model beats the neural network it replaced on tabular data, and you cannot say why — so when it loses on the next dataset you have no diagnosis, only a hyperparameter grid.
+    - `learning_rate=0.1, n_estimators=10000` is folklore you have copied from a blog post. It is also a specific claim about variance, and on 2,000 rows a depth-6 model at the default `eta=0.3` reaches **1.2597** test MSE while 1,000 stumps at `eta=0.1` reach **1.0229** — a 19% gap that no amount of grid search over `max_depth` recovers if you have the shrinkage wrong.
+    - `min_child_weight=1` looks like "at least one row per leaf". In a logistic model it means five rows at the start of training and 138 rows by round 300 — and the parameter silently changes meaning as the model converges.
+    - XGBoost and LightGBM produce different trees from identical data and identical hyperparameter names, because one grows depth-wise and the other leaf-wise, and `max_depth=6` and `num_leaves=31` do not describe the same object.
+    - You need to explain to a reviewer why a 10,000-tree model is not overfitting when their 100-tree model is, and "gradient boosting is robust" is not an explanation.
+
+    ### The mechanisms, in full
+
+    - **Boosting is gradient descent with functions in place of parameters.** In *Gradient Descent Variants* the update was $\theta \leftarrow \theta - \eta \nabla L(\theta)$. Here the object being updated is the model: $F_m = F_{m-1} + \nu f_m$, where $f_m$ is fitted to the negative gradient $-g_i = -\partial L(y_i, F)/\partial F$ evaluated at $F_{m-1}$. For squared loss $g_i = F_{m-1}(x_i) - y_i$, so the negative gradient *is* the residual — "fit the residuals" is not a heuristic, it is the gradient. On 2,000 rows with a depth-3 base learner and $\nu = 0.1$, train MSE falls from the variance 5.99 to 0.73 in 100 rounds. The catch: because $f_m$ is a tree, the step is piecewise constant. A stump moves the prediction in exactly two values, so each round is a two-parameter descent step, not a full gradient step.
+    - **The leaf value is solved, not chosen: $w^\star = -G/(H+\lambda)$.** A gradient-descent step needs a step size; XGBoost does not guess one. It minimises the second-order Taylor expansion of the loss inside each leaf, which has a closed-form minimiser in terms of the summed gradient $G = \sum_i g_i$ and summed hessian $H = \sum_i h_i$. For squared loss $h_i = 1$, so $w^\star$ is the mean residual. For logistic loss $h_i = p_i(1-p_i)$, so $w^\star$ is a **curvature-weighted** mean that discounts rows the model already classifies confidently. Numbers: on 2,000 rows at a 27.7% positive rate the mean hessian at round 1 is 0.2003, so $H = 400.5$ — the effective sample size is a fifth of the row count, and a first-order implementation that assumes $h=1$ takes a step 4.99× too large.
+    - **The split gain is the tree criterion from *Decision Trees*, with the target swapped for the gradient.** XGBoost scores a candidate split by $$\text{gain} = \tfrac{1}{2}\left[\frac{G_L^2}{H_L+\lambda} + \frac{G_R^2}{H_R+\lambda} - \frac{G^2}{H+\lambda}\right] - \gamma.$$ With squared loss, $\lambda = 0$ and $\gamma = 0$ this is **exactly** half the reduction in sum of squared error that a regression CART maximises — verified over 2,000 random splits, maximum absolute difference $1.26 \times 10^{-13}$. So the impurity function did not change; the *target* did. Worked example: residuals $[-1,-1,+1,+1]$ split down the middle give $G_L = -2$, $H_L = 2$, $G_R = +2$, $H_R = 2$, so the gain is $\tfrac{1}{2}(2 + 2 - 0) = 2$, and the SSE falls from 4 to 0 — half of 4 is 2. The difference from Gini appears only through $h$: with logistic loss every row is weighted by its own curvature, so confident rows count less, while Gini charges every row equally.
+    - **$\lambda$ and $\gamma$ are different prices and you need both.** $\gamma$ is charged **once per split**, in the same units as the gain, which makes it exactly `min_impurity_decrease` from *Decision Trees*: a split whose gain does not exceed $\gamma$ is refused. $\lambda$ is charged **continuously per leaf**, and it enters both the leaf value and the gain. Measured on a leaf with $G = -5$, $H = 3$: $w^\star$ is 1.667 at $\lambda = 0$, 1.25 at $\lambda = 1$, 0.385 at $\lambda = 10$ and 0.049 at $\lambda = 100$. On a leaf with $G = -300$, $H = 1000$ the same $\lambda = 10$ moves 0.300 to 0.297 — a 1% change. That asymmetry is the point: $\lambda$'s bite scales as $1/(H+\lambda)$, so it crushes three-row leaves and leaves thousand-row leaves alone.
+    - **`min_child_weight` is a hessian sum, not a row count — the most consistently mis-set parameter in the library.** The constraint is $H_{\text{child}} \ge$ `min_child_weight`, and for squared loss $H = n$, which is why the documentation says "in linear regression this simply corresponds to the minimum number of instances". For anything else it is false. Measured on the 2,000-row logistic problem: cover is 400.5 in round 1 (4.99 rows per unit) and 14.5 by round 300 at $\nu = 1.0$ (138 rows per unit). The same `min_child_weight=1` is therefore 28× more conservative at the end of training than at the start, without anyone editing the config.
+    - **Shrinkage $\nu$ is what makes the number of rounds a safe knob rather than a second capacity knob.** Each tree contributes $\nu$ times its fitted values, so the residual bias decays like $(1-\nu)^M \approx e^{-\nu M}$ while the variance injected grows like $\nu^2 M$. The two curves cross at an $M^\star$ that scales as $1/\nu$, and the floor of the U-curve falls with $\nu$. Measured on the additive target at depth 3: $\nu = 1.0$ bottoms at round 10 with test MSE 1.3652 and is still climbing at round 1,000 (1.8554); $\nu = 0.3$ bottoms at round 25 with 1.1108; $\nu = 0.1$ bottoms at round 100 with **1.0580**. A 3.3× smaller learning rate moved the optimum 4× later and lowered the floor — the empirical shape of $M^\star \propto 1/\nu$.
+    - **Why 10,000 shallow trees beat 100 deep ones — and exactly when they stop.** Same 2,000 rows, same loss: 10,000 stumps at $\nu = 0.1$ reach test MSE **1.0990**; 100 depth-6 trees at $\nu = 1.0$ reach **1.9166**, 42.7% worse, despite the stumps carrying 20,000 leaf parameters against the deep model's 6,200. The mechanism is variance, not capacity: one depth-6 tree on this data has 62 leaves fitted to about 32 rows each, and at $\nu = 1$ all 62 noisy means are committed at full strength and never revisited. A stump commits two values at 10% strength; a wrong split is partly undone by later stumps, and the variance injected per round is $\nu^2\sigma^2$, not $\sigma^2$. Then the failure mode: on the interaction target ($4x_0x_1 + 3|x_2-x_3|$) the same 10,000 stumps reach **4.9650** against a target variance of 4.7364 — worse than the constant mean — because no sum of axis-aligned constants can represent a product. Depth 6 reaches 1.4419. "Shallow and many" is a bet that the truth is additive, and the bet is free only when it is true.
+    - **Depth is interaction order, and the row count decides how much of it you can afford.** A tree of depth $d$ can express $d$-way interactions; a stump expresses none. That is why stumps dominate on the additive target (1.0229 at 1,000 rounds, the best number in the whole study) and lose to the mean on the interaction target. It is also why depth 3 beat depth 6 at the same learning rate once $n$ fell to 2,000: on the interaction target depth 3 reached 1.3570 and depth 6 reached 1.4419. XGBoost's default `max_depth=6` is a compromise tuned for datasets of $10^4$ to $10^6$ rows. It is not a law, and on 2,000 rows it is too deep.
+    - **LightGBM buys its speed with three approximations, and each one changes what you should tune.** (1) *Histogram binning*: features are bucketed into `max_bin=255` bins, so a split search costs $O(255 \cdot d)$ per node instead of sorting $n$ values — for $n = 10^6$ and $d = 100$ the candidate thresholds per feature fall from 999,999 to 254, a factor of **3,937** — at the cost of being blind to any boundary finer than one bin. (2) *GOSS*: keep the top $a = 0.2$ of rows by $|g_i|$, sample $b = 0.1$ of the rest, and multiply the sampled part by $(1-a)/b = 8$; that is 30% of the rows for a nearly unbiased gain estimate. (3) *EFB*: bundle mutually exclusive sparse features into one column. The consequence is that `max_bin` and `min_data_in_leaf` (default 20) matter more than `max_depth` (default −1, i.e. unlimited).
+    - **Leaf-wise growth makes `num_leaves`, not `max_depth`, the capacity knob.** Depth-wise growth splits every node at a level, so 31 leaves means depth 5 ($2^5 = 32$). Leaf-wise growth always splits the single leaf with the largest gain, so 31 leaves can be 30 levels deep — same leaf budget, much lower training loss, much higher variance per leaf, and no depth bound to stop it. Measured, a depth-6 tree on 2,000 rows has **62 leaves**; LightGBM's default 31 leaves is roughly half that capacity but can reach a depth XGBoost would never allow. This is why `min_data_in_leaf=20` is doing the job that `max_depth` does in XGBoost, and why porting a tuned XGBoost config to LightGBM by copying `max_depth` produces a different model.
+
+
+  derivations:
+    - title: "From the second-order expansion to the leaf value and the split gain"
+      latex: |
+        Fix a leaf containing a set $I$ of rows, and let the leaf's constant
+        output be $w$. Around the current prediction $F_{m-1}(x_i)$ the loss is
+
+        $$L \approx \sum_{i \in I}\left[L(y_i, F_{m-1}) + g_i w +
+          \tfrac{1}{2}h_i w^2\right] + \tfrac{1}{2}\lambda w^2$$
+
+        with $g_i = \partial_{F}L(y_i,F)$ and $h_i = \partial^2_{F}L(y_i,F)$
+        evaluated at $F_{m-1}$. Dropping the constant and writing
+        $G = \sum_{i \in I} g_i$, $H = \sum_{i \in I} h_i$:
+
+        $$\hat{L}(w) = G w + \tfrac{1}{2}(H+\lambda)w^2$$
+
+        Setting $\mathrm{d}\hat{L}/\mathrm{d}w = 0$ gives the optimal leaf value
+
+        $$w^\star = -\frac{G}{H+\lambda}, \qquad
+          \hat{L}(w^\star) = -\frac{1}{2}\frac{G^2}{H+\lambda}$$
+
+        A split partitions $I$ into $I_L$ and $I_R$. The gain is the parent's
+        optimal objective minus the children's, minus a price $\gamma$ per split:
+
+        $$\text{gain} = \tfrac{1}{2}\left[\frac{G_L^2}{H_L+\lambda} +
+          \frac{G_R^2}{H_R+\lambda} - \frac{G^2}{H+\lambda}\right] - \gamma$$
+
+        and the split is accepted only if this is positive.
+      prose: >-
+        Every quantity in XGBoost's split search comes out of one Taylor
+        expansion. The leaf value is where the quadratic bottoms out; the gain is
+        how much lower the bottom is after splitting. $\lambda$ appears in both
+        because it is part of the same quadratic, which is exactly why it
+        shrinks small leaves (where $H$ is comparable to $\lambda$) and ignores
+        large ones.
+    - title: "With squared loss the gain is exactly half of CART's SSE reduction"
+      latex: |
+        For squared loss $L = \tfrac{1}{2}(y - F)^2$, so
+
+        $$g_i = F - y_i = -r_i, \qquad h_i = 1$$
+
+        where $r_i = y_i - F$ is the residual. Then $G = -\sum r_i$ and $H = n$,
+        and the gain becomes
+
+        $$\text{gain} = \tfrac{1}{2}\left[\frac{(\sum_{L} r)^2}{n_L} +
+          \frac{(\sum_{R} r)^2}{n_R} - \frac{(\sum r)^2}{n}\right]$$
+
+        Now compute the SSE of the residuals in the parent and in the children:
+
+        $$\text{SSE}_{\text{parent}} = \sum_i r_i^2 - \frac{(\sum_i r_i)^2}{n},
+          \qquad
+          \text{SSE}_{\text{children}} = \sum_i r_i^2 -
+          \frac{(\sum_L r)^2}{n_L} - \frac{(\sum_R r)^2}{n_R}$$
+
+        Subtracting,
+
+        $$\text{SSE}_{\text{parent}} - \text{SSE}_{\text{children}}
+          = \frac{(\sum_L r)^2}{n_L} + \frac{(\sum_R r)^2}{n_R}
+            - \frac{(\sum r)^2}{n}
+          = 2\,\text{gain}$$
+
+        so the gain is half the SSE reduction. The factor of 2 is inherited from
+        the $\tfrac12$ in the loss, and it cancels in every argmax.
+      prose: >-
+        This is the formal statement that gradient boosting did not invent a new
+        split criterion. It is the regression-tree variance reduction from
+        Decision Trees, evaluated on residuals instead of labels, with a factor
+        of two that never changes a ranking. The moment $h_i$ stops being 1 —
+        logistic loss, Poisson, ranking — the criterion genuinely changes,
+        because rows acquire different weights.
+    - title: "Why the optimal number of rounds scales as 1/nu"
+      latex: |
+        Model the ensemble's error in one direction as a bias that each round
+        removes a fraction $\nu$ of, plus noise injected by each tree:
+
+        $$\text{MSE}(M) \approx c^2(1-\nu)^{2M} + \nu^2\sigma^2 M$$
+
+        The first term is squared bias, decaying geometrically; the second is
+        accumulated variance, growing linearly because the trees' errors are
+        treated as independent. Differentiate with respect to $M$ and set to
+        zero:
+
+        $$\frac{\mathrm{d}}{\mathrm{d}M} = -2\ln\!\frac{1}{1-\nu}\,
+          c^2(1-\nu)^{2M} + \nu^2\sigma^2 = 0$$
+
+        $$\Longrightarrow\quad (1-\nu)^{2M^\star}
+          = \frac{\nu^2\sigma^2}{2c^2\ln\frac{1}{1-\nu}}$$
+
+        Taking logs, and using $\ln\frac{1}{1-\nu} \approx \nu$ for small $\nu$:
+
+        $$M^\star = \frac{1}{2\ln\frac{1}{1-\nu}}
+          \ln\frac{2c^2\ln\frac{1}{1-\nu}}{\nu^2\sigma^2}
+          \;\approx\; \frac{1}{2\nu}\ln\frac{2c^2}{\nu\sigma^2}$$
+
+        so $M^\star$ scales as $1/\nu$ up to a logarithm. Substituting $M^\star$
+        back, the variance term at the optimum is
+        $\nu^2\sigma^2 M^\star \approx \tfrac12 \nu\sigma^2 \ln(\cdot)$, so the
+        floor of the U-curve is **linear in $\nu$**.
+      prose: >-
+        Two predictions, both testable. The best round count should scale
+        inversely with the learning rate — measured, 25 rounds at nu = 0.3 and
+        100 at nu = 0.1, a factor of 4 for a factor of 3.3. And the best
+        achievable error should fall as nu falls — measured, 1.1108 at nu = 0.3
+        against 1.0580 at nu = 0.1. At nu = 1 the bias term vanishes after one
+        round ((1-1)^M = 0) and only the variance term survives, which is why
+        that curve turns immediately and never comes back.
+
+  implementations:
+    - language: python
+      title: "XGBoost's objective from scratch: hessians, lambda, gamma, and shrinkage"
+      note: >-
+        Numerically wrong in three places, all of them deliberate simplifications
+        of the real library. (1) Splits are found by exact sorting of every
+        feature at every node, so this will not reproduce LightGBM's histogram
+        model — on 1e6 rows LightGBM considers 254 thresholds per feature and
+        this considers every distinct value. (2) Missing values are not handled:
+        `X[:, f] <= thr` sends `NaN` to the right child always, whereas XGBoost
+        learns a default direction per split from the data. (3) The gain is
+        compared with a strict `>` and no epsilon, so two splits whose gains
+        differ by 1e-17 are decided by float noise, and permuting the columns can
+        change the tree.
+      code: |
+        import numpy as np
+
+        class Node:
+            __slots__ = ("feat", "thr", "left", "right", "value")
+            def __init__(self, value=0.0):
+                self.feat = self.thr = None
+                self.left = self.right = None
+                self.value = value
+
+        def best_split(X, g, h, lam, min_h):
+            """Exhaustive sweep. Returns (feature, threshold), best_gain."""
+            n, d = X.shape
+            G, H = g.sum(), h.sum()
+            base = G * G / (H + lam)
+            best_gain, best = -np.inf, None
+            for f in range(d):
+                order = np.argsort(X[:, f], kind="mergesort")
+                xs = X[order, f]
+                # Prefix sums give both children's statistics in O(1) per
+                # candidate: the right child is the total minus the left.
+                GL = np.cumsum(g[order])[:-1]
+                HL = np.cumsum(h[order])[:-1]
+                GR, HR = G - GL, H - HL
+                # A threshold only exists between two distinct values, and a
+                # child below min_child_weight (a HESSIAN sum) is refused.
+                valid = (xs[:-1] < xs[1:]) & (HL >= min_h) & (HR >= min_h)
+                if not valid.any():
+                    continue
+                gains = 0.5 * (GL**2 / (HL + lam) + GR**2 / (HR + lam) - base)
+                gains = np.where(valid, gains, -np.inf)
+                j = int(np.argmax(gains))
+                if gains[j] > best_gain:
+                    best_gain = float(gains[j])
+                    best = (f, 0.5 * (xs[j] + xs[j + 1]))
+            return best, best_gain
+
+        def grow(X, g, h, lam=1.0, gamma=0.0, max_depth=6, min_h=1e-6, depth=0):
+            G, H = g.sum(), h.sum()
+            denom = H + lam
+            node = Node(value=float(-G / denom) if denom > 0 else 0.0)
+            if depth >= max_depth or len(g) < 2:
+                return node
+            split, gain = best_split(X, g, h, lam, min_h)
+            if split is None or gain <= gamma:      # gamma: the price of a split
+                return node
+            f, thr = split
+            m = X[:, f] <= thr
+            if m.all() or (~m).all():
+                return node
+            node.feat, node.thr = f, thr
+            node.left = grow(X[m], g[m], h[m], lam, gamma, max_depth, min_h, depth + 1)
+            node.right = grow(X[~m], g[~m], h[~m], lam, gamma, max_depth, min_h, depth + 1)
+            return node
+
+        def predict_tree(node, X):
+            out = np.empty(len(X))
+            stack = [(node, np.arange(len(X)))]
+            while stack:
+                nd, ix = stack.pop()
+                if nd.feat is None:
+                    out[ix] = nd.value
+                    continue
+                m = X[ix, nd.feat] <= nd.thr
+                if m.any():
+                    stack.append((nd.left, ix[m]))
+                if (~m).any():
+                    stack.append((nd.right, ix[~m]))
+            return out
+
+        def fit_gbdt(X, y, loss="squared", rounds=100, lr=0.1, lam=1.0,
+                     gamma=0.0, max_depth=3, early_stop=None, X_val=None, y_val=None):
+            """Functional gradient descent. Returns (F_train, F_val, best_round)."""
+            if loss == "squared":
+                F = np.full(len(y), float(np.mean(y)))
+                def grad_hess(F, y):
+                    return F - y, np.ones_like(F)          # h = 1 everywhere
+                def metric(F, y):
+                    return float(np.mean((y - F) ** 2))
+            else:
+                p0 = float(np.clip(np.mean(y), 1e-6, 1 - 1e-6))
+                F = np.full(len(y), np.log(p0 / (1 - p0)))  # base score: log-odds
+                def sig(z):
+                    return 1.0 / (1.0 + np.exp(-z))
+                def grad_hess(F, y):
+                    p = sig(F)
+                    return p - y, p * (1 - p)              # h = p(1-p): curvature
+                def metric(F, y):
+                    p = np.clip(sig(F), 1e-12, 1 - 1e-12)
+                    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+
+            Fv = np.full(len(y_val), F[0]) if X_val is not None else None
+            best, best_round, stale = np.inf, 0, 0
+            for m in range(rounds):
+                g, h = grad_hess(F, y)
+                tree = grow(X, g, h, lam, gamma, max_depth)
+                F = F + lr * predict_tree(tree, X)         # shrink, then add
+                if X_val is not None:
+                    Fv = Fv + lr * predict_tree(tree, X_val)
+                    score = metric(Fv, y_val)
+                    if score < best - 1e-12:
+                        best, best_round, stale = score, m + 1, 0
+                    else:
+                        stale += 1
+                        if early_stop and stale >= early_stop:
+                            break
+            return F, Fv, best_round
+
+        # Measured, 2,000 rows / 8 features / additive target, depth 3, lam=1:
+        #   nu=1.0: best test MSE 1.3652 at round 10, 1.8554 at round 1000
+        #   nu=0.3: best test MSE 1.1108 at round 25
+        #   nu=0.1: best test MSE 1.0580 at round 100
+        # Classification, 2,000 rows at 27.7% positive, depth 3:
+        #   nu=0.1: test logloss 0.4915 at round 100
+        #   nu=1.0: test logloss 1.0667 at round 300 (train accuracy 1.0000)
+
+    - language: python
+      title: "Residual boosting: the version that is only right for squared loss"
+      note: >-
+        Numerically wrong for any loss other than squared error, and this is the
+        most common from-scratch mistake. It hard-codes $h_i = 1$, so the leaf
+        value is the *mean gradient* rather than the Newton step
+        $-G/(H+\lambda)$. On the 2,000-row logistic problem the mean hessian at
+        round 1 is 0.2003, so every step is 4.99× too large relative to the
+        second-order solution — and the error is not a constant: as the model
+        becomes confident the true $H$ falls from 400.5 to 14.5, so the same code
+        keeps taking steps sized as if curvature were still 1. Measured
+        consequence: at $\nu = 1.0$ this version reaches test logloss 0.5353 at
+        round 300, where the Newton version has already blown up to 1.0667; at
+        $\nu = 0.1$ it reaches 0.4984, where the Newton version peaks at 0.4915
+        at round 100. Neither is uniformly better — which is the point: they are
+        different estimators, and the first-order one has no curvature term to
+        stabilise it.
+      code: |
+        import numpy as np
+
+        def best_stump(X, r):
+            """Split minimising the SSE of r -- i.e. assuming h = 1 for every row."""
+            n, d = X.shape
+            G = float(r.sum())
+            best_gain, best = -np.inf, None
+            for f in range(d):
+                order = np.argsort(X[:, f], kind="mergesort")
+                xs = X[order, f]
+                GL = np.cumsum(r[order])[:-1]
+                GR = G - GL
+                nL = np.arange(1, n, dtype=float)
+                nR = n - nL
+                gains = np.where(xs[:-1] < xs[1:],
+                                 GL**2 / nL + GR**2 / nR - G * G / n, -np.inf)
+                j = int(np.argmax(gains))
+                if gains[j] > best_gain:
+                    best_gain = float(gains[j])
+                    best = (f, 0.5 * (xs[j] + xs[j + 1]))
+            return best, best_gain
+
+        def boost_residuals(X, y, rounds=100, lr=0.1):
+            """Gradient descent on squared loss only. Leaf value = mean residual.
+
+            For logistic loss this is WRONG: the correct leaf is -G/(H+lam) with
+            h = p(1-p), which is 5x larger at p = 0.5 and grows without bound as
+            the model saturates. Here h is silently 1.
+            """
+            X = np.asarray(X, float)
+            y = np.asarray(y, float)
+            F = np.full(len(y), float(y.mean()))
+            for _ in range(rounds):
+                r = y - F                      # -g, only because loss is squared
+                (f, thr), gain = best_stump(X, r)
+                if not np.isfinite(gain) or gain <= 0.0:
+                    break
+                left = X[:, f] <= thr
+                w = np.where(left, r[left].mean(), r[~left].mean())
+                F = F + lr * w
+            return F
+
+        # On the classification set this function produces numbers that look
+        # plausible and are not the XGBoost leaf: measured test logloss 0.5353
+        # at round 300 with lr=1.0, against 0.4915 for the Newton version at
+        # its best round.
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A colleague implements boosting for logistic regression by fitting each
+        tree to the residuals $y_i - p_i$ and setting each leaf to their mean.
+        What exactly is wrong, and by what factor?
+      answerKind: short_text
+      hint: >-
+        What is the second derivative of the logistic loss with respect to the
+        prediction, and what does the leaf formula become if you assume it is 1?
+      solution: >-
+        The gradient is right — $y_i - p_i$ is $-g_i$ — but the leaf value is
+        wrong. The second-order optimum is $w^\star = -G/(H+\lambda)$ with
+        $h_i = p_i(1-p_i)$, and the code uses $H = n$ instead. The ratio is
+        $n/\sum h_i = 1/\bar{h}$, which at a 27.7% positive rate is
+        $1/0.2003 = 4.99$ — the step is five times too large. Worse, the error is
+        not constant: $\bar h$ falls from 0.2003 to 0.0072 as the model saturates,
+        so the same code takes steps that are 138× too large by round 300. That
+        is exactly the regime where the measured Newton run diverges to test
+        logloss 1.0667 at $\nu = 1$.
+    - id: cp-2
+      question: >-
+        You set `min_child_weight=1` on a binary classifier with 2,000 rows.
+        Roughly how many rows per leaf does that permit at the start of training,
+        and at the end?
+      answerKind: short_text
+      hint: >-
+        The constraint is on the hessian sum, and for logistic loss the hessian
+        of a row is $p(1-p)$, which is at most 0.25.
+      solution: >-
+        It is not one row. At round 1 the mean hessian is 0.2003, so one unit of
+        cover is 4.99 rows. By round 300 at $\nu = 1.0$ the mean hessian has
+        fallen to 0.0072 and one unit of cover is 138 rows. The same setting is
+        28× more conservative at the end of training than at the beginning,
+        because cover measures curvature, not count. Set it in the units you
+        mean: multiply the rows you want per leaf by the mean hessian, and
+        re-check it after you change the learning rate.
+    - id: cp-3
+      question: >-
+        On 2,000 rows, 100 depth-6 trees at $\nu = 1.0$ give test MSE 1.9166
+        while 10,000 stumps at $\nu = 0.1$ give 1.0990. The stumps have more
+        parameters. Explain the gap, and then say what would reverse it.
+      answerKind: short_text
+      hint: >-
+        Compare how many rows support each leaf value, and how strongly each leaf
+        value is committed.
+      solution: >-
+        Each depth-6 tree has 62 leaves fitted to about 32 rows apiece, and at
+        $\nu = 1$ all 62 noisy means enter the model at full strength, where
+        nothing later can revise them — the gradient at those rows is already
+        zero. A stump commits two values at 10% strength, so a split that
+        captured noise is partly cancelled by later stumps, and the variance
+        injected per round is $\nu^2\sigma^2$ rather than $\sigma^2$. Parameter
+        count is the wrong metric; commitment per parameter is the right one.
+        It reverses when the target is not additive: on
+        $4x_0x_1 + 3|x_2-x_3|$ the same 10,000 stumps reach 4.9650 — worse than
+        the 4.7364 variance — while depth 6 reaches 1.4419. Shallow is a bet on
+        additivity, and it loses that bet completely.
+    - id: cp-4
+      question: >-
+        With squared loss, `reg_lambda = 0` and `gamma = 0`, is XGBoost's split
+        criterion different from the one a CART regression tree uses? Show the
+        algebra.
+      answerKind: short_text
+      hint: >-
+        Substitute $h_i = 1$ into the gain formula and compare with the definition
+        of an SSE reduction.
+      solution: >-
+        Identical up to a factor of two. With $h_i = 1$, $H = n$, so the gain is
+        $\tfrac12[(\sum_L r)^2/n_L + (\sum_R r)^2/n_R - (\sum r)^2/n]$, and that
+        bracket is exactly $\text{SSE}_{\text{parent}} -
+        \text{SSE}_{\text{children}}$. The factor of 2 comes from the $\tfrac12$
+        in the loss and cancels in every argmax. Verified numerically over 2,000
+        random splits: maximum absolute difference $1.26\times10^{-13}$. So
+        gradient boosting reuses the decision-tree criterion and changes only the
+        target — from the label to the negative gradient. The criteria diverge as
+        soon as $h_i \ne 1$, because then rows carry different weights.
+    - id: cp-5
+      question: >-
+        Your validation loss bottoms at round 400 and then rises, while training
+        loss keeps falling. Which of `learning_rate`, `max_depth`, and
+        `n_estimators` do you change, and what do you expect to happen?
+      answerKind: short_text
+      hint: >-
+        One of those three is already being chosen by the curve you are looking
+        at.
+      solution: >-
+        `n_estimators` is already answered: 400. Use early stopping and stop
+        there. The real question is whether the floor at 400 is good enough, and
+        that is governed by $\nu$ and depth. Lower $\nu$ moves the optimum later
+        and lowers the floor — measured, 25 rounds at $\nu = 0.3$ and 100 at
+        $\nu = 0.1$ on a much shorter run, with test MSE 1.1108 versus 1.0580 —
+        so the move is $\nu$ down and let early stopping find the new, larger
+        round count. Reduce depth only if the gap between train and validation is
+        growing fast relative to the improvement, which on small $n$ is the
+        common case: at 2,000 rows depth 3 beat depth 6 at the same $\nu$.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A boosted model is a sum of small trees, and each tree is added to
+        correct what the current sum gets wrong. The important part is what
+        "wrong" means: it is the negative derivative of the loss with respect to
+        the current prediction, evaluated row by row. For squared error that is
+        the residual, which is why the recipe is usually taught as "fit the
+        residuals" — but that description is a special case, and it is the reason
+        most from-scratch implementations are wrong for classification.
+      blocks:
+        - kind: checklist
+          body: |
+            - The thing being updated is the model, not a parameter vector
+            - Each tree is fitted to -g, the negative gradient at the current prediction
+            - Squared loss: -g is the residual. Logistic loss: -g is y - p
+            - Leaf values are solved from the curvature, not averaged
+            - The learning rate multiplies each tree before it is added
+            - The number of trees is chosen by held-out loss, never by training loss
+      checkpoint: >-
+        If the tree is fitted to the negative gradient rather than to $y$, what
+        happens to the model's predictions on rows it already gets exactly right?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Three separate questions, and they need three different tools. *What
+        should each tree fit?* — the negative gradient, which is a one-line
+        derivative of whichever loss you chose. *How large should each leaf be?*
+        — do not pick a step size; expand the loss to second order inside the
+        leaf and solve the quadratic, which gives a closed form in the summed
+        gradient and summed hessian. *How many trees?* — shrinkage plus a
+        validation curve, because training loss is monotone in the round count
+        and therefore cannot choose it.
+      blocks:
+        - kind: checklist
+          body: |
+            - Fit: derivative of the loss w.r.t. the prediction, negated
+            - Leaf: minimise G*w + 0.5*(H+lam)*w^2  ->  w* = -G/(H+lam)
+            - Split: compare the parent's optimal objective with the children's, minus gamma
+            - Shrink: F <- F + nu*tree, with nu around 0.05-0.1
+            - Stop: the round where validation loss stops improving
+      checkpoint: >-
+        Why does the leaf formula need the hessian at all, when the tree was
+        fitted to the gradient?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The shape of one round, and of the loop around it. Note where the loss
+        enters — only in the first two lines — and where the regularisation
+        enters — only in the leaf and gain expressions.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # one round
+            g_i = dLoss/dF at F(x_i)          # first derivative
+            h_i = d2Loss/dF2 at F(x_i)        # second derivative (curvature)
+            tree = grow(X, g, h, lam, gamma)  # splits scored by the gain below
+            for each leaf: w = -sum(g) / (sum(h) + lam)
+            F = F + nu * tree.predict(X)
+
+            # the gain used inside grow()
+            gain(split) = 0.5 * ( GL^2/(HL+lam) + GR^2/(HR+lam) - G^2/(H+lam) ) - gamma
+            accept the split only if gain > 0
+
+            # the loop
+            F = base_score(y)
+            for m in 1..M:
+                one round
+                if validation loss has not improved for `patience` rounds: break
+      checkpoint: >-
+        In the gain expression, which term stops a tree from splitting a node
+        whose two children have large but *opposite* gradients?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Everything follows from one second-order expansion. Expand the loss in
+        each leaf around the current prediction, keep terms to second order, add
+        the L2 penalty, and minimise the resulting quadratic in the leaf value.
+      blocks:
+        - kind: math
+          body: |
+            In a leaf holding rows $I$, with constant output $w$:
+
+            $$\hat{L}(w) = \sum_{i\in I}\left[g_i w + \tfrac12 h_i w^2\right]
+              + \tfrac12\lambda w^2 = G w + \tfrac12(H+\lambda)w^2$$
+
+            $$\frac{d\hat{L}}{dw} = G + (H+\lambda)w = 0
+              \quad\Longrightarrow\quad w^\star = -\frac{G}{H+\lambda},
+              \qquad \hat{L}(w^\star) = -\frac12\frac{G^2}{H+\lambda}$$
+
+            A split into $L, R$ improves the objective by
+
+            $$\text{gain} = \tfrac12\left[\frac{G_L^2}{H_L+\lambda}
+              + \frac{G_R^2}{H_R+\lambda} - \frac{G^2}{H+\lambda}\right] - \gamma$$
+
+            With squared loss $g_i = F-y_i$, $h_i = 1$, so $H = n$ and the gain
+            collapses to half the SSE reduction:
+
+            $$\text{gain} = \tfrac12\left[\frac{(\sum_L r)^2}{n_L}
+              + \frac{(\sum_R r)^2}{n_R} - \frac{(\sum r)^2}{n}\right]
+              = \tfrac12\left(\text{SSE}_p - \text{SSE}_c\right)$$
+
+            Shrinkage: bias decays as $(1-\nu)^M \approx e^{-\nu M}$, variance
+            grows as $\nu^2\sigma^2 M$, so
+
+            $$M^\star \sim \frac{1}{\nu}, \qquad
+              \text{MSE}(M^\star) \approx \tfrac12\nu\sigma^2\ln(\cdot)$$
+      checkpoint: >-
+        The gain has three terms with the same denominator form. Why is the
+        parent's term subtracted rather than added, and what would a negative
+        gain mean?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete implementation of the round, the loop, and the two functions
+        the exercises ask for, with the guards that matter.
+      blocks:
+        - kind: warning
+          body: >-
+            Attempt the exercises before reading. The trap that catches almost
+            everyone is using the mean gradient as the leaf value: it is correct
+            for squared loss, looks correct for logistic loss, and is off by
+            $1/\bar h$ — a factor of five at the start of training and a factor
+            of 138 once the model saturates.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def xgboost_gain(G, H, GL, HL, GR, HR, lam=0.0, gamma=0.0):
+                """Regularised split gain. Negative means: do not split."""
+                def term(g, h):
+                    d = h + lam
+                    return 0.0 if d <= 0.0 else g * g / d
+                return 0.5 * (term(GL, HL) + term(GR, HR) - term(G, H)) - gamma
+
+            def leaf_newton(g, h, lam=0.0):
+                """The second-order optimal leaf value, -G/(H+lam)."""
+                G = float(np.sum(g)) if len(g) else 0.0
+                H = float(np.sum(h)) if len(h) else 0.0
+                d = H + lam
+                return 0.0 if d <= 0.0 else -G / d
+
+            def boost_stumps(X, y, n_rounds, lr):
+                """Functional gradient descent with depth-1 trees, squared loss."""
+                X = np.asarray(X, dtype=float)
+                y = np.asarray(y, dtype=float)
+                n, d = X.shape
+                F = np.full(n, float(y.mean()))
+                if n_rounds <= 0 or n < 2:
+                    return [float(v) for v in F]
+                order = np.argsort(X, axis=0, kind="mergesort")
+                xs = np.take_along_axis(X, order, axis=0)
+                valid = xs[:-1] < xs[1:]
+                for _ in range(n_rounds):
+                    r = y - F                      # -g, because the loss is squared
+                    G = float(r.sum())
+                    GL = np.cumsum(r[order], axis=0)[:-1]
+                    GR = G - GL
+                    nL = np.arange(1, n, dtype=float)[:, None]
+                    nR = n - nL
+                    gain = np.where(valid,
+                                    GL**2 / nL + GR**2 / nR - G * G / n,
+                                    -np.inf)
+                    if not np.isfinite(gain).any() or gain.max() <= 0.0:
+                        break
+                    j, f = np.unravel_index(int(np.argmax(gain)), gain.shape)
+                    thr = 0.5 * (xs[j, f] + xs[j + 1, f])
+                    left = X[:, f] <= thr
+                    w = np.where(left, r[left].mean(), r[~left].mean())
+                    F = F + lr * w
+                return [float(v) for v in F]
+
+            # Cross-checked against sklearn's GradientBoostingRegressor with
+            # max_depth=1, subsample=1.0: identical to 0.0 or 8.9e-16 on every
+            # case, which is the only useful test that "fit the residuals"
+            # was implemented correctly.
+      checkpoint: >-
+        `boost_stumps` breaks out of the loop when the best gain is zero. What
+        data would make that happen on the first round, and what should the model
+        predict in that case?
+
+  problems:
+    - id: p-xgb-gain
+      title: "The regularised split gain"
+      difficulty: medium
+      prompt: >-
+        Implement `xgboost_gain(G, H, GL, HL, GR, HR, lam, gamma)` — the quantity
+        XGBoost maximises when choosing a split. `G` and `H` are the summed
+        gradient and hessian of the parent node; `GL, HL` and `GR, HR` are the
+        same for the two children. Return
+        $\tfrac12\left[\frac{G_L^2}{H_L+\lambda} +
+        \frac{G_R^2}{H_R+\lambda} - \frac{G^2}{H+\lambda}\right] - \gamma$.
+        A **negative return means the split must be refused**. Guard any
+        denominator of the form $H + \lambda$ that is not positive by returning
+        0.0 for that term rather than dividing.
+      starter: |
+        def xgboost_gain(G, H, GL, HL, GR, HR, lam=0.0, gamma=0.0):
+            # your implementation here
+            pass
+      language: python
+      entry: xgboost_gain
+      testCases:
+        - input: "[-10.0, 100.0, -8.0, 40.0, -2.0, 60.0, 0.0, 0.0]"
+          expected: "0.33333333333333337"
+          mode: json
+          tolerance: 1e-12
+        - input: "[-10.0, 100.0, -8.0, 40.0, -2.0, 60.0, 1.0, 0.0]"
+          expected: "0.31822518517345544"
+          mode: json
+          tolerance: 1e-12
+        - input: "[-10.0, 100.0, -8.0, 40.0, -2.0, 60.0, 100.0, 0.0]"
+          expected: "-0.008928571428571425"
+          mode: json
+          tolerance: 1e-12
+        - input: "[0.0, 10.0, 1.0, 5.0, -1.0, 5.0, 0.0, 0.0]"
+          expected: "0.2"
+          mode: json
+          tolerance: 1e-12
+        - input: "[0.0, 10.0, 1.0, 5.0, -1.0, 5.0, 0.0, 0.25]"
+          expected: "-0.04999999999999999"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def xgboost_gain(G, H, GL, HL, GR, HR, lam=0.0, gamma=0.0):
+            def term(g, h):
+                d = h + lam
+                return 0.0 if d <= 0.0 else g * g / d
+            return 0.5 * (term(GL, HL) + term(GR, HR) - term(G, H)) - gamma
+      solutionExplanation: >-
+        The three terms are the optimal objective of the parent
+        ($-G^2/(H+\lambda)$) and of the two children, with the signs arranged so
+        that a better split produces a larger number. The first case is the
+        clean one: with no regularisation the gain is
+        $\tfrac12(64/40 + 4/60 - 1) = 0.3333$. The second shows $\lambda = 1$
+        shrinking every denominator, which costs about 4.5% of the gain —
+        regularisation always makes a split look worse, which is the point. The
+        third is the important case: $\lambda = 100$ turns the same split
+        negative, so it is refused, and a large enough $\lambda$ prunes the tree
+        without any depth limit. The fourth and fifth isolate $\gamma$: the raw
+        gain is 0.2, and $\gamma = 0.25$ makes it $-0.05$, so the split is
+        refused. Note that the two children's gradients can be large and
+        opposite — $G_L = +1$ and $G_R = -1$ — and the parent term is what
+        prevents that balancing act from being scored as progress.
+      complexity: "O(1) time and O(1) space"
+      tags: [xgboost, split-gain, regularisation]
+
+    - id: p-boost-stumps
+      title: "Ten thousand stumps, one loop"
+      difficulty: hard
+      prompt: >-
+        Implement `boost_stumps(X, y, n_rounds, lr)`: gradient boosting with
+        **depth-1 trees** and squared loss, returning the training predictions
+        after `n_rounds` rounds.
+
+        Details that decide the answer:
+        (a) start from $F_0 = \text{mean}(y)$;
+        (b) each round, the target is the current residual $r_i = y_i - F(x_i)$;
+        (c) the best stump splits on the feature and threshold that minimise the
+        SSE of $r$ — equivalently maximise
+        $(\sum_L r)^2/n_L + (\sum_R r)^2/n_R - (\sum r)^2/n$ — considering only
+        midpoints between adjacent **distinct** values;
+        (d) each side's leaf value is the **mean residual** on that side;
+        (e) add `lr * stump_prediction` to $F$, and keep going even when the
+        residual looks small;
+        (f) break early only if no split with positive gain exists.
+
+        Break exact ties toward the **smaller threshold**, and among features
+        toward the **lower index**. If `n_rounds <= 0` or there are fewer than
+        two rows, return $F_0$ repeated.
+      starter: |
+        import numpy as np
+
+        def boost_stumps(X, y, n_rounds, lr):
+            # your implementation here
+            pass
+      language: python
+      entry: boost_stumps
+      testCases:
+        - input: "[[[0.0], [1.0], [2.0], [3.0]], [0.0, 1.0, 2.0, 3.0], 1, 1.0]"
+          expected: "[0.5, 0.5, 2.5, 2.5]"
+          mode: json
+          tolerance: 1e-12
+        - input: "[[[0.0], [1.0], [2.0], [3.0]], [0.0, 1.0, 2.0, 3.0], 2, 1.0]"
+          expected: "[0.0, 0.6666666666666666, 2.6666666666666665, 2.6666666666666665]"
+          mode: json
+          tolerance: 1e-12
+        - input: "[[[0.0], [1.0], [2.0], [3.0]], [0.0, 1.0, 2.0, 3.0], 2, 0.5]"
+          expected: "[0.5, 1.1666666666666667, 2.1666666666666665, 2.1666666666666665]"
+          mode: json
+          tolerance: 1e-12
+        - input: "[[[0.0], [1.0], [2.0]], [2.0, 2.0, 2.0], 3, 0.5]"
+          expected: "[2.0, 2.0, 2.0]"
+          mode: json
+          tolerance: 1e-12
+        - input: "[[[0.0, 1.0], [1.0, 0.0], [2.0, 3.0], [3.0, 2.0]], [0.0, 1.0, 4.0, 9.0], 4, 0.3]"
+          expected: "[1.48245, 1.48245, 3.79455, 7.24055]"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def boost_stumps(X, y, n_rounds, lr):
+            X = np.asarray(X, dtype=float)
+            y = np.asarray(y, dtype=float)
+            n, d = X.shape
+            F = np.full(n, float(y.mean()))
+            if n_rounds <= 0 or n < 2:
+                return [float(v) for v in F]
+            order = np.argsort(X, axis=0, kind="mergesort")
+            xs = np.take_along_axis(X, order, axis=0)
+            valid = xs[:-1] < xs[1:]
+            for _ in range(n_rounds):
+                r = y - F
+                G = float(r.sum())
+                GL = np.cumsum(r[order], axis=0)[:-1]
+                GR = G - GL
+                nL = np.arange(1, n, dtype=float)[:, None]
+                nR = n - nL
+                gain = np.where(valid,
+                                GL**2 / nL + GR**2 / nR - G * G / n,
+                                -np.inf)
+                if not np.isfinite(gain).any() or gain.max() <= 0.0:
+                    break
+                j, f = np.unravel_index(int(np.argmax(gain)), gain.shape)
+                thr = 0.5 * (xs[j, f] + xs[j + 1, f])
+                left = X[:, f] <= thr
+                w = np.where(left, r[left].mean(), r[~left].mean())
+                F = F + lr * w
+            return [float(v) for v in F]
+      solutionExplanation: >-
+        This is functional gradient descent with a two-parameter base learner.
+        The first round on `y = [0,1,2,3]` starts at $F_0 = 1.5$, giving residuals
+        $[-1.5,-0.5,0.5,1.5]$; the middle split at 1.5 has gain
+        $2/2 + 2/2 = 4$ against 2.33 for the split at 0.5 and 3.0 for the split at
+        2.5, so the leaves are $-1.0$ and $+1.0$ and the predictions become
+        $[0.5,0.5,2.5,2.5]$. Round two leaves residuals $[-0.5,0.5,-0.5,0.5]$,
+        where two splits tie at 0.3333 and the stated rule picks the smaller
+        threshold. The third case does the same two rounds at half strength, and
+        every value is a convex combination of the previous prediction and the
+        new leaf, which is exactly what shrinkage means. The constant target case
+        is the guard that matters: every residual is zero, every gain is zero, the
+        loop breaks on round one, and the answer is the mean — a model with no
+        split is the correct model. The last case has two features and is where
+        the feature-index tie-break becomes observable. The implementation was
+        cross-checked against sklearn's `GradientBoostingRegressor` with
+        `max_depth=1, subsample=1.0`; the two agree to 8.9e-16 on every case.
+      complexity: "O(n log n + M*n*d) time for M rounds over d features, O(n*d) space"
+      tags: [gradient-boosting, functional-gradient-descent, stumps, shrinkage]
+
+    - id: p-newton-leaf
+      title: "The Newton leaf value"
+      difficulty: easy
+      prompt: >-
+        Implement `leaf_newton(g, h, lam)` — the value XGBoost assigns to a leaf,
+        $w^\star = -\sum_i g_i / (\sum_i h_i + \lambda)$. Return `0.0` when
+        $\sum h + \lambda \le 0$, which is the degenerate-leaf guard. Handle empty
+        inputs as a sum of zero.
+      starter: |
+        import numpy as np
+
+        def leaf_newton(g, h, lam=0.0):
+            # your implementation here
+            pass
+      language: python
+      entry: leaf_newton
+      testCases:
+        - input: "[[-2.0, 1.0, -0.5], [0.25, 0.25, 0.25], 1.0]"
+          expected: "0.8571428571428571"
+          mode: json
+          tolerance: 1e-12
+        - input: "[[-2.0, 1.0, -0.5], [0.25, 0.25, 0.25], 0.0]"
+          expected: "2.0"
+          mode: json
+          tolerance: 1e-12
+        - input: "[[-1.5, 0.5], [1.0, 1.0], 0.0]"
+          expected: "0.5"
+          mode: json
+          tolerance: 1e-12
+        - input: "[[0.0, 0.0], [0.0, 0.0], 0.0]"
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-12
+        - input: "[[-5.0], [3.0], 10.0]"
+          expected: "0.38461538461538464"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def leaf_newton(g, h, lam=0.0):
+            G = float(np.sum(g)) if len(g) else 0.0
+            H = float(np.sum(h)) if len(h) else 0.0
+            d = H + lam
+            if d <= 0.0:
+                return 0.0
+            return -G / d
+      solutionExplanation: >-
+        The numerator is the summed gradient — how wrong the leaf is, weighted by
+        how much each row matters — and the denominator is the summed curvature
+        plus the L2 penalty. The first two cases differ only in $\lambda$: 2.0
+        becomes 0.8571 when $\lambda = 1$, a 57% shrink, because $H = 0.75$ is
+        comparable to the penalty. The fifth case shows the opposite regime:
+        $H = 3$ against $\lambda = 10$ shrinks 1.6667 to 0.3846, a 77% cut. This
+        is why $\lambda$ is described as punishing small leaves: it is small
+        leaves that have an $H$ near $\lambda$. The third case is the
+        squared-loss form, where $h_i = 1$ and the answer is just the mean
+        gradient. The fourth case is the guard — a leaf with zero curvature and
+        no penalty has no defined optimum, and returning 0.0 keeps an empty node
+        from producing a NaN that would poison the whole ensemble.
+      complexity: "O(n) time and O(1) space for n rows in the leaf"
+      tags: [newton-method, leaf-value, hessian]
+
+  visualizers:
+    - id: vs-boost-rounds
+      kind: loss_surface
+      title: "Rounds against learning rate"
+      description: >-
+        Sweep the number of rounds from 1 to 1,000 at $\nu$ in {1.0, 0.3, 0.1}
+        and watch the validation curve turn at a round that scales as $1/\nu$.
+        The plotted numbers are the measured values in this topic.
+      params:
+        minRounds: 1
+        maxRounds: 1000
+        learningRates: [1.0, 0.3, 0.1]
+        dataset: "additive-2000"
+
+  try_it: >-
+    On the same 2,000 rows, fit 1,000 stumps at `learning_rate=0.1` and 100
+    depth-6 trees at `learning_rate=1.0`, and compare test MSE — 1.0229 against
+    1.9166. Then print the hessian sum for one leaf alongside `min_child_weight`
+    and explain why they coincide for squared loss and diverge for logistic.
+  interview_questions:
+    - question: "Why is the leaf value $-G/(H+\\lambda)$ rather than a step size someone chose?"
+      level: mid
+      key_points:
+        - "Each round minimises a second-order Taylor expansion of the loss inside the leaf, which is a one-dimensional quadratic in the leaf value."
+        - "Its minimiser is $-G/(H+\\lambda)$ with $G = \\sum_i g_i$ and $H = \\sum_i h_i$ — solved, not tuned."
+        - "For squared loss $H = n$ and the leaf value is the mean residual; for logistic loss $h_i = p_i(1-p_i)$, so confident rows contribute almost no curvature."
+        - "That is why a leaf full of confident, wrong predictions barely moves — the Newton step is small precisely where the gradient is large."
+      follow_up: "A leaf has 100 rows and a huge negative gradient but a tiny hessian sum. What does XGBoost do, and is that right?"
+    - question: "$\\lambda$ and $\\gamma$ both look like regularisation. What is the difference?"
+      level: senior
+      key_points:
+        - "$\\gamma$ is charged once per split, in the same units as the gain — it is exactly `min_impurity_decrease`, refusing splits that do not pay for themselves."
+        - "$\\lambda$ is charged continuously on every leaf value, shrinking $G/(H+\\lambda)$ toward zero as evidence thins."
+        - "So $\\gamma$ controls tree size and $\\lambda$ controls leaf magnitude; tuning one does not substitute for the other."
+        - "The practical consequence: increasing $\\gamma$ simplifies structure, increasing $\\lambda$ smooths predictions while keeping the same structure."
+      follow_up: "You raise $\\lambda$ and both train and test error rise. What does that tell you about where you were on the curve?"
+    - question: "Why do 10,000 shallow trees beat 100 deep ones?"
+      level: mid
+      key_points:
+        - "Shrinkage makes the residual bias decay like $(1-\\nu)^M \\approx e^{-\\nu M}$ while injected variance grows like $\\nu^2 M$, and the two curves cross at a computable $M$."
+        - "Measured: 10,000 stumps at $\\nu = 0.1$ reached 1.0990 test MSE; 100 depth-6 trees at $\\nu = 1.0$ reached 1.9166, despite fitting 20,000 leaf parameters."
+        - "Depth is interaction order — a stump expresses none — so the choice is about what the target needs, not about capacity in the abstract."
+        - "On an additive target stumps win outright (1.0229 at 1,000 rounds), which is the same statement from the other direction."
+  common_mistakes:
+    - "Setting `min_child_weight` as if it were a row count for logistic loss, where it is a hessian sum over the leaf and $h_i = p_i(1-p_i)$."
+    - "Copying `eta=0.3` with many rounds and attributing the resulting 1.2597 test MSE to the data rather than to the step size."
+    - "Treating `num_leaves` as a depth cap in LightGBM: leaf-wise growth means 31 leaves can sit 30 levels deep."
+  further_reading:
+    - label: "Friedman, Greedy Function Approximation: A Gradient Boosting Machine (Annals of Statistics, 2001)"
+    - label: "Chen & Guestrin, XGBoost: A Scalable Tree Boosting System (KDD 2016)"

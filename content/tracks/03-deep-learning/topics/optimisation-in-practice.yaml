@@ -1,0 +1,1424 @@
+id: optimisation-in-practice
+slug: optimisation-in-practice
+title: "Optimisation in Practice: Schedules, Warmup, and Clipping"
+summary: >-
+  Assemble the four knobs that decide whether a run converges — the schedule,
+  the warmup, the clip, and the accumulation count — into one configuration,
+  and audit it with the only number that describes what the model actually
+  experienced: the realised budget, which on a measured run was half of what
+  the schedule asked for.
+kind: lesson
+difficulty: hard
+position: 10
+estMinutes: 29
+prerequisites: [learning-rate-schedules, gradient-stability]
+phase: deep-learning-foundations
+tags: [optimisation, learning-rate, warmup, cosine, gradient-clipping, gradient-accumulation, adamw, loss-scale, budget-audit]
+
+body:
+  big_idea: >-
+    A training configuration is a product, not a checklist: schedule, clip and
+    accumulation each silently rescale the others, and the number that
+    describes what you built is the realised budget $\sum_t \eta_t s_t$.
+
+  problem:
+    - >-
+      You add `clip_grad_norm_(1.0)` because a blog said to: the run stops
+      spiking, stops improving, and 49% of the LR budget has vanished.
+    - >-
+      You port a 300k-step recipe to an 8k-step fine-tune: a quarter of the
+      run is warmup and the result is worse than a constant LR.
+    - >-
+      You emulate a 4× batch with gradient accumulation and land 0.3 worse,
+      because you clipped each micro-batch instead of the accumulated
+      gradient.
+
+  analogy: |
+    A rally stage: pace notes, cold tyres, a rev limiter. The notes are the
+    schedule, planned against a fixed time budget. The first kilometre is
+    warmup — full throttle is unavailable until things reach operating
+    temperature. The limiter is the clip: at 6000 rpm it does nothing, at 8000
+    it decides everything. Accumulation is the co-driver averaging four laps
+    before you change one thing.
+
+  concept_points:
+    - >-
+      **The applied step is a product of four functions, and only one is the one you drew.**
+      $\theta_{t+1} = \theta_t - \eta_t s_t \hat{u}_t - \eta_t\lambda\theta_t$
+      with $s_t = \min(1, c/\|g_t\|)$. On the reference rig the schedule draws
+      $\sum_t \eta_t = 3.002$ and the clip delivers
+      $\sum_t \eta_t s_t = 1.536$:
+      **49% of the learning rate was removed by a constant you set once and never revisited.**
+    - >-
+      **Clipping is a schedule you did not draw, and it is state-dependent.**
+      At $c = 1.0$ the clip fires on **100% / 96.5% / 78.5% / 50.3% / 36.7%**
+      of steps across the run's quintiles as median gradient norm falls
+      **3.11 → 0.86**. So $s_t$ climbs from 0.10 to 1.00 by step 2100, and the
+      realised curve peaks at **step 578** while $\eta_t$ peaks at 149.
+    - >-
+      **The clip rate and the budget ratio are different numbers.** On the
+      same run the clip fires on **72.4%** of steps but removes only **48.8%**
+      of the budget: the rate is an unweighted mean of $[s_t<1]$, the ratio
+      weights $s_t$ by $\eta_t$. Because clipping bites hardest where $\eta_t$
+      is largest, averaging $s_t$ instead of weighting it
+      **overstates the realised budget by 19%**.
+    - >-
+      **Under Adam, a clip that fires on every step is almost a no-op.** Clip
+      values 0.05, 0.1 and 0.25 give a final loss of **0.1351** at budget
+      ratios 0.027, 0.054 and 0.134: a 5× range of realised budget changes the
+      answer by 0.01%. Adam divides by $\sqrt{\hat{v}}$, so a uniform rescale
+      cancels. Under SGD the same $c=0.05$ is a **73×** learning-rate cut and
+      loss **2.42** against 0.19.
+    - >-
+      **Clipping is not a smaller learning rate, and the experiment is cheap.**
+      At matched realised budget — 1.536 against 1.501 — the clipped run
+      finishes at **0.1397** and the unclipped at **1.0018**, a factor of
+      **7.2**. Clipping spends the budget on the 72% of steps with ordinary
+      gradients and refuses to spend it on spikes; lowering the learning rate
+      spends less on both.
+    - >-
+      **Warmup and cosine compose to a constant area, so any warmup bug costs exactly the warmup fraction.**
+      With the ramp inside $T$, the area is $\eta_{\max}T/2$, independent of
+      $T_w$: measured **10.002** at $T_w = 500$ against 10.0005 with none —
+      0.01%. Append the ramp on top and you buy **+5.0%**; leave the cosine
+      unshifted and you lose **−5.0%**. Both errors equal $T_w/T$.
+
+  definitions:
+    - term: "Realised budget"
+      meaning: >-
+        $\sum_t \eta_t s_t$, the total parameter movement the optimizer actually
+        applied, where $s_t$ is the clip's scale. It is the quantity the model
+        experienced; the drawn budget $\sum_t \eta_t$ is the quantity you
+        configured. Their ratio is the single number that tells you how much of
+        your schedule survived.
+    - term: "Clip activation rate"
+      meaning: >-
+        The fraction of steps on which $s_t < 1$. Not the same as the budget
+        ratio and never a substitute for it: on the reference run the rate is
+        72.4% while the budget ratio is 0.512, because most clipped steps are
+        clipped by a few percent.
+    - term: "Global-norm clipping"
+      meaning: >-
+        Rescaling the whole gradient vector by $\min(1, c/\|g\|)$ so its norm is
+        at most $c$. Direction-preserving by construction, which is why it can
+        be reasoned about as a step-size cap. The default in every framework's
+        `clip_grad_norm_`.
+    - term: "Value clipping"
+      meaning: >-
+        Clamping each coordinate independently, $\operatorname{clip}(g_i, -c,
+        c)$. Not direction-preserving: measured on the reference gradient,
+        clipping at ±0.2 touched 13.8% of entries, took the norm from 13.91 to
+        7.39, and left a cosine of **0.761** with the original direction. Use it
+        only when you mean "no coordinate may exceed this", never as a stability
+        tool.
+    - term: "Effective step size"
+      meaning: >-
+        $\eta_t s_t$: the learning rate after the clip has had its say. Its peak
+        is not the peak of $\eta_t$. On the measured default run the drawn peak
+        is at step 149 and the realised peak is at step 578.
+    - term: "Gradient accumulation"
+      meaning: >-
+        Computing several micro-batch gradients at the same weights and summing
+        them, size-weighted, before one optimizer step. Exact for a mean-reduced
+        loss; exact for a sum-reduced loss only if you weight by the number of
+        terms (tokens, not examples).
+    - term: "Micro-batch"
+      meaning: >-
+        The slice that fits in memory in one forward/backward. Its size is what
+        normalisation layers and dropout see, so it is the unit at which the
+        "same as a large batch" claim breaks.
+    - term: "Accumulation weighting"
+      meaning: >-
+        The factor $n_j / \sum_i n_i$ applied to micro-batch $j$'s gradient.
+        With equal chunks it is $1/k$ and everything is exact; with a short last
+        chunk, dropping it biases the gradient by a scale factor — measured
+        0.9% at two chunks, 1.8% at twelve, and 5% for a 200/40 token split.
+    - term: "Loss scale"
+      meaning: >-
+        The constant $S$ by which the loss is multiplied before backward so that
+        fp16 gradients stay representable. It must be divided out before
+        clipping, or the clip threshold is silently divided by $S$: at
+        $S = 65536$ a clip of 1.0 becomes a cap of $1.5\times10^{-5}$.
+    - term: "Warmup fraction"
+      meaning: >-
+        $T_w/T$, the share of the run spent ramping. It is the exact size of
+        both composition bugs (ramp on top of $T$: $+T_w/T$ budget; unshifted
+        cosine: $-T_w/T$), and 5% is the value at which the worst-step bound
+        stops improving on the measured rig.
+    - term: "Schedule composition"
+      meaning: >-
+        The rule that $\eta(t)$ is one function assembled from a ramp and a
+        decay, not two schedules multiplied. Composed correctly the area is
+        $\eta_{\max}T/2$ for any warmup length; composed as a product of two
+        normalised curves it is not, and the error is the warmup fraction.
+    - term: "Decoupled weight decay"
+      meaning: >-
+        Applying $\theta \leftarrow \theta - \eta\lambda\theta$ outside the
+        gradient, as AdamW does, rather than adding $\lambda\theta$ to $g$.
+        Decoupled decay bypasses the clip, so when $s_t \approx 0.5$ its share
+        of the parameter movement is 1.95× what $\lambda$ says.
+    - term: "Budget audit"
+      meaning: >-
+        The three-number report you run before trusting any optimisation change:
+        drawn against realised budget, clip rate by phase, and the worst update
+        as a multiple of the median. It costs one instrumented run and it
+        explains most "the recipe did not transfer" failures.
+
+  diagrams:
+    - type: pipeline
+      title: "The order of operations in one step — and which knob enters where"
+      nodes:
+        - label: "Sample the global batch"
+          note: "B examples, split into k micro-batches"
+          detail: "The only place batch size is decided. Everything downstream sees a micro-batch, which is why normalisation layers and dropout disagree with a true large batch."
+        - label: "Forward + backward per micro-batch"
+          note: "k gradients, each mean-reduced over its own slice"
+          detail: "Mean-reduced losses make the accumulation exact. Sum-reduced losses (token-level LM) do not — you must weight by token count, not by chunk index."
+        - label: "Weight and sum"
+          note: "w_j = n_j / Σ n_i"
+          detail: "With equal chunks this is 1/k. With a short last chunk, dropping the weight is a scale bias: 0.9% at 2 chunks, 1.8% at 12, 5% for a 200/40 split."
+        - label: "Unscale (fp16 only)"
+          note: "divide by S before anything else"
+          detail: "Skip this and the clip threshold is divided by S. At S=65536 the run's effective learning rate multiplier is 1.4e-6: frozen, not unstable."
+        - label: "Clip once"
+          note: "s = min(1, c/‖g‖)"
+          detail: "Once, on the accumulated tensor. Clipping each micro-batch applies the cap k times: measured norm 0.4077 against 0.5000 for clipping once."
+        - label: "Adam moments + bias correction"
+          note: "m, v, then m̂/√v̂"
+          detail: "This is what makes a cap that fires every step a no-op: a uniform rescale of g cancels in m̂/√v̂, so only relative reweighting across steps survives."
+        - label: "Decoupled decay"
+          note: "θ ← θ − ηλθ, outside the clip"
+          detail: "The decay is not clipped, so its share of the movement rises as s falls. At a budget ratio of 0.512 it is 1.95x the intended fraction."
+        - label: "Next step, next η from the schedule"
+          note: "η_t is read, not accumulated"
+          detail: "Computing the schedule as a running product (η *= decay each step) drifts from the closed form and makes the budget unreproducible across restarts."
+    - type: plot
+      title: "Drawn versus realised learning rate on the measured default run"
+      chart: line
+      xLabel: "optimizer step"
+      yLabel: "learning rate (drawn vs realised)"
+      series:
+        - name: "drawn η_t (cosine, 5% warmup)"
+          points:
+            - { x: 0, y: 0.00001333 }
+            - { x: 299, y: 0.00198654 }
+            - { x: 599, y: 0.00188000 }
+            - { x: 899, y: 0.00167809 }
+            - { x: 1199, y: 0.00140270 }
+            - { x: 1499, y: 0.00108368 }
+            - { x: 1799, y: 0.00075558 }
+            - { x: 2099, y: 0.00045397 }
+            - { x: 2399, y: 0.00021154 }
+            - { x: 2699, y: 0.00005454 }
+            - { x: 2999, y: 0.00000061 }
+        - name: "realised η_t · s_t (clip 1.0)"
+          points:
+            - { x: 0, y: 0.00000134 }
+            - { x: 299, y: 0.00097848 }
+            - { x: 599, y: 0.00159282 }
+            - { x: 899, y: 0.00158885 }
+            - { x: 1199, y: 0.00092184 }
+            - { x: 1499, y: 0.00095836 }
+            - { x: 1799, y: 0.00042491 }
+            - { x: 2099, y: 0.00045397 }
+            - { x: 2399, y: 0.00021154 }
+            - { x: 2699, y: 0.00000955 }
+            - { x: 2999, y: 0.00000061 }
+    - type: plot
+      title: "Final loss against the clip value — flat where it always fires, a cliff where it never does"
+      chart: line
+      xLabel: "clip value c (100 = no clip)"
+      yLabel: "held-out MSE"
+      series:
+        - name: "AdamW, cosine, 5% warmup"
+          points:
+            - { x: 0.05, y: 0.1351 }
+            - { x: 0.1, y: 0.1351 }
+            - { x: 0.25, y: 0.1351 }
+            - { x: 0.5, y: 0.1352 }
+            - { x: 1.0, y: 0.1397 }
+            - { x: 2.0, y: 0.1758 }
+            - { x: 4.0, y: 0.2787 }
+            - { x: 100.0, y: 0.8438 }
+    - type: compare
+      title: "Two things people confuse: a clip and a smaller learning rate"
+      left_label: "Same realised budget — 1.54 vs 1.50"
+      left_points:
+        - "cosine 2e-3 + clip 1.0: drawn 3.002, realised 1.536, held-out MSE 0.1397"
+        - "cosine 1e-3, no clip: drawn 1.501, realised 1.501, held-out MSE 1.0018"
+        - "Identical schedule shape, identical optimizer, identical movement available — 7.2x apart"
+        - "The clipped run spends full rate on 28% of steps and ~45% on the rest; the low-rate run spends 100% everywhere, including on the spikes that wreck the weights"
+      right_label: "Same clip value, different optimizer"
+      right_points:
+        - "AdamW, c = 0.05: budget ratio 0.027, loss 0.1351 — a no-op, because Adam divides by √v̂"
+        - "SGD lr 0.01, c = 0.05: budget ratio 0.0137, loss 2.4240 — a 73x learning-rate cut"
+        - "SGD lr 0.01, no clip: loss 2.2422 and θ drifting 1.56x — the spikes are the problem"
+        - "AdamW, c = 1.0: loss 0.1397; SGD lr 0.01, c = 1.0: 0.1905 — 1.0 is the value that survives both"
+    - type: architecture
+      title: "Where each knob lives, and which ones talk to each other"
+      nodes:
+        - { id: sched, x: 0, y: 0, label: "schedule η_t", kind: worker, detail: "Reads (step, total_steps, warmup, peak). Produces one scalar per step and nothing else. Its budget is η·T/2 for any warmup length — if your warmup is inside T." }
+        - { id: clip, x: 1, y: 0, label: "clip c", kind: worker, detail: "Reads the accumulated gradient norm and the schedule's current η. It is the only knob whose effect depends on where in the schedule you are, because the gradient norm falls as the loss falls: 3.11 to 0.86 across the run." }
+        - { id: acc, x: 0, y: 1, label: "accumulation k", kind: queue, detail: "Decides what 'the gradient' even is: k size-weighted micro-batch means. It is exact for the mean and inexact for the clip, for dropout, and for any per-micro normalisation." }
+        - { id: opt, x: 1, y: 1, label: "AdamW (m, v, λ)", kind: model, detail: "Applies the step. Its √v̂ division is why an always-on clip is a no-op, and its decoupled decay bypasses the clip entirely, which is why the decay's share doubles when s ≈ 0.5." }
+        - { id: audit, x: 2, y: 0, label: "budget audit", kind: server, detail: "Σ η_t s_t / Σ η_t, clip rate by quintile, worst update over median. Three numbers, one instrumented run, and it explains most transfer failures." }
+        - { id: params, x: 2, y: 1, label: "θ", kind: storage, detail: "The only thing that matters. Everything above is a way of deciding how far to move it; the audit tells you how far you actually moved it." }
+      edges:
+        - { from: sched, to: clip, label: "sets the stakes" }
+        - { from: acc, to: clip, label: "what gets clipped" }
+        - { from: clip, to: opt, label: "s_t · g" }
+        - { from: sched, to: opt, label: "η_t" }
+        - { from: opt, to: params, label: "−η(s·û + λθ)" }
+        - { from: opt, to: audit, label: "trace" }
+        - { from: audit, to: sched, label: "re-tune", style: "async" }
+
+  markdown: |
+    ## One step, four knobs
+
+    The optimizer step, with every practical knob written into it:
+
+    $$\theta_{t+1} = \theta_t - \eta_t\, s_t\, \hat{u}_t - \eta_t\lambda\theta_t,
+      \qquad s_t = \min\!\left(1, \frac{c}{\|g_t\|}\right)$$
+
+    where $\hat{u}_t$ is Adam's bias-corrected normalised direction. Read left to
+    right: $\eta_t$ is the schedule from *Learning Rate Schedules, Warmup, and
+    Batch Size*; $s_t$ is the clip from *Numerical Stability*; $g_t$ is whatever
+    accumulation decided the gradient is; $\lambda$ is the decay. They enter as a
+    **product**, so each one rescales the others.
+
+    | knob | what you set | what it silently changes |
+    |---|---|---|
+    | schedule $\eta_t$ | peak, warmup, shape | how often the clip fires, because it fires where the loss is high |
+    | clip $c$ | a norm ceiling | the realised budget, the decay's share, and the location of the effective peak |
+    | accumulation $k$ | memory per step | which tensor gets clipped and how many times |
+    | decay $\lambda$ | shrinkage per step | nothing in the gradient — but its relative size doubles when $s_t \approx 0.5$ |
+
+    On the reference rig the schedule draws $\sum_t\eta_t = 3.002$ and the clip
+    delivers $1.536$. Half the learning rate was removed by a constant.
+
+    ## Clipping is a schedule you did not draw
+
+    The clip is usually described as a safety net for rare NaNs. Measured, it is
+    a second schedule that fires constantly, because the gradient norm falls as
+    the loss falls:
+
+    | quintile of the run | 1 | 2 | 3 | 4 | 5 |
+    |---|---|---|---|---|---|
+    | median gradient norm | 3.11 | 1.79 | 1.36 | 1.00 | 0.86 |
+    | clip rate at c = 1.0 | 100% | 96.5% | 78.5% | 50.3% | 36.7% |
+
+    A fixed cap against a falling norm is a *hard* cap early and a slack one
+    late, so $s_t$ rises through the run and the curve the model experiences,
+    $\eta_t s_t$, is not the curve you drew. The drawn peak is at step 149; the
+    realised peak is at **step 578**. Clipping does not scale your schedule, it
+    delays it — which is why adding a clip changes the optimal peak learning rate
+    by a factor of two without changing anything else.
+
+    It is also partly a warmup. With warmup switched off but $c = 1.0$ left on,
+    the worst update is 10.4x the median; add 5% warmup and it is 3.35x. Two
+    knobs, one effect, and the second one is the one you are not looking at.
+
+    ## What clipping is not
+
+    The tempting explanation for "clipping helped" is "it lowered the learning
+    rate". It did not, and the experiment is one line of bookkeeping:
+
+    | run | drawn | realised | held-out MSE |
+    |---|---|---|---|
+    | cosine 2e-3 + clip 1.0 | 3.002 | 1.536 | **0.1397** |
+    | cosine 1e-3, no clip | 1.501 | 1.501 | 1.0018 |
+    | cosine 1.4e-3, no clip | 2.101 | 2.101 | 0.8903 |
+
+    At *matched realised budget* the clipped run is **7.2x** better. The
+    difference is not how much movement was available but which steps got to
+    spend it: the clipped run pays full rate on the 28% of steps with ordinary
+    gradients and roughly 45% on the rest, while the low-rate run pays 100%
+    everywhere, including on the batches that were going to wreck the weights.
+
+    One caveat catches people moving a recipe between codebases. A cap that fires
+    on *every* step is nearly a no-op under Adam, because Adam divides by
+    $\sqrt{\hat v}$ and a uniform rescale cancels: clip values 0.05, 0.1 and 0.25
+    give 0.1351, 0.1351 and 0.1351 — a 5x range of realised budget, a 0.01%
+    change in loss. The same $c = 0.05$ under SGD is a 73x learning-rate cut and
+    a loss of 2.42. *The clip value is only meaningful next to the optimizer that
+    consumes it.*
+
+    ## Warmup and cosine compose to a constant area
+
+    Put the ramp inside $T$ and let the cosine span $[T_w, T)$:
+
+    $$\eta(t) = \eta_{\max}\frac{t+1}{T_w}\ \ (t<T_w),
+      \qquad
+      \eta(t) = \eta_{\max}\cdot\tfrac12\left(1+\cos\pi\frac{t-T_w}{T-T_w}\right)\ \ (T_w \le t < T)$$
+
+    The ramp contributes a triangle of area $\eta_{\max}T_w/2$; the cosine
+    contributes $\eta_{\max}(T-T_w)/2$, because
+    $\int_0^1 \tfrac12(1+\cos\pi x)\,dx = \tfrac12$. The total is
+    $\eta_{\max}T/2$ — **the warmup length cancels**. Measured: 10.002 at
+    $T_w = 500$ out of $T = 10^4$, and 10.0005 with no warmup, a 0.01%
+    difference. Both ways of getting it wrong then cost exactly the warmup
+    fraction:
+
+    | composition | area | vs correct |
+    |---|---|---|
+    | ramp inside T, cosine shifted | 10.002 | — |
+    | ramp appended on top of T | 10.502 | +5.0% |
+    | cosine unshifted (starts at t/T) | 9.504 | −5.0% |
+
+    ## Accumulation: exact for the mean, inexact for the pipeline
+
+    Four micro-batches of 64 over the same 256 samples reproduce the full-batch
+    gradient to cosine 1.0000000 and norm ratio 1.0000. Everything downstream is
+    where the differences live:
+
+    | variant | cosine vs true | norm ratio |
+    |---|---|---|
+    | 4 x 64, clip once | 1.0000 | 1.0000 |
+    | clip each micro-batch at c | 0.9940 | 0.8155 |
+    | unweighted short last chunk, k = 4 | 0.99996 | 0.9912 |
+    | unweighted, k = 12 | 0.99979 | 0.9818 |
+    | uneven chunks, 200 and 40 samples | 0.9718 | 0.9500 |
+    | dropout 0.2 inside each micro-batch | 0.8963 | 1.0336 |
+
+    The clip row is the one that matters here: clipping each micro-batch applies
+    the cap $k$ times, so the accumulated gradient can never exceed $c$ even when
+    the true full-batch gradient is ten times that. The uneven-chunk row is the
+    LLM version — weight by *tokens*, not by chunk index, or a batch that happens
+    to contain short sequences silently reweights the gradient.
+
+    ## Units: loss scale, batch size, value versus norm
+
+    **Loss scale.** Clipping the scaled gradient caps at $1/S$. At $S = 65536$
+    that is $1.5\times10^{-5}$ against a typical norm of 10.96 — an effective
+    learning-rate multiplier of $1.4\times10^{-6}$. The run is frozen, and the
+    curve looks like a bad initialisation rather than a bad clip.
+
+    **Batch size.** Fitting $\|g_B\|^2 = a + b/B$ over $B \in [8, 512]$ gives
+    $a = 100.2$ and $b = 2271$: the median norm falls from 16.03 to 9.68 over a
+    64x range, not by 8x, because the true gradient dominates at large $B$. The
+    noise share is 75.4% at $B = 8$, 26.5% at $B = 64$, 4.7% at $B = 512$. A cap
+    tuned at one batch size is a different cap at another.
+
+    **Value versus norm.** Clamping each coordinate at ±0.2 touched 13.8% of
+    entries, took the norm from 13.91 to 7.39, and left a cosine of 0.761 with
+    the original direction. Norm clipping is cosine 1.0 by construction.
+
+    ## The recipe, and what it costs
+
+    | configuration | held-out MSE |
+    |---|---|
+    | AdamW, cosine 2e-3, 5% warmup, clip 1.0 | 0.1397 |
+    | same, no clip | 0.8438 |
+    | same, no warmup | 0.1482 |
+    | constant 1e-3 (best of five constant-LR tunes, matched drawn budget) | 1.0203 |
+    | constant 5e-4 | 1.0297 |
+    | constant 2e-3 | 1.4240 |
+    | constant 8e-3 | 3.2212 |
+    | cosine 4e-3, 5% warmup, clip 1.0 (best of fifteen) | 0.1167 |
+
+    The default is 7.3x better than the best constant learning rate at the same
+    drawn budget, and 16% worse than the best of fifteen hand-tuned runs. On a
+    clean version of the same task it wins at matched budget by 27% (0.1037
+    against 0.1412) and loses to a constant 4e-3 given four times the budget
+    (0.0697). The case for the default is not that it is best, but that its worst
+    case is bounded — and the bound is worth about 7x on spiky data.
+
+    ## Where this stops
+
+    These are measurements on one small rig, and the ratios transfer better than
+    the absolutes. What transfers: clipping is a state-dependent schedule, its
+    budget cost must be measured rather than assumed, a cap that fires every step
+    is invisible to Adam, and warmup plus cosine is one function with a constant
+    area. What does not: the specific clip value, warmup fraction and 7.3x, which
+    move with your data's gradient noise — which is why the audit exists.
+
+    ## The longer version
+
+    A training configuration is a product, not a checklist: the step the model
+    actually takes is $\eta_t \cdot \min(1, c/\|g_t\|) \cdot \hat{u}_t$ plus the
+    decay term, so the schedule, the clip, and the accumulation count each
+    silently rescale the others — and the number that tells you what you built
+    is the realised budget $\sum_t \eta_t s_t$, not the peak learning rate you
+    typed.
+
+    A rally stage: pace notes, cold tyres, and a rev limiter. The notes are the
+    schedule — where to be fast and where to be slow, planned before the stage
+    against a fixed time budget. The first kilometre on cold tyres is warmup:
+    you cannot use the full throttle you will use later, not because the engine
+    is weak but because nothing has reached operating temperature. The rev
+    limiter is the clip: at 6000 rpm it does nothing at all, at 8000 it decides
+    everything. Accumulation is the co-driver averaging four laps of telemetry
+    before you change one thing about the setup — one change per four laps, not
+    four changes per lap.
+
+    Where the analogy breaks, and this is the content of the topic. First, the
+    limiter engages on 72% of the measured run's steps, not only at the
+    redline — because the gradient norm is 3.11 at the start of the run and 0.86
+    at the end, a fixed cap is a *hard* cap early and a slack one late. Second,
+    an automatic gearbox (Adam) hides the limiter: it re-gears to whatever
+    torque arrives, so a cap that fires every step changes almost nothing,
+    while a manual box (SGD) turns the same cap directly into road speed and a
+    73× loss of it. Third, the limiter caps engine torque but not the brake:
+    weight decay bypasses the clip entirely, so the moment the cap bites, the
+    balance between acceleration and braking shifts by 1.95× without you
+    touching either.
+
+    ### What goes wrong
+
+    - You add `clip_grad_norm_(1.0)` because a blog post said to. The run
+      stops spiking and also stops improving. You cannot say whether the clip
+      helped, hurt, or merely ate 49% of the learning-rate budget, because you
+      have no number for "how much step size the clip removed" — and the peak
+      LR you set is no longer the peak LR the model saw.
+    - You port a recipe from a 300k-step pretraining run to an 8k-step
+      fine-tune: 2000 warmup steps, cosine to zero over `total_steps`, clip
+      1.0. A quarter of your run is now spent ramping, the cosine never
+      reaches its flat region, and the result is worse than the constant
+      learning rate you replaced — but every individual component is
+      "correct".
+    - You emulate a 4× larger batch with gradient accumulation, get a loss
+      curve of the same shape, and land 0.3 worse on eval. You clipped each
+      micro-batch instead of the accumulated gradient: on the measured rig
+      that is a 0.82× norm and a cap applied four times, not once.
+    - You enable fp16, keep the clip at 1.0, and the loss never leaves its
+      initial value. The clip is capping the *scaled* gradient, so the update
+      is 1.4×10⁻⁶ of what you intended and every step is a rounding error.
+    - An interviewer asks why everyone runs AdamW + cosine + 5% warmup + clip
+      1.0, and which of the four is actually doing the work. You have run the
+      recipe a hundred times and never run the experiment that separates them.
+
+    ### The full treatment
+
+    **The applied step is a product of four functions, and only one of them is
+    the one you drew.** $\theta_{t+1} = \theta_t - \eta_t s_t \hat{u}_t -
+    \eta_t\lambda\theta_t$, with $s_t = \min(1, c/\|g_t\|)$. On the reference
+    rig — a 10→64→64→1 tanh MLP, MSE, batch 64, 3000 steps, AdamW at
+    $\lambda = 0.01$, with 0.4% of training targets contaminated by
+    $\mathcal{N}(0, 30^2)$ noise — the schedule draws a budget of
+    $\sum_t \eta_t = 3.002$ and the clip delivers
+    $\sum_t \eta_t s_t = 1.536$. **Forty-nine percent of the learning rate was
+    removed by a constant you set once and never looked at again.** The trap
+    is tuning the peak $\eta$ after adding a clip and calling it a schedule
+    fix; you are then tuning a product by adjusting one factor.
+
+    **Clipping is a schedule you did not draw, and it is state-dependent.**
+    Measured at $c = 1.0$, the clip fires on **100% / 96.5% / 78.5% / 50.3% /
+    36.7%** of steps across the five quintiles of the run, tracking the median
+    gradient norm down **3.11 → 1.79 → 1.36 → 1.00 → 0.86**. So $s_t$ climbs
+    from **0.10 at step 0** to 1.00 by step 2100, non-monotonically, because
+    each contaminated batch re-triggers it. The consequence is not just a
+    smaller area: the realised curve $\eta_t s_t$ peaks at **step 578**, while
+    $\eta_t$ peaks at step 149. A clip does not scale your schedule, it
+    *delays* it.
+
+    **The clip rate and the budget ratio are different numbers, and confusing
+    them is the standard reporting error.** On the same run the clip fires on
+    **72.4%** of steps but removes only **48.8%** of the budget. The clip rate
+    is an unweighted mean of the indicator $[s_t<1]$; the budget ratio is
+    $\sum_t \eta_t s_t / \sum_t \eta_t$, a mean of $s_t$ weighted by $\eta_t$.
+    Because clipping is worst exactly where $\eta_t$ is largest, the weighted
+    mean is below the unweighted one: the mean scale is **0.608** against a
+    budget ratio of **0.5116**, so averaging $s_t$ instead of weighting it
+    **overstates the realised budget by 19%**. "The clip fires on 3% of steps,
+    so it cannot matter" is the same error in the other direction.
+
+    **Under Adam, a clip that fires on every step is almost a no-op — and that
+    is measurable.** Clip values 0.05, 0.1 and 0.25 all give a final loss of
+    **0.1351** with budget ratios of **0.027, 0.054 and 0.134**: a 5× range of
+    realised budget changes the answer by 0.01%. Adam divides by
+    $\sqrt{\hat{v}}$, so a uniform rescale of the gradient cancels, and a cap
+    that always fires is a uniform rescale with slowly varying magnitude. Only
+    a cap that fires on *some* steps reweights them. Under SGD the same
+    $c = 0.05$ is a hard step-size cap: at $\eta = 0.01$ the budget ratio is
+    **0.0137** — a 73× learning-rate cut — and the loss is **2.42** against
+    0.19 for $c=1.0$. The clip value is not portable between optimizers, and
+    quoting "clip 1.0" without the optimizer is quoting half a fact.
+
+    **Clipping is not a smaller learning rate, and the experiment that proves
+    it is cheap.** At *matched realised budget* — 1.536 for
+    cosine-2e-3-with-clip-1.0 against 1.501 for cosine-1e-3-without-clip —
+    the clipped run finishes at **0.1397** and the unclipped one at
+    **1.0018**, a factor of **7.2**. Same schedule shape, same movement
+    available, same optimizer; the only difference is *which steps* got to
+    spend it. Clipping spends the budget on the 28% of steps with ordinary
+    gradients and refuses to spend it on the spikes; lowering the learning
+    rate spends less on both. This is why "just lower the LR instead of
+    clipping" is not a substitute, and why the two belong in the same
+    sentence as *which* budget, not *what* peak.
+
+    **Warmup and cosine compose to a constant area, so any warmup bug costs
+    exactly the warmup fraction.** With the ramp inside $T$ and the cosine
+    spanning $[T_w, T)$, the area is $\eta_{\max}T/2$ — independent of
+    $T_w$. Measured at $T = 10^4$, $\eta_{\max} = 2\times10^{-3}$: **10.002**
+    for $T_w = 500$, and **10.0005** with no warmup at all, a 0.01% difference.
+    Append the ramp *on top* of $T$ and you buy **+5.0%** budget (10.502);
+    leave the cosine unshifted so it starts at progress $t/T$ instead of
+    $(t-T_w)/(T-T_w)$ and you lose **−5.0%** (9.504). Both errors equal
+    $T_w/T$ — the warmup fraction — which is why the bug is invisible at 5%
+    and fatal at 25%.
+
+    **Warmup's measured effect is on the worst step, not the mean.** Sweeping
+    the warmup over 0 / 1 / 2.5 / 5 / 10 / 20% of the run gives final losses
+    of **0.148 / 0.144 / 0.145 / 0.140 / 0.142 / 0.141** — flat to ±6%, with a
+    shallow minimum at 5%. The worst update as a multiple of the median update
+    over the same sweep falls **10.4 → 6.2 → 3.7 → 3.35 → 3.46 → 3.40**. So
+    warmup is not buying loss, it is buying a bound on the largest step, and
+    5% is where that bound stops improving. The trap is spending a week tuning
+    a knob whose loss response is inside the seed noise, while the clip — a
+    knob with a 6× loss response — sits at its default.
+
+    **Accumulation is exact for the gradient and inexact for everything you do
+    to it.** Four micro-batches of 64 over the same 256 samples reproduce the
+    full-batch gradient to **cosine 1.0000000 and norm ratio 1.0000**. But:
+    clip each micro-batch separately and the accumulated norm is **0.4077**
+    against **0.5000** for clipping once (cosine 0.9940) — the cap is applied
+    four times; drop the last chunk's size weight and the norm is off by
+    **0.9% at 2 chunks and 1.8% at 12**; use uneven chunks of 200 and 40
+    samples and the unweighted average has **cosine 0.9718** and norm ratio
+    **0.9500** against the true gradient; add dropout at 0.2 and the identity
+    fails outright at **cosine 0.8963**, because each micro-batch draws its
+    own mask. "Accumulation is the same as a large batch" is true for the
+    mean and false for the pipeline.
+
+    **The clip threshold lives in the units of the tensor you hand it, so it
+    moves with loss scale and batch size.** Under fp16 loss scaling by
+    $S = 65536$, clipping the scaled gradient at 1.0 caps the update at
+    $1/65536 = 1.5\times10^{-5}$ against a typical norm of 10.96, an effective
+    learning-rate multiplier of **1.4×10⁻⁶** — the run is frozen, not
+    unstable. Unscale first, then clip. Batch size moves the threshold more
+    gently than people assume: fitting $\|g_B\|^2 = a + b/B$ over
+    $B \in [8, 512]$ gives **a = 100.2, b = 2271**, so the median norm falls
+    only **16.03 → 9.68** over a 64× range of batch size, and the noise share
+    of the gradient is **75.4% at B=8, 26.5% at B=64, 4.7% at B=512**. A clip
+    tuned at B=64 is a different cap at B=8 because the *variance* changed,
+    not the mean.
+
+    **The default recipe is insurance, and its price is measurable.** At
+    matched budget, AdamW + cosine + 5% warmup + clip 1.0 beats the best of five
+    constant-LR hand-tunes by **7.3×** on the spiky rig (0.1397 against
+    1.0203) and by **27%** on a clean one (0.1037 against 0.1412). But the
+    best of fifteen hand-tuned configurations — cosine at peak 4e-3 with the
+    same clip — reaches **0.1167**, 16% better than the default, for fifteen
+    runs of tuning; and on clean data with 4× the budget a constant 4e-3 wins
+    outright at **0.0697**. The honest statement is not "this recipe is
+    optimal" but "this recipe is within 16% of the best thing you would find
+    by tuning, and it is the thing that does not fail when the data is bad".
+    That is what a default is for.
+
+
+  derivations:
+    - title: "The area of a warmup-plus-cosine schedule is η·T/2, whatever the warmup length"
+      latex: |
+        Split the sum at the join:
+        $$\sum_{t=0}^{T-1}\eta(t) \;=\;
+          \underbrace{\sum_{t=0}^{T_w-1}\eta_{\max}\frac{t+1}{T_w}}_{\text{ramp}}
+          \;+\;
+          \underbrace{\sum_{t=T_w}^{T-1}\eta_{\max}\cdot\tfrac12\left(1+\cos\pi\frac{t-T_w}{T-T_w}\right)}_{\text{cosine}}$$
+
+        The ramp is an arithmetic series with mean $\eta_{\max}/2$:
+        $$\sum_{t=0}^{T_w-1}\eta_{\max}\frac{t+1}{T_w}
+          = \eta_{\max}\frac{T_w+1}{2} \;\approx\; \frac{\eta_{\max}T_w}{2}$$
+
+        The cosine is a Riemann sum of $\tfrac12(1+\cos\pi x)$ over $x\in[0,1]$,
+        whose integral is $1/2$:
+        $$\int_0^1 \tfrac12\left(1+\cos\pi x\right)dx
+          = \tfrac12\left[x + \frac{\sin\pi x}{\pi}\right]_0^1 = \tfrac12$$
+
+        so the cosine contributes $\eta_{\max}(T-T_w)/2$ and
+
+        $$\sum_{t=0}^{T-1}\eta(t) = \frac{\eta_{\max}T_w}{2}
+          + \frac{\eta_{\max}(T-T_w)}{2} = \frac{\eta_{\max}T}{2}.$$
+
+        Append the ramp outside $T$ instead and the run gains the whole triangle,
+        $+\eta_{\max}T_w/2$, i.e. $+T_w/T$ relative. Leave the cosine unshifted
+        and it starts at progress $T_w/T$ instead of 0, losing approximately
+        $\eta_{\max}T_w/2$, i.e. $-T_w/T$. Both measured at 5%: $+5.0\%$ and
+        $-5.0\%$.
+      prose: >-
+        The cancellation is the point: a warmup does not buy you extra budget
+        and must not cost you any, and the only way to get both is to make the
+        decay span the steps the ramp did not use. This is also the fastest
+        check on someone else's schedule code — compute the area, and if it is
+        not $\eta_{\max}T/2$ to within a rounding error, the warmup is being
+        composed wrongly and the error is exactly the warmup fraction.
+    - title: "The budget ratio is a weighted mean, so the clip rate overstates the damage"
+      latex: |
+        The realised budget is a sum of per-step products, while the clip rate is
+        a count:
+        $$B_{\text{real}} = \sum_t \eta_t s_t, \qquad
+          r = \frac{1}{T}\sum_t \mathbf{1}[s_t<1].$$
+
+        Dividing by the drawn budget turns the first into a mean of $s_t$
+        weighted by the schedule:
+        $$\frac{B_{\text{real}}}{B_{\text{drawn}}}
+          = \sum_t \underbrace{\frac{\eta_t}{\sum_u \eta_u}}_{w_t}\, s_t,
+          \qquad \sum_t w_t = 1.$$
+
+        If $s_t$ and $\eta_t$ are similarly ordered — clipping is worst early,
+        where $\eta$ is largest — Chebyshev's sum inequality gives
+        $$\sum_t w_t s_t \;\le\; \frac{1}{T}\sum_t s_t,$$
+        so the unweighted mean scale is biased *above* the budget ratio.
+        Measured: mean scale 0.608, budget ratio 0.512, an overstatement of
+        **19%**. In the other direction a clip that fires only on the schedule's
+        flat top would make the unweighted mean *understate* the cost.
+      prose: >-
+        Reporting a clip rate is reporting how many steps were touched; reporting
+        a budget ratio is reporting how much step size was removed. They differ
+        by the correlation between the clip and the schedule, which is exactly
+        the thing you were trying to understand, so never substitute one for the
+        other. The measurement is two lines: the sum of $\eta_t s_t$ and the sum
+        of $\eta_t$.
+    - title: "Accumulation is exact; clipping before or after averaging is not"
+      latex: |
+        For a mean-reduced loss over $N$ samples split into chunks $C_j$ of size
+        $n_j$ with $\sum_j n_j = N$:
+        $$\hat{g}_{\text{acc}} = \sum_j \frac{n_j}{N}\,\hat{g}_j
+          = \sum_j \frac{n_j}{N}\cdot\frac{1}{n_j}\sum_{i\in C_j}\nabla\ell_i
+          = \frac{1}{N}\sum_{i=1}^{N}\nabla\ell_i = g_{\text{full}}.$$
+
+        The middle equality needs $n_j/N$ as the weight; using $1/k$ instead
+        leaves
+        $$\hat{g}_{\text{unw}} - g_{\text{full}}
+          = \sum_j\left(\frac{1}{k}-\frac{n_j}{N}\right)\hat{g}_j,$$
+        which vanishes only when all $n_j$ are equal. For a 250/256 split into
+        four chunks this is a 0.9% norm error; at twelve chunks, 1.8%; for a
+        200/40 token split, 5%.
+
+        Clipping is a nonlinear map, so it does not commute with the average:
+        $$\left\|\sum_j w_j\,\operatorname{clip}_c(\hat{g}_j)\right\|
+          \;\le\; \sum_j w_j \min(c, \|\hat{g}_j\|) \;\le\; c,$$
+        whereas clipping once gives
+        $\min(c, \|\sum_j w_j \hat{g}_j\|)$. With per-micro clipping the ceiling
+        $c$ binds on every chunk separately, so the accumulated norm can never
+        exceed $c$ even when the true gradient is $10c$ — measured 0.4077
+        against 0.5000, cosine 0.9940.
+      prose: >-
+        This is the precise content of "accumulation is not the same as a large
+        batch". The gradient is identical; the *clip* is applied $k$ times
+        instead of once, the *normalisation layers* see $1/k$ of the samples per
+        forward pass, and the *decay* is applied once per $k$ micro-batches
+        rather than once per large batch. Every one of those is a change in the
+        optimisation problem, and every one of them is invisible in a loss curve
+        that only has the right shape.
+
+  implementations:
+    - language: python
+      title: "One auditable step: accumulate, unscale, clip once, then AdamW"
+      note: >-
+        Numerically wrong in two specific ways, both worth knowing. First, in
+        float32 the tail of the schedule falls below the half-ulp of a
+        unit-magnitude weight: on the reference run measured at peak 2e-3 over
+        10,000 steps, **33 of the last steps** add less than 6e-8 to a weight and
+        are silently discarded, so "cosine to zero" is really "cosine to the
+        dtype's floor". Second, if `loss_scale` is passed to the clip instead of
+        being divided out first, the effective cap is `c / S` and at S = 65536
+        the step is 1.4e-6 of the intended size — the function still runs, still
+        returns finite weights, and learns nothing. `unscale=True` is the only
+        correct usage.
+      code: |
+        import math
+        import numpy as np
+
+        class ClippedAdamW:
+            """The assembly from this topic, with nothing hidden in a library call."""
+
+            def __init__(self, params, peak_lr, total_steps, warmup_steps,
+                         clip=1.0, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8):
+                self.p = [np.asarray(x, dtype=np.float64) for x in params]
+                self.peak, self.T, self.Tw = peak_lr, total_steps, warmup_steps
+                self.clip, self.wd, self.eps = clip, weight_decay, eps
+                self.b1, self.b2 = betas
+                self.m = [np.zeros_like(x) for x in self.p]
+                self.v = [np.zeros_like(x) for x in self.p]
+                self.t = 0
+
+            # the ramp is INSIDE T, and the cosine is shifted by Tw.
+            # both mistakes cost exactly Tw/T; see the derivation.
+            def lr_at(self, step):
+                if self.Tw > 0 and step < self.Tw:
+                    return self.peak * (step + 1) / self.Tw
+                if step >= self.T:
+                    return 0.0
+                prog = (step - self.Tw) / max(1, self.T - self.Tw)
+                return self.peak * 0.5 * (1.0 + math.cos(math.pi * prog))
+
+            @staticmethod
+            def _norm(grads):
+                return float(np.sqrt(sum(float((g * g).sum()) for g in grads)))
+
+            def step(self, micro_grads, micro_sizes, loss_scale=1.0, unscale=True):
+                sizes = np.asarray(micro_sizes, dtype=np.float64)
+                total = float(sizes.sum())
+                grads = [np.zeros_like(x) for x in self.p]
+                for g, n in zip(micro_grads, sizes):
+                    w = n / total
+                    for i in range(len(grads)):
+                        grads[i] += g[i] * w
+                if loss_scale != 1.0:
+                    if not unscale:
+                        raise ValueError("clip before unscale caps at c/loss_scale")
+                    for i in range(len(grads)):
+                        grads[i] /= loss_scale
+                gn = self._norm(grads)
+                scale = 1.0 if self.clip is None else min(1.0, self.clip / (gn + 1e-300))
+                for i in range(len(grads)):
+                    grads[i] *= scale
+
+                lr = self.lr_at(self.t)
+                self.t += 1
+                bc1 = 1.0 - self.b1 ** self.t
+                bc2 = 1.0 - self.b2 ** self.t
+                for i, p in enumerate(self.p):
+                    self.m[i] = self.b1 * self.m[i] + (1 - self.b1) * grads[i]
+                    self.v[i] = self.b2 * self.v[i] + (1 - self.b2) * grads[i] ** 2
+                    mh = self.m[i] / bc1
+                    vh = self.v[i] / bc2
+                    p -= lr * mh / (np.sqrt(vh) + self.eps)
+                    p -= lr * self.wd * p          # decoupled: NOT inside grads
+                return {"lr": lr, "gn": gn, "scale": scale,
+                        "realised": lr * scale, "drawn": lr}
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            opt = ClippedAdamW([rng.normal(size=(4, 3)), np.zeros(4)],
+                               peak_lr=2e-3, total_steps=1000, warmup_steps=50)
+            drawn = realised = 0.0
+            for t in range(1000):
+                g = [rng.normal(0, 1.0, (4, 3)), rng.normal(0, 1.0, 4)]
+                if rng.random() < 0.05:
+                    g = [x * 30.0 for x in g]      # one contaminated batch
+                info = opt.step([g], [64])
+                drawn += info["drawn"]
+                realised += info["realised"]
+            print(round(realised / drawn, 4))
+            # ~0.4-0.6 depending on the seed: the clip ate half the schedule
+    - language: python
+      title: "The budget audit: three numbers before any optimisation change"
+      note: >-
+        Two ways to make this report wrong. Averaging the per-step scales
+        instead of weighting them by the learning rate overstates the realised
+        budget — measured 0.608 against 0.5116, a 19% error, and the error has
+        the same sign every time because clipping is worst where the schedule is
+        largest. Auditing the gradient norm *before* clipping reports a clip
+        rate of zero and a budget ratio of 1.0 for a run that lost half its
+        schedule; the trace must record the norm that was actually applied.
+      code: |
+        import numpy as np
+
+        def budget_audit(lrs, applied_scales, grad_norms, updates, quintiles=5):
+            """Everything the three curves cannot tell you, in one dict."""
+            lr = np.asarray(lrs, dtype=float)
+            s = np.asarray(applied_scales, dtype=float)
+            gn = np.asarray(grad_norms, dtype=float)
+            upd = np.asarray(updates, dtype=float)
+            T = len(lr)
+
+            drawn = float(lr.sum())
+            realised = float((lr * s).sum())
+            edges = np.linspace(0, T, quintiles + 1).astype(int)
+
+            return {
+                "drawn_budget": drawn,
+                "realised_budget": realised,
+                "budget_ratio": realised / drawn,
+                "clip_rate": float((s < 1.0).mean()),
+                # the wrong number, kept so you can see the gap
+                "mean_scale_NOT_the_ratio": float(s.mean()),
+                "clip_rate_by_quintile": [
+                    float((s[edges[i]:edges[i + 1]] < 1.0).mean())
+                    for i in range(quintiles)
+                ],
+                "gn_median_by_quintile": [
+                    float(np.median(gn[edges[i]:edges[i + 1]]))
+                    for i in range(quintiles)
+                ],
+                "worst_update_over_median": float(upd.max() / np.median(upd)),
+                "move_in_last_10pct": float(upd[int(0.9 * T):].sum() / upd.sum()),
+                # the effective peak, which is not where eta peaks
+                "peak_step_drawn": int(np.argmax(lr)),
+                "peak_step_realised": int(np.argmax(lr * s)),
+            }
+
+        def verdict(a):
+            if a["budget_ratio"] < 0.7:
+                return "clip is eating the schedule: raise c or lower the peak"
+            if a["worst_update_over_median"] > 8:
+                return "spikes survive: lower c, or lengthen warmup"
+            if a["move_in_last_10pct"] > 0.05:
+                return "no tail: the schedule is not annealing, expect a noise floor"
+            return "consistent"
+
+  checkpoints:
+    - id: cp-1
+      question: "Your run draws a budget of 3.00 and the audit reports a realised budget of 1.54. Give two different clip regimes that produce the same ratio, and the measurement that separates them."
+      answerKind: short_text
+      hint: "One regime clips almost every step a little; the other clips a few steps a lot. Which statistic distinguishes them?"
+      solution: >-
+        Either the clip fires on most steps with a mild scale — the measured
+        case: 72.4% of steps, median scale 0.453 — or it fires on a quarter of
+        steps with a severe one, e.g. 25% at scale 0.08. The budget ratio is
+        identical and says nothing about which. The separating measurement is
+        the clip rate by quintile together with the median gradient norm by
+        quintile: the first regime shows a rate that decays with the norm
+        (100/96.5/78.5/50.3/36.7) and a scale near 0.45, the second shows
+        sporadic firing concentrated wherever the contaminated batches land.
+        The consequence differs too: the mild-always regime is close to a
+        per-step normaliser, the sparse-severe regime is a spike filter, and
+        only the second one gets better when you raise the peak learning rate.
+    - id: cp-2
+      question: "Why is clip 1.0 a no-op when it fires on every step under Adam, but a 73x learning-rate cut under SGD?"
+      answerKind: short_text
+      hint: "What does Adam divide by, and what happens to a constant factor in that quotient?"
+      solution: >-
+        Adam's step is $\eta\,\hat m/(\sqrt{\hat v}+\epsilon)$. If a cap rescales
+        the gradient by a constant $s$, then $m$ scales by $s$ and $v$ by $s^2$,
+        so $\hat m/\sqrt{\hat v}$ is unchanged — the cap cancels exactly. A cap
+        that fires every step is a *slowly varying* constant, so it barely
+        perturbs the direction sequence and the loss barely moves: 0.1351 at
+        $c = 0.05$ against 0.1397 at $c = 1.0$, across a 19x range of realised
+        budget. SGD has no such quotient: the update is $\eta g$, so a cap at
+        $c$ is literally a step-size ceiling, and at $\eta = 0.01$ with a median
+        norm near 11 the realised/drawn ratio is 0.0137 — the run behaves like
+        $\eta = 1.4\times10^{-4}$ and finishes at 2.42.
+    - id: cp-3
+      question: "You move a 5% warmup from inside `total_steps` to on top of it. What happens to the budget, by how much, and what does the loss curve look like afterwards?"
+      answerKind: short_text
+      hint: "Draw the two curves. One of them has an extra triangle at the start, at full peak height."
+      solution: >-
+        The budget grows by the area of the ramp that is now outside the decay,
+        $\eta_{\max}T_w/2$, which is $T_w/T = 5\%$ of the total. Measured:
+        10.502 against 10.002 on a 10,000-step run at peak 2e-3. The loss curve
+        does not jump — a 5% budget change is inside seed noise on most runs —
+        which is exactly why the bug survives. It becomes visible when the
+        fraction is large: port a 2000-step warmup into an 8,000-step run and you
+        have added 25% to the budget, spent entirely at the peak, on a run whose
+        whole cosine was supposed to be the annealing.
+    - id: cp-4
+      question: "Your accumulation reproduces the full-batch gradient to cosine 1.0, yet the run is worse than the same batch size on four GPUs. Name three mechanisms that survive the exactness of the mean."
+      answerKind: short_text
+      hint: "The gradient is exact. What else does the step contain, and what does each micro-batch see that a real 256-sample batch would not?"
+      solution: >-
+        (1) Clipping: per-micro clipping applies the cap $k$ times, giving a
+        norm of 0.4077 against 0.5000 for clipping the accumulated gradient, and
+        a cosine of 0.9940 — the cap now binds per chunk, not globally. (2)
+        Per-micro stochasticity and normalisation: dropout at 0.2 gives cosine
+        0.8963 because every micro-batch draws its own mask; BatchNorm computes
+        statistics over 64 samples instead of 256, which is a different function,
+        not a noisier estimate of the same one. (3) Uneven chunk sizes: with
+        mean-reduced losses the weights fix it (cosine 1.0), but with
+        sum-reduced token losses an unweighted 200/40 split gives cosine 0.9718
+        and a 5% norm error. Add decoupled weight decay applied once per
+        optimizer step rather than once per large batch and you have a fourth.
+    - id: cp-5
+      question: "The clip rate is 72.4% and the budget ratio is 0.512. Which is the honest number to quote, and what does the gap between them tell you?"
+      answerKind: short_text
+      hint: "One is a count, the other is a weighted sum. What is the weight?"
+      solution: >-
+        The budget ratio, because it is the fraction of the learning rate the
+        model actually received. The gap — 72.4% of steps touched, 48.8% of the
+        budget removed — says the clip is firing early and mildly: many steps are
+        clipped, but most by only a few percent, and the steps it hits hardest
+        are the ones where $\eta_t$ is largest. The unweighted mean scale is
+        0.608, so quoting an "average clip factor" overstates the realised
+        budget by 19%. If you want one sentence for a colleague: "the clip cost
+        half the schedule, mostly in the first third".
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Four knobs decide one number: how far the weights move on each step. The
+        schedule says how far you would like to move, the clip says how far you
+        are allowed to, the accumulation count decides what the gradient even is,
+        and the decay moves the weights whether or not any gradient arrived.
+        They multiply. So a change to any one of them is a change to the others'
+        effective values, and a run that "stopped working when I added clipping"
+        is usually a run whose learning rate quietly halved.
+      blocks:
+        - kind: checklist
+          body: |
+            - What is drawn: sum of the schedule over the run
+            - What is delivered: that sum after the clip has scaled each step
+            - What the clip touched: the fraction of steps, and by how much
+            - What the model saw: where the realised step size actually peaks
+            - What the gradient was: k micro-batches, size-weighted, before clipping
+      checkpoint: >-
+        Before reading on: if your clip fires on 70% of steps, is the run's
+        effective learning rate closer to 70% of the peak or to 50% of the drawn
+        budget? What would make it 50%?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Do not reason about the four knobs separately — instrument one run and
+        compute the ratio. The tool is a budget audit: record $\eta_t$, the
+        applied scale $s_t$, the pre-clip gradient norm, and the update norm, then
+        report $\sum\eta_t s_t / \sum\eta_t$, the clip rate by quintile, and the
+        worst update over the median. That single table separates the three
+        failure modes — a clip that is eating the schedule, a schedule that is
+        not annealing, and a warmup that is too short — which look identical on a
+        loss curve. The alternative, staring at the loss and adjusting, is what
+        produced the bug.
+      blocks:
+        - kind: checklist
+          body: |
+            - Log eta_t, s_t, the pre-clip grad norm, and the update norm, every step
+            - Compute realised/drawn, not the mean of s_t
+            - Split the run into quintiles and report the clip rate in each
+            - Find argmax(eta_t) and argmax(eta_t * s_t); if they differ, the clip is a schedule
+            - Only then change a knob, and change one
+      checkpoint: >-
+        Which of the four logged series would you look at first to decide whether
+        the problem is the clip or the schedule, and what pattern would settle it?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three functions: the schedule (one function, two pieces, ramp inside T),
+        the step (accumulate with weights, unscale, clip once, Adam, decay), and
+        the audit (sums, not means).
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. schedule: ONE function, ramp inside T
+            def lr_at(step):
+                if step < Tw: return peak * (step + 1) / Tw
+                if step >= T: return 0
+                p = (step - Tw) / (T - Tw)
+                return peak * 0.5 * (1 + cos(pi * p))
+            # area over the run is peak * T / 2, for any Tw
+
+            # 2. one step
+            g = sum_j (n_j / N) * micro_grad_j     # size-weighted, not 1/k
+            if loss_scale != 1: g /= loss_scale    # BEFORE the clip
+            s = min(1, c / norm(g))                # once, on the sum
+            g *= s
+            m, v = adam_moments(g)
+            theta -= lr * m_hat / (sqrt(v_hat) + eps)
+            theta -= lr * wd * theta               # outside the clip
+
+            # 3. the audit
+            ratio = sum(lr * s) / sum(lr)           # not mean(s)
+            per_quintile: clip rate, grad norm median
+            worst_update / median_update
+            argmax(lr) vs argmax(lr * s)
+      checkpoint: >-
+        In step 2, why must the unscale happen before the clip rather than after,
+        and what exactly goes wrong at a loss scale of 65536 if you forget?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Two identities do most of the work: the area of the composed schedule,
+        and the fact that the budget ratio is a weighted mean while the clip rate
+        is a count.
+      blocks:
+        - kind: math
+          body: |
+            Composed schedule, ramp inside $T$:
+
+            $$\sum_{t=0}^{T-1}\eta(t)
+              = \underbrace{\eta_{\max}\frac{T_w}{2}}_{\text{ramp triangle}}
+              + \underbrace{\eta_{\max}\frac{T-T_w}{2}}_{\text{cosine}}
+              = \frac{\eta_{\max}T}{2}$$
+
+            using $\int_0^1 \tfrac12(1+\cos\pi x)\,dx = \tfrac12$. So the warmup
+            length cancels, and appending the ramp outside $T$ adds
+            $+T_w/T$ while an unshifted cosine subtracts $T_w/T$.
+
+            Realised budget versus clip rate:
+
+            $$\frac{B_{\text{real}}}{B_{\text{drawn}}}
+              = \sum_t \frac{\eta_t}{\sum_u \eta_u}\, s_t,
+              \qquad r = \frac{1}{T}\sum_t \mathbf{1}[s_t<1]$$
+
+            The first is a mean weighted by the schedule, the second is a plain
+            count. Since $s_t$ and $\eta_t$ are similarly ordered (clipping is
+            worst early), Chebyshev gives weighted $\le$ unweighted: measured
+            0.512 against 0.608, a 19% overstatement.
+
+            Accumulation, mean-reduced loss:
+
+            $$\sum_j \frac{n_j}{N}\cdot\frac{1}{n_j}\sum_{i\in C_j}\nabla\ell_i
+              = \frac{1}{N}\sum_{i=1}^{N}\nabla\ell_i$$
+
+            exact for any chunking with the right weights, and biased by
+            $\sum_j (1/k - n_j/N)\hat g_j$ without them.
+
+            Clipping is a nonlinear map and does not commute with the average:
+
+            $$\left\|\sum_j w_j\,\operatorname{clip}_c(\hat g_j)\right\| \le c
+              \quad\text{but}\quad
+              \left\|\operatorname{clip}_c\!\left(\sum_j w_j \hat g_j\right)\right\| \le c$$
+
+            with the first bound binding $k$ times, which is why per-micro
+            clipping measured 0.4077 against 0.5000.
+      checkpoint: >-
+        In the Chebyshev step, what would have to be true of the correlation
+        between $s_t$ and $\eta_t$ for the weighted mean to *exceed* the
+        unweighted one, and when does that happen in a real run?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete step and audit, plus the reference numbers so you can check
+        your own run against them.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the expected numbers before the code. On the reference rig the
+            default draws 3.002 and delivers 1.536; the clip fires on 72.4% of
+            steps with a median scale of 0.453; the realised peak sits at step
+            578 against a drawn peak at 149. If your implementation reports a
+            budget ratio near 1.0 while the clip rate is above 50%, you are
+            auditing the pre-clip norm.
+        - kind: code
+          language: python
+          body: |
+            import math
+            import numpy as np
+
+            def lr_at(step, T, Tw, peak, min_lr=0.0):
+                if Tw > 0 and step < Tw:
+                    return peak * (step + 1) / Tw
+                if step >= T:
+                    return min_lr
+                p = (step - Tw) / max(1, T - Tw)
+                return min_lr + (peak - min_lr) * 0.5 * (1 + math.cos(math.pi * p))
+
+            def audit(lrs, scales, gnorms, updates):
+                lr = np.asarray(lrs); s = np.asarray(scales)
+                gn = np.asarray(gnorms); up = np.asarray(updates)
+                T = len(lr)
+                e = np.linspace(0, T, 6).astype(int)
+                return {
+                    "drawn": float(lr.sum()),
+                    "realised": float((lr * s).sum()),
+                    "ratio": float((lr * s).sum() / lr.sum()),
+                    "clip_rate": float((s < 1).mean()),
+                    "mean_scale": float(s.mean()),      # the wrong number
+                    "rate_by_quintile": [float((s[e[i]:e[i+1]] < 1).mean()) for i in range(5)],
+                    "gn_median_by_quintile": [float(np.median(gn[e[i]:e[i+1]])) for i in range(5)],
+                    "worst_over_median": float(up.max() / np.median(up)),
+                    "last10pct_move": float(up[int(0.9*T):].sum() / up.sum()),
+                    "peak_drawn": int(np.argmax(lr)),
+                    "peak_realised": int(np.argmax(lr * s)),
+                }
+
+            # reference run, T=3000, Tw=150, peak=2e-3, clip=1.0, AdamW, batch 64
+            # drawn            3.002
+            # realised         1.536      ratio 0.5116
+            # clip rate        0.724      mean scale 0.608
+            # median scale when clipped   0.453
+            # worst/median update         3.35
+            # last 10% of steps           0.15% of total movement
+            # peak drawn 149 -> peak realised 578
+      checkpoint: >-
+        Your audition of the same recipe on a different dataset reports
+        ratio 0.94, clip rate 0.08, worst/median 22. Which knob do you change
+        first, and what does the combination tell you that either number alone
+        does not?
+
+  problems:
+    - id: p-warmup-cosine
+      title: "Compose warmup and cosine into one schedule"
+      difficulty: medium
+      prompt: >-
+        Implement `warmup_cosine_lr(step, total_steps, warmup_steps, peak_lr,
+        min_lr=0.0)` returning the learning rate as a float. The ramp is
+        **inside** `total_steps`: for `step < warmup_steps` the rate is
+        `peak_lr * (step + 1) / warmup_steps`, so the first step is never exactly
+        zero. For `step >= total_steps` return `min_lr`. Otherwise, with
+        `progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)`,
+        return `min_lr + (peak_lr - min_lr) * 0.5 * (1 + cos(pi * progress))`.
+        When `warmup_steps` is 0 the cosine spans the whole run, so
+        `progress = step / total_steps`.
+      starter: |
+        import math
+
+        def warmup_cosine_lr(step, total_steps, warmup_steps, peak_lr, min_lr=0.0):
+            # your implementation here
+            pass
+      language: python
+      entry: warmup_cosine_lr
+      testCases:
+        - input: '[0, 1000, 100, 0.001, 0.0]'
+          expected: "1e-05"
+          mode: json
+          tolerance: 1e-12
+        - input: '[99, 1000, 100, 0.001, 0.0]'
+          expected: "0.001"
+          mode: json
+          tolerance: 1e-12
+        - input: '[100, 1000, 100, 0.001, 0.0]'
+          expected: "0.001"
+          mode: json
+          tolerance: 1e-12
+        - input: '[550, 1000, 100, 0.001, 0.0]'
+          expected: "0.0005"
+          mode: json
+          tolerance: 1e-12
+        - input: '[999, 1000, 100, 0.001, 0.0]'
+          expected: "3.046171104803541e-09"
+          mode: json
+          tolerance: 1e-12
+        - input: '[1000, 1000, 100, 0.001, 0.0]'
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-12
+        - input: '[600, 1000, 0, 0.002, 0.0001]'
+          expected: "0.0007564338553438001"
+          mode: json
+          tolerance: 1e-12
+        - input: '[3000, 3000, 0, 0.001, 0.0]'
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-12
+        - input: '[0, 100, 10, 1.0, 0.01]'
+          expected: "0.1"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import math
+
+        def warmup_cosine_lr(step, total_steps, warmup_steps, peak_lr, min_lr=0.0):
+            if warmup_steps > 0 and step < warmup_steps:
+                return peak_lr * (step + 1) / warmup_steps
+            if step >= total_steps:
+                return min_lr
+            span = max(1, total_steps - warmup_steps)
+            progress = (step - warmup_steps) / span
+            return min_lr + (peak_lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
+      solutionExplanation: >-
+        The whole exercise is the join. Three details decide whether the schedule
+        you wrote is the schedule you meant. The `+ 1` in the ramp means step 0
+        gets `peak/warmup_steps` rather than zero, which matters because a
+        literal zero step is a wasted step and because some optimizers divide by
+        the rate. The cosine spans `total_steps - warmup_steps`, not
+        `total_steps`: with an unshifted argument the curve starts at progress
+        `warmup_steps/total_steps` and the run loses about `warmup_steps/total_steps`
+        of its budget — 5% at a 5% warmup, measured 9.504 against 10.002 on a
+        10,000-step run. And the `step >= total_steps` branch must return
+        `min_lr`, not the cosine evaluated past the end, or a resumed run at the
+        boundary starts climbing back up. The composed area is
+        `peak_lr * total_steps / 2` for any warmup length, which is the check to
+        run on any schedule you inherit.
+      complexity: "O(1) time, O(1) space"
+      tags: [schedule, warmup, cosine, composition]
+
+    - id: p-realised-budget
+      title: "The realised budget, and the number the clip rate hides"
+      difficulty: medium
+      prompt: >-
+        Implement `realised_budget(lrs, grad_norms, clip_value)`. Each step `t`
+        applies a scale `s_t = min(1, clip_value / grad_norms[t])`; if a gradient
+        norm is exactly zero the step is not clipped, so take `s_t = 1` rather
+        than dividing by zero. Return
+        `sum(lrs[t] * s_t) / sum(lrs)`, the fraction of the drawn learning-rate
+        budget the model actually received, as a float. The inputs are equal
+        length lists of numbers.
+      starter: |
+        def realised_budget(lrs, grad_norms, clip_value):
+            # your implementation here
+            pass
+      language: python
+      entry: realised_budget
+      testCases:
+        - input: '[[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0], 1.0]'
+          expected: "0.5"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[1.0, 0.5], [0.5, 4.0], 1.0]'
+          expected: "0.75"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.001, 0.001, 0.001], [0.2, 0.3, 0.4], 1.0]'
+          expected: "1.0"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.002, 0.001, 0.0005, 0.0001], [8.0, 2.0, 0.5, 0.25], 1.0]'
+          expected: "0.37500000000000006"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[1.0, 1.0, 1.0], [0.0, 2.0, 4.0], 1.0]'
+          expected: "0.5833333333333334"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.5, 0.5, 0.5, 0.5], [10.0, 1.0, 10.0, 1.0], 1.0]'
+          expected: "0.55"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def realised_budget(lrs, grad_norms, clip_value):
+            drawn = 0.0
+            realised = 0.0
+            for lr, gn in zip(lrs, grad_norms):
+                drawn += lr
+                if gn <= 0.0:
+                    realised += lr
+                else:
+                    realised += lr * min(1.0, clip_value / gn)
+            return realised / drawn
+      solutionExplanation: >-
+        Two things are being taught here. The arithmetic is a weighted mean of
+        the per-step scales, weighted by the learning rate — not the average of
+        the scales, which is what the "clip rate" measures and which overstates
+        the realised budget whenever clipping correlates with the high-rate part
+        of the schedule. On the reference run the mean scale is 0.608
+        and the budget ratio is 0.512, a 19% gap; test case 4 is the same effect
+        in miniature, where the clip bites hardest on the two largest rates and
+        the answer is 0.375 rather than the 0.55 that averaging the four scales
+        (1, 0.5, 1, 1) would give. The zero-norm branch is not pedantry: a
+        perfectly zero gradient happens on the first step of a
+        zero-initialised layer, and `1/0` in the min would raise rather than
+        return.
+      complexity: "O(n) time, O(1) space"
+      tags: [clipping, budget, weighted-mean, audit]
+
+    - id: p-accumulate
+      title: "Accumulate with weights, and clip in the place you meant"
+      difficulty: hard
+      prompt: >-
+        Implement
+        `accumulate(micro_grads, micro_sizes, clip_value=None, clip_scope="after")`.
+        `micro_grads` is a list of gradient vectors (each already mean-reduced
+        over its own micro-batch), `micro_sizes` the number of samples in each.
+        Weight each vector by `micro_sizes[j] / sum(micro_sizes)` and sum them.
+        If `clip_value` is given and `clip_scope == "after"`, scale the summed
+        vector by `min(1, clip_value / ||g||)` where the norm is the Euclidean
+        norm over the whole vector. If `clip_scope == "per_micro"`, clip each
+        micro-gradient to that norm **before** weighting and summing, and do not
+        clip again. Return the resulting vector as a list of floats.
+      starter: |
+        import math
+
+        def accumulate(micro_grads, micro_sizes, clip_value=None, clip_scope="after"):
+            # your implementation here
+            pass
+      language: python
+      entry: accumulate
+      testCases:
+        - input: '[[[1.0, 1.0], [3.0, 3.0]], [1, 1], null, "after"]'
+          expected: "[2.0, 2.0]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 1.0], [3.0, 3.0]], [1, 3], null, "after"]'
+          expected: "[2.5, 2.5]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[3.0, 0.0], [0.0, 3.0]], [1, 1], 1.0, "after"]'
+          expected: "[0.7071067811865476, 0.7071067811865476]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[3.0, 0.0], [0.0, 3.0]], [1, 1], 1.0, "per_micro"]'
+          expected: "[0.5, 0.5]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[2.0, 2.0], [0.0, 0.0]], [3, 1], 5.0, "after"]'
+          expected: "[1.5, 1.5]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.6, 0.8], [0.6, 0.8]], [1, 1], 1.0, "after"]'
+          expected: "[0.6, 0.8]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[4.0, 0.0], [4.0, 0.0]], [1, 1], 1.0, "per_micro"]'
+          expected: "[1.0, 0.0]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+
+        def accumulate(micro_grads, micro_sizes, clip_value=None, clip_scope="after"):
+            total = float(sum(micro_sizes))
+            vecs = [[float(x) for x in g] for g in micro_grads]
+
+            if clip_scope == "per_micro" and clip_value is not None:
+                clipped = []
+                for g in vecs:
+                    norm = math.sqrt(sum(x * x for x in g))
+                    f = 1.0 if norm <= clip_value or norm == 0.0 else clip_value / norm
+                    clipped.append([x * f for x in g])
+                vecs = clipped
+
+            acc = [0.0] * len(vecs[0])
+            for g, n in zip(vecs, micro_sizes):
+                w = n / total
+                for i, x in enumerate(g):
+                    acc[i] += x * w
+
+            if clip_scope == "after" and clip_value is not None:
+                norm = math.sqrt(sum(x * x for x in acc))
+                if norm > clip_value and norm > 0.0:
+                    acc = [x * (clip_value / norm) for x in acc]
+            return acc
+      solutionExplanation: >-
+        The weighting is what makes accumulation an unbiased estimator: with
+        `n_j / N` the sum telescopes to the mean over all samples, and with `1/k`
+        it only agrees when every chunk is the same size. Test case 2 separates
+        them (2.5 against 2.0 for an equal-weight mean). The two clip scopes then
+        give deliberately different answers on the same input: cases 3 and 4 feed
+        two vectors that are individually at norm 3 and orthogonal. Clipping
+        after averaging caps the mean at 1.0 (each component 0.7071); clipping
+        each vector first turns both into unit vectors and averages them to
+        `[0.5, 0.5]`, a norm of 0.707 — the cap applied twice, and a different
+        direction. That is the measured 0.4077 against 0.5000 in the lesson, and
+        it is why the pipeline diagram puts a single clip node after the sum: if
+        you clip per micro-batch you are not emulating a large batch, you are
+        emulating a large batch with a smaller trust region.
+      complexity: "O(k · d) time, O(d) space"
+      tags: [gradient-accumulation, clipping, micro-batch, bias]
+
+  visualizers:
+    - id: vs-budget-audit
+      kind: loss_surface
+      title: "Watch the realised budget fall as the clip tightens"
+      description: >-
+        Drive the reference run's schedule and gradient-norm trace through
+        different clip values and watch $\sum \eta_t s_t / \sum \eta_t$ fall
+        while the clip rate saturates. At $c = 0.05$ the rate is 100% and the
+        ratio is 0.027; at $c = 4.0$ the rate is 22% and the ratio is 0.889. The
+        held-out loss is flat from 0.05 to 0.5 and doubles by 2.0 — the budget is
+        not the objective.
+      params:
+        total_steps: 3000
+        warmup_steps: 150
+        peak_lr: 0.002
+        clip_values: [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0]
+
+  try_it: >-
+    Log $\|g_t\|$ at every step of a 3,000-step run with clip 1.0, then compute two numbers: the
+    fraction of steps where the clip fired, and $\sum_t \eta_t s_t / \sum_t \eta_t$. You should
+    reproduce roughly 72% and 49% — if the two numbers agree, you have collapsed them into one.
+  interview_questions:
+    - question: 'What is the difference between the clip rate and the budget ratio, and why does reporting the first one mislead?'
+      level: mid
+      key_points:
+        - 'The clip rate is an unweighted mean of the indicator [s_t < 1]; the budget ratio weights each step by its learning rate, sum(eta_t s_t) / sum(eta_t).'
+        - 'On the measured run the clip fired on 72.4% of steps but removed only 48.8% of the budget.'
+        - 'It fires most in the early quintiles, where gradients are largest and the learning rate is also smallest, so the steps it shortens are the cheap ones.'
+        - 'Reporting the rate as if it were the budget overstates the intervention by about 1.5x on this run.'
+    - question: 'You have a spiky run and a clean run. When is clipping actually buying something, and how do you prove it?'
+      level: senior
+      key_points:
+        - 'The experiment is matched realised budget: cosine 2e-3 with clip 1.0 (budget 1.536) against cosine 1e-3 without clip (budget 1.501).'
+        - 'At matched budget the clipped run finishes at 0.1397 and the unclipped one at 1.0018, a factor of 7.2 — clipping is not a smaller learning rate.'
+        - 'Under Adam a clip that fires on every step is nearly a no-op, because the update is divided by sqrt(v_hat): clip values 0.05, 0.1 and 0.25 all give 0.1351 with budgets 0.027, 0.054 and 0.134.'
+        - 'On a clean rig the same recipe buys 27% (0.1037 against 0.1412), so the benefit scales with how heavy the tails are.'
+      follow_up: 'If a clip that fires on every step is a no-op under Adam, what is it doing to a run that uses SGD with momentum?'
+    - question: 'Gradient accumulation reproduces the gradient exactly but not the update. Where does it break?'
+      level: mid
+      key_points:
+        - 'Four micro-batches of 64 over 256 samples reproduce the full-batch gradient to cosine 1.0000000 and norm ratio 1.0000, so the mean is exact.'
+        - 'Clip each micro-batch separately and the accumulated norm is 0.4077 against the correct value, because you summed clipped gradients instead of clipping the sum.'
+        - 'BatchNorm and other batch statistics are computed per micro-batch, so the forward pass itself differs from the full-batch one.'
+        - 'The rule is to accumulate unclipped gradients and apply the clip once, after the loop, at the same place the unaccumulated run would.'
+      follow_up: 'Warmup and cosine compose to a constant area of eta_max T / 2. Why does that make any warmup bug cost exactly the warmup fraction of the budget?'
+  common_mistakes:
+    - 'Clipping each micro-batch inside an accumulation loop, so the accumulated gradient is a sum of clipped gradients rather than the clip of the sum (0.4077 against the correct norm).'
+    - 'Reading the clip rate as the amount of learning rate removed: 72.4% of steps against 48.8% of the budget on the same run.'
+    - 'Clipping the loss-scaled gradient at 1.0 under fp16 scaling by 65536, which caps the real update at 1/65536, about 1.5e-5, against a typical norm of 10.96.'
+  further_reading:
+    - label: "Goyal, Dollár, Girshick, Noordhuis, Wesolowski, Kyrola, Tulloch, Jia & He, Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour (2017)"
+    - label: "Loshchilov & Hutter, SGDR: Stochastic Gradient Descent with Warm Restarts (ICLR 2017)"

@@ -1,0 +1,694 @@
+id: neural-audio-codecs
+slug: neural-audio-codecs
+title: "Neural Audio Codecs: Turning a Waveform into Tokens"
+summary: >-
+  A waveform at 24 kHz is 24,000 numbers a second, which no transformer can
+  predict; a learned codec with a 320-sample hop, eight residual quantisers and
+  1024-entry codebooks compresses it to 600 tokens a second at 6 kbps, and that
+  single multiplication — frame rate times codebooks — is the number every audio
+  model is designed around.
+kind: lesson
+difficulty: medium
+position: 1
+estMinutes: 25
+prerequisites: []
+
+body:
+  big_idea: >-
+    A neural codec is a learned analysis-by-synthesis compressor: residual
+    quantisation turns each latent frame into a stack of codebook indices, and
+    75 frames/s × 8 books is the 600 tokens/s every audio model budgets.
+  problem:
+    - "You flatten samples: 24 kHz is 24,000 tokens per second per channel, so a 30-second clip is 720,000 tokens before a single layer runs."
+    - "You conclude a mel spectrogram is cheaper, then find your vocoder inventing phase detail the model never predicted, audible on every sustained vowel."
+    - "You flatten eight codebooks into one 8,192-way softmax: the first book learns, the second slowly, the eighth barely moves."
+  analogy: >-
+    Sending a photograph by description. The first sentence gives the broad
+    shapes, the second corrects the shapes, the third corrects the correction.
+    Each is drawn from a palette of 1,024 stock phrases, so the message is a
+    short list of indices rather than a grid of colours — eight corrections
+    per 13.3 ms frame is 6 kbps.
+  concept_points:
+    - "**The sample rate sets the raw bill, and the hop sets everything else.** 24 kHz mono at 16 bits is 384 kbps; a hop of 320 samples gives $24{,}000/320 = 75$ frames per second. From there: 75 x 8 codebooks is 600 tokens/s, and 600 x 10 bits is 6 kbps. The hop is the shortest placeable event, so a 5 ms plosive smears across the boundary."
+    - "**A mel spectrogram is fixed analysis, not compression you can invert.** 80 mel bins at a 10 ms hop is $80 \\times 100 = 8{,}000$ values per second — thirteen times the codec's 600 tokens — and they are continuous floats, so no cross-entropy fits over them. The filterbank also discards phase, so a vocoder must invent it."
+    - "**VQ-VAE is a lookup table with a gradient smuggled through it.** The quantiser replaces $z_e(x)$ with the nearest codebook entry $e_k$, and because the argmin has no useful gradient, training uses the straight-through estimator: forward passes the quantised vector, backward passes the gradient as if the quantiser were the identity. The loss adds $\\| \\operatorname{sg}[z_e] - e \\|^2$ and $\\beta \\| z_e - \\operatorname{sg}[e] \\|^2$, with $\\beta$ near 0.25."
+    - "**Residual quantisation makes the rate linear and the distortion geometric.** The first quantiser codes the frame, the second codes what the first got wrong, the eighth what the seventh got wrong. Each adds $\\log_2 K$ bits per frame and, removing a fraction $\\rho$ of the remaining error energy, leaves $\\rho^{N_q}$ of it: with $\\rho = 0.5$ and 8 books that is $0.5^8 = 0.0039$ — a 24 dB reduction."
+    - "**The token rate is a multiplication you should be able to do out loud.** $75 \\times 8 = 600$ tokens per second; a minute is 36,000; an hour is 2.16 million, larger than a 1M-token window. A 16 kHz codec with a 320-sample hop runs at 50 frames/s, so eight books give 400 tokens/s; halving the hop gives 800. Text is 3.25 tokens/s, so speech is 185 times faster."
+    - "**Codebook size and codebook count trade at fixed bitrate, and they are not equivalent.** At 75 frames/s, 6 kbps is 80 bits per frame: eight books of 1,024, or five of 65,536, or sixteen of 32. Bigger books mean fewer sequential stages but each code must be visited often enough to train, and a 65,536-entry book at 75 Hz starves."
+  definitions:
+    - term: "Sampling rate"
+      meaning: >-
+        The number of amplitude measurements per second. 24 kHz means 24,000
+        samples per second per channel; at 16 bits that is 384 kbps of raw PCM,
+        and it is the ceiling every compression ratio in this topic is measured
+        against.
+    - term: "Hop (frame rate)"
+      meaning: >-
+        The number of samples between consecutive encoder outputs. A hop of 320
+        at 24 kHz gives 75 frames per second, one frame every 13.33 ms, and it
+        sets both the token rate and the shortest event the codec can localise.
+    - term: "Mel spectrogram"
+      meaning: >-
+        A fixed time–frequency analysis: a short-time Fourier transform, a
+        triangular filterbank on a perceptual frequency scale, and a logarithm.
+        80 bins at a 10 ms hop is 8,000 values per second. It is invertible only
+        up to phase, which is discarded, so reconstruction requires a vocoder.
+    - term: "VQ-VAE"
+      meaning: >-
+        A variational autoencoder whose latent is replaced by the nearest entry
+        of a learned codebook, trained with a reconstruction loss, a codebook
+        loss and a commitment loss, and differentiated through a straight-through
+        estimator. It is the structure every neural audio codec inherits.
+    - term: "Codebook"
+      meaning: >-
+        The set of $K$ learned vectors a quantiser may choose from. Each choice
+        costs $\log_2 K$ bits: 1,024 entries is 10 bits, 4,096 is 12, 65,536 is
+        16. A codebook that is only partly used wastes the difference between
+        $\log_2 K$ and the entropy of the actual usage distribution.
+    - term: "Straight-through estimator"
+      meaning: >-
+        The identity function used as the backward pass of a non-differentiable
+        forward op such as an argmin. Forward returns the quantised vector,
+        backward copies the gradient unchanged, which is biased but stable and is
+        why codecs train at all.
+    - term: "Commitment loss"
+      meaning: >-
+        $\beta \| z_e - \operatorname{sg}[e] \|^2$, the term that stops the
+        encoder from moving its output faster than the codebook can follow.
+        Without it the encoder can encode information in the *scale* of $z_e$,
+        which the quantiser then throws away.
+    - term: "Residual vector quantisation (RVQ)"
+      meaning: >-
+        A cascade of $N_q$ quantisers where quantiser $i$ codes the residual left
+        by quantisers $1 \dots i-1$. Rate grows linearly in $N_q$, distortion
+        falls roughly geometrically, and the first book carries the coarse
+        structure while later books carry detail.
+    - term: "Codec bandwidth"
+      meaning: >-
+        The bitrate of the token stream, $f_r \times N_q \times \log_2 K$. EnCodec
+        at 24 kHz, 75 Hz and eight 1,024-entry books is 6 kbps; sixteen books is
+        12 kbps; thirty-two is 24 kbps.
+    - term: "Semantic vs acoustic tokens"
+      meaning: >-
+        Semantic tokens come from a self-supervised model trained to predict
+        masked units and carry linguistic content at a low rate; acoustic tokens
+        come from a reconstruction codec and carry speaker, prosody and channel.
+        Systems that need both run two token streams or one codec with more books.
+    - term: "Delay pattern"
+      meaning: >-
+        A scheduling trick for multi-codebook language models: codebook $i$ is
+        shifted $i-1$ frames later, so each autoregressive step predicts one
+        codebook for one frame and the model never needs a joint 8,192-way
+        softmax. It costs a constant $N_q - 1$ frames of latency.
+
+  diagrams:
+    - type: architecture
+      title: "Waveform to tokens and back, with the numbers that matter"
+      caption: >-
+        One 13.33 ms frame enters, eight codes leave. Every number on this
+        diagram is derived from two choices — the 320-sample hop and the
+        1,024-entry codebook — and changing either one changes the token rate the
+        language model has to live with.
+      nodes:
+        - id: wav
+          x: 0
+          y: 1
+          label: "24 kHz waveform"
+          kind: client
+          detail: "24,000 samples per second, 16 bits, 384 kbps mono. A 30-second clip is 720,000 samples."
+        - id: enc
+          x: 1
+          y: 1
+          label: "conv encoder, hop 320"
+          kind: gpu
+          detail: "75 frames per second, one every 13.33 ms. The hop is a strided convolution, so the frame rate is a design choice and not a property of the signal."
+        - id: z
+          x: 2
+          y: 1
+          label: "latent, 75 Hz, 128-d"
+          kind: storage
+          detail: "9,600 float values per second before quantisation. Continuous, so it is not yet something a transformer can put a cross-entropy over."
+        - id: rvq1
+          x: 3
+          y: 0
+          label: "RVQ book 1 (coarse)"
+          kind: model
+          detail: "10 bits per frame. Carries most of the energy: the coarse spectral envelope, voicing, and enough formant structure to be intelligible on its own."
+        - id: rvq8
+          x: 3
+          y: 1
+          label: "RVQ books 2-8 (residuals)"
+          kind: model
+          detail: "Seven more 10-bit indices per frame, each coding what the previous books got wrong. 80 bits per frame in total, 6 kbps at 75 Hz."
+        - id: tok
+          x: 4
+          y: 1
+          label: "8 x 75 = 600 tokens/s"
+          kind: server
+          detail: "Ten seconds is 6,000 tokens; one minute is 36,000; one hour is 2.16 million and does not fit a 1M window."
+        - id: dec
+          x: 5
+          y: 1
+          label: "decoder to 24 kHz"
+          kind: gpu
+          detail: "Transposed convolutions back to 24,000 samples per second. Trained with multi-scale spectral and adversarial losses, not with sample-level MSE, because MSE averages phase and produces muffled output."
+        - id: out
+          x: 6
+          y: 1
+          label: "reconstructed waveform"
+          kind: client
+          detail: "6 kbps in, 384 kbps out: a 64x reconstruction. What is lost is not random — it is whatever the adversarial critic cannot hear."
+      edges:
+        - { from: wav, to: enc, label: "320 samples per frame" }
+        - { from: enc, to: z, label: "stride 320" }
+        - { from: z, to: rvq1, label: "nearest entry" }
+        - { from: rvq1, to: rvq8, label: "residual" }
+        - { from: rvq8, to: tok, label: "8 indices per frame" }
+        - { from: tok, to: dec, label: "dequantise" }
+        - { from: dec, to: out, label: "24,000 samples/s" }
+
+    - type: plot
+      title: "Bitrate is linear in codebooks: 75 frames/s with 1,024-entry (10-bit) books"
+      chart: line
+      xLabel: "number of residual codebooks"
+      yLabel: "bitrate (kbps)"
+      series:
+        - name: "24 kHz, 75 Hz frame rate"
+          points:
+            - { x: 1, y: 0.75 }
+            - { x: 2, y: 1.5 }
+            - { x: 4, y: 3.0 }
+            - { x: 8, y: 6.0 }
+            - { x: 16, y: 12.0 }
+            - { x: 32, y: 24.0 }
+        - name: "16 kHz, 50 Hz frame rate"
+          points:
+            - { x: 1, y: 0.5 }
+            - { x: 2, y: 1.0 }
+            - { x: 4, y: 2.0 }
+            - { x: 8, y: 4.0 }
+            - { x: 16, y: 8.0 }
+            - { x: 32, y: 16.0 }
+
+    - type: compare
+      title: "Mel spectrogram or learned codec as the interface to a generative model"
+      left_label: "Mel spectrogram"
+      left_points:
+        - "Fixed analysis: 80 bins at a 10 ms hop is 8,000 values per second, thirteen times the codec's token count"
+        - "Continuous floats, so generation needs a regression or a diffusion model rather than a softmax"
+        - "Phase is discarded at analysis time and must be hallucinated by a vocoder"
+        - "Perfectly aligned with human pitch perception, which is why it survives as a conditioning signal"
+        - "No learned parameters, so no codebook collapse, no training instability, no bitrate ladder"
+      right_label: "Learned codec (RVQ)"
+      right_points:
+        - "600 tokens per second at 75 Hz and 8 books, or 6 kbps — a rate a transformer can model with cross-entropy"
+        - "Discrete, so it composes with every language-modelling trick: sampling, beam search, classifier-free guidance, KV cache"
+        - "Trained through a decoder, so it keeps whatever the decoder needs, including phase-sensitive transients"
+        - "Bitrate is a dial: 1.5, 3, 6, 12, 24 kbps are the same architecture with 2, 4, 8, 16, 32 books"
+        - "Learned, so it can collapse: unused codes, codebook drift, and a token stream whose entropy is below its nominal bitrate"
+
+    - type: mermaid
+      title: "One frame, eight decisions, one residual chain"
+      code: |
+        flowchart LR
+          Z["latent frame z (128-d)"] --> Q1["Q1: nearest of 1024"]
+          Q1 -->|"code c1, 10 bits"| S1["sum"]
+          Q1 -->|"residual r1 = z - e(c1)"| Q2["Q2: nearest of 1024"]
+          Q2 -->|"code c2, 10 bits"| S1
+          Q2 -->|"residual r2"| Q3["Q3 ... Q8"]
+          Q3 -->|"codes c3..c8, 60 bits"| S1
+          S1 --> D["decoder"]
+          D --> W["13.33 ms of 24 kHz audio"]
+
+  markdown: |
+    ## The number that decides everything
+
+    Audio arrives as a sequence of amplitudes. At 24 kHz, one second is 24,000
+    numbers; at 16 bits each, that is $24{,}000 \times 16 = 384{,}000$ bits per
+    second per channel, or 384 kbps. Stereo doubles it. None of that is a
+    representation a transformer can predict, because the thing that makes a
+    waveform a waveform — the phase of every partial — is high-entropy and
+    perceptually almost irrelevant.
+
+    So the first job in any audio model is to choose a shorter sequence that the
+    decoder can still turn back into sound. There are two families of answer, and
+    the difference between them is the whole topic.
+
+    ## Analysis or learning
+
+    A mel spectrogram is *analysis*: a short-time Fourier transform, a
+    triangular filterbank on a perceptual frequency scale, a logarithm. It is
+    fixed, parameter-free, and it throws away phase on purpose. With 80 bins and
+    a 10 ms hop it produces $80 \times 100 = 8{,}000$ values per second. Those
+    values are continuous floats, so a generative model over them must be a
+    regression or a diffusion model, and because phase is gone, a vocoder has to
+    invent it.
+
+    A neural codec is *learning*: an encoder, a quantiser and a decoder trained
+    together so that the quantised code is enough to rebuild the waveform. The
+    decoder is the training signal, so the code keeps whatever the decoder needs
+    — including the transient structure that a mel filterbank smears. What comes
+    out is discrete, which means a transformer can put a cross-entropy over it.
+
+    | property | mel spectrogram | neural codec |
+    |---|---|---|
+    | values or tokens per second | 8,000 | 600 at 75 Hz × 8 books |
+    | type | continuous floats | discrete codes |
+    | phase | discarded, must be invented | implicit in the code |
+    | invertible | only with a vocoder | by construction |
+    | parameters | none | encoder, codebook, decoder |
+
+    ## VQ-VAE, and the gradient that does not exist
+
+    Take an encoder $E$, a codebook $\{e_1, \dots, e_K\}$ and a decoder $D$. The
+    forward pass is
+
+    $$z_e = E(x), \qquad k = \arg\min_j \| z_e - e_j \|_2, \qquad
+      \hat x = D(e_k).$$
+
+    The argmin is piecewise constant. Its derivative is zero almost everywhere,
+    so backpropagation through it would train nothing. The straight-through
+    estimator replaces the backward pass with the identity: on the forward pass
+    the decoder sees $e_k$, on the backward pass the encoder receives the
+    gradient as if $e_k$ had been $z_e$. The loss makes that substitution
+    honest:
+
+    $$\mathcal{L} = \| x - \hat x \|^2
+      + \| \operatorname{sg}[z_e] - e_k \|^2
+      + \beta \| z_e - \operatorname{sg}[e_k] \|^2,$$
+
+    where $\operatorname{sg}$ is stop-gradient. The second term moves the codebook
+    toward the encoder; the third, with $\beta \approx 0.25$, stops the encoder
+    from running away from the codebook. The first term is the only one that
+    cares about audio.
+
+    The characteristic failure is codebook collapse. If only 300 of 1,024 codes
+    are ever chosen, the index entropy is $\log_2 300 = 8.23$ bits rather than
+    10, so 17.7% of the bitrate buys nothing. Exponential-moving-average codebook
+    updates, restarting dead codes from random encoder outputs, and lowering the
+    latent width all help, and all of them are patches on the same problem: a
+    hard nearest-neighbour assignment with no exploration.
+
+    ## Residual quantisation: eight books instead of one big one
+
+    A single 1,024-entry codebook at 10 bits per 13.33 ms frame is 750 bit/s and
+    sounds like a cheap telephone. The fix is not a bigger codebook — it is a
+    chain of small ones. Quantiser 1 codes $z$; quantiser 2 codes $z - e^{(1)}$;
+    quantiser 8 codes what the seventh left over. If each stage removes a
+    fraction $\rho$ of the remaining error energy, eight stages leave
+    $\rho^8$. At $\rho = 0.5$ that is $0.0039$, a 24 dB improvement, and it is
+    bought at exactly 8 × 10 = 80 bits per frame, or 6 kbps at 75 Hz.
+
+    That is the whole design of SoundStream, EnCodec and DAC: a convolutional
+    encoder with a strided hop, a stack of residual quantisers, and a decoder
+    trained with reconstruction, multi-scale spectral and adversarial losses. The
+    differences are the hop, the number of books and the codebook size. EnCodec
+    at 24 kHz uses a 320-sample hop — 75 Hz — and offers 1.5, 3, 6, 12 and
+    24 kbps as 2, 4, 8, 16 and 32 books of 1,024. The arithmetic is one line:
+    $75 \times N_q \times 10$ bits per second.
+
+    ## The token rate, derived twice
+
+    Tokens per second is the frame rate times the number of books:
+
+    $$f_r \times N_q = 75 \times 8 = 600 \ \text{tokens/s}.$$
+
+    Bitrate is the same product with the codebook width:
+
+    $$f_r \times N_q \times \log_2 K = 75 \times 8 \times 10 = 6{,}000 \ \text{bit/s}.$$
+
+    Ten seconds is 6,000 tokens. One minute is 36,000. One hour is 2,160,000,
+    which is more than twice a 1M-token window — a number worth remembering the
+    next time someone proposes an hour-long audio transcript in a single prompt.
+
+    Now compare with text. Speech at 150 words per minute is 2.5 words per
+    second; at roughly 1.3 tokens per word that is 3.25 tokens per second, or 195
+    per minute. The ratio is $600 / 3.25 = 185$. One second of audio costs as
+    many tokens as 185 seconds of the words it contains.
+
+    The 16 kHz variant is the same multiplication with a different hop. A
+    320-sample hop at 16 kHz is 50 frames/s, so eight books is 400 tokens/s;
+    a 160-sample hop is 100 frames/s and 800 tokens/s. Moving from 16 kHz to
+    24 kHz at a fixed hop length is a 1.5× increase in token rate for a bandwidth
+    extension above 8 kHz that mostly carries fricatives and air.
+
+    ## What it costs a transformer
+
+    A decoder-only model over codec tokens sees one token per codebook per frame.
+    At 600 tokens/s, a 4,096-wide, 32-layer model in fp16 accumulates a KV cache
+    of
+
+    $$600 \times 32 \times 2 \times 4096 \times 2\ \text{B}
+      = 314{,}572{,}800\ \text{B/s} \approx 315\ \text{MB/s},$$
+
+    which is 18.9 GB per minute of audio. The same minute of *text* at 195
+    tokens is 102 MB. The ratio is the same 185, and it is the reason audio
+    models are sold on context length: context is not free, it is memory per
+    second of speech.
+
+    ## Where codecs break
+
+    Three failures, in the order they bite. **Codebook collapse**: the entropy of
+    the index falls below $\log_2 K$ and you pay for bits that carry nothing,
+    which shows up as a model that is fluent and slightly muffled. **Book
+    imbalance**: the first book explains most of the energy, so a flat
+    cross-entropy over eight books spends its gradient on the easy one; the usual
+    fix is a delay pattern or per-book loss weights. **Latency**: a non-causal
+    encoder with a one-second receptive field cannot emit a frame until it has
+    seen the future, and no amount of GPU makes that stream. If the product needs
+    sub-200 ms responses, the codec's convolution stack is on the critical path
+    before the language model is.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A neural codec is a learned analysis-by-synthesis compressor: an encoder turns the waveform into a low-rate latent, residual vector quantisation turns each latent frame into a short stack of codebook indices, and a decoder is trained to rebuild the waveform from those indices — so the token sequence keeps exactly the information the decoder needs, and its length is $f_r \times N_q$ tokens per second, with $f_r = 75$ and $N_q = 8$ giving the 600 tokens a second that every audio language model budgets against.
+
+    ### The analogy, in full
+
+    Sending a photograph by description instead of by pixel. The first sentence gives the broad shapes; the second corrects the shapes; the third corrects the correction. Each sentence is drawn from a fixed palette of 1,024 stock phrases, so the whole message is a short list of palette indices rather than a grid of colours. With eight correction sentences per 13.3 ms frame, the message is 6 kbps and the listener can redraw something that looks like the photograph. Three things break in the analogy. The palette is not fixed — the encoder, the palette entries and the decoder are trained together, so the codes end up meaning whatever makes reconstruction easiest, which is why a code has no human-readable gloss. The quality criterion is not fidelity to pixels: codecs are trained with multi-scale spectral and adversarial losses, so they are allowed to be wrong in ways a pixel metric would punish and a listener would not notice. And the correction sentences are not independent: each one describes the *residual* left by the previous ones, so an error in the first sentence is inherited by all seven corrections rather than averaged away.
+
+    ### Failure modes, in full
+
+    - You have 24 kHz speech, a transformer, and no plan. Flattened samples are 24,000 tokens per second per channel, so a 30-second clip is 720,000 tokens before a single layer runs — more context than most text corpora need for a whole conversation, spent on half a minute of audio.
+    - You compare a mel spectrogram to a neural codec by counting values and conclude the mel is cheaper, then discover your vocoder is inventing phase detail the model never predicted, and the artefact is audible on every sustained vowel.
+    - You flatten eight codebooks into one 8,192-way softmax and train. The first book learns, the second learns slowly, the eighth barely moves — because the residual books carry small, high-entropy corrections and the loss is dominated by the coarse book that already explains most of the energy.
+    - An interviewer asks why "eight codebooks at 75 Hz" is about 600 tokens a second and what that costs in a 128k context. If you cannot do the multiplication and then divide, you cannot defend a context budget, a streaming design, or a latency number.
+
+    ### The mechanisms, in full
+
+    - **The sample rate sets the raw bill, and the hop sets everything else.** 24 kHz mono at 16 bits is $24{,}000 \times 16 = 384{,}000$ bit/s, or 384 kbps; stereo doubles it to 768 kbps. A hop of 320 samples gives $24{,}000/320 = 75$ frames per second, one frame every 13.33 ms, and every downstream number follows from that: 75 frames/s times 8 codebooks is 600 tokens/s, and 600 tokens/s times 10 bits per code is 6,000 bit/s. The hop is also the shortest event the codec can place: a 5 ms plosive burst is narrower than one frame, so its onset is smeared across the frame boundary whatever the bitrate.
+    - **A mel spectrogram is fixed analysis, not compression you can invert.** 80 mel bins at a 10 ms hop is $80 \times 100 = 8{,}000$ values per second — thirteen times the codec's 600 tokens — and those values are continuous floats, so a language model cannot put a cross-entropy over them. Worse, the mel filterbank discards phase entirely, so a vocoder must invent it; that is fine when the mel came from real audio and the vocoder is only asked to sound plausible, and it is not fine when you need the output to be the signal you conditioned on.
+    - **VQ-VAE is a lookup table with a gradient smuggled through it.** The encoder emits $z_e(x)$, the quantiser replaces it with the nearest entry $e_k$ of a codebook of size $K$, and the decoder reconstructs from $e_k$. The nearest-neighbour argmin has no useful gradient, so training uses the straight-through estimator: forward passes the quantised vector, backward passes the gradient as if the quantiser were the identity. The loss is reconstruction plus $\| \operatorname{sg}[z_e] - e \|^2$ (pull the codebook toward the encoder) plus $\beta \| z_e - \operatorname{sg}[e] \|^2$ (keep the encoder from growing without bound), and $\beta$ around 0.25 is the original setting.
+    - **Codebook collapse is the failure mode, and its symptom is a bitrate you pay for and do not use.** If 1,024 codes are available and only 300 are ever selected, the entropy of the index is $\log_2 300 = 8.23$ bits rather than 10, so 17.7% of the bits you budgeted carry nothing. The usual causes are a dead-code initialisation, a learning rate that lets a few codes win every batch, and a decoder strong enough to ignore the codes entirely. EMA codebook updates, random restarts of dead entries, and lower-dimensional latents are the standard fixes.
+    - **Residual quantisation makes the rate linear and the distortion geometric.** The first quantiser codes the latent frame; the second codes what the first got wrong; the eighth codes what the seventh got wrong. Each stage adds $\log_2 K$ bits per frame and, if it removes a fraction $\rho$ of the remaining error energy, $N_q$ stages leave $\rho^{N_q}$ of it. With $\rho = 0.5$ and 8 books that is $0.5^8 = 0.0039$, a 24 dB reduction in error energy, which is why the first two books sound intelligible and the last two only add timbre and transients.
+    - **The token rate is a multiplication you should be able to do out loud.** $75 \times 8 = 600$ tokens per second; a minute is $600 \times 60 = 36{,}000$ tokens; an hour is 2.16 million, which is larger than a 1M-token window. A 16 kHz codec with a 320-sample hop runs at 50 frames/s, so eight books give 400 tokens/s; halve the hop to 160 and the same eight books give 800 tokens/s. Text at 150 words per minute and 1.3 tokens per word is $150 \times 1.3 = 195$ tokens per minute, or 3.25 tokens/s — so speech at 600 tokens/s is 185 times the token rate of the words it contains.
+    - **Codebook size and codebook count trade against each other at fixed bitrate, and they are not equivalent.** At 75 frames/s, 6 kbps is 80 bits per frame: eight books of 1,024 (8 × 10 bits), or five books of 65,536 (5 × 16 bits), or sixteen books of 32 (16 × 5 bits). Bigger books mean fewer sequential stages and lower decoding depth, but each code must be visited often enough to train, and a 65,536-entry book at 75 Hz sees 75 chances per second to be used, so most entries starve. More, smaller books are easier to train and cost more sequential steps — which is exactly the latency the downstream language model pays.
+    - **Flattening the books into one vocabulary is legal and usually wrong.** Eight books of 1,024 give 8,192 possible ids, and one softmax over them costs $600 \times 8{,}192 = 4.9$ million logits per second of audio; a delay-pattern scheme keeps eight 1,024-way heads and predicts one book per step, costing $600 \times 1{,}024 = 614{,}400$ logits per second — an 8× saving — at the price that the model can no longer express the joint distribution of a frame's eight codes in one factorised draw.
+    - **Latency is an architectural property, not a tuning knob.** A codec built from non-causal convolutions with a one-second receptive field cannot emit frame $t$ until it has seen audio after $t$; a causal codec with a one-frame lookahead emits it 13.3 ms late. The same 320-sample hop that fixed the token rate also fixes the algorithmic latency floor, which is why streaming voice systems quote a codec frame rather than a model depth.
+  derivations:
+    - title: "Token rate, bitrate and the codebook ladder are one multiplication"
+      latex: |
+        With frame rate $f_r$, $N_q$ residual books and codebook size $K$:
+
+        $$\text{tokens/s} = f_r N_q, \qquad
+          R = f_r N_q \log_2 K \ \text{bit/s}.$$
+
+        At $f_r = 75$ (24 kHz, hop 320), $N_q = 8$, $K = 1024$:
+
+        $$\text{tokens/s} = 75 \times 8 = 600, \qquad
+          R = 75 \times 8 \times 10 = 6{,}000\ \text{bit/s} = 6\ \text{kbps}.$$
+
+        Holding $R$ fixed at 6 kbps and $f_r$ at 75 Hz gives 80 bits per frame,
+        which is any pair satisfying $N_q \log_2 K = 80$: eight books of 1,024,
+        five of 65,536, or sixteen of 32.
+      prose: >-
+        The two outputs answer different questions. Tokens per second is what the
+        language model pays in context and sequential steps; bitrate is what the
+        network pays in bandwidth. They move together only because both contain
+        $N_q$: doubling the books doubles the token rate and doubles the bitrate,
+        while doubling the codebook size raises the bitrate by one bit per frame
+        and leaves the token rate alone. That asymmetry is the reason a codec
+        tuned for a language model prefers more, smaller books — the token budget
+        is already spent, so the extra bits are nearly free in context terms.
+
+    - title: "Why residual quantisation converges geometrically"
+      latex: |
+        Let $r_0 = z$ and let stage $i$ choose $e^{(i)}$ so that the residual
+        $r_i = r_{i-1} - e^{(i)}$ has energy
+        $\| r_i \|^2 \le \rho \| r_{i-1} \|^2$ for some $\rho < 1$. Then
+
+        $$\| r_{N_q} \|^2 \le \rho^{N_q} \| z \|^2,$$
+
+        so the reconstruction error falls by $10 \log_{10} \rho$ dB per book. With
+        $\rho = 0.5$ that is $-3.01$ dB per book and $-24.1$ dB after eight.
+      prose: >-
+        The bound is an idealisation: a real quantiser's residual ratio worsens as
+        the residual becomes noise-like, because a codebook trained on the first
+        residual is a poor fit for the eighth. That is why the perceptual return
+        on books 5-8 is smaller than the curve suggests and why codecs at 24 kbps
+        are not four times better than codecs at 6 kbps. The useful reading is
+        qualitative and directional: bits spent on the first two books buy
+        intelligibility, bits spent on the last two buy timbre and transients.
+
+  implementations:
+    - language: python
+      title: "An RVQ in twenty lines, and the residual energy it actually leaves"
+      note: >-
+        This is a faithful toy and an unfaithful codec. The codebooks are random
+        rather than trained, so the residual ratios below are much worse than a
+        trained EnCodec's; what it demonstrates is the *shape* of the decay and
+        the arithmetic of the rate. The one design choice worth copying is that
+        each stage fits the residual of the previous stage and nothing else — an
+        implementation that re-quantises the original vector at every stage
+        produces eight codes that all describe the same coarse structure, and the
+        decoder learns to ignore seven of them.
+      code: |
+        import numpy as np
+
+
+        def rvq(x, books, K=1024, seed=0):
+            """x: (n_frames, d). Returns codes (n_frames, n_books) and the residual."""
+            rng = np.random.default_rng(seed)
+            codebooks = [rng.normal(size=(K, x.shape[1])) for _ in books]
+            residual = x.copy()
+            codes = np.zeros((x.shape[0], len(books)), dtype=int)
+            for i, cb in enumerate(codebooks):
+                # nearest entry for every frame, in one (n, K) distance matrix
+                d = ((residual[:, None, :] - cb[None, :, :]) ** 2).sum(-1)
+                idx = d.argmin(1)
+                codes[:, i] = idx
+                residual = residual - cb[idx]
+                print(f"book {i + 1}: residual energy {np.mean(residual ** 2):.4f}")
+            return codes, residual
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(1)
+            x = rng.normal(size=(75, 8))          # one second at 75 Hz, 8-d latent
+            rvq(x, books=range(8))
+            # 75 frames x 8 books = 600 tokens for one second
+            # 75 x 8 x 10 bits = 6,000 bit/s = 6 kbps
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A codec runs at 24 kHz with a 320-sample hop and sixteen 1,024-entry
+        codebooks. What is its token rate, its bitrate, and how many tokens does a
+        two-minute clip cost?
+      answerKind: short_text
+      hint: "Frame rate is sample rate over hop. Bitrate is frame rate times books times bits per book."
+      solution: >-
+        $24{,}000/320 = 75$ frames/s. Tokens: $75 \times 16 = 1{,}200$/s. Bitrate:
+        $75 \times 16 \times 10 = 12{,}000$ bit/s = 12 kbps. Two minutes is
+        $1{,}200 \times 120 = 144{,}000$ tokens — which is why a 12 kbps codec is
+        a different product decision from a 6 kbps one, not a quality setting.
+
+    - id: cp-2
+      question: >-
+        Your codec trains, sounds fine, and its 1,024-entry codebooks have a
+        measured index entropy of 7.1 bits. What are you paying for, and what are
+        you not getting?
+      answerKind: short_text
+      hint: "Nominal bits per code is log2 K. Compare with what the usage distribution actually carries."
+      solution: >-
+        Nominal is $\log_2 1024 = 10$ bits; actual is 7.1, so 2.9 bits per code
+        per frame are wasted — 29% of the bitrate. At 75 Hz and 8 books that is
+        $75 \times 8 \times 2.9 = 1{,}740$ bit/s of the 6 kbps stream carrying
+        nothing. The cause is codebook collapse: a subset of entries wins every
+        assignment and the rest are dead. The fixes are EMA codebook updates,
+        restarting dead entries from encoder outputs, and reducing latent width.
+
+    - id: cp-3
+      question: >-
+        Why can a mel spectrogram not simply be fed to a language model as tokens,
+        given that it is thirteen times cheaper than a 6 kbps codec?
+      answerKind: short_text
+      hint: "Two separate objections: one about the type of the values, one about what analysis destroyed."
+      solution: >-
+        It is not thirteen times cheaper — it is thirteen times *larger*:
+        8,000 values/s against 600 tokens/s. And the values are continuous
+        floats, so there is no cross-entropy to train; you would need a regression
+        or diffusion head. Finally the filterbank discarded phase, so any
+        reconstruction is the vocoder's invention rather than the signal you
+        conditioned on, which is fatal when the output must be the input.
+
+  try_it: >-
+    Compute the token rate and bitrate for three codecs: 24 kHz with hop 320 and
+    8 books of 1,024; 16 kHz with hop 160 and 8 books of 1,024; and 44.1 kHz with
+    hop 512 and 9 books of 1,024. Then compute how many seconds of each fit in a
+    128k context, and check your answer against $128{,}000 / (f_r N_q)$.
+
+  interview_questions:
+    - question: "Why does an audio language model use 600 tokens per second instead of the 24,000 samples per second it is trying to produce?"
+      level: mid
+      key_points:
+        - "Samples are high-entropy and phase-dominated; a codec's 10-bit code at 75 Hz is a denser description of what a listener hears."
+        - "600 tokens/s is 40 times shorter than 24,000 samples/s, and it is discrete, so a transformer can train with cross-entropy."
+        - "The rate is a product: frame rate times codebooks. A 320-sample hop at 24 kHz is 75 Hz; eight books gives 600."
+        - "The compression is not free — the tokens carry 6 kbps against 384 kbps of PCM, a 64x reduction that is only acceptable because the loss is perceptual."
+      follow_up: "What would change if the product needed 20 ms algorithmic latency rather than 200 ms?"
+    - question: "Explain residual vector quantisation and why it is preferred to one large codebook."
+      level: senior
+      key_points:
+        - "Each stage quantises the residual of the previous stage, so the rate is linear in the number of books and the distortion falls roughly geometrically."
+        - "A single 20-bit codebook would need 1,048,576 entries, most of which would never be visited often enough to train; eight 10-bit books see 75 assignments per second each."
+        - "The first book carries the coarse envelope and most of the energy; later books carry timbre, transients and noise-like detail."
+        - "The cost is sequential depth: eight books means eight decisions per frame, which a language model must model as eight tokens rather than one."
+      follow_up: "If the last two books contribute little, why does dropping them make speech sound worse rather than just quieter?"
+    - question: "Your codec's nominal bitrate is 6 kbps but the measured index entropy says 4.8 kbps. Where did the rest go, and how would you find out?"
+      level: senior
+      key_points:
+        - "Nominal is f_r times N_q times log2 K; actual is f_r times N_q times the entropy of the usage distribution, so a gap means unused codes."
+        - "Codebook collapse: a few entries win every assignment, the rest are dead, and the decoder compensates by ignoring the codes."
+        - "Diagnose by plotting the histogram of code usage per book and by measuring perplexity per book; a healthy 1,024-entry book is used in the hundreds."
+        - "Fix with EMA updates, dead-code restarts, lower latent dimension, or a commitment weight that keeps the encoder from outrunning the codebook."
+      follow_up: "Why does lowering the latent dimension help codebook usage rather than making the codec worse?"
+
+  common_mistakes:
+    - "Comparing a mel spectrogram with a codec by counting values and concluding the mel is cheaper — it is 8,000 values per second against 600 tokens, and it is not discrete."
+    - "Flattening eight codebooks into one 8,192-way softmax and expecting the residual books to learn, when the first book already explains most of the energy."
+    - "Quoting a codec's nominal bitrate without measuring its index entropy, then wondering why the promised quality does not arrive."
+    - "Ignoring the encoder's receptive field when quoting latency: a non-causal convolution stack cannot emit a frame before it has seen the future."
+
+  further_reading:
+    - label: "Zeghidour, Luebs, Omran, Skoglund & Tagliasacchi, SoundStream: An End-to-End Neural Audio Codec (2021)"
+    - label: "Défossez, Copet, Synnaeve & Adi, High Fidelity Neural Audio Compression (EnCodec, 2022)"
+    - label: "Kumar et al., High-Fidelity Audio Compression with Improved RVQGAN (DAC, 2023)"
+    - label: "van den Oord, Vinyals & Kavukcuoglu, Neural Discrete Representation Learning (VQ-VAE, 2017)"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Separate three objects. The waveform is 24,000 numbers a second. The
+        encoder's latent is 75 numbers a second. The codec's output is 8 codes per
+        latent frame, each one an index into a 1,024-entry table. Every number in
+        this topic is one of those three counts multiplied by another.
+      blocks:
+        - kind: checklist
+          body: |
+            - sample rate / hop = frames per second
+            - frames per second x books = tokens per second
+            - tokens per second x bits per code = bitrate
+            - a codec is trained by reconstruction, so its codes keep what a decoder needs
+        - kind: warning
+          body: >-
+            Do not start from the codec's name and look up its bitrate. Start from
+            the hop and the number of books, and derive it. The published number is
+            usually rounded and sometimes counts a side stream.
+      checkpoint: >-
+        If the hop were 160 instead of 320 at 24 kHz, which of the three counts
+        changes, and by how much?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work from the signal upward. Fix the sample rate, choose the hop from the
+        shortest event you must represent, then choose the number of books from the
+        bitrate you can afford, then check the token rate against the context you
+        have. If the token rate is too high, raise the hop before you cut books:
+        dropping books costs intelligibility, and raising the hop costs transient
+        sharpness.
+      blocks:
+        - kind: checklist
+          body: |
+            - 24 kHz and hop 320: 75 Hz, 13.33 ms per frame
+            - 8 books of 1,024: 80 bits per frame, 6 kbps, 600 tokens/s
+            - 16 books: 12 kbps, 1,200 tokens/s
+            - 32 books: 24 kbps, 2,400 tokens/s
+            - 1M tokens of 600 tokens/s audio: 1,666 s, or 27.8 minutes
+      checkpoint: >-
+        Which change would you make first to fit a 30-minute conversation in a 1M
+        window: halve the books, double the hop, or lower the sample rate?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Four steps: encode, quantise, dequantise, decode. The quantiser is a loop
+        over books, each one a nearest-neighbour search on the residual.
+      blocks:
+        - kind: pseudocode
+          body: |
+            encode(x, hop=320):
+                z = encoder(x)                  # (T/320, d)
+                return z
+
+            quantise(z, books):
+                residual = z
+                codes = []
+                for cb in books:
+                    idx = argmin_j || residual - cb[j] ||^2
+                    codes.append(idx)
+                    residual = residual - cb[idx]
+                return codes                   # N_q x T/320 indices
+
+            dequantise(codes, books):
+                return sum(books[i][codes[i]] for i in range(len(books)))
+
+            decode(zq):
+                return decoder(zq)              # 24,000 samples per second
+
+            # rate:   75 frames/s x 8 books            = 600 tokens/s
+            # bitrate: 75 x 8 x log2(1024)              = 6,000 bit/s
+      checkpoint: >-
+        In `quantise`, what happens to the residual if `idx` is chosen from `z`
+        rather than from `residual` on the second iteration?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Two derivations carry the topic: the rate identity, and the geometric
+        decay of residual error.
+      blocks:
+        - kind: math
+          body: |
+            Rate. With frame rate $f_r$, $N_q$ books and codebook size $K$:
+
+            $$\text{tokens/s} = f_r N_q, \qquad
+              R = f_r N_q \log_2 K.$$
+
+            At $f_r = 75$, $N_q = 8$, $K = 1024$:
+            $75 \times 8 = 600$ tokens/s and $75 \times 8 \times 10 = 6{,}000$
+            bit/s.
+
+            Residual decay. With $r_i = r_{i-1} - e^{(i)}$ and
+            $\| r_i \|^2 \le \rho \| r_{i-1} \|^2$:
+
+            $$\| r_{N_q} \|^2 \le \rho^{N_q} \| z \|^2
+              \quad\Longrightarrow\quad
+              \text{error falls by } 10\log_{10}\rho \text{ dB per book.}$$
+
+            At $\rho = 0.5$: $-3.01$ dB per book, $-24.1$ dB after eight.
+      checkpoint: >-
+        The decay bound assumes the same $\rho$ at every stage. Why does the real
+        curve flatten, and what does that imply about where to spend the ninth
+        book?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The rate table and the residual measurement, in one place, with the
+        numbers the rest of the topic quotes.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            def rate_table(sample_rate=24000, hop=320, books=(2, 4, 8, 16, 32), bits=10):
+                fr = sample_rate / hop
+                for n in books:
+                    print(f"{n:2d} books: {fr * n:7.0f} tokens/s, "
+                          f"{fr * n * bits:7.0f} bit/s")
+
+            # 24000/320 = 75 frames/s
+            # 8 books: 600 tokens/s, 75*8*10 = 6,000 bit/s
+            # 1M tokens / 600 = 1,666.7 s = 27.8 minutes
+      checkpoint: >-
+        What does the table look like at 16 kHz and hop 160, and why is the
+        tokens-per-second column exactly twice the 24 kHz/hop-320 column?

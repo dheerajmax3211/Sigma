@@ -1,0 +1,1353 @@
+id: mlp-from-scratch
+slug: mlp-from-scratch
+title: "MLP: Layers, Activations, and Initialisation"
+summary: >-
+  Turn the autograd graph into a working network: layers as parameter
+  containers with a shape contract, activations with a measurable saturation
+  region, and an initialisation scale derived from variance propagation rather
+  than copied from a tutorial — so a fifty-layer stack neither vanishes by
+  layer 12 nor overflows by layer 36.
+kind: lesson
+difficulty: medium
+position: 3
+estMinutes: 26
+prerequisites: [autograd-engine, linear-algebra-foundations]
+phase: deep-learning-foundations
+tags: [mlp, activations, initialisation, xavier, kaiming, variance-propagation, relu]
+
+body:
+  big_idea: >-
+    An MLP is affine maps separated by a fixed nonlinearity, and whether it
+    trains is decided before the first step: each layer multiplies the signal
+    by $\sqrt{\text{fan\_in}}\,\sigma_W$ forward and
+    $\sqrt{\text{fan\_out}}\,\sigma_W$ backward.
+
+  problem:
+    - >-
+      You add twenty layers to a working MLP and the loss pins at 2.302585 —
+      $\ln 10$ — so the network outputs a uniform distribution.
+    - >-
+      You copy `* 0.01` from a tutorial; at width 512, depth 40, activations
+      are $10^{-30}$ by layer 12 and no learning rate rescues it.
+    - >-
+      Asked why He uses $\sqrt{2/\text{fan\_in}}$ and Xavier
+      $\sqrt{2/(\text{fan\_in}+\text{fan\_out})}$, you can only say "one is
+      for ReLU".
+
+  analogy: |
+    A line of people passing a whispered message, each multiplying it by a
+    volume knob. Set every knob to 0.9 and after fifty people the message is
+    0.005 of its loudness; set 1.1 and it is 117 times too loud and the
+    microphone clips. Initialisation picks one knob so the message arrives as
+    loud as it started.
+
+  concept_points:
+    - >-
+      **A layer is a parameter container with a shape contract, not a function.**
+      `Linear(fan_in, fan_out)` owns `W` of shape `(fan_out, fan_in)` and `b`
+      of shape `(fan_out,)`, with forward `x @ W.T + b`. For 784→256→256→10
+      that is 200,960 + 65,792 + 2,570 = **269,322** parameters, **74.6%** in
+      the first layer. Store `W` transposed and a square layer still passes
+      its test, silently broadcasting later.
+    - >-
+      **Depth without a nonlinearity is a lie, and the rank tells you how big.**
+      $W_2(W_1 x) = (W_2 W_1)x$, so an L-layer affine stack is one matrix of
+      rank at most the minimum width. On 64×64 Gaussian factors at unit gain,
+      numerical rank falls **64 → 55 → 41 → 26 → 13** at L = 1, 5, 10, 20, 50,
+      and stable rank **46.2 → 3.1**.
+    - >-
+      **A ReLU is a gate, and half of it is off at any instant.** For
+      symmetric zero-mean pre-activations $P(z<0) = 0.5$: measured at width
+      256 with He init, **0.5001** of units are zero at layer 1 and **0.4866**
+      at layer 50. That halving is the entire reason for the 2 in He
+      initialisation. A unit negative on every example never moves again — a
+      weight-scale bug, not an activation-function bug.
+    - >-
+      **The variance argument gives the one number you cannot guess.** With
+      $W$ entries iid mean 0 variance $\sigma^2$,
+      $\operatorname{Var}(z_j) = \text{fan\_in}\cdot\sigma^2\cdot\operatorname{Var}(x_i)$,
+      so the per-layer gain is $g = \sqrt{\text{fan\_in}}\,\sigma$. Setting
+      $g=1$ gives $\sigma = 1/\sqrt{\text{fan\_in}}$: **0.0625** at fan-in
+      256, **0.0357** at 784. That is LeCun initialisation, a units conversion
+      rather than a hyperparameter.
+    - >-
+      **ReLU costs a factor of two, so the factor is $\sqrt{2}$.** For
+      symmetric $z$,
+      $\mathbb{E}[\operatorname{ReLU}(z)^2] = \mathbb{E}[z^2]/2$, so the
+      second moment halves per layer and the repair is
+      $\sigma^2 = 2/\text{fan\_in}$ — **0.0884** at fan-in 256. Measured on a
+      50-layer net: LeCun collapses to **$1.7\times10^{-8}$** by layer 50, He
+      holds **0.41**. A factor of 1.414 separates trainable from dead.
+    - >-
+      **The backward pass has its own gain, and that is where fan-out enters.**
+      A linear layer's VJP multiplies by $W^\top$, so
+      $\operatorname{Var}(g_{\text{in}}) = \text{fan\_out}\cdot\sigma^2\cdot\operatorname{Var}(g_{\text{out}})$.
+      Forward wants $1/\text{fan\_in}$, backward wants $1/\text{fan\_out}$,
+      and Xavier takes the harmonic mean:
+      $\sigma^2 = 2/(\text{fan\_in}+\text{fan\_out})$, giving **0.0502** for
+      784→10. At square layers the two coincide exactly.
+
+  definitions:
+    - term: "Affine layer (Linear)"
+      meaning: >-
+        A parameterised map $z = xW^\top + b$ storing
+        $W\in\mathbb{R}^{\text{fan\_out}\times\text{fan\_in}}$ and
+        $b\in\mathbb{R}^{\text{fan\_out}}$. Called "linear" in every framework
+        even though the bias makes it affine; the distinction matters only when
+        you reason about whether a stack can represent the identity.
+    - term: "fan_in / fan_out"
+      meaning: >-
+        The number of inputs arriving at a layer and the number of outputs it
+        produces. fan_in governs the forward variance, fan_out governs the
+        backward variance, and their disagreement is the whole reason Xavier
+        exists.
+    - term: "Activation function"
+      meaning: >-
+        A fixed, parameter-free nonlinearity applied elementwise after the
+        affine map. Its job is not "to add expressiveness" in the abstract; it
+        is to stop the composition of layers from collapsing to a single
+        matrix, and to do so without destroying the variance on the way through.
+    - term: "Saturation"
+      meaning: >-
+        The region where an activation's derivative is near zero — $|z|\gtrsim
+        3$ for tanh, $|z|\gtrsim 4$ for sigmoid. A saturated unit still passes a
+        value forward; it passes almost no gradient backward.
+    - term: "Dead unit"
+      meaning: >-
+        A ReLU unit whose pre-activation is negative for every input in the
+        dataset, so its gradient is identically zero and its weights never
+        change again. Distinguished from a unit that is merely off for the
+        current batch, which is normal and expected half the time.
+    - term: "Per-layer gain"
+      meaning: >-
+        The factor by which one layer multiplies the standard deviation of its
+        input: $\sqrt{\text{fan\_in}}\,\sigma_W$ for the forward pass, plus a
+        factor $\sqrt{1/2}$ if the activation is ReLU. The product of the gains
+        over $L$ layers is the whole story of whether a deep network trains.
+    - term: "Variance-preserving initialisation"
+      meaning: >-
+        Any scheme that chooses $\sigma_W$ so the per-layer gain equals 1 at
+        initialisation. LeCun, Xavier and He are the three canonical instances,
+        differing only in which direction they preserve and whether they account
+        for ReLU's factor of two.
+    - term: "LeCun initialisation"
+      meaning: >-
+        $\sigma_W = 1/\sqrt{\text{fan\_in}}$, i.e. variance
+        $1/\text{fan\_in}$. Correct for a linear or tanh layer; too small by
+        $\sqrt{2}$ for ReLU.
+    - term: "Xavier (Glorot) initialisation"
+      meaning: >-
+        $\sigma_W = \sqrt{2/(\text{fan\_in}+\text{fan\_out})}$, the harmonic
+        mean of the forward requirement $1/\text{fan\_in}$ and the backward
+        requirement $1/\text{fan\_out}$. Designed for symmetric activations;
+        under-scales ReLU layers by $\sqrt{2}$.
+    - term: "He (Kaiming) initialisation"
+      meaning: >-
+        $\sigma_W = \sqrt{2/\text{fan\_in}}$, the LeCun scale with the factor of
+        2 that ReLU's halved second moment demands. The default for any ReLU
+        network and for every convolution stack you will meet later.
+    - term: "Symmetry breaking"
+      meaning: >-
+        The requirement that no two units in a layer start with identical
+        weights. Without it, identical units receive identical gradients and
+        remain identical forever — a width-256 layer that behaves as width 1.
+    - term: "Effective width"
+      meaning: >-
+        The number of units in a layer that are actually contributing for a
+        given input: half the nominal width for ReLU at initialisation, less as
+        units die. It is what the layer's capacity really is, as opposed to what
+        its parameter count claims.
+
+  diagrams:
+    - type: architecture
+      title: "What one layer owns, and the only invariant it has to enforce"
+      nodes:
+        - { id: x, x: 0, y: 1, label: "x", kind: client, detail: "Shape (batch, fan_in). The one thing forward must check: x.shape[-1] == W.shape[1]. A mismatch here does not raise — it broadcasts." }
+        - { id: w, x: 1, y: 0, label: "W  (fan_out, fan_in)", kind: storage, detail: "The parameter. 784×256 = 200,960 numbers for the first layer of an MNIST MLP. Stored transposed relative to the maths convention because both backward products, g.T @ h and g @ W, are natural in this layout." }
+        - { id: lin, x: 1, y: 1, label: "z = x @ W.T", kind: model, detail: "The affine map. Its VJP is two matrix products: dL/dW = g.T @ x and dL/dx = g @ W. The second one is where fan_out enters the variance argument." }
+        - { id: b, x: 1, y: 2, label: "b  (fan_out,)", kind: storage, detail: "Broadcast over the batch axis. Its gradient is a sum over that axis — the unbroadcast rule from the autograd engine. Initialise to zero; it cannot break symmetry in either direction." }
+        - { id: act, x: 2, y: 1, label: "activation", kind: server, detail: "Elementwise and parameter-free. tanh costs a factor of ~0.6 in variance even when unsaturated; ReLU costs exactly half the second moment. That cost is what the initialisation scale has to pay for." }
+        - { id: out, x: 3, y: 1, label: "h  (batch, fan_out)", kind: client, detail: "Becomes fan_in for the next layer. If its std has changed by more than ~10% from the input's, the stack has a gain problem and no amount of training will fix it." }
+      edges:
+        - { from: x, to: lin, label: "fan_in must match" }
+        - { from: w, to: lin, label: "parameters" }
+        - { from: b, to: lin, label: "broadcast" }
+        - { from: lin, to: act, label: "pre-activation" }
+        - { from: act, to: out, label: "post-activation" }
+
+    - type: plot
+      title: "Per-layer std gain at fan-in 256: one crossing point, and it is 1/√256"
+      chart: line
+      xLabel: "weight std σ_W"
+      yLabel: "gain = √fan_in · σ_W"
+      series:
+        - name: "gain (forward, linear map)"
+          points:
+            - { x: 0.0, y: 0.0 }
+            - { x: 0.01, y: 0.16 }
+            - { x: 0.02, y: 0.32 }
+            - { x: 0.03, y: 0.48 }
+            - { x: 0.04, y: 0.64 }
+            - { x: 0.05, y: 0.8 }
+            - { x: 0.0625, y: 1.0 }
+            - { x: 0.08, y: 1.28 }
+            - { x: 0.1, y: 1.6 }
+        - name: "critical gain = 1"
+          points:
+            - { x: 0.0, y: 1.0 }
+            - { x: 0.1, y: 1.0 }
+
+    - type: plot
+      title: "Measured: log10 gradient norm at layer 1 versus depth (ReLU, width 256)"
+      chart: line
+      xLabel: "depth (layers)"
+      yLabel: "log10 ‖∂L/∂W₁‖"
+      series:
+        - name: "σ = 1.0 (gain 16)"
+          points:
+            - { x: 5, y: 8.01 }
+            - { x: 10, y: 13.26 }
+            - { x: 20, y: 23.71 }
+            - { x: 30, y: 34.28 }
+            - { x: 40, y: 44.74 }
+            - { x: 50, y: 55.2 }
+        - name: "σ = √(2/256) = 0.0884 (He)"
+          points:
+            - { x: 5, y: 3.8 }
+            - { x: 10, y: 3.78 }
+            - { x: 20, y: 3.69 }
+            - { x: 30, y: 3.73 }
+            - { x: 40, y: 3.65 }
+            - { x: 50, y: 3.58 }
+        - name: "σ = 0.02 (gain 0.32)"
+          points:
+            - { x: 5, y: 1.22 }
+            - { x: 10, y: -2.03 }
+            - { x: 20, y: -8.58 }
+            - { x: 30, y: -14.99 }
+            - { x: 40, y: -21.52 }
+            - { x: 50, y: -28.05 }
+
+    - type: compare
+      title: "Two initialisations, measured on the same architecture"
+      left_label: "Bad init — three ways to fail"
+      left_points:
+        - "Zero: every activation is exactly 0 from layer 1; layer-1 gradient is 0; after 300 SGD steps max|W₁| = 0.0 — frozen, not slow"
+        - "σ = 1.0 at fan-in 256: gain 16 per layer, activations 1.7e51 at layer 50, `inf` in float32 at layer 36"
+        - "σ = 0.02: gain 0.32 per layer, activations 9.8e-33 at layer 50, flushed to exactly 0.0 at layer 70 in float32"
+        - "Constant 0.05 + tanh: 95% of units saturated at layer 2, 100% by layer 5, gradient identically 0"
+      right_label: "Variance-preserving init — one way to work"
+      right_points:
+        - "He + ReLU: post-activation std 0.83 at layer 1, 0.73 at 25, 0.41 at 50"
+        - "Layer-1 gradient stays at log10 ≈ 3.7 from depth 5 to depth 50 — flat, not a cliff"
+        - "Half the ReLU units active by construction, and the factor 2 pays for exactly that"
+        - "Xavier for tanh: both forward and backward gains held at 1 at once"
+
+    - type: pipeline
+      title: "The five-minute diagnostic, in the order that finds the bug fastest"
+      nodes:
+        - label: "Print σ_W · √fan_in for every layer"
+          note: "expect 1.0 (He: 1.414 before the ReLU halves it)"
+          detail: "This costs nothing and catches the majority of real bugs. Note it is the *linear* gain; the activation's factor is applied separately, so for He + ReLU the number to expect is √2, not 1."
+        - label: "Forward one real batch, record std per layer"
+          note: "expect a flat line"
+          detail: "Use a real batch, not noise: correlated inputs and dead features change the variance. If the std halves at layer 1 and stays there, your ReLU factor is missing."
+        - label: "Record the saturation fraction per layer"
+          note: "expect < 5% for tanh, ~50% zeros for ReLU"
+          detail: "For tanh, a fraction near 1 means the pre-activations are too large. For ReLU, 100% zeros means the layer is dead, not sparse."
+        - label: "Backward, record ‖∂L/∂W‖ per layer"
+          note: "expect roughly flat, not a staircase"
+          detail: "A sustained 10x fall per layer compounds to 1e-50 at depth 50. One drop at a single layer is usually just that layer's activation scale, not a gain bug."
+        - label: "Change one thing — the std — and re-run steps 1-4"
+          note: "never change the activation and the init in the same experiment"
+          detail: "The diagnostic is only useful if it isolates a variable. The usual mistake is to switch to He *and* to tanh, then conclude that He fixed it."
+
+  markdown: |
+    ## A layer is a container, not a formula
+
+    Write `Linear(fan_in, fan_out)` once and reuse it. It owns two arrays and
+    one shape rule:
+
+    | | shape | 784→256 | 256→256 | 256→10 |
+    |---|---|---|---|---|
+    | `W` | `(fan_out, fan_in)` | (256, 784) | (256, 256) | (10, 256) |
+    | `b` | `(fan_out,)` | (256,) | (256,) | (10,) |
+    | params | `fan_out·(fan_in+1)` | 200,960 | 65,792 | 2,570 |
+
+    Total: **269,322** parameters, 1.03 MiB in fp32, **74.6%** of them in the
+    first layer. The layout is not arbitrary. Backward needs `g.T @ h`, shape
+    `(fan_out, fan_in)`, and `g @ W`, shape `(batch, fan_in)`. Stored the other
+    way round, both silently compute the transpose of what you meant — and for
+    a square layer the shapes still agree, so the bug survives every test on a
+    256→256 stack and appears the first time you use 784 inputs.
+
+    The autograd engine from *Building an Autograd Engine from Scratch* consumes
+    exactly this: something that holds leaf nodes and can emit a forward
+    expression, without ever knowing what the numbers mean.
+
+    ## Depth buys nothing without a nonlinearity
+
+    Two affine layers compose:
+
+    $$W_2(W_1x + b_1) + b_2 = (W_2W_1)x + (W_2b_1 + b_2)$$
+
+    So a stack of $L$ affine maps is a single matrix of rank at most the
+    smallest width — the rank inequality from *Linear Algebra Foundations*,
+    applied to a product you built by accident.
+
+    The bound understates the damage: products of random matrices spread the
+    singular values apart, exponentially in depth. Measured on 64×64 Gaussian
+    factors scaled to unit gain:
+
+    | L | condition number | stable rank | rank at 1e-3 |
+    |---|---|---|---|
+    | 1 | 2.1e2 | 46.2 | 64 |
+    | 5 | 3.1e7 | 21.0 | 55 |
+    | 10 | 2.0e11 | 11.9 | 41 |
+    | 20 | 6.9e17 | 7.9 | 26 |
+    | 50 | 4.3e17 | 3.1 | 13 |
+
+    At $L=50$ the condition number has stopped growing only because the
+    smallest singular values hit the float64 noise floor. Stable rank — the
+    participation ratio of the spectrum — has fallen from 46 to 3: a 50-layer
+    linear network of width 64 is numerically a rank-3 map. Depth without a
+    nonlinearity destroys the rank you started with.
+
+    ## One layer, one gain
+
+    Let $z_j = \sum_i W_{ji}x_i + b_j$, with $W_{ji}$ iid, zero-mean, variance
+    $\sigma^2$, independent of $x$. Then
+
+    $$\operatorname{Var}(z_j) = \sum_i \operatorname{Var}(W_{ji}x_i)
+      = \text{fan\_in}\cdot\sigma^2\cdot\operatorname{Var}(x_i)$$
+
+    so the std is multiplied by
+
+    $$g = \sqrt{\text{fan\_in}}\,\sigma_W.$$
+
+    Everything follows from that line. Set $g=1$ and you get
+    $\sigma_W = 1/\sqrt{\text{fan\_in}}$:
+
+    | fan_in | $1/\sqrt{\text{fan\_in}}$ (LeCun) | $\sqrt{2/\text{fan\_in}}$ (He) | $\sqrt{2/(\text{in}+\text{out})}$ (Xavier) |
+    |---|---|---|---|
+    | 64 | 0.1250 | 0.1768 | 0.1250 (64→64) |
+    | 256 | 0.0625 | 0.0884 | 0.0625 (256→256) |
+    | 784 | 0.0357 | 0.0505 | 0.0502 (784→10) |
+
+    Note the third column: for a square layer Xavier and LeCun give the same
+    number, because $\sqrt{2/512} = 1/\sqrt{256}$. They agree whenever
+    $\text{fan\_in} = \text{fan\_out}$ — true for most hidden layers, false for
+    every input and output layer, which is exactly where the distinction
+    matters.
+
+    ## The 2 in √(2/fan_in)
+
+    ReLU is not symmetric, so tracking the variance is the wrong instrument.
+    Track the second moment. For $z$ symmetric about zero,
+
+    $$\mathbb{E}[\operatorname{ReLU}(z)^2] = \int_0^\infty z^2p(z)\,dz
+      = \tfrac12\mathbb{E}[z^2].$$
+
+    Exactly half the second moment is thrown away at every layer, forever. So
+    the recursion is $M_{l+1} = \tfrac12\,\text{fan\_in}\,\sigma^2 M_l$, and
+    holding $M$ constant needs $\sigma^2 = 2/\text{fan\_in}$.
+
+    The factor is **2, not 4**: two is what makes the halves cancel. Measured
+    on the same 50-layer width-256 ReLU network, LeCun (missing the 2) holds
+    0.587 at layer 1 and is at $1.7\times10^{-8}$ by layer 50. He holds 0.83
+    and 0.41. Nothing else about the two runs differs.
+
+    One precision, since it gets asked: $\operatorname{Var}(\operatorname{ReLU}(z))$
+    is $0.341\,\sigma_z^2$, not $0.5\,\sigma_z^2$, because ReLU has a non-zero
+    mean, and using it would give $\sqrt{2.93/\text{fan\_in}}$. Nobody does,
+    because the mean is carried forward and the next layer's zero-mean weights
+    turn it back into a second-moment contribution. Second moments compose;
+    variances do not.
+
+    ## Why Xavier is a harmonic mean
+
+    Run the argument backwards. A linear layer's VJP is
+    $g_{\text{in}} = W^\top g_{\text{out}}$, a sum over **fan_out** terms, so
+
+    $$\operatorname{Var}(g_{\text{in}}) = \text{fan\_out}\cdot\sigma^2\cdot
+      \operatorname{Var}(g_{\text{out}}).$$
+
+    Forward wants $\sigma^2 = 1/\text{fan\_in}$; backward wants
+    $\sigma^2 = 1/\text{fan\_out}$. For a non-square layer there is no $\sigma$
+    that satisfies both, so Xavier compromises on the variances:
+
+    $$\sigma^2 = \frac{2}{\text{fan\_in}+\text{fan\_out}},$$
+
+    which is the harmonic mean of $1/\text{fan\_in}$ and $1/\text{fan\_out}$ —
+    the mean that is dominated by the smaller of the two, because the smaller
+    one is the bottleneck. For 784→10 it gives 0.0502 against LeCun's 0.0357.
+
+    ## What bad initialisation measures like
+
+    Same architecture every time: width 256, 50 layers, batch 512, float64,
+    linear output; the last column is $\|\partial L/\partial W_1\|$ under a
+    unit cotangent.
+
+    | init | post-act std at L1 | at L25 | at L50 | layer-1 gradient |
+    |---|---|---|---|---|
+    | zero | 0.0 | 0.0 | 0.0 | 0.0 |
+    | constant 0.1, tanh | 0.746 | 1.000 (all saturated) | 1.000 | 0.0 |
+    | normal, σ = 1.0 | 9.40 | 1.6e26 | 1.7e51 | 1.6e55 |
+    | normal, σ = 0.02 | 0.188 | 5.4e-17 | 9.8e-33 | 9.0e-29 |
+    | LeCun, ReLU | 0.587 | 1.3e-4 | 1.7e-8 | 1.6e-4 |
+    | He, ReLU | 0.831 | 0.730 | 0.411 | 3778 |
+
+    Read the last two rows together: one factor of $\sqrt{2}$ in the weight
+    scale, **seven orders of magnitude** in the gradient reaching layer 1
+    after fifty layers. The first four rows are not "worse training"; they are
+    arithmetic that has left the representable range — in float32, σ = 1.0
+    overflows at layer 36 and σ = 0.02 flushes to 0.0 at layer 70.
+
+    ## The diagnostic, not the formula
+
+    The formula is a first-order argument about second moments, under an
+    independence assumption real data violates. It lands within a factor of
+    about two of the right scale and the exponent does the rest — which is why
+    the practical skill is measurement:
+
+    1. Print $\sigma_W\sqrt{\text{fan\_in}}$ per layer. Expect 1.0 for a linear
+       map; expect $\sqrt{2}$ if a ReLU follows and you used He.
+    2. Run one real batch forward, recording the std after every layer. Flat is
+       correct; a monotone slope is a gain bug.
+    3. Record the saturation fraction. For tanh, above 5% is a warning. For
+       ReLU, half the units at exactly zero is correct and 100% is dead.
+    4. Backprop and record $\|\partial L/\partial W\|$ per layer. A sustained
+       10x fall per layer compounds to $10^{-50}$ at depth 50 — an init bug, not
+       a learning-rate bug.
+
+    ## Where this argument stops
+
+    Residual connections and normalisation layers exist because the variance
+    argument only holds for a plain chain. A residual stream accumulates $L$
+    independent branches, so its variance grows like $L$ and its std like
+    $\sqrt{L}$ — 3.46 at $L=12$, 6.93 at $L=48$ — which is why GPT-2 scales
+    each residual output projection by $1/\sqrt{2N}$. That is the same argument
+    applied to a sum instead of a product; LayerNorm, two topics from now, is
+    the same argument made dynamic — measuring the variance instead of
+    predicting it.
+
+    ## The longer version
+
+    An MLP is a chain of affine maps separated by a fixed nonlinearity, and
+    whether it trains is decided before the first gradient step — because each
+    layer multiplies the forward signal by the gain $\sqrt{\text{fan\_in}}\,\sigma_W$
+    and the backward signal by $\sqrt{\text{fan\_out}}\,\sigma_W$, so only one
+    weight scale keeps both gains at 1 through fifty layers.
+
+    A line of people passing a message by whispering. Each person hears the
+    number, multiplies it by their own volume knob, and passes it on. If every
+    knob is set to 0.9, then after fifty people the message is at
+    $0.9^{50} = 0.005$ of its original loudness — inaudible. Set every knob to
+    1.1 and after fifty people it is 117 times too loud: distortion, then
+    screaming, then the microphone clips. The whole job of initialisation is to
+    choose one knob setting so that the message arrives at the far end with the
+    same loudness it started with.
+
+    Two things break the analogy, and both are the actual content of the topic.
+    First, the correct knob is not a constant: it depends on how many people
+    each person is listening to (fan-in), because summing $n$ independent
+    whispers grows the variance by $n$ — so the knob must be $1/\sqrt{n}$,
+    which is why a 784-input layer wants a smaller knob than a 64-input one.
+    Second, the message also has to travel back down the same line, and on the
+    return trip each person's knob applies to a *different* count (fan-out). For
+    a non-square layer those two counts disagree, and Xavier's
+    $\sqrt{2/(\text{fan\_in}+\text{fan\_out})}$ is the compromise.
+
+    ### What goes wrong
+
+    - You build the three-layer MLP from the autograd engine, it reaches 97%
+      on MNIST, you add twenty more layers, and the loss pins itself at
+      exactly 2.302585 — the value of $\ln 10$ — which means the network is
+      outputting a uniform distribution and has learned nothing at all.
+    - You copy `np.random.randn(...) * 0.01` from a tutorial. It works at
+      width 64 and depth 3. At width 512 and depth 40 every activation is
+      $10^{-30}$ by layer 12, the gradient reaching layer 1 is $10^{-60}$, and
+      no learning rate rescues it because the numbers are no longer
+      representable.
+    - You switch to `* 1.0` to "give it more signal" and the loss is `NaN` on
+      the first step, because the per-layer gain is 22.6 and $22.6^{29}$
+      overflows float32.
+    - An interviewer asks why He initialisation uses $\sqrt{2/\text{fan\_in}}$
+      and Xavier uses $\sqrt{2/(\text{fan\_in}+\text{fan\_out})}$, and you can
+      only say "one is for ReLU" — the actual answer is a variance calculation
+      in each direction plus one factor of one half.
+    - You inherit a model whose ReLU units are 60% dead at step zero and spend
+      two days tuning the learning rate for what is a weight-scale bug.
+
+    ### The full treatment
+
+    **A layer is a parameter container with a shape contract, not a
+    function.** `Linear(fan_in, fan_out)` owns `W` of shape
+    `(fan_out, fan_in)` and `b` of shape `(fan_out,)`, and its forward is
+    `x @ W.T + b`. For 784→256→256→10 that is 200,960 + 65,792 + 2,570 =
+    **269,322** parameters, **74.6%** of them in the first layer. The trap is
+    storing `W` as `(fan_in, fan_out)`: it still multiplies correctly for a
+    square layer and for a batch of one, so your unit test passes and the bug
+    surfaces later as a silent broadcast to `(batch, fan_out, fan_out)`.
+    Assert `x.shape[-1] == W.shape[1]` inside forward and the whole class of
+    bug disappears.
+
+    **Depth without a nonlinearity is a lie, and the rank tells you how big
+    the lie is.** `W2(W1 x) = (W2 W1) x`, so an L-layer affine stack is
+    exactly one matrix with rank at most the minimum width — the rank
+    inequality from *Linear Algebra Foundations*, applied to a product you
+    created by accident. It is worse than the bound: products of random
+    matrices push the singular values apart. Measured on 64×64 Gaussian
+    factors scaled to unit gain, the numerical rank at a $10^{-3}$ relative
+    threshold falls **64 → 55 → 41 → 26 → 13** at L = 1, 5, 10, 20, 50, and
+    the stable rank falls **46.2 → 3.1**. A "50-layer deep linear network" of
+    width 64 has the capacity of a rank-13 map and a condition number of
+    $4\times10^{17}$.
+
+    **A ReLU is a gate, and half of it is off at any instant.** For symmetric
+    zero-mean pre-activations, $P(z<0) = 0.5$, so half the units output
+    exactly zero for a given input. Measured at width 256 with He init:
+    **0.5001** at layer 1, **0.4866** at layer 50. That halving is the entire
+    reason for the 2 in He initialisation, and the reason your effective
+    width is half what the parameter count suggests. The permanent version is
+    worse: a unit whose pre-activation is negative for *every* example gets
+    zero gradient, and if that holds across the dataset it never moves again.
+    The trap is treating dead units as an activation-function problem — they
+    are almost always a weight-scale problem, because a unit dies when its
+    initial weights put it out of range on day one.
+
+    **Sigmoid and tanh have a saturation region with a number attached.**
+    $\tanh'(z) = 1-\tanh^2(z)$: **0.00987** at $z=3$, **$1.8\times10^{-4}$**
+    at $z=5$. Sigmoid's derivative is **0.0177** at $z=4$ and **0.00247** at
+    $z=6$. Measured over 2M samples at pre-activation std 3: **37.7%** of
+    units sit at $|\tanh|>0.99$ and the layer-average $|\tanh'|$ is
+    **0.255** — a 3.9x attenuation per layer, so thirty such layers multiply
+    the gradient by **$1.6\times10^{-18}$**. Saturation is invisible in the
+    activations (clean ±1 looks like confidence) and invisible in the loss
+    for the first few hundred steps.
+
+    **The variance argument gives the one number you cannot guess.** Take
+    $W$ entries iid with mean 0 and variance $\sigma^2$, independent of $x$.
+    Then $\operatorname{Var}(z_j) = \text{fan\_in}\cdot\sigma^2\cdot
+    \operatorname{Var}(x_i)$, so the per-layer standard-deviation gain is
+    $g = \sqrt{\text{fan\_in}}\,\sigma$. Setting $g=1$ gives
+    $\sigma = 1/\sqrt{\text{fan\_in}}$: **0.0625** at fan-in 256, **0.0357**
+    at 784, **0.125** at 64. That is LeCun initialisation, and it is a units
+    conversion, not a hyperparameter — tuning it is like tuning metres into
+    feet.
+
+    **ReLU costs a factor of two, so the factor is $\sqrt{2}$.** For
+    symmetric $z$, $\mathbb{E}[\operatorname{ReLU}(z)^2] =
+    \mathbb{E}[z^2]/2$ exactly, so the second moment is halved at every layer
+    and the repair is $\sigma^2 = 2/\text{fan\_in}$. At fan-in 256 that is
+    **0.0884**, exactly $\sqrt{2}$ times LeCun's 0.0625. Measured on the same
+    50-layer width-256 ReLU net: LeCun holds 0.587 at layer 1 and collapses
+    to **$1.7\times10^{-8}$** by layer 50; He holds **0.83** at layer 1 and
+    **0.41** at layer 50, with the layer-1 gradient between $3.8\times10^{3}$
+    and $6.3\times10^{3}$ at every depth from 5 to 50. One constant, a
+    factor of 1.414, separates a trainable network from a dead one.
+
+    **The backward pass has its own gain, and that is where fan-out enters.**
+    A linear layer's VJP multiplies by $W^\top$, so
+    $\operatorname{Var}(g_{\text{in}}) = \text{fan\_out}\cdot\sigma^2\cdot
+    \operatorname{Var}(g_{\text{out}})$. Forward wants $\sigma^2 =
+    1/\text{fan\_in}$, backward wants $\sigma^2 = 1/\text{fan\_out}$, and for
+    non-square layers those disagree. Xavier takes the harmonic mean:
+    $\sigma^2 = 2/(\text{fan\_in}+\text{fan\_out})$, giving **0.0502** for
+    784→10 where LeCun gives 0.0357. At square layers they coincide exactly —
+    $\sqrt{2/512} = 0.0625 = 1/\sqrt{256}$ — which is why the two names get
+    used interchangeably, and why quoting Xavier for a ReLU net under-scales
+    by $\sqrt{2}$.
+
+    **Bad initialisation has three distinct signatures and all three look
+    like "it doesn't train".** Zero init: every activation is exactly 0 from
+    layer 1, the layer-1 gradient is exactly 0, and after 300 SGD steps
+    `max|W1| = 0.0` — the network is not slow, it is frozen. $\sigma=1.0$ at
+    fan-in 256: gain 16 per layer, activations at **$1.7\times10^{51}$** by
+    layer 50, and in float32 the forward pass reaches `inf` at layer **36**.
+    $\sigma=0.02$: gain 0.32, activations at **$9.8\times10^{-33}$** by layer
+    50, and in float32 they flush to exactly 0.0 at layer **70**. None of the
+    three raises a shape error; two of the three do not even raise a NaN.
+
+    **Bias at zero is safe; weights at a constant never are.** $b=0$ is the
+    right default, because the nonlinearity is applied after the sum and the
+    randomness in $W$ already separates the units. But if $W$ is constant
+    *and every layer is constant*, every hidden unit computes the same
+    function and receives the same gradient forever: measured on a 64→64→1
+    net with 0.05 everywhere, after 200 SGD steps `max|W1 - W1[0]| = 0.0` and
+    100% of hidden units are identical. Adding a random bias does not help;
+    the symmetry is in the weights. "Initialise to a small constant so it
+    starts calm" starts calm and stays there.
+
+    **The gain compounds, so the cost of being wrong is exponential in
+    depth.** std 0.05 at fan-in 512 gives gain 1.131, which is **471x** after
+    50 layers; std 0.02 gives gain 0.452 and **$6.1\times10^{-18}$**; a 10%
+    error in $\sigma$ is **117x** at depth 50 and 1.05x at depth 3. That is
+    why the same initialisation trains a 3-layer model and destroys a
+    50-layer one. The honest limit: this is a first-order,
+    independence-based statement about second moments, so it gets you within
+    roughly a factor of two and the exponent does the rest. Residual
+    connections and LayerNorm are the second and third fixes — a residual
+    stream's std grows like $\sqrt{L}$ (3.46 at L=12, 6.93 at L=48), which is
+    why GPT-2 scales each residual output projection by $1/\sqrt{2N}$.
+
+
+  derivations:
+    - title: "Variance through one affine layer, and the critical scale"
+      latex: |
+        Let $z_j = \sum_{i=1}^{n} W_{ji}x_i + b_j$ with $n = \text{fan\_in}$,
+        $W_{ji}$ iid with $\mathbb{E}[W]=0$, $\operatorname{Var}(W)=\sigma^2$,
+        independent of $x$, and $x_i$ iid with second moment $M$.
+
+        $$\operatorname{Var}(z_j) = \sum_i \operatorname{Var}(W_{ji}x_i)
+          = \sum_i \sigma^2 M = n\sigma^2 M$$
+
+        so $\operatorname{std}(z) = \sqrt{n}\,\sigma\,\operatorname{std}(x)$.
+        Setting the gain $\sqrt{n}\sigma = 1$:
+
+        $$\sigma = \frac{1}{\sqrt{\text{fan\_in}}}$$
+
+        Over $L$ layers the std is multiplied by $g^L$. With $g = 1+\epsilon$,
+        $(1+\epsilon)^{50} = 1.1$ at $\epsilon = 0.0019$ — a 0.2% error per
+        layer is a 10% error at depth 50, and a 10% error is 117x.
+      prose: >-
+        The sum is what forces the square root: variances add over the fan-in,
+        so the standard deviation grows like the square root of the number of
+        terms, and the weight scale has to undo exactly that. The exponential in
+        depth is what makes the constant matter — the same 0.2% error is
+        invisible in a three-layer network and fatal in a fifty-layer one.
+    - title: "Why ReLU demands a factor of two"
+      latex: |
+        For $z$ with a symmetric distribution about zero, split the second
+        moment at the origin:
+
+        $$\mathbb{E}[\operatorname{ReLU}(z)^2]
+          = \int_{-\infty}^{0} 0^2 p(z)\,dz + \int_{0}^{\infty} z^2 p(z)\,dz
+          = \frac{1}{2}\int_{-\infty}^{\infty} z^2 p(z)\,dz
+          = \frac{1}{2}\mathbb{E}[z^2].$$
+
+        With $M_l = \mathbb{E}[x_l^2]$ and $z_l = W x_{l-1}$:
+
+        $$M_l = \tfrac{1}{2}\,\text{fan\_in}\,\sigma^2\,M_{l-1}
+          \quad\Longrightarrow\quad
+          \sigma^2 = \frac{2}{\text{fan\_in}}.$$
+
+        (The variance, not the second moment, gives
+        $\operatorname{Var}(\operatorname{ReLU}(z)) =
+        (\tfrac12-\tfrac{1}{2\pi})\sigma_z^2 = 0.341\,\sigma_z^2$, which would
+        ask for $\sqrt{2.93/\text{fan\_in}}$. The second moment is the right
+        invariant because it is what composes through the next zero-mean layer.)
+      prose: >-
+        ReLU deletes every negative pre-activation, and for a symmetric
+        distribution that is exactly half of the mass — so exactly half of the
+        squared signal. The factor of two in the numerator is that half being
+        paid back. Get it wrong in either direction and the error compounds
+        geometrically with depth, which is why the difference between LeCun and
+        He is fourteen orders of magnitude after fifty layers.
+    - title: "Xavier: the harmonic mean of the two directions"
+      latex: |
+        Forward requires $\sigma^2 = 1/\text{fan\_in}$. Backward, since
+        $g_{\text{in}} = W^\top g_{\text{out}}$ sums over fan_out terms,
+        requires $\sigma^2 = 1/\text{fan\_out}$. Both cannot hold when
+        $\text{fan\_in}\ne\text{fan\_out}$, so average the two variances:
+
+        $$\sigma^2 = \left(\frac{1}{2}\left(\frac{1}{\text{fan\_in}}
+          + \frac{1}{\text{fan\_out}}\right)\right)^{-1}\cdot\frac{1}{2}
+          \;\;=\;\; \frac{2}{\text{fan\_in}+\text{fan\_out}}.$$
+
+        More directly: the harmonic mean of $a$ and $b$ is $2ab/(a+b)$; with
+        $a = 1/\text{fan\_in}$ and $b = 1/\text{fan\_out}$ this is
+        $2/(\text{fan\_in}+\text{fan\_out})$.
+      prose: >-
+        The harmonic mean, rather than the arithmetic one, because the smaller
+        of the two requirements is the binding constraint: if fan_in is 784 and
+        fan_out is 10, a scale that satisfies the backward pass will explode the
+        forward one, and the harmonic mean stays close to the tighter of the
+        two. For a square layer the two requirements coincide and Xavier
+        collapses to LeCun — which is exactly the coincidence that makes the two
+        names so easy to conflate.
+
+  implementations:
+    - language: python
+      title: "The layer and the stack: a shape contract you can assert"
+      note: >-
+        This computes correct forward values and is deliberately incomplete: it
+        records nothing for the autograd engine, so `.backward()` on the output
+        would fail. It also has one real numerical hazard — `np.maximum(z, 0.0)`
+        with a Python float silently upcasts float32 activations to float64 at
+        every layer, doubling memory and hiding float32 underflow. Pass a
+        dtype-matched zero, or use `np.where(z > 0, z, 0)` on the same dtype.
+      code: |
+        import numpy as np
+
+        class Linear:
+            """An affine layer: the only object in an MLP that owns parameters."""
+
+            def __init__(self, fan_in, fan_out, rng, scheme="he"):
+                self.fan_in, self.fan_out = fan_in, fan_out
+                self.W = rng.normal(0.0, init_std(fan_in, fan_out, scheme),
+                                    (fan_out, fan_in))
+                self.b = np.zeros(fan_out)          # zero is safe: see concept 9
+                self.params = [self.W, self.b]
+
+            def forward(self, x):
+                # The one invariant. Without it a mismatch broadcasts silently
+                # to (batch, fan_out, fan_out) instead of raising.
+                assert x.shape[-1] == self.W.shape[1], (
+                    f"expected fan_in={self.W.shape[1]}, got {x.shape[-1]}")
+                return x @ self.W.T + self.b
+
+            def n_params(self):
+                return self.fan_out * (self.fan_in + 1)
+
+        def init_std(fan_in, fan_out, scheme):
+            if scheme == "lecun":
+                return float(np.sqrt(1.0 / fan_in))
+            if scheme == "he":
+                return float(np.sqrt(2.0 / fan_in))
+            if scheme == "xavier":
+                return float(np.sqrt(2.0 / (fan_in + fan_out)))
+            raise ValueError(scheme)
+
+        class MLP:
+            def __init__(self, sizes, rng, scheme="he", activation="relu"):
+                self.layers = [Linear(a, b, rng, scheme)
+                               for a, b in zip(sizes[:-1], sizes[1:])]
+                self.activation = activation
+
+            def forward(self, x, return_trace=False):
+                trace = []
+                for i, layer in enumerate(self.layers):
+                    x = layer.forward(x)
+                    last = i == len(self.layers) - 1
+                    if not last:                       # logits get no activation
+                        x = np.maximum(x, 0.0) if self.activation == "relu" else np.tanh(x)
+                    if return_trace:
+                        trace.append(float(x.std()))
+                return (x, trace) if return_trace else x
+
+            def n_params(self):
+                return sum(l.n_params() for l in self.layers)
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            net = MLP([784, 256, 256, 10], rng)
+            print(net.n_params())           # 269322
+            x = rng.normal(size=(64, 784))
+            _, trace = net.forward(x, return_trace=True)
+            print([round(t, 4) for t in trace])   # [0.8278, 0.8511, 1.3795]
+    - language: python
+      title: "The diagnosis that actually finds the bug"
+      note: >-
+        The `zero`, `constant` and `overlarge` branches are numerically wrong by
+        construction — they are included so you can watch each failure mode, not
+        so you can use them. Two further traps are baked into the measurement
+        itself: `np.std` defaults to `ddof=0`, and the difference from `ddof=1`
+        is 0.1% at batch 512, which is smaller than the effect you are hunting
+        but larger than the 1e-9 agreement you might assume; and measuring in
+        float64 hides the float32 flush-to-zero that ends real training runs.
+      code: |
+        import numpy as np
+
+        def build(scheme, sizes, rng, dtype=np.float64):
+            """scheme: 'zero' | 'constant' | 'overlarge' | 'lecun' | 'xavier' | 'he'."""
+            Ws = []
+            for fan_out, fan_in in zip(sizes[1:], sizes[:-1]):
+                if scheme == "zero":
+                    W = np.zeros((fan_out, fan_in), dtype)
+                elif scheme == "constant":
+                    W = np.full((fan_out, fan_in), 0.05, dtype)
+                elif scheme == "overlarge":
+                    W = rng.normal(0, 1.0, (fan_out, fan_in)).astype(dtype)
+                elif scheme == "lecun":
+                    W = rng.normal(0, np.sqrt(1.0 / fan_in), (fan_out, fan_in)).astype(dtype)
+                elif scheme == "xavier":
+                    W = rng.normal(0, np.sqrt(2.0 / (fan_in + fan_out)), (fan_out, fan_in)).astype(dtype)
+                elif scheme == "he":
+                    W = rng.normal(0, np.sqrt(2.0 / fan_in), (fan_out, fan_in)).astype(dtype)
+                else:
+                    raise ValueError(scheme)
+                Ws.append(W)
+            return Ws
+
+        def diagnose(Ws, x, activation="relu", dtype=np.float64):
+            """Forward and backward, reporting the three numbers that matter."""
+            h = np.asarray(x, dtype)
+            hs, zs = [h], []
+            for i, W in enumerate(Ws):
+                z = h @ W.T
+                zs.append(z)
+                last = i == len(Ws) - 1
+                h = z if last else (np.maximum(z, 0) if activation == "relu" else np.tanh(z))
+                hs.append(h)
+
+            g = np.ones_like(hs[-1])
+            gnorms = [0.0] * len(Ws)
+            for i in range(len(Ws) - 1, -1, -1):
+                gnorms[i] = float(np.linalg.norm(g.T @ hs[i]))
+                if i == 0:
+                    break
+                g = g @ Ws[i]
+                prev = zs[i - 1]
+                g = g * (prev > 0) if activation == "relu" else g * (1 - np.tanh(prev) ** 2)
+
+            post = [float(hh.std()) for hh in hs[1:]]
+            sat = [float((np.abs(hh) > 0.99).mean()) if activation == "tanh"
+                   else float((hh == 0).mean()) for hh in hs[1:]]
+            return {"post_std": post, "saturated": sat, "grad_norm": gnorms,
+                    "first_last_ratio": gnorms[0] / gnorms[-1] if gnorms[-1] else float("inf")}
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            x = rng.normal(size=(512, 256))
+            for scheme in ("zero", "constant", "overlarge", "lecun", "he"):
+                d = diagnose(build(scheme, [256] * 51, rng), x)
+                print(f"{scheme:10s} L1={d['post_std'][0]:.4g} "
+                      f"L50={d['post_std'][-1]:.4g} g1={d['grad_norm'][0]:.4g}")
+
+  checkpoints:
+    - id: cp-1
+      question: "You stack twenty 256-wide affine layers with no activation between them. How many parameters does the stack have, and what is the rank of the function it computes?"
+      answerKind: short_text
+      hint: "Compose two affine maps and see what the product of the weights is."
+      solution: >-
+        $20 \times (256\cdot256 + 256) = 1{,}321{,}984$ parameters, and the
+        function is a single matrix $W_{20}\cdots W_1$ with rank at most 256 —
+        and in practice far less, because products of random matrices push the
+        spectrum apart. Measured on width 64, the numerical rank at a $10^{-3}$
+        threshold falls from 64 to 13 over 50 layers, and the stable rank from
+        46 to 3. So the parameter count grew twentyfold and the capacity fell.
+    - id: cp-2
+      question: "A layer maps 784 inputs to 256 outputs, followed by ReLU. What standard deviation should its weights have, and what is the standard deviation of the signal after ten such layers if you get it right?"
+      answerKind: short_text
+      hint: "He's scale is $\\sqrt{2/\\text{fan\\_in}}$, and the linear gain of $\\sqrt{2}$ is exactly cancelled by ReLU's factor of one half."
+      solution: >-
+        $\sigma_W = \sqrt{2/784} = 0.05051$. The linear map multiplies the
+        second moment by $\text{fan\_in}\cdot\sigma^2 = 2$, and the ReLU
+        halves it, so the pair multiplies by exactly 1. After ten layers the
+        signal's standard deviation is unchanged from the input's. If you used
+        LeCun's $1/\sqrt{784} = 0.03571$ instead, the per-layer second-moment
+        factor is 0.5 and after ten layers the signal is $0.5^{10} = 9.8\times
+        10^{-4}$ of where it started.
+    - id: cp-3
+      question: "A 30-layer tanh network has a pre-activation standard deviation of 3 at every layer. Roughly what fraction of the gradient survives from the loss back to layer 1?"
+      answerKind: short_text
+      hint: "Compute $\\tanh'(3)$, then the layer-average derivative at that pre-activation scale."
+      solution: >-
+        $\tanh'(3) = 1-\tanh^2(3) = 0.00987$, but that is the derivative at
+        exactly 3; over a Gaussian with std 3 the layer-average $|\tanh'|$ is
+        0.255, because many units sit closer to zero. So the gradient is
+        multiplied by about 0.255 per layer, and $0.255^{30} = 1.6\times
+        10^{-18}$. At the same time **37.7%** of the units are saturated at
+        $|\tanh|>0.99$, which is the visible symptom you would have noticed.
+    - id: cp-4
+      question: "Your 10-class classifier's loss is exactly 2.302585 and does not move. What is the network computing, and which initialisation bug produces exactly that number?"
+      answerKind: short_text
+      hint: "What is $-\\ln(1/10)$?"
+      solution: >-
+        2.302585 is $\ln 10$ — the cross-entropy of a uniform prediction over
+        ten classes. The logits are all equal (usually all zero), so the softmax
+        is uniform and every gradient is exactly zero. Zero-initialised weights
+        do this, and so does any init that drives the activations to underflow
+        before the last layer: the logits collapse to a constant, not to a small
+        random vector. It is a symmetry/scale bug, not a learning-rate bug.
+    - id: cp-5
+      question: "Why is the ReLU factor 2 rather than 4, given that ReLU zeroes half of its inputs?"
+      answerKind: short_text
+      hint: "Track the second moment, not the count of surviving units."
+      solution: >-
+        Because the quantity that has to be preserved is the squared signal, and
+        zeroing half the *values* removes half the *squared* mass:
+        $\mathbb{E}[\operatorname{ReLU}(z)^2] = \tfrac12\mathbb{E}[z^2]$. A
+        factor of 4 would correspond to losing three quarters of the second
+        moment, which is what a function that kept only a quarter of the mass
+        would do. Since the loss is exactly one half per layer, the compensating
+        factor in $\sigma^2$ is exactly 2.
+    - id: cp-6
+      question: "For a 256→256 layer, Xavier gives $\\sqrt{2/512} = 0.0625$, which is exactly LeCun's $1/\\sqrt{256}$. Is that a coincidence, and when does it stop being true?"
+      answerKind: short_text
+      hint: "Set $\\text{fan\\_in} = \\text{fan\\_out} = n$ in each formula."
+      solution: >-
+        Not a coincidence: with $\text{fan\_in}=\text{fan\_out}=n$, Xavier's
+        $\sqrt{2/(2n)} = 1/\sqrt{n}$, which is LeCun's formula exactly. It
+        stops being true the moment the layer is non-square. For 784→10, Xavier
+        gives $\sqrt{2/794} = 0.05019$ and LeCun gives $0.03571$ — a 40%
+        difference in scale, which is a factor of $1.4^{L}$ in signal after $L$
+        layers. Every input layer and every output layer is non-square, so the
+        distinction matters exactly where it is hardest to notice.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A deep network is a chain of multiplications. Each layer multiplies the
+        signal by some factor, and the factors compound: fifty layers of 0.9 is
+        not "slightly quieter", it is 0.5% of the original signal. The same is
+        true going backwards, and the backward factor is not the same number as
+        the forward one. Initialisation is the act of choosing the weight scale
+        so that both factors are as close to 1 as the architecture allows.
+      blocks:
+        - kind: checklist
+          body: |
+            - Forward factor: how many inputs each unit sums, and how wide the
+              weight distribution is
+            - Backward factor: how many consumers each unit feeds
+            - Activations change the factor: ReLU throws away half the squared
+              signal, tanh throws away some depending on how hard it saturates
+            - The failure is exponential in depth, so it is invisible at depth 3
+              and fatal at depth 50
+            - Everything here is measurable on one batch in under a second
+      checkpoint: >-
+        Before reading on: if a layer's weights are all exactly zero, what is
+        the gradient with respect to those weights, and what happens to them
+        after one step?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Do not tune the scale — derive it, then verify it by measurement. The
+        tool is variance propagation: write the variance of one pre-activation
+        as a sum over its inputs, assume independence, and read off the factor.
+        Then run one batch through the real network and plot the standard
+        deviation per layer; a flat line confirms the derivation, a slope tells
+        you which assumption broke. The alternative — grid-searching the init
+        scale — costs a training run per point and teaches you nothing about
+        why the winner won.
+      blocks:
+        - kind: checklist
+          body: |
+            - Derive: Var(z) = fan_in · Var(w) · Var(x), so the std gain is
+              sqrt(fan_in) · std(w)
+            - Correct: divide the activation's own factor out (ReLU: 2)
+            - Correct again: the backward pass sums over fan_out, not fan_in
+            - Verify: forward one batch, record std per layer
+            - Verify: backward one batch, record gradient norm per layer
+      checkpoint: >-
+        Which of those two corrections — the ReLU factor or the fan_out factor —
+        would you expect to matter more for a network whose hidden layers are
+        all square?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three functions: one that builds the weights, one that measures the
+        forward trace, one that measures the backward trace. The measurement is
+        the part people skip.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. the scale
+            def init_std(fan_in, fan_out, scheme):
+                lecun  -> sqrt(1 / fan_in)
+                he     -> sqrt(2 / fan_in)                # the 2 pays for ReLU
+                xavier -> sqrt(2 / (fan_in + fan_out))    # forward + backward
+
+            # 2. the forward trace
+            h = x
+            for W in weights:
+                h = h @ W.T
+                if not last_layer: h = activation(h)
+                record std(h)
+
+            # 3. the backward trace
+            g = ones_like(h)
+            for W, z in reversed(zip(weights, pre_activations)):
+                record norm(g.T @ h_prev)     # this is dL/dW
+                g = g @ W
+                g = g * activation_derivative(z)
+
+            # 4. the verdict
+            forward std flat?  backward ratio under 1e3?  saturation sane?
+      checkpoint: >-
+        In step 3, why is the gradient with respect to `W` computed from the
+        *incoming* cotangent and the *stored* input, rather than from the
+        output?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The whole ladder follows from one variance identity plus two
+        corrections that each contribute exactly one factor.
+      blocks:
+        - kind: math
+          body: |
+            One layer, $z_j = \sum_{i=1}^{n} W_{ji}x_i$, with $W$ zero-mean,
+            variance $\sigma^2$, independent of $x$:
+
+            $$\operatorname{Var}(z_j) = n\,\sigma^2\,\operatorname{Var}(x_i)
+              \quad\Longrightarrow\quad
+              \text{gain} = \sqrt{n}\,\sigma.$$
+
+            Critical scale (gain = 1):
+
+            $$\sigma = \frac{1}{\sqrt{\text{fan\_in}}}.$$
+
+            ReLU, tracking the second moment $M=\mathbb{E}[x^2]$:
+
+            $$\mathbb{E}[\operatorname{ReLU}(z)^2] = \tfrac12\mathbb{E}[z^2]
+              \quad\Longrightarrow\quad
+              M_{l+1} = \tfrac12 n\sigma^2 M_l
+              \quad\Longrightarrow\quad
+              \sigma = \sqrt{\frac{2}{\text{fan\_in}}}.$$
+
+            Backward, $g_{\text{in}} = W^\top g_{\text{out}}$, sums over
+            fan_out:
+
+            $$\operatorname{Var}(g_{\text{in}}) = \text{fan\_out}\,\sigma^2
+              \operatorname{Var}(g_{\text{out}}).$$
+
+            Both directions at once (harmonic mean of the two variances):
+
+            $$\sigma^2 = \frac{2}{\text{fan\_in}+\text{fan\_out}}.$$
+      checkpoint: >-
+        The harmonic mean is dominated by its smaller argument. Which direction —
+        forward or backward — is the binding constraint for a 784→10 layer, and
+        what does that imply about which one will blow up first if you use the
+        wrong scale?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete initialisation and diagnostic, with the numbers it produces
+        on the reference architecture so you can check your own run.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the diagnostic output before you read the code. If your own
+            implementation reports a flat forward trace and a gradient ratio
+            near 1, you do not need the reference; if it reports a slope, the
+            comparison will tell you which factor you dropped.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def init_std(fan_in, fan_out, scheme="he"):
+                if scheme == "lecun":
+                    return float(np.sqrt(1.0 / fan_in))
+                if scheme == "he":
+                    return float(np.sqrt(2.0 / fan_in))
+                if scheme == "xavier":
+                    return float(np.sqrt(2.0 / (fan_in + fan_out)))
+                raise ValueError(scheme)
+
+            def make_net(sizes, scheme="he", seed=0, dtype=np.float64):
+                rng = np.random.default_rng(seed)
+                return [rng.normal(0, init_std(fi, fo, scheme), (fo, fi)).astype(dtype)
+                        for fi, fo in zip(sizes[:-1], sizes[1:])]
+
+            def trace(Ws, x, activation="relu"):
+                h = np.asarray(x, dtype=Ws[0].dtype)
+                hs, zs = [h], []
+                for i, W in enumerate(Ws):
+                    z = h @ W.T
+                    zs.append(z)
+                    h = z if i == len(Ws) - 1 else (
+                        np.maximum(z, 0) if activation == "relu" else np.tanh(z))
+                    hs.append(h)
+                g, gn = np.ones_like(hs[-1]), [0.0] * len(Ws)
+                for i in range(len(Ws) - 1, -1, -1):
+                    gn[i] = float(np.linalg.norm(g.T @ hs[i]))
+                    if i == 0:
+                        break
+                    g = g @ Ws[i]
+                    z = zs[i - 1]
+                    g = g * (z > 0) if activation == "relu" else g * (1 - np.tanh(z) ** 2)
+                return {
+                    "post_std": [float(h.std()) for h in hs[1:]],
+                    "sat": [float((np.abs(h) > 0.99).mean()) if activation == "tanh"
+                            else float((h == 0).mean()) for h in hs[1:]],
+                    "grad_norm": gn,
+                    "ratio": gn[0] / gn[-1] if gn[-1] else float("inf"),
+                }
+
+            if __name__ == "__main__":
+                x = np.random.default_rng(1).normal(size=(512, 256))
+                for scheme in ("lecun", "xavier", "he"):
+                    t = trace(make_net([256] * 51, scheme), x, "relu")
+                    print(f"{scheme:7s} L1={t['post_std'][0]:.3f} "
+                          f"L50={t['post_std'][-1]:.3g} ratio={t['ratio']:.3g}")
+                # lecun   L1=0.582 L50=1.85e-08 ratio=0.1
+                # xavier  L1=0.582 L50=1.85e-08 ratio=0.1   (square layers!)
+                # he      L1=0.823 L50=0.62     ratio=0.1
+                # exact values move with the seed; the slope does not.
+      checkpoint: >-
+        Xavier and LeCun produce *identical* traces on this network while
+        differing by 40% on 784→10. Explain the identity, and explain why the
+        demonstration is weaker for having hidden it.
+
+  problems:
+    - id: p-init-std
+      title: "The initialisation scale"
+      difficulty: easy
+      prompt: >-
+        Implement `init_std(fan_in, fan_out, scheme)` returning the standard
+        deviation for a zero-mean Gaussian weight initialisation. Support three
+        schemes: `"lecun"` → $1/\sqrt{\text{fan\_in}}$; `"he"` →
+        $\sqrt{2/\text{fan\_in}}$; `"xavier"` →
+        $\sqrt{2/(\text{fan\_in}+\text{fan\_out})}$. Any other scheme raises
+        `ValueError`. Return a Python float.
+      starter: |
+        import numpy as np
+
+        def init_std(fan_in, fan_out, scheme):
+            # your implementation here
+            pass
+      language: python
+      entry: init_std
+      testCases:
+        - input: '[256, 256, "xavier"]'
+          expected: "0.0625"
+          mode: json
+          tolerance: 1e-12
+        - input: '[512, 128, "he"]'
+          expected: "0.0625"
+          mode: json
+          tolerance: 1e-12
+        - input: '[784, 10, "lecun"]'
+          expected: "0.03571428571428571"
+          mode: json
+          tolerance: 1e-12
+        - input: '[100, 400, "xavier"]'
+          expected: "0.06324555320336758"
+          mode: json
+          tolerance: 1e-12
+        - input: '[64, 64, "he"]'
+          expected: "0.1767766952966369"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import math
+
+        def init_std(fan_in, fan_out, scheme):
+            if scheme == "lecun":
+                return float(math.sqrt(1.0 / fan_in))
+            if scheme == "he":
+                return float(math.sqrt(2.0 / fan_in))
+            if scheme == "xavier":
+                return float(math.sqrt(2.0 / (fan_in + fan_out)))
+            raise ValueError("unknown scheme: %r" % (scheme,))
+      solutionExplanation: >-
+        All three are the same variance identity with different corrections. The
+        square root is there because the identity is about variance while the
+        number you pass to `randn` is a standard deviation — forgetting it gives
+        a weight scale that is off by a squaring, which at fan-in 256 means
+        0.0625 versus 0.0039. He doubles the variance relative to LeCun to pay
+        for ReLU's halved second moment; Xavier averages the forward and
+        backward requirements, and on the square 256→256 case that average
+        happens to land exactly on LeCun's value.
+      complexity: "O(1) time, O(1) space"
+      tags: [initialisation, variance, he, xavier, lecun]
+
+    - id: p-forward-trace
+      title: "Forward variance trace"
+      difficulty: medium
+      prompt: >-
+        Implement `forward_std_trace(weights, x, activation="relu")`.
+        `weights` is a list of 2-D arrays, each of shape `(fan_out, fan_in)`,
+        applied in order; `x` is a 2-D batch of shape `(n, fan_in)`;
+        `activation` is one of `"relu"`, `"tanh"`, `"linear"`. Apply every
+        weight matrix, and apply the activation after **every** layer including
+        the last. Return the list of per-layer output standard deviations
+        (population std, `ddof=0`, over all elements of the batch) as floats, in
+        layer order.
+      starter: |
+        import numpy as np
+
+        def forward_std_trace(weights, x, activation="relu"):
+            # your implementation here
+            pass
+      language: python
+      entry: forward_std_trace
+      testCases:
+        - input: '[[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0]]], [[1.0, 2.0], [3.0, 4.0]], "relu"]'
+          expected: "[1.118033988749895, 2.0]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0]]], [[1.0, 2.0], [3.0, 4.0]], "tanh"]'
+          expected: "[0.09817978061347268, 0.012546124618067145]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[2.0, 0.0], [0.0, -2.0]]], [[1.0, 1.0]], "relu"]'
+          expected: "[1.0]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 1.0]]], [[0.0, 0.0], [2.0, 2.0]], "linear"]'
+          expected: "[2.0]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[0.5, -0.5], [1.0, 2.0]], [[1.0, 1.0]]], [[2.0, 4.0], [-1.0, 1.0]], "tanh"]'
+          expected: "[0.8255100893971689, 0.11699471728192609]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def forward_std_trace(weights, x, activation="relu"):
+            h = np.asarray(x, dtype=float)
+            out = []
+            for W in weights:
+                W = np.asarray(W, dtype=float)
+                h = h @ W.T
+                if activation == "relu":
+                    h = np.maximum(h, 0.0)
+                elif activation == "tanh":
+                    h = np.tanh(h)
+                elif activation != "linear":
+                    raise ValueError("unknown activation: %r" % (activation,))
+                out.append(float(h.std()))     # population std over all elements
+            return out
+      solutionExplanation: >-
+        This is the measurement half of the variance argument, and its value is
+        in the shape of the resulting list, not any single number. A correct
+        initialisation produces a nearly flat list; a missing factor of two
+        produces a list that halves at every step; an over-large scale produces
+        one that grows geometrically. Two details matter for the comparison to
+        be honest: the std must be taken over the whole batch (not averaged over
+        per-sample stds, which is a different statistic when the sample mean
+        differs), and the activation must be applied on the last layer too, or
+        the final entry will not be comparable to the rest.
+      complexity: "O(L · n · d²) time for L layers of width d and batch n, O(n·d) space"
+      tags: [forward-pass, variance, diagnostics]
+
+    - id: p-grad-norms
+      title: "Backward pass by hand, and the norms it produces"
+      difficulty: hard
+      prompt: >-
+        Implement `grad_norms(weights, x, activation="relu")` — the backward
+        half of the same diagnostic, written against the chain rule from the
+        autograd topic rather than against a framework. `weights` is a list of
+        2-D arrays applied in order; `x` is a 2-D batch; the activation is
+        applied after every layer **except the last**; and the loss is the sum
+        of all final outputs, so the cotangent seeded at the output is an array
+        of ones. Return the Frobenius norm of $\partial L/\partial W_i$ for each
+        layer, in forward order, as floats.
+      starter: |
+        import numpy as np
+
+        def grad_norms(weights, x, activation="relu"):
+            # your implementation here
+            pass
+      language: python
+      entry: grad_norms
+      testCases:
+        - input: '[[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0], [1.0, -1.0]]], [[1.0, 2.0]], "relu"]'
+          expected: "[4.47213595499958, 3.1622776601683795]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0], [1.0, -1.0]]], [[1.0, 2.0]], "tanh"]'
+          expected: "[1.8781823533093625, 1.7374549395784682]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[2.0, 0.0], [0.0, 1.0]], [[1.0, -1.0]]], [[1.0, 3.0], [0.5, -2.0]], "relu"]'
+          expected: "[3.640054944640259, 4.242640687119285]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0], [0.0, 1.0]], [[1.0, 1.0], [0.5, -1.0]], [[2.0, -1.0]]], [[1.0, 2.0]], "linear"]'
+          expected: "[7.5, 12.041594578792296, 7.0178344238090995]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def grad_norms(weights, x, activation="relu"):
+            Ws = [np.asarray(W, dtype=float) for W in weights]
+            hs = [np.asarray(x, dtype=float)]
+            zs = []
+            h = hs[0]
+            for i, W in enumerate(Ws):
+                z = h @ W.T
+                zs.append(z)
+                last = i == len(Ws) - 1
+                if last:
+                    h = z
+                elif activation == "relu":
+                    h = np.maximum(z, 0.0)
+                elif activation == "tanh":
+                    h = np.tanh(z)
+                elif activation == "linear":
+                    h = z
+                else:
+                    raise ValueError("unknown activation: %r" % (activation,))
+                hs.append(h)
+
+            g = np.ones_like(hs[-1])          # dL/d(output) for L = sum(output)
+            norms = [0.0] * len(Ws)
+            for i in range(len(Ws) - 1, -1, -1):
+                norms[i] = float(np.linalg.norm(g.T @ hs[i]))   # dL/dW_i
+                if i == 0:
+                    break
+                g = g @ Ws[i]                                    # dL/dh_i
+                if activation == "relu":
+                    g = g * (zs[i - 1] > 0.0)
+                elif activation == "tanh":
+                    g = g * (1.0 - np.tanh(zs[i - 1]) ** 2)
+            return norms
+      solutionExplanation: >-
+        Two products per layer, and getting them the right way round is the
+        whole exercise: the gradient with respect to the weights is
+        `g.T @ h_prev`, shape `(fan_out, fan_in)`, while the gradient that
+        continues backwards is `g @ W`, shape `(batch, fan_in)`. Note which one
+        carries fan_out — that asymmetry is exactly why Xavier needs a harmonic
+        mean. The activation derivative must be evaluated at the *stored
+        pre-activation*, not recomputed from the post-activation, or a ReLU mask
+        taken after the fact will be all-ones and the gradient will be wrong in
+        a way that still looks plausible. Test case 2 is the one that catches a
+        missing tanh derivative: without it the norms come out about 25% too
+        large, which is far enough to fail the tolerance but close enough to
+        look like floating-point noise if you are eyeballing it.
+      complexity: "O(L · n · d²) time, O(L · n · d) space for the stored activations"
+      tags: [backpropagation, chain-rule, gradient-norms, diagnostics]
+
+  visualizers:
+    - id: vs-init-collapse
+      kind: shape_flow
+      title: "Watch a 50-layer stack die, and come back"
+      description: >-
+        Push one batch through 50 layers at width 256 and watch the per-layer
+        standard deviation. At $\sigma = 0.02$ it reaches $2.2\times10^{-33}$ by
+        layer 50; at $\sigma = 1.0$ it reaches $1.9\times10^{52}$; at
+        $\sqrt{2/256} = 0.0884$ it stays between 0.4 and 0.9 the whole way.
+      params:
+        depth: 50
+        width: 256
+        batch: 512
+        schemes: ["zero", "constant-0.1", "normal-1.0", "normal-0.02", "lecun", "xavier", "he"]
+
+  try_it: >-
+    Initialise the same 50-layer, 512-wide ReLU stack three ways — std 0.02, std 0.05, and He
+    with $\sigma = \sqrt{2/512} = 0.0625$ — and record the activation standard deviation at
+    layers 1, 10, 25 and 50. You should see it collapse to about $6.1\times10^{-18}$, explode
+    to 471x, and hold near 1.0 respectively.
+  interview_questions:
+    - question: 'Derive the factor of 2 in He initialisation from the variance of one layer.'
+      level: mid
+      key_points:
+        - 'With W entries iid mean 0 variance sigma^2, Var(z_j) = fan_in * sigma^2 * Var(x_i), so the per-layer standard-deviation gain is sqrt(fan_in) * sigma.'
+        - 'For symmetric zero-mean pre-activations, P(z < 0) = 0.5, so about half of every ReLU layer outputs exactly zero (measured 0.5001 at layer 1).'
+        - 'E[ReLU(z)^2] = E[z^2]/2 exactly, so the second moment is halved per layer and the repair is sigma^2 = 2/fan_in.'
+        - 'At fan-in 256 that is 0.0884, exactly sqrt(2) times the Xavier value of 1/fan_in.'
+    - question: 'A 50-layer net sits at a loss of exactly 2.302585. Diagnose it from that number alone.'
+      level: senior
+      key_points:
+        - '2.302585 is ln 10, which is the loss of a uniform distribution over ten classes: the network is outputting chance and has learned nothing, so this is not slow training.'
+        - 'The zero-init signature: every activation is exactly 0 from layer 1, the layer-1 gradient is exactly 0, and max|W1| is still 0.0 after 300 SGD steps.'
+        - 'The other signature is a vanishing gain: std 0.02 at fan-in 512 gives gain 0.452 and 6.1e-18 after fifty layers.'
+        - 'Neither is a learning-rate problem, so raising the step size, adding data or lowering the rate all leave the number where it is.'
+      follow_up: 'How would you distinguish the zero-init case from the vanishing-gain case in one forward pass, without looking at the weights?'
+    - question: 'Why does the backward pass want a different weight scale from the forward pass, and what does Xavier do about it?'
+      level: mid
+      key_points:
+        - 'A linear layer VJP multiplies by W^T, so Var(g_in) = fan_out * sigma^2 * Var(g_out), giving backward gain sqrt(fan_out) * sigma.'
+        - 'Forward wants sigma^2 = 1/fan_in and backward wants sigma^2 = 1/fan_out, and both can only be satisfied at once when fan_in = fan_out.'
+        - 'Xavier takes the harmonic mean, sigma^2 = 2/(fan_in + fan_out), which splits the error between the two gains.'
+        - 'He keeps the forward gain at 1 and accepts about 1/sqrt(2) on the backward path, because the ReLU nets it was designed for are deep in the forward direction.'
+      follow_up: 'Where does the gain argument stop being the right model at all?'
+  common_mistakes:
+    - 'Zero-initialising the weights and reading the flat loss as a learning-rate problem, when every activation and the layer-1 gradient are exactly zero.'
+    - 'Using std 1.0 at fan-in 256, where the per-layer gain is 16 and the activations overflow within a few dozen layers.'
+    - 'Initialising every weight in a layer to the same constant, which makes all hidden units compute the same function and receive the same gradient, so symmetry never breaks.'
+  further_reading:
+    - label: "Glorot & Bengio, Understanding the difficulty of training deep feedforward neural networks (AISTATS 2010)"
+    - label: "He, Zhang, Ren & Sun, Delving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet Classification (ICCV 2015)"

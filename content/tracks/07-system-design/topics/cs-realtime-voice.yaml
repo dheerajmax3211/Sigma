@@ -1,0 +1,656 @@
+id: cs-realtime-voice
+slug: cs-realtime-voice
+title: "Case Study: A Full-Duplex Real-Time Voice Assistant"
+summary: >-
+  Hold a spoken conversation where the gap between the user stopping and the
+  assistant starting is under 800 ms — a budget of six terms that sums to 720 ms,
+  and a KV cache problem that a ten-minute call turns into 7.86 GB unless the
+  audio window rolls.
+kind: case_study
+difficulty: expert
+position: 15
+estMinutes: 21
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [voice, realtime, full-duplex, codec, turn-detection, barge-in, latency-budget, kv-cache]
+
+body:
+  big_idea: >-
+    A voice assistant is a latency budget spent before the model says
+    anything: six serialised terms sum to 720 ms of an 800 ms account, and
+    every architectural decision is a withdrawal from it.
+  problem:
+    - "You build an ASR-LLM-TTS cascade and it feels slow although each part benchmarks well: nobody added up the 720 ms."
+    - "Keep the whole call in context: ten minutes is 60,000 audio tokens, 7.86 GB of KV cache and 2.4 s of prefill at minute eight."
+    - "Your VAD waits 300 ms of silence, which is correct and costs 300 ms; cutting it to 120 ms makes the assistant interrupt people mid-sentence."
+  analogy: >-
+    A simultaneous interpreter in a booth. She hears a sentence, waits for it
+    to end, translates, speaks — and the gap between the speaker stopping and
+    her starting is what makes her feel fluent or exhausting. She does not
+    wait for the whole speech: she works in clauses, commits early, and
+    corrects if the sentence turns. Misjudge the pause and she talks over the
+    speaker.
+  concept_points:
+    - "**The budget is six serialised terms and it adds to 720 ms.** Endpointing 120, ASR finalisation 90, LLM TTFT 250, TTS first chunk 140, network 60, playout buffer 60. That leaves **80 ms of slack** under an 800 ms target, so no single term may double. Voice systems are designed from the budget backwards, not assembled from components."
+    - "**Endpointing is a product decision disguised as a timing constant.** A 300 ms silence threshold is safe and costs 300 ms; 120 ms is responsive and cuts people off mid-thought. The resolution is a semantic endpointing model that reads the partial transcript for a completed clause, so the system commits in 120 ms and still recovers when the user continues."
+    - "**Codec tokens are expensive because there are so many of them.** A neural codec at 12.5 frames/s with 8 codebooks produces **100 tokens per second of audio** — 6,000 per minute, 60,000 for a ten-minute call. Text of the same speech is about 200 tokens per minute, so audio is **30x more expensive per second**."
+    - "**KV cache turns that token rate into memory.** For a 32-layer, 8-KV-head, 128-dim model in bf16 the cache is $2 \\times 32 \\times 8 \\times 128 \\times 2 = 131{,}072$ bytes = **128 KiB per token**. A ten-minute call is **7.86 GB** for one user; a 4,096-token rolling window is 512 MB, and 10,000 concurrent calls is 5.1 TB."
+    - "**Context length is a latency term, not just a memory term.** Prefill is $2NS$: at 4,096 tokens an 8B model needs $6.7\\times10^{13}$ FLOPs, **166 ms** at 40% MFU, inside the 250 ms TTFT budget. At 60,000 tokens it is $9.6\\times10^{14}$ FLOPs and **2.4 s** — the budget is gone before a token is emitted."
+    - "**Barge-in is a flush problem, not a detection problem.** Detecting speech takes about 60 ms; the failure is that 100 ms of TTS audio is already queued in the playout buffer and 200 ms more is in flight, so the buffer, decoder and network queue must all be dropped within 150 ms. Without echo cancellation the VAD fires on the system's own voice."
+  definitions:
+    - { term: "Endpointing", meaning: "Deciding that the user has finished their turn. A silence timer, a semantic model over the partial transcript, or both." }
+    - { term: "VAD", meaning: "Voice activity detection: a frame-level classifier that says whether the current 20 ms of audio contains speech. The trigger for both endpointing and barge-in." }
+    - { term: "Codec token", meaning: "A discrete audio unit produced by a neural codec, at a fixed frame rate with one or more codebooks per frame. The audio equivalent of a subword token." }
+    - { term: "Frame rate", meaning: "Codec frames per second of audio, typically 12.5 to 50. Multiplied by codebooks it gives the token rate." }
+    - { term: "TTFB (time to first byte of audio)", meaning: "The interval from end of user speech to the first audible assistant sample. The voice equivalent of TTFT." }
+    - { term: "Barge-in", meaning: "The user speaking while the assistant is speaking, requiring the assistant to stop within a bounded time." }
+    - { term: "AEC (acoustic echo cancellation)", meaning: "Removing the assistant's own output from the microphone signal, so VAD and ASR do not treat it as user speech." }
+    - { term: "Playout buffer", meaning: "Audio queued at the client to absorb network jitter. Its depth is added latency and its underrun is an audible gap." }
+    - { term: "Rolling window", meaning: "Keeping only the most recent N tokens of audio in context and summarising older turns as text, to bound KV cache and prefill." }
+    - { term: "RTF (real-time factor)", meaning: "Seconds of compute per second of audio. Below 1 is faster than real time; a streaming TTS needs headroom above 1 to survive jitter." }
+    - { term: "Half duplex", meaning: "The assistant cannot hear while speaking, so interruption needs a separate always-on detection path and a hard flush of queued audio." }
+    - { term: "Semantic endpointing", meaning: "Predicting turn completion from the transcript and prosody rather than from silence alone, so a mid-sentence pause does not end the turn." }
+
+  diagrams:
+    - type: architecture
+      title: "The audio path, with the budget attached to each hop"
+      nodes:
+        - { id: mic, x: 0, y: 1, label: "Client audio", kind: client, detail: "24 kHz mono, Opus at 24 kbps. A 20 ms frame cadence is the granularity of every timing decision downstream." }
+        - { id: vad, x: 1, y: 0, label: "VAD + AEC", kind: server, detail: "20 ms frames, 60 ms to detect speech onset. AEC subtracts the assistant's own output or the VAD triggers on it." }
+        - { id: asr, x: 1, y: 2, label: "Streaming ASR", kind: model, detail: "Emits partial hypotheses every 80 ms; finalisation after endpoint costs one more chunk plus 10 ms = 90 ms." }
+        - { id: llm, x: 2, y: 1, label: "LLM (8B)", kind: model, detail: "TTFT 250 ms: 166 ms of prefill for a 4,096-token window at 40% MFU, plus queue and sampling. A 60,000-token context would make this 2.4 s." }
+        - { id: tts, x: 3, y: 0, label: "Streaming TTS", kind: model, detail: "Emits 250 ms of audio (25 codec tokens) before playback starts: 25 ms of decode, 100 ms of vocoder, 15 ms of packetisation." }
+        - { id: play, x: 3, y: 2, label: "Playout buffer", kind: cache, detail: "60 ms of jitter buffer. Deeper absorbs more jitter and adds latency; shallower underruns and produces audible gaps." }
+      edges:
+        - { from: mic, to: vad, label: "20 ms frames" }
+        - { from: vad, to: asr, label: "speech" }
+        - { from: asr, to: llm, label: "final text" }
+        - { from: llm, to: tts, label: "first sentence" }
+        - { from: tts, to: play, label: "audio chunks" }
+
+    - type: compare
+      title: "Cascade versus speech-to-speech"
+      left_label: "ASR -> LLM -> TTS cascade"
+      left_points:
+        - "Each stage is independently swappable, debuggable and measurable, and each has a text transcript you can log"
+        - "Pays 90 ms of ASR finalisation and 140 ms of TTS start-up that a joint model does not"
+        - "Loses prosody and emotion at the ASR boundary: the text carries the words but not the tone"
+        - "Barge-in requires an explicit flush across three services"
+      right_label: "End-to-end speech-to-speech"
+      right_points:
+        - "One model, one latency budget: no finalisation handoff and no TTS cold start"
+        - "Keeps prosody and can emit backchannels ('mm-hm') while the user is still speaking"
+        - "Full duplex by construction, so interruption is a model behaviour rather than a pipeline flush"
+        - "Opaque: no transcript to debug, harder to constrain, and the audio token context is larger"
+
+    - type: pipeline
+      title: "720 ms from end of speech to first audible sample"
+      nodes:
+        - label: "Endpoint confirm"
+          note: "120 ms"
+          detail: "Semantic endpointing over the partial hypothesis. A 300 ms silence timer is safer and consumes 38% of the budget on its own."
+        - label: "ASR finalise"
+          note: "90 ms"
+          detail: "One 80 ms chunk plus 10 ms to emit the final hypothesis. Streaming partials are what make the LLM call startable earlier."
+        - label: "LLM TTFT"
+          note: "250 ms"
+          detail: "166 ms of prefill at a 4,096-token window plus sampling and queue. The largest single term and the one that context length attacks."
+        - label: "TTS first chunk"
+          note: "140 ms"
+          detail: "25 codec tokens for 250 ms of audio, plus vocoder and packetisation. Buffering a whole sentence instead would be 600 ms."
+        - label: "Network + playout"
+          note: "120 ms"
+          detail: "30 ms each way plus a 60 ms jitter buffer. The buffer is the only term you can trade directly against audible glitches."
+
+  markdown: |
+    ## The budget comes first
+
+    Speech has a social contract: a gap longer than about a second reads as
+    broken. Work backwards from 800 ms and you get six terms that must all hold
+    at once.
+
+    | term | p50 | p99 | what moves it |
+    |---|---|---|---|
+    | endpoint confirm | 120 | 300 | silence threshold, semantic model |
+    | ASR finalise | 90 | 180 | chunk size, streaming vs batch |
+    | LLM TTFT | 250 | 600 | context length, queue, model size |
+    | TTS first chunk | 140 | 260 | chunk size, vocoder, model |
+    | network | 60 | 200 | RTT, jitter, region |
+    | playout buffer | 60 | 60 | fixed by design |
+
+    Sum the p50s: 720 ms. Sum the p99s: 1,600 ms. **The p50 fits and the p99 does
+    not**, which is the defining problem of real-time voice: the design has to
+    control the tail, not the mean, and the tail is dominated by queueing in the
+    LLM and by jitter in the network.
+
+    ## Codec tokens are the hidden cost
+
+    A neural codec at 12.5 frames/s with 8 codebooks produces
+
+    $$r_{\text{tok}} = 12.5 \times 8 = 100\ \text{tokens per second of audio}.$$
+
+    Ten minutes is 60,000 tokens. The same speech as text is roughly 200 tokens
+    per minute, or 2,000 tokens for ten minutes — so **audio costs 30× more
+    context per second of conversation** than a transcript does.
+
+    That matters twice. In memory:
+
+    $$M_{\text{KV}} = 2 L H_{kv} d\, b = 2 \times 32 \times 8 \times 128 \times 2
+    = 131{,}072\ \text{B} = 128\ \text{KiB per token},$$
+
+    so 60,000 tokens is **7.86 GB of KV for one call**. At 10,000 concurrent
+    calls that is 78.6 TB, which is not a cluster, it is a data centre.
+
+    And in latency: prefill is $2NS$, so a 4,096-token window is
+    $6.7\times10^{13}$ FLOPs = 166 ms at 40% MFU, while a 60,000-token window is
+    $9.6\times10^{14}$ FLOPs = **2.4 s**. The context window is not a memory knob
+    that happens to affect latency; at this scale it *is* the latency.
+
+    The fix is a rolling window plus text summarisation: keep the last 4,096
+    audio tokens (about 41 s), replace everything older with a 200-token text
+    summary per minute. Ten minutes becomes 4,096 audio tokens (512 MB) plus
+    2,000 text tokens (256 MB) — **768 MB instead of 7.86 GB**, a 10× reduction,
+    and prefill stays at 166 ms instead of 2.4 s.
+
+    ## Turn detection is where the product lives
+
+    Silence-based endpointing is a single number with two failure modes: too
+    short and you interrupt, too long and you feel slow. A 300 ms threshold is
+    the safe default and it consumes 38% of the entire budget.
+
+    Semantic endpointing reads the partial transcript and asks whether the
+    utterance is syntactically and semantically complete — "I need to book a
+    flight to" is not, "I need to book a flight to Berlin" is. That lets the
+    system commit at 120 ms of silence while still accepting a continuation if
+    the user resumes within the recovery window.
+
+    $$\text{commit at } t_{\text{silence}} = 120\ \text{ms if complete, else } 400\ \text{ms}.$$
+
+    The recovery window is what makes it safe: if the user keeps talking after a
+    commit, the system must cancel the in-flight LLM call and re-open the turn.
+    That cancellation path is a real piece of engineering, and systems that skip
+    it produce the "it answers before I finish" complaint that no threshold fixes.
+
+    ## Barge-in is a flush, not a detector
+
+    Detecting that the user is speaking takes about 60 ms with a 20 ms frame
+    cadence. The hard part is that by the time you detect it, the pipeline holds
+    audio you have already committed to play:
+
+    - 60 ms in the playout buffer at the client,
+    - up to 250 ms in flight from the server,
+    - an unbounded amount still being generated by the TTS decoder.
+
+    A barge-in that stops only the model leaves 300 ms of assistant speech that
+    the user hears after they started talking — which reads as being talked over,
+    even though the model stopped. The flush has to be end-to-end: cancel the
+    decoder, drop the send queue, and send an explicit flush marker that tells
+    the client to discard its buffer.
+
+    And none of it works without echo cancellation. The microphone hears the
+    assistant at 20-40 dB below its own voice, which is well inside VAD
+    sensitivity. Without AEC the assistant triggers on itself, stops, hears
+    silence, resumes, and loops.
+
+    ## The p99 is the design target
+
+    An assistant that is fast on average and slow one time in twenty is not a
+    fast assistant; it is an assistant people stop using. The p50 budget of
+    720 ms leaves 80 ms of slack, which is less than the p99 excess of any single
+    term, so the design cannot be "the sum of the means plus margin". Each term's
+    tail has to be bounded independently: a prefill queue with admission control,
+    a TTS decoder kept warm so its first chunk does not include a model load, and
+    a regional deployment so the RTT tail does not consume the slack.
+
+    The practical consequence is that voice systems are provisioned at 40-50%
+    utilisation rather than 80%. That looks wasteful on a CPU dashboard and is
+    exactly right against a latency SLO, because queueing delay grows without
+    bound as utilisation approaches one — and in a voice product the user hears
+    the queue as a pause.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A voice assistant is **a latency budget you spend before the model says anything**: 120 ms of endpointing, 90 ms of ASR finalisation, 250 ms to first token, 140 ms to first audio frame, 60 ms of network and 60 ms of playout sums to 720 ms, and every architectural decision is a withdrawal from that 800 ms account — including the size of the audio context, which costs 2.4 s of prefill if you let a ten-minute call reach 60,000 tokens.
+
+    ### The analogy, in full
+
+    A simultaneous interpreter in a booth. She hears a sentence, waits for it to end, translates it, and speaks — and the gap between the speaker stopping and her starting is what makes her feel either fluent or exhausted to listen to. The interpreter does not wait for the whole speech. She works in clauses, commits early, and corrects if the sentence turns. That is streaming ASR with partial hypotheses, and it is the only way to hide the recognition cost. She also has to know when to stop talking. If she misjudges the pause, she either talks over the speaker or sits silent for a second after they finish. Where the analogy breaks: the interpreter can hear herself and knows she is speaking. The system hears its own output through the user's microphone, so without echo cancellation it triggers on its own voice, stops, restarts, and produces the stutter that users describe as "it keeps interrupting me" when the truth is that it keeps interrupting itself.
+
+    ### Failure modes, in full
+
+    - You build a cascade of ASR, LLM and TTS and the response feels slow even though each component benchmarks well. The budget is 720 ms of six serialised terms, and nobody added them up before the architecture was chosen.
+    - You keep the full conversation in context and a ten-minute call reaches 60,000 audio tokens at 100 tokens per second. That is 7.86 GB of KV cache for one call, and 2.4 s of prefill on the next turn — a latency cliff that arrives at minute eight, not at minute one.
+    - Your VAD waits for 300 ms of silence before ending the turn, which is correct and costs 300 ms of the budget. Cutting it to 120 ms makes the assistant interrupt people mid-sentence, and the fix is semantic endpointing rather than a smaller number.
+    - The user interrupts and the assistant keeps talking for 400 ms, because the playout buffer is 100 ms deep, the TTS keeps generating, and nothing flushes the pipeline on barge-in.
+    - An interviewer asks why the system needs a speech-to-speech model. The honest answer is that the cascade spends 210 ms on ASR finalisation and TTS start-up that a joint model does not, and that this is 26% of the entire budget.
+
+    ### The mechanisms, in full
+
+    - **The budget is six serialised terms and it adds to 720 ms.** Endpointing 120, ASR finalisation 90, LLM TTFT 250, TTS first chunk 140, network 60, playout buffer 60. That leaves **80 ms of slack** under an 800 ms target, which means no single term may double. This is why voice systems are designed from the budget backwards rather than assembled from components.
+    - **Endpointing is a product decision disguised as a timing constant.** A 300 ms silence threshold is safe and costs 300 ms; 120 ms is responsive and cuts people off mid-thought. The resolution is a semantic endpointing model that reads the partial transcript for a completed clause, so the system can commit in 120 ms while still recovering when the user continues.
+    - **Codec tokens are expensive because there are so many of them.** A neural codec at 12.5 frames/s with 8 codebooks produces **100 tokens per second of audio** — 6,000 tokens per minute, 60,000 for a ten-minute call. Text of the same speech is about 200 tokens per minute, so audio is **30× more expensive per second of conversation**.
+    - **KV cache turns that token rate into memory and latency.** For a 32-layer, 8-KV-head, 128-dim model in bf16 the cache is $2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes = **128 KiB per token**. A full ten-minute call is 7.86 GB for one user; a 4,096-token rolling window is 512 MB, and 10,000 concurrent calls is 5.1 TB either way you provision it.
+    - **Context length is a latency term, not just a memory term.** Prefill is $2NS$: at 4,096 tokens an 8B model needs $6.7\times10^{13}$ FLOPs, which is **166 ms** at 40% MFU and fits inside the 250 ms TTFT budget. At 60,000 tokens it is $9.6\times10^{14}$ FLOPs and **2.4 s** — the budget is gone before the model emits a token.
+    - **Streaming is mandatory at every stage, and each stage must emit before it is finished.** ASR emits partials every 80 ms, the LLM emits its first token after prefill, and TTS must emit a first chunk of 250 ms of audio rather than a whole sentence. A stage that buffers its full output adds its entire latency to the budget, which is how a 720 ms design becomes 2 s.
+    - **Barge-in is a flush problem, not a detection problem.** Detecting speech takes about 60 ms; the failure is that 100 ms of TTS audio is already queued in the playout buffer and 200 ms more is in flight. Stopping the model is not enough — the buffer, the decoder and the network queue all have to be dropped within 150 ms.
+    - **Echo cancellation is what makes barge-in work at all.** The microphone hears the assistant. Without AEC, the VAD fires on the system's own voice, the assistant interrupts itself, and the symptom looks like a turn-detection bug rather than an audio-processing one.
+    - **Cost per minute is dominated by generated audio, not understood audio.** At 6,000 input tokens and 6,000 output tokens per minute, a 0.30 USD/M input and 1.20 USD/M output price gives 0.0018 + 0.0072 = **0.009 USD per minute**, so a million minutes a month is 9,000 USD before ASR and TTS compute.
+    - **Full-duplex is an architectural choice, not a feature.** Half-duplex means the assistant cannot hear while speaking, so interruption requires a separate always-on VAD path and a hard flush. Full-duplex means the model consumes and emits audio simultaneously, which removes the flush problem and adds the echo problem.
+  problem_statement: >-
+    Design a full-duplex voice assistant that responds within 800 ms of the user
+    finishing a sentence, supports natural interruption, holds a ten-minute
+    conversation, and runs 10,000 concurrent calls on a single-digit-millisecond
+    jitter budget. State the codec token rate, the KV cache plan, the turn
+    detection policy and the latency budget line by line.
+
+  requirements:
+    functional:
+      - "Stream audio both ways with echo cancellation, so the assistant can hear the user while speaking"
+      - "Detect end of turn semantically and allow the user to resume within a recovery window without losing the turn"
+      - "Support barge-in with a full flush of decoder, send queue and client buffer within 150 ms"
+      - "Maintain conversation context across a ten-minute call without unbounded KV growth"
+      - "Emit partial transcripts and partial audio so no stage buffers its full output"
+    non_functional:
+      - "Time from end of user speech to first audible assistant sample: p50 <= 750 ms, p99 <= 1,200 ms"
+      - "Barge-in stop latency <= 150 ms from detected speech onset"
+      - "KV cache per concurrent call <= 1 GB at any call duration"
+      - "No audible underrun during steady playback on a 60 ms jitter buffer at p99 network jitter"
+      - "Cost per minute of conversation <= 0.02 USD including ASR and TTS compute"
+
+  clarifying_questions:
+    - question: "Is the target 800 ms measured from end of speech or from the last ASR partial?"
+      why_it_matters: "Measuring from the last partial hides the endpointing cost, which is 120-300 ms of the budget. The number has to be defined at the client's audio interface or it is not a user-facing SLO."
+    - question: "Does the product need to handle interruptions, or can it be push-to-talk?"
+      why_it_matters: "Push-to-talk removes endpointing entirely and simplifies barge-in to nothing, which frees 120 ms and a lot of complexity. Many products ship push-to-talk first for exactly this reason."
+    - question: "What is the call length distribution, and is there a hard cap?"
+      why_it_matters: "A ten-minute p99 call at 100 audio tokens per second is 7.86 GB of KV if kept whole; a 60-second cap makes the problem disappear. The context plan follows from this one number."
+    - question: "Is the audio path 24 kHz wideband, and what codec does the client support?"
+      why_it_matters: "Codec choice sets the token rate and the bandwidth: 12.5 Hz x 8 codebooks is 100 tokens/s, while 25 Hz x 12 is 300 tokens/s — a 3x difference in both KV and cost for a quality gain that must be justified."
+    - question: "How much of the traffic is mobile, and what is the p99 network RTT?"
+      why_it_matters: "A 200 ms p99 RTT consumes a quarter of the budget and forces regional deployment. Voice latency is a geography problem before it is a model problem."
+
+  capacity_estimation:
+    assumptions:
+      - "Audio: 24 kHz mono, Opus at 24 kbps, 20 ms frames; neural codec at 12.5 frames/s with 8 codebooks"
+      - "Model: 8B parameters, 32 layers, 8 KV heads, head_dim 128, bf16 KV cache; 40% MFU on H100 for prefill"
+      - "Traffic: 10,000 concurrent calls at peak, 1,000,000 minutes per month, average call 4 minutes, p99 call 10 minutes"
+      - "Latency target: 800 ms from end of user speech to first audible sample; 60 ms playout buffer; 30 ms network each way"
+      - "Pricing: 0.30 USD per million input tokens, 1.20 USD per million output tokens"
+
+    arithmetic:
+      - label: "Codec token rate and per-call token volume"
+        calculation: "12.5 frames/s x 8 codebooks = 100 tokens per second of audio. Per minute: 100 x 60 = 6,000 tokens. Ten-minute call: 100 x 600 = 60,000 tokens. Equivalent text at 200 tokens per minute: 2,000 tokens, so audio is 60,000/2,000 = 30x more context."
+        conclusion: "100 tokens/s, 6,000 per minute, 60,000 for a ten-minute call — the number that drives both KV memory and prefill latency."
+
+      - label: "KV cache per call at full context"
+        calculation: "2 x 32 layers x 8 KV heads x 128 head_dim x 2 bytes = 131,072 bytes = 128 KiB per token. Ten minutes: 60,000 x 128 KiB = 7.68e6 KiB = 7.86e9 bytes = 7.86 GB. At 10,000 concurrent calls: 10,000 x 7.86 GB = 78.6 TB."
+        conclusion: "7.86 GB per call and 78.6 TB across the fleet — unaffordable. Full-context audio is not a viable design at any realistic concurrency."
+
+      - label: "KV cache with a rolling window and text summary"
+        calculation: "Rolling window 4,096 audio tokens x 128 KiB = 512 MB. Summary: 200 text tokens per minute x 10 minutes = 2,000 tokens x 128 KiB = 256 MB. Total per call = 768 MB. Fleet: 10,000 x 0.768 GB = 7.68 TB, or 7.68e12 / 80e9 = 96 GPUs of KV capacity."
+        conclusion: "768 MB per call instead of 7.86 GB — a 10.2x reduction — and the fleet's KV fits in 96 GPUs rather than 983."
+
+      - label: "Prefill latency at two context lengths"
+        calculation: "Prefill FLOPs = 2 x 8e9 params x context. At 4,096 tokens: 6.55e13 FLOPs; at 40% MFU on an H100 (3.96e14 FLOPS) = 166 ms. At 60,000 tokens: 9.6e14 FLOPs / 3.96e14 = 2.42 s."
+        conclusion: "166 ms versus 2,420 ms for the same model: context length is a 14.6x latency multiplier, and the 250 ms TTFT term only survives with a bounded window."
+
+      - label: "The 720 ms budget, summed"
+        calculation: "Endpoint 120 + ASR finalise 90 + LLM TTFT 250 + TTS first chunk 140 + network (2 links x 30 ms) 60 + playout 60 = 720 ms. Slack against an 800 ms target = 800 - 720 = 80 ms. P99 version: 300 + 180 + 600 + 260 + (2 x 100) 200 + 60 = 1,600 ms."
+        conclusion: "The p50 fits with 80 ms to spare; the p99 misses by 800 ms. Real-time voice is a tail-latency problem, and the tail lives in LLM queueing and network jitter."
+
+      - label: "TTS throughput and real-time factor"
+        calculation: "100 codec tokens per second of audio. A decoder running at 1,000 tokens/s produces 1,000 / 100 = 10 s of audio per second of compute, an RTF of 0.1. A 30 s response is 30 x 100 = 3,000 tokens, generated in 3.0 s. The first chunk of 250 ms of audio needs 0.25 x 100 = 25 tokens = 25 ms of decode, plus 100 ms of vocoder and 15 ms of packetisation = 140 ms."
+        conclusion: "RTF 0.1 means throughput is never the constraint; start-up latency and chunk size are. Buffering a whole sentence (600 tokens) would cost 600 ms and break the budget on its own."
+
+      - label: "Bandwidth for 10,000 concurrent calls"
+        calculation: "Opus at 24 kbps per stream, bidirectional: 10,000 x 24 kbps = 240 Mbps = 30 MB/s. Raw PCM at 24 kHz x 16 bits would be 384 kbps per stream: 10,000 x 384 kbps = 3.84 Gbps."
+        conclusion: "240 Mbps is trivial for any modern network; 3.84 Gbps for raw PCM is not, which is why a codec is mandatory rather than optional."
+
+      - label: "Cost per minute of conversation"
+        calculation: "Input 6,000 tokens x 0.30e-6 = 0.0018 USD. Output audio 6,000 tokens x 1.20e-6 = 0.0072 USD. Total 0.009 USD per minute. At 1,000,000 minutes per month: 9,000 USD, before ASR and TTS GPU time."
+        conclusion: "0.009 USD per minute, 80% of it generated audio. The output side is where the cost is, which is why response length is a product lever with a direct price."
+
+      - label: "Endpointing trade against the budget"
+        calculation: "Silence threshold 300 ms vs semantic endpoint at 120 ms saves 300 - 120 = 180 ms, which is 180 / 800 = 22.5% of an 800 ms budget. Over 1,000 calls that is 1,000 x 180 ms = 180 s of user wait removed. The cost is a cancellation path: a wrong commit wastes 2 x 8e9 x 4096 = 6.6e13 FLOPs, or 166 ms of prefill already spent."
+        conclusion: "180 ms of budget for a semantic endpointing model and a cancellation path — the highest-leverage 180 ms in the design."
+
+  architecture_summary: >-
+    A client streams Opus audio into a VAD with acoustic echo cancellation;
+    streaming ASR emits partials and semantic endpointing commits the turn at
+    120 ms of silence. An 8B model with a 4,096-token rolling audio window and a
+    text summary of older turns produces a first sentence in 250 ms, and a
+    streaming codec TTS emits a 250 ms first chunk in 140 ms. Barge-in flushes
+    decoder, send queue and client buffer end to end within 150 ms.
+
+  deep_dives:
+    - topic: "Cascade versus end-to-end speech-to-speech"
+      explanation: >-
+        The cascade buys observability and modularity at a fixed latency cost: an
+        ASR finalisation boundary and a TTS start-up, roughly 230 ms of the 720 ms
+        budget. Speech-to-speech removes both and keeps prosody, at the cost of
+        losing the transcript that makes debugging and compliance possible.
+      tradeoffs:
+        - option: "ASR -> LLM -> TTS cascade"
+          pros: "Every stage is measurable and swappable, the transcript is a first-class artefact for logging and moderation, and text LLM tooling applies unchanged."
+          cons: "Pays 90 ms of finalisation and 140 ms of TTS start-up — 32% of the budget — and loses prosody at the text boundary."
+        - option: "End-to-end speech-to-speech"
+          pros: "One model and one budget, no handoff, prosody preserved, and backchannels are natural because the model is listening while it speaks."
+          cons: "Opaque: no transcript to audit, harder to constrain to a tool schema, and the audio token context is 30x larger than text so KV cost rises."
+        - option: "Cascade with a speech-to-speech fallback for barge-in"
+          pros: "Keeps the debuggable path for normal turns and uses the joint model only where interruption timing matters."
+          cons: "Two model stacks to serve and keep in sync, and the routing decision itself costs time in the exact path that is latency-critical."
+
+    - topic: "Turn detection policy"
+      explanation: >-
+        Endpointing is the only budget term that is a language-model problem
+        rather than a systems problem. Silence is a proxy for completion, and it
+        is wrong in both directions: people pause mid-sentence and people finish
+        without pausing. Semantic endpointing prices that better, but only if the
+        system can cancel a committed turn.
+      tradeoffs:
+        - option: "Fixed silence threshold (300 ms)"
+          pros: "Trivial to implement, predictable, and no model to host or evaluate; 300 ms is safe enough that interruptions are rare."
+          cons: "Consumes 38% of the budget and still feels slow; a user who pauses to think gets an answer to half a question."
+        - option: "Semantic endpointing over partial transcripts"
+          pros: "Commits at 120 ms when the utterance is complete and waits when it is not, recovering 180 ms without raising false cut-offs."
+          cons: "A model in the latency path (adds its own inference time), needs labelled turn-end data, and requires a cancellation path for a wrong commit."
+        - option: "Speculative execution: start the LLM on partials"
+          pros: "Hides both the endpoint and the ASR finalisation, potentially saving 210 ms of the budget."
+          cons: "Wasted prefill on hypotheses that change, and a cancelled call still costs 166 ms of GPU; at 10,000 concurrent calls that waste is a capacity line item."
+
+    - topic: "Audio token budget and codec choice"
+      explanation: >-
+        The codec sets tokens per second, and tokens per second sets KV memory,
+        prefill latency and cost simultaneously. Higher frame rates and more
+        codebooks improve audio quality and multiply all three, so the codec is a
+        capacity decision that is usually made by an audio engineer in isolation.
+      tradeoffs:
+        - option: "12.5 Hz x 8 codebooks (100 tokens/s)"
+          pros: "6,000 tokens per minute keeps a ten-minute call under 60,000 tokens; quality is adequate for speech and the KV cost is manageable with a rolling window."
+          cons: "Prosody and background detail are coarse, and emotion-sensitive products will notice the loss."
+        - option: "25 Hz x 12 codebooks (300 tokens/s)"
+          pros: "Noticeably better audio fidelity and finer prosody, which matters for expressive assistants."
+          cons: "Triples KV, prefill and cost: a ten-minute call becomes 180,000 tokens and 23.6 GB at 128 KiB per token — untenable without aggressive summarisation."
+        - option: "Text-only context with audio regenerated per turn"
+          pros: "Cheapest possible context: 200 tokens per minute instead of 6,000, so a ten-minute call is 2,000 tokens."
+          cons: "Loses paralinguistic information entirely (tone, hesitation, emphasis), which is often the actual content of a spoken turn."
+
+    - topic: "Barge-in and echo cancellation"
+      explanation: >-
+        Full duplex means the microphone hears the speaker. Echo cancellation
+        makes the VAD honest, and the flush makes the interruption feel instant.
+        Both are required: AEC without a flush means the assistant stops thinking
+        but keeps talking; a flush without AEC means it stops because it heard
+        itself.
+      tradeoffs:
+        - option: "AEC plus a 150 ms end-to-end flush"
+          pros: "Interruption feels immediate, the assistant can be interrupted mid-word, and the user never hears speech after they started talking."
+          cons: "AEC needs a reference signal and drifts when the device changes; the flush must reach the client buffer, which means a control message on the same channel as audio."
+        - option: "Half duplex: mute the microphone while speaking"
+          pros: "No echo problem at all, no AEC to tune, and the VAD is trivially correct."
+          cons: "The user cannot interrupt, which users experience as the assistant being deaf; and backchannels are impossible."
+        - option: "Server-side VAD only, no client flush"
+          pros: "Simple: one place decides, one place stops."
+          cons: "300 ms of already-queued audio still plays after the stop, which is exactly the symptom users report as being talked over."
+
+  bottlenecks:
+    - failure: "Playout underrun during network jitter"
+      symptom: "Audible gaps or robotic clipping in the assistant's speech at p99 jitter; the client buffer empties; the gap correlates with network conditions rather than with server load."
+      mitigation: "Adaptive jitter buffer that grows on observed jitter and shrinks on stability, plus redundant audio packets so a single loss does not create a gap; keep the floor at 60 ms and accept the latency."
+    - failure: "Context-length latency cliff on long calls"
+      symptom: "The first turn answers in 400 ms and the twentieth in 2.5 s; prefill time grows linearly with call duration; KV memory per call grows until the node refuses new sequences."
+      mitigation: "Roll the audio window at 4,096 tokens, summarise older turns into 200 text tokens per minute, and alert on p99 TTFT by call age rather than in aggregate."
+    - failure: "Self-interruption from missing or degraded AEC"
+      symptom: "The assistant stops mid-sentence with no user speech present; barge-in events cluster at the start of the assistant's own turns; the transcript shows the assistant's words recognised as user input."
+      mitigation: "Feed the AEC a proper reference signal, monitor echo return loss, and gate the barge-in detector on AEC convergence rather than trusting the VAD unconditionally."
+    - failure: "Endpointing false cut-off"
+      symptom: "The assistant answers a half-finished question; users repeat themselves; the transcript shows a turn boundary in the middle of a clause."
+      mitigation: "Semantic endpointing with a recovery window: commit at 120 ms only on a syntactically complete hypothesis, keep the turn open for 400 ms if not, and cancel the in-flight LLM call when the user resumes."
+
+  what_to_steal:
+    - "Write the latency budget as six named terms and sum both p50 and p99. 720 ms against 1,600 ms is the whole design problem, and it is invisible if you only quote a mean."
+    - "Quote codec tokens as tokens per second of audio (frames x codebooks). 100 tokens/s is what turns a conversation into a 60,000-token context and a 7.86 GB KV cache."
+    - "Treat context length as a latency term: prefill is 2NS, so 4,096 tokens is 166 ms and 60,000 tokens is 2.42 s on the same model. The rolling window is a latency fix first."
+    - "Price endpointing explicitly: 300 ms of silence is 38% of the budget, and semantic endpointing buys 180 ms back for one small model and a cancellation path."
+    - "Design barge-in as an end-to-end flush (decoder, send queue, client buffer) and make AEC a prerequisite, or the system will interrupt itself and you will debug the wrong layer."
+
+  try_it: >-
+    Recompute the budget for a 25 Hz, 12-codebook codec: the token rate triples
+    to 300/s, so a ten-minute call is 180,000 tokens and 23.6 GB of KV, and
+    prefill at 4,096 tokens is unchanged but the window covers only 13.6 s of
+    audio. Work out what the summary ratio has to become to keep KV under 1 GB,
+    and then decide whether the fidelity is worth it.
+
+  interview_questions:
+    - question: "Walk me through the 800 ms budget for a voice assistant. Which term do you attack first?"
+      level: staff
+      key_points:
+        - "Six serialised terms: endpoint 120, ASR finalise 90, LLM TTFT 250, TTS first chunk 140, network 60, playout 60 — 720 ms p50 against 1,600 ms p99."
+        - "The LLM's 250 ms is the largest single term, and 166 ms of it is prefill for a 4,096-token window; a 60,000-token context makes that term 2.4 s."
+        - "The cheapest win is endpointing: 300 ms of silence is 38% of the budget, and semantic endpointing recovers 180 ms for one small model."
+        - "The tail, not the mean, is the real problem: p99 queueing in the LLM and p99 network jitter each exceed their p50 by 2-3x."
+      follow_up: "Where does the p99 go if the user is on mobile with a 200 ms RTT?"
+
+    - question: "Why is a ten-minute voice call a memory problem?"
+      level: senior
+      key_points:
+        - "A 12.5 Hz, 8-codebook codec produces 100 audio tokens per second, so ten minutes is 60,000 tokens — 30x the text equivalent."
+        - "At 128 KiB per token for a 32-layer, 8-KV-head model, that is 7.86 GB of KV for one call, and 78.6 TB across 10,000 concurrent calls."
+        - "Prefill is 2NS, so the same context is 2.42 s of TTFT, which breaks the budget before memory does."
+        - "The fix is a 4,096-token rolling audio window plus 200-token-per-minute text summaries: 768 MB per call, 166 ms of prefill, a 10x reduction."
+      follow_up: "What do you lose when you summarise the audio into text, and how would you measure it?"
+
+    - question: "The user interrupts and the assistant keeps talking for 400 ms. Diagnose it."
+      level: senior
+      key_points:
+        - "Detection is not the problem: a 20 ms frame cadence detects speech onset in about 60 ms."
+        - "The audio already committed is the problem: 60 ms in the client buffer, up to 250 ms in flight, plus whatever the TTS decoder keeps producing."
+        - "The flush must be end-to-end — cancel the decoder, drop the send queue, and send a control message that makes the client discard its buffer."
+        - "If the assistant is also interrupting itself, the cause is upstream: missing or unconverged AEC feeding the VAD its own output."
+      follow_up: "How would you distinguish self-interruption from real barge-in in production telemetry?"
+
+    - question: "Would you build the voice assistant as a cascade or end-to-end?"
+      level: staff
+      key_points:
+        - "The cascade pays 90 ms of ASR finalisation and 140 ms of TTS start-up — 32% of the budget — but gives a transcript you can log, audit and moderate."
+        - "End-to-end speech-to-speech removes both handoffs, preserves prosody, and makes backchannels and interruption model behaviours rather than pipeline features."
+        - "The cost is opacity: no transcript, harder schema constraints, and an audio token context 30x larger than text, which raises KV and prefill."
+        - "The pragmatic answer is usually cascade first for debuggability, with the joint model introduced where interruption timing is the product."
+      follow_up: "How would you evaluate a speech-to-speech model when you have no transcript to score?"
+
+  common_mistakes:
+    - "Benchmarking each component against its own target and never summing them: six terms each 'fast enough' add to 720 ms p50 and 1,600 ms p99."
+    - "Keeping the full call in context and discovering at minute eight that prefill has grown to 2.4 s and KV to 7.86 GB per call."
+    - "Cutting the silence threshold from 300 ms to 120 ms without semantic endpointing, which trades a slow assistant for one that interrupts mid-sentence."
+    - "Stopping only the TTS model on barge-in, leaving 300 ms of already-queued audio that the user hears after they started speaking."
+    - "Shipping without echo cancellation, then debugging turn detection for a week while the VAD is actually triggering on the assistant's own voice."
+
+  further_reading:
+    - label: "Defossez, Mazaré, Orsini, Royer, Pérez, Jégou, Zeghidour, Moshi: a speech-text foundation model for real-time dialogue (2024)"
+    - label: "Zeghidour, Luebs, Omran, Skoglund, Tagliasacchi, SoundStream: An End-to-End Neural Audio Codec (2021)"
+    - label: "Défossez, Copet, Synnaeve, Adi, High Fidelity Neural Audio Compression (2022)"
+    - label: "Zhang, Takanobu, Szlam, Ma, Multi-Turn Dialogue Turn-Taking prediction literature on semantic endpointing, e.g. Ekstedt and Skantze, Voice Activity Projection (2022)"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Two systems share one clock. One is a pipeline of six stages that must
+        each emit before they finish; the other is a context that grows with every
+        second of audio. The first decides whether it feels fast, the second
+        decides whether it still feels fast in minute nine.
+      blocks:
+        - kind: checklist
+          body: |
+            - Budget = endpoint + ASR + TTFT + TTS + network + playout
+            - Tokens/s = codec frame rate x codebooks
+            - KV = 2 x layers x KV heads x head_dim x bytes, per token
+            - Prefill = 2 x params x context
+            - Barge-in = detection + flush of everything already queued
+      checkpoint: >-
+        Which of those five is a memory number, which is a latency number, and
+        which is both?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Sum the budget before choosing components, then attack the largest term
+        that is under your control. For most systems that is endpointing (a policy
+        choice) and context length (a summarisation choice), not the model itself.
+        Then make every stage streaming, because a stage that buffers adds its
+        entire latency.
+      blocks:
+        - kind: warning
+          body: >-
+            Do not optimise the model first. A 2x faster LLM saves 125 ms; semantic
+            endpointing and a bounded window save 180 ms and 2.2 s respectively,
+            and neither requires a new model.
+      checkpoint: >-
+        If your p99 is 1,600 ms, which two terms account for most of the excess,
+        and why are they both queueing problems?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Stream everything, bound the context, flush on interruption.
+      blocks:
+        - kind: pseudocode
+          body: |
+            for frame in mic(20ms):
+                if vad(frame) and speaking: flush(); cancel_llm()
+                partial = asr.push(frame)
+                if semantic_end(partial) and silence > 120ms:
+                    ctx = roll(audio_window, 4096) + summary
+                    for tok in llm(ctx): tts.push(tok)
+            # tts emits 25 codec tokens before playback starts
+      checkpoint: >-
+        Which line, if it buffered its output instead of streaming, would add the
+        most latency, and how much?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Token rate, KV per call, prefill at two contexts.
+      blocks:
+        - kind: math
+          body: |
+            **Token rate.**
+            $$r = f_{\text{frame}} \times n_{\text{codebooks}}$$
+
+            **KV per call.**
+            $$M = 2 L H_{kv} d\, b \times r \times t$$
+
+            **Prefill.**
+            $$F = 2 N S$$
+      checkpoint: >-
+        With 12.5 Hz x 8 codebooks, 32 layers, 8 KV heads and 2 bytes, do you get
+        100 tokens/s, 128 KiB per token and 7.86 GB for ten minutes?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The 720 ms budget, the rolling window, and the flush.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            fps, books = 12.5, 8
+            L, Hkv, d, b = 32, 8, 128, 2
+            r = fps * books
+            kv_tok = 2*L*Hkv*d*b
+            full = kv_tok * r * 600
+            roll = kv_tok * 4096 + kv_tok * 2000
+            pre4k  = 2*8e9*4096 / (989e12*0.40)
+            pre60k = 2*8e9*60000 / (989e12*0.40)
+            print(r, kv_tok, round(full/1e9,2), round(roll/1e9,2),
+                  round(pre4k*1e3), round(pre60k*1e3))
+      checkpoint: >-
+        The script prints two prefill times that differ by 14.6x. Which term in the
+        latency budget do they belong to, and what happens to the p50 if you use the
+        larger one?
+  implementations:
+    - language: python
+      title: "The 720 ms voice budget and the KV cost of a long call"
+      note: >-
+        Six serialised terms sum to 720 ms, leaving 80 ms of slack; at 100 codec tokens per second a ten-minute call is 60,000 tokens and 7.86 GB of KV, so the context must roll to about 76 s for a 1 GB budget. The endpointing table is a logistic illustration of the responsive-versus-safe trade, not a measured cut-off rate.
+      code: |
+        import numpy as np
+
+        BUDGET_MS = 800
+        TERMS = {"endpointing": 120, "asr_final": 90, "llm_ttft": 250,
+                 "tts_first": 140, "network": 60, "playout": 60}
+        FRAMES_PER_S, CODEBOOKS = 12.5, 8
+        KV_BYTES_PER_TOKEN = 128 * 1024
+        CALL_SECONDS = 600
+
+
+        def latency_budget(terms=TERMS, budget=BUDGET_MS):
+            used = sum(terms.values())
+            return used, budget - used
+
+
+        def kv_bytes(seconds, rate=FRAMES_PER_S, books=CODEBOOKS,
+                     per_token=KV_BYTES_PER_TOKEN):
+            tokens = seconds * rate * books
+            return int(tokens), tokens * per_token
+
+
+        def rolling_window(kv_budget_gb, per_token=KV_BYTES_PER_TOKEN,
+                           rate=FRAMES_PER_S, books=CODEBOOKS):
+            tokens = kv_budget_gb * 1e9 / per_token
+            return tokens / (rate * books)
+
+
+        def main():
+            used, slack = latency_budget()
+            print(f"serialised budget: {used} ms; slack under {BUDGET_MS} ms: {slack} ms")
+
+            tokens, kb = kv_bytes(CALL_SECONDS)
+            print(f"10-minute call: {tokens:,.0f} codec tokens; KV {kb/1e9:.2f} GB")
+            print(f"audio in a 1 GB KV budget: {rolling_window(1.0):.1f} s")
+
+            # Endpointing trade: a short threshold is responsive and cuts people off.
+            pauses = np.array([80, 120, 200, 300, 500], float)
+            p_finished = 1 / (1 + np.exp(-(pauses - 180) / 60))
+            cut_off = 1 - p_finished
+            print("cut-off probability by threshold:",
+                  {int(p): round(float(c), 2) for p, c in zip(pauses, cut_off)})
+
+            assert used == 720 and slack == 80
+            assert tokens == 60_000 and abs(kb / 1e9 - 7.86) < 0.01
+            assert 60 < rolling_window(1.0) < 100
+            assert cut_off[0] > cut_off[-1]
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-voice-kv-budget
+      title: "KV cost of a call"
+      difficulty: easy
+      prompt: >-
+        A codec emits `rate * books` tokens per second and each token costs `bytes_per_token` of
+        KV cache. Return the KV size in GB for `seconds` of audio.
+      language: python
+      entry: kv_gb
+      testCases:
+        - input: '{}'
+          expected: "7.86432"
+          tolerance: 1e-6
+        - input: '{"seconds": 60}'
+          expected: "0.786432"
+          tolerance: 1e-6
+      solution: |
+        def kv_gb(seconds=600, rate=12.5, books=8, bytes_per_token=128 * 1024):
+            return seconds * rate * books * bytes_per_token / 1e9
+      solutionExplanation: >-
+        60,000 tokens at 128 KiB is 7.86 GB for ten minutes, so a long call cannot keep its full
+        history and the window must roll.
+      tags: [voice, kv-cache]

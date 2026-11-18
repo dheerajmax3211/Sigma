@@ -1,0 +1,1330 @@
+id: computation-graphs
+slug: computation-graphs
+title: "Computation Graphs, Fusion, and Graph Execution"
+summary: >-
+  Treat the graph as a program rather than a derivative recipe: schedule its
+  nodes, fuse the passes that only touch memory, plan which activations stay
+  alive, and decide honestly when capturing the graph is worth losing dynamic
+  control flow.
+kind: lesson
+difficulty: hard
+position: 2
+estMinutes: 24
+prerequisites: [autograd-engine]
+phase: deep-learning-foundations
+tags: [computation-graph, graph-execution, operator-fusion, memory-planning, eager-vs-graph, kernels]
+
+body:
+  big_idea: >-
+    The graph is a program, not just a derivative recipe: what a model can
+    fuse, what it must keep alive, and whether it can replay a schedule are
+    properties of the graph's shape.
+
+  problem:
+    - >-
+      You profile a training step and 30% of the wall time is LayerNorm, GELU,
+      dropout and residual adds — ops that do almost no arithmetic.
+    - >-
+      `torch.compile` is fast until the last, short batch of every epoch: the
+      compiled graph was specialised to a shape it no longer sees.
+    - >-
+      You OOM on a 40 GB card, and "activations" is a diagnosis, not a fix:
+      the schedule decides which tensors stay alive.
+
+  analogy: |
+    A restaurant kitchen. The recipe's dependencies are the graph. An eager
+    cook reads one line at a time, walking to the pantry for each ingredient
+    and using a fresh pan: correct, but the walking costs more than the
+    cooking. A graph-mode kitchen writes a prep sheet — chop all the onions at
+    once, one pan for three steps — and clears counter space by predicting
+    when each component finishes.
+
+  concept_points:
+    - >-
+      **One graph, many schedules, and the executor picks one.** A DAG with
+      $V$ nodes has exponentially many valid topological orders, and finding
+      one is linear: measured, an iterative post-order DFS takes 0.16-0.19 us
+      per node, while Kahn's algorithm takes 41.1 ms on a 100,000-node chain —
+      2.2x slower for its in-degree counters. The order your Python wrote is
+      not the order that runs.
+    - >-
+      **Eager mode rebuilds and re-sorts the graph every step; graph mode captures it once.**
+      A numpy-level op on a one-element array costs 0.458 us of dispatch, so a
+      480-op step pays 0.22 ms before any arithmetic. Measured on a
+      768→3072→768 MLP: batch 1 runs at 366.7 us/token (25.7 GFLOP/s), batch
+      256 at 14.7 us/token (641 GFLOP/s). The 25x gap is launch overhead.
+    - >-
+      **Elementwise chains are memory-bound, and their arithmetic intensity does not improve with length.**
+      For $k$ elementwise ops on $N$ fp32 elements, the unfused form moves
+      $8kN$ bytes for $kN$ flops: **0.125 flop/byte regardless of $k$**.
+      Measured on 32 MiB, 1 op is 2.09 ms and 32 ops are 79.35 ms — linear, at
+      a flat 27 GB/s. Even fused, the chain reaches 4 flop/byte.
+    - >-
+      **Fusion is worth the number of collapsed passes, and pass counting gives a floor.**
+      Softmax-cross-entropy on 1024x50,257 fp32 unfused took 256.9 ms; a
+      log-sum-exp form making five passes instead of six took 130.2 ms —
+      **1.97x** on a 1.2x traffic cut, because the removed pass was a `log`
+      over 51 million elements. Transcendentals cost far more than loads.
+    - >-
+      **Peak memory is a property of the schedule, not of the graph.** The
+      same seven-node graph in two valid orders peaks at 1500 versus 1900
+      bytes — 27% more — purely from evaluating the shallow-but-large branch
+      first. The rule is Sethi-Ullman: evaluate the larger-peak subtree first.
+      A 24-layer stack keeping 12 tensors of 128 MiB per layer is 36 GiB
+      against 2.6 GB of weights.
+    - >-
+      **Training memory is retention, and checkpointing converts it to compute at $\sqrt{n}$.**
+      Storing all $n=32$ layer boundaries costs 32 tensors; storing every $k$
+      -th and recomputing the rest costs $n/k + k$, minimised at
+      $k=\sqrt{n}=5.66$, so $32/6 + 6 = 11.3$ tensors — a **2.8x** reduction
+      for about **33%** more compute.
+
+  definitions:
+    - term: "Graph executor"
+      meaning: >-
+        The component that reads a computation graph and turns it into work:
+        chooses a topological order, decides which ops to fuse, assigns memory, and
+        launches kernels. In eager frameworks it runs per step; in graph-mode
+        frameworks it runs once at capture and replays.
+    - term: "Operator fusion"
+      meaning: >-
+        Compiling two or more adjacent ops into a single kernel so intermediate
+        values stay in registers instead of going through memory. Buys bandwidth,
+        not flops.
+    - term: "Kernel"
+      meaning: >-
+        One function launched on the device, with its own launch overhead and its
+        own pass over memory. An unfused elementwise chain of 32 ops is 32 kernels
+        and 64 array-sized transfers; a fused one is 1 and 2.
+    - term: "Memory-bound"
+      meaning: >-
+        A kernel whose runtime is set by bytes moved rather than arithmetic
+        performed. Nearly every elementwise, normalisation, and reduction kernel in
+        deep learning is memory-bound; matmuls usually are not.
+    - term: "Arithmetic intensity"
+      meaning: >-
+        Flops performed per byte moved, $I = F/B$. An unfused elementwise chain sits
+        at 0.125 flop/byte in fp32 no matter how long it is; a fused chain of $k$ ops
+        sits at $k/8$, which is still below the ridge point until $k$ reaches a few
+        hundred.
+    - term: "Roofline model"
+      meaning: >-
+        $t = \max(F/P,\; B/\beta)$ for peak compute $P$ and bandwidth $\beta$. The
+        two terms cross at the ridge intensity $P/\beta$; below it you are
+        bandwidth-bound and only traffic reduction helps.
+    - term: "Activation memory"
+      meaning: >-
+        The forward values retained because a backward closure will read them. It
+        scales with batch, sequence length, width, and depth, and it is usually ten
+        times the parameter memory of a model.
+    - term: "Memory planner"
+      meaning: >-
+        The allocator pass that assigns each tensor a buffer and decides when that
+        buffer is reusable. Its objective is peak live bytes, which depends on the
+        execution order as much as on tensor sizes.
+    - term: "Graph capture and replay"
+      meaning: >-
+        Recording a sequence of kernels once, with their arguments and addresses,
+        then re-issuing the whole sequence with one call. Removes per-op launch and
+        dispatch cost; requires every input to live at the same address on every
+        replay.
+    - term: "Graph break"
+      meaning: >-
+        Any construct the tracer cannot record — data-dependent control flow,
+        `.item()`, printing, unsupported Python — which ends the captured region.
+        The model still runs, but the surrounding regions revert to eager and the
+        boundary is materialised.
+    - term: "Static shape guard"
+      meaning: >-
+        The condition under which a captured graph is valid: same shapes, dtypes,
+        and devices. A new batch or sequence length either triggers a recompile or
+        falls back, which is why dynamic shapes cost either padding or a cache of
+        compiled variants.
+    - term: "Rematerialisation (activation checkpointing)"
+      meaning: >-
+        Discarding forward values and recomputing them during the backward pass.
+        Trades one extra forward pass for $O(\sqrt{n})$ instead of $O(n)$ retained
+        tensors over $n$ layers.
+    - term: "Eager (define-by-run) mode"
+      meaning: >-
+        The graph is a side effect of executing Python, rebuilt every step. Fully
+        dynamic, trivially debuggable, and pays dispatch plus launch cost per
+        operation.
+    - term: "Graph (define-and-run) mode"
+      meaning: >-
+        The graph is built or captured ahead of execution and then optimised and
+        replayed. Enables fusion, memory planning, and whole-graph scheduling at the
+        cost of static shapes and a harder debugging story.
+
+  diagrams:
+    - type: mermaid
+      title: "Four elementwise ops, one kernel: the boundary is where fan-out or a reduction appears"
+      code: |
+        flowchart LR
+          x["x: N floats"] --> m1["mul 1.000001"]
+          m1 --> a1["add 0.000001"]
+          a1 --> t["tanh"]
+          t --> m2["mul 0.5"]
+          m2 --> y["y"]
+
+          subgraph K1["kernel 1 — read once, write once, values stay in registers"]
+            m1
+            a1
+            t
+            m2
+          end
+
+    - type: compare
+      title: "Eager vs graph mode: same arithmetic, different contract"
+      left_label: "Eager (define-by-run)"
+      left_points:
+        - "Rebuilds the graph and re-derives the schedule every step"
+        - "0.458 us of dispatch per op; 0.22 ms per 480-op step before any maths"
+        - "No cross-op fusion: 32 elementwise ops are 32 passes over the tensor"
+        - "Fully dynamic: shapes, control flow, and prints all work"
+        - "Errors point at your line of Python"
+      right_label: "Graph (capture and replay)"
+      right_points:
+        - "Captures once, then replays a fixed sequence of kernels"
+        - "Launch cost amortised: one submission instead of hundreds"
+        - "Fusion and memory planning run over the whole graph"
+        - "Static shapes and stable addresses; a new batch size recompiles"
+        - "One unsupported call breaks the region back to eager"
+
+    - type: architecture
+      title: "Where the executor sits between your model and the kernels"
+      nodes:
+        - { id: model, x: 0, y: 1, label: "Model code", kind: client, detail: "Ordinary Python or a traced function. In eager mode this is the graph; in graph mode it is the input to a tracer." }
+        - { id: capture, x: 1, y: 0, label: "Capture / trace", kind: server, detail: "Records ops, shapes, dtypes, and argument addresses into an IR. Anything it cannot record becomes a graph break, not an error." }
+        - { id: ir, x: 1, y: 2, label: "Graph IR", kind: "storage", detail: "Nodes plus shape and layout metadata. This is what the optimisation passes read — not your source code." }
+        - { id: passes, x: 2, y: 0, label: "Passes: DCE, CSE, fusion", kind: worker, detail: "Dead-code elimination, common-subexpression elimination, and fusion. Fusion is restricted to single-consumer elementwise edges because a fan-out would be recomputed." }
+        - { id: plan, x: 2, y: 2, label: "Memory planner", kind: database, detail: "Computes tensor lifetimes from the chosen order and assigns reusable buffers. Peak live bytes is its objective, and it is the number that decides whether you OOM." }
+        - { id: launch, x: 3, y: 1, label: "Scheduler / launcher", kind: gpu, detail: "Emits kernels in topological order, one launch per fused group. In replay mode it re-issues the recorded sequence with a single call." }
+      edges:
+        - { from: model, to: capture, label: "trace" }
+        - { from: capture, to: ir, label: "lower" }
+        - { from: ir, to: passes, label: "rewrite" }
+        - { from: passes, to: plan, label: "fused ops" }
+        - { from: plan, to: launch, label: "buffers + order" }
+      caption: >-
+        Every arrow is a place a framework can refuse to compile. The passes are
+        also the only stage that can see across operations, which is why they
+        capture the entire win — and the entire risk.
+
+    - type: plot
+      title: "Measured: an unfused elementwise chain is linear in the number of passes"
+      chart: "line"
+      xLabel: "elementwise ops in the chain (k)"
+      yLabel: "wall time (ms) on a 32 MiB float64 array"
+      series:
+        - name: "unfused numpy, measured"
+          points:
+            - { x: 1, y: 2.093 }
+            - { x: 4, y: 10.794 }
+            - { x: 16, y: 40.037 }
+            - { x: 32, y: 79.354 }
+        - name: "one fused pass, ideal"
+          points:
+            - { x: 1, y: 2.093 }
+            - { x: 4, y: 2.093 }
+            - { x: 16, y: 2.093 }
+            - { x: 32, y: 2.093 }
+
+    - type: graph
+      title: "Fan-out is a fusion barrier: the residual value has two consumers"
+      nodes:
+        - { id: x, label: "x" }
+        - { id: n1, label: "norm(x)" }
+        - { id: f, label: "f(n1): 12 ops" }
+        - { id: add, label: "x + f(n1)" }
+      edges:
+        - { from: x, to: n1, label: "1 consumer: fusible" }
+        - { from: n1, to: f, label: "1 consumer: fusible" }
+        - { from: x, to: add, label: "2 consumers: barrier" }
+        - { from: f, to: add, label: "1 consumer: fusible" }
+
+  markdown: |
+    ## The graph you built is a program
+
+    *Building an Autograd Engine* ended with a working `backward()`: nodes,
+    closures, a reverse topological walk. That engine answers "what is the
+    derivative?" A framework also has to answer three other questions: in what
+    order do the ops run, which of them can be merged, and which buffers must
+    stay alive while they run? Those are the **executor's** questions, and on
+    modern hardware they decide more of your throughput than the architecture
+    does.
+
+    Start with the measurement that motivates all of it. Take one 32 MiB float64
+    array, apply $k$ elementwise ops — multiply by a constant, add a constant,
+    repeat — and time it:
+
+    | $k$ | wall time | effective bandwidth | bytes moved |
+    |---|---|---|---|
+    | 1 | 2.09 ms | 32.1 GB/s | 64 MiB |
+    | 4 | 10.79 ms | 24.9 GB/s | 256 MiB |
+    | 16 | 40.04 ms | 26.8 GB/s | 1.0 GiB |
+    | 32 | 79.35 ms | 27.1 GB/s | 2.0 GiB |
+
+    Time is linear in $k$; bandwidth is flat at about 27 GB/s. Nothing about the
+    arithmetic changed — every op read the whole array and wrote the whole array.
+    At $k = 32$ you moved **2 GiB to perform 32 operations per element**. A fused
+    kernel would read once, keep the value in a register, apply all 32 ops, and
+    write once: 64 MiB and 2.1 ms. **About 38x measured** (repeat runs land between
+    37x and 40x), which is the traffic ratio of 32 with a little arithmetic on top.
+
+    ## Fusion is a bandwidth optimisation
+
+    Write the cost of a kernel the way the roofline model does:
+
+    $$t = \max\!\left(\frac{F}{P},\; \frac{B}{\beta}\right)$$
+
+    with $P$ peak flops and $\beta$ bandwidth. For fp32 elementwise code,
+    $F = kN$ and $B = 8kN$ bytes unfused, so
+
+    $$I_{\text{unfused}} = \frac{kN}{8kN} = 0.125\ \text{flop/byte},
+      \qquad I_{\text{fused}} = \frac{kN}{8N} = \frac{k}{8}.$$
+
+    The ridge point of this class of hardware is roughly 20-30 flop/byte, so an
+    unfused chain is about 200x below it and even a fully fused 32-op chain
+    reaches only 4 flop/byte. **Elementwise code is never compute-bound, fused or
+    not. Fusing it does not make the arithmetic faster; it deletes memory
+    traffic.**
+
+    Now the case that pays for the whole machinery — softmax followed by
+    cross-entropy, which every language model runs once per token over a 50,257-way
+    vocabulary:
+
+    | form | full-array passes | peak extra memory | time (1024 x 50,257, fp32) |
+    |---|---|---|---|
+    | unfused: max, sub, exp, sum, div, log, gather | 6 | 617.7 MB | 256.9 ms |
+    | log-sum-exp: max, sub, exp+sum, log, sub | 5 | 205.9 MB | 130.2 ms |
+    | hand-fused epilogue (one pass over the row) | 1 | ~0 | not expressible in numpy |
+
+    Read the two numbers against each other. The log-sum-exp form makes five
+    full-array passes where the unfused form makes six — a 1.2x reduction in
+    traffic — yet it runs **1.97x** faster. The extra win is compute: the eliminated
+    `log` over 51 million elements costs far more per element than a load and a
+    store, so removing one transcendental pass is worth more than removing one
+    vectorised add. Pass counting gives you a floor on the speedup, not the
+    speedup.
+
+    The third row is what a truly fused kernel does: it keeps the row in registers
+    and never materialises the 50,257 probabilities at all. That is why every
+    framework ships `cross_entropy` as one op rather than as `log_softmax` plus
+    `nll_loss` — the composition is correct and roughly twice as expensive as the
+    best numpy form, and more than that against a real fused kernel.
+
+    ## Memory is the schedule's shadow
+
+    Every forward value that a backward closure will read has to survive until
+    that closure runs. The set of live tensors is a function of the *order*, and
+    the peak of that set is what your allocator has to satisfy:
+
+    $$M_{\text{peak}} = \max_{t}\ \sum_{v\ \text{live at}\ t} \text{bytes}(v).$$
+
+    Two valid orders of the same graph can differ by tens of percent. Evaluate a
+    shallow branch first and its result sits on the counter while you run a deep
+    one; evaluate the deep branch first and only the small result waits. That is
+    Sethi-Ullman, and it is the same argument a compiler makes when it colours
+    registers.
+
+    For training the arithmetic is brutal and simple. Take width 4096, batch 8,
+    sequence 2048, bf16: one activation is $8 \times 2048 \times 4096 \times 2 =
+    134{,}217{,}728$ bytes = 128 MiB. A transformer block retains on the order of a
+    dozen of them, and 24 layers gives **36 GiB** against **2.6 GB** of weights — a
+    factor of 13.8. Checkpointing every $k$-th boundary makes the retained set
+    $n/k + k$ tensors, minimised at $k = \sqrt{n}$, for about a third more compute.
+
+    ## Eager and graph mode are two contracts
+
+    Eager mode's contract: the graph is whatever Python did, this step, and it
+    will be different next step if you want it to be. Graph mode's contract: the
+    graph is fixed, the shapes are fixed, the **addresses** are fixed, and in
+    exchange the executor may reorder, fuse, and pre-plan memory across the whole
+    program.
+
+    The address clause is where the in-place-mutation hazard from *Building an
+    Autograd Engine* returns in a new form. Eager mode can afford a version
+    counter, because it checks a saved tensor just before a closure reads it.
+    A captured graph has already baked the read into a kernel argument; when the
+    allocator hands layer 2 the block layer 1 used, replay depends on that write
+    having happened. So graph compilers either prove a write is safe and rewrite
+    it functionally, or they refuse to capture the region. That refusal is a graph
+    break, and it is not free: the boundary tensor is materialised and the device
+    synchronises.
+
+    ## Where people stop
+
+    The first trap is thinking fusion is about arithmetic. It is about traffic, and
+    the upper bound is the number of passes you collapse, which is why fan-out
+    limits it and why a compiler that fuses aggressively can still lose to one that
+    fuses conservatively.
+
+    The second trap is measuring a compiled model on the shape you compiled it for.
+    The win evaporates on the short batch, on the padded sequence, on the eval
+    loop with `no_grad`. Report throughput over a real epoch, including
+    recompiles.
+
+    The third is expecting the compiler to fix an algorithm. Fusion gave 1.97x on
+    the loss above; replacing the $O(V^2)$ Jacobian with an $O(V)$ VJP is worth a
+    factor of $V$. Optimise what is computed before you optimise how it is
+    executed.
+
+    ## The longer version
+
+    The graph is a program, not just a derivative recipe — what a model can fuse,
+    what it must keep alive, and whether it can replay a schedule instead of
+    rebuilding one are all properties of the graph's *shape*, so the same
+    arithmetic runs 2x or 40x faster depending on decisions made by the executor
+    that reads it.
+
+    A restaurant kitchen. The recipe's dependency structure — chop before you
+    sauté, sauté before you plate — is the graph. An **eager** cook reads one
+    line at a time, walks to the pantry for each ingredient, and uses a fresh pan
+    for every step: perfectly correct, and the walk to the pantry costs more than
+    the cooking. A **graph-mode** kitchen reads the whole recipe once, writes a
+    prep sheet that says "chop all the onions in one pass, use one pan for the
+    three things that go in it", and clears counter space by predicting when each
+    component is finished.
+
+    The mapping is exact: the prep sheet is a schedule, combining steps that use
+    the same pan is **fusion**, and counter space is **activation memory** — a
+    finished sauce sits on the counter until the step that needs it, and the
+    kitchen runs out of counter before it runs out of burners.
+
+    It breaks in two places that matter. First, the prep sheet is written for
+    exactly four guests: change the batch size and the sheet is invalid, because
+    every pan size and every counter allocation was chosen for that number. That
+    is a **static shape guard**, and it is why the last short batch of an epoch
+    recompiles. Second, a cook can taste and adjust; a captured graph cannot.
+    "Add salt until it is right" is a data-dependent branch, and it tears the prep
+    sheet — a **graph break** — dropping that whole region back to eager.
+
+    ### What goes wrong
+
+    - You profile a training step and 30% of the wall time is LayerNorm, GELU,
+      dropout, and residual adds — ops that do almost no arithmetic. You
+      rewrite the model to 'optimise' it, gain nothing, and never learn that
+      each of those ops is a separate pass over a 128 MiB tensor.
+    - You enable `torch.compile` (or XLA, or TensorRT) and the first step
+      takes four seconds, the next thousand are fast, and then the last batch
+      of every epoch — the short one — falls off a cliff because the compiled
+      graph was specialised to a shape it no longer sees.
+    - You OOM at batch 8 on a 24-layer model whose bf16 weights are 2.6 GB, on
+      a 40 GB card. 'Activations' is the diagnosis; the actionable version is
+      knowing which tensors the schedule keeps alive, for how long, and which
+      three levers actually reduce that number.
+    - Your hand-written fused attention or loss returns `nan` in production
+      but passes every unit test, because one row was fully masked and you
+      never subtracted the row maximum before exponentiating.
+    - Every ML-systems interview asks 'why does PyTorch have both eager and
+      graph mode', 'why is softmax-cross-entropy one kernel', and 'what does
+      torch.compile actually do'. The expected answers are about scheduling,
+      bandwidth, and memory — not about the chain rule.
+
+    ### The full treatment
+
+    **One graph, many schedules, and the executor picks one.** A DAG with $V$
+    nodes has exponentially many valid topological orders in the worst case, but
+    finding one costs linear time: measured on this machine, an iterative
+    post-order DFS takes 0.16-0.19 us per node (a 100,000-node chain in 18.9 ms),
+    while Kahn's algorithm takes 41.1 ms on the same chain — 2.2x slower because
+    it maintains in-degree counters and a queue. The trap is believing the order
+    your Python wrote is the order that runs. It is not, and once fusion is
+    enabled it is not even the same set of operations.
+
+    **Eager mode rebuilds and re-sorts the graph every step; graph mode captures
+    it once.** A numpy-level op on a 1-element array costs 0.458 us of pure
+    dispatch, so a 480-op model step pays 0.22 ms before any arithmetic happens.
+    Measured on a 768->3072->768 MLP: batch 1 runs at 366.7 us/token (25.7
+    GFLOP/s), batch 256 at 14.7 us/token (641 GFLOP/s) — 25x better per token.
+    Almost none of that gap is arithmetic; it is launch overhead and Python
+    dispatch, which is the entire reason capture-and-replay exists.
+
+    **Elementwise chains are memory-bound, and their arithmetic intensity does
+    not improve with length.** For $k$ elementwise ops on $N$ fp32 elements, the
+    unfused form moves $8kN$ bytes (read and write, four bytes each, per pass) for
+    $kN$ flops, so intensity is 0.125 flop/byte *regardless of k*. Measured on a
+    32 MiB array: 1 op takes 2.09 ms, 32 ops take 79.35 ms — about 38x, linear
+    in $k$, at a flat 27 GB/s. Even fully fused, a 32-op chain reaches only
+    $32/8 = 4$ flop/byte, still below the 20-30 flop/byte ridge of the hardware,
+    so elementwise code never becomes compute-bound. The trap is optimising the
+    arithmetic in these kernels; there is no arithmetic to optimise, only traffic.
+
+    **Fusion is worth the number of collapsed passes, and pass counting only
+    gives you a floor.** Softmax-cross-entropy on 1024x50,257 fp32, written
+    unfused, took 256.9 ms; a log-sum-exp form making five full-array passes
+    instead of six took 130.2 ms — 1.97x on a 1.2x traffic reduction, because the
+    pass it removed was a `log` over 51 million elements, and a transcendental
+    costs far more per element than a load and a store. The fused kernel is not
+    magic: it is fewer round trips plus fewer expensive instructions.
+
+    **Fusion duplicates work at fan-out, which is why compilers only fuse
+    single-consumer edges.** Fuse a value into two consumers and it is computed
+    twice. A residual stream value has two consumers by construction, and the
+    branch hanging off it is a dozen ops, so fusing across the residual replays
+    twelve ops for one saved read. XLA and TorchInductor both restrict producer
+    fusion to single-consumer chains — this is the fan-out rule from *Building an
+    Autograd Engine* reappearing on the forward pass, where it costs compute
+    instead of correctness.
+
+    **Peak memory is a property of the schedule, not of the graph.** The same
+    seven-node graph, two valid orders: 1500 bytes versus 1900 bytes, 27% more,
+    purely from evaluating the shallow-but-large branch before the deep one. The
+    rule is Sethi-Ullman: evaluate the subtree with the larger peak first, so the
+    smaller result is what stays live across it. The trap is assuming memory is
+    set by model size — a 24-layer stack keeping 12 tensors of 128 MiB per layer
+    is 36 GiB of activations against 2.6 GB of bf16 weights, a factor of 13.8.
+
+    **Training memory is retention, and checkpointing converts it to compute at
+    sqrt(n).** Storing all $n=32$ layer boundaries costs 32 tensors; storing every
+    $k$-th and recomputing the rest costs $n/k + k$, minimised at $k=\sqrt{n}$
+    = 5.66, i.e. 32/6 + 6 = 11.3 tensors — a 2.8x reduction. You pay for it in
+    recompute: each layer's forward runs twice, so the step goes from
+    forward+backward to 2x forward+backward, about 33% more compute.
+
+    **Graph mode's contract is static shapes and stable addresses, which is why
+    in-place mutation stops being a runtime warning and becomes a compile-time
+    constraint.** Eager PyTorch catches mutation after the fact with a version
+    counter. A captured graph holds raw pointers: the allocator hands layer 2 the
+    same 128 MiB block layer 1 used, and replay assumes every address is
+    unchanged. So a captured graph must either forbid writes to captured buffers
+    or rewrite them into functional form, and a data-dependent write — `.item()`,
+    masked assignment — forces a graph break instead.
+
+    **A graph break is all-or-nothing per region, and one is enough to lose the
+    win.** A single `.item()` in the middle of a 50-layer model splits it into
+    three regions: two compiled, one eager. The eager gap forces a device sync and
+    materialises every boundary tensor. Amdahl then does the rest: if 30% of the
+    step is elementwise and you make that 4x faster, the step is
+    $1/(0.7 + 0.3/4) = 1.29$x faster, not 4x. Make half the step 8x faster and
+    you get 1.78x.
+
+    **The compiler cannot see the biggest win, because it is the algorithm.**
+    Fusion rewrites how the same flops execute; it cannot turn a $V^2$ softmax
+    into a $V$ one, cannot delete the 2,525,766,049-entry Jacobian you never
+    needed, and cannot notice that a naive attention recomputes the same K and V
+    for 32 heads. A compiler pass is worth 2-4x. Reformulating what is computed
+    is worth 10-50x, which is why flash-attention is a new algorithm *plus* a
+    fused kernel rather than a fusion pass.
+
+
+  derivations:
+    - title: "Why an unfused chain's arithmetic intensity is independent of its length"
+      latex: |
+        Let a chain of $k$ elementwise ops act on $N$ elements of fp32, each op
+        costing one flop per element. An unfused executor runs $k$ kernels, and
+        each kernel reads its input array and writes its output array:
+        $$F_{\text{unf}} = kN, \qquad B_{\text{unf}} = 2k \cdot 4N = 8kN
+          \quad\Longrightarrow\quad
+          I_{\text{unf}} = \frac{kN}{8kN} = \frac{1}{8}\ \text{flop/byte}.$$
+        A fused kernel reads the input once, writes the output once, and holds the
+        intermediate in registers:
+        $$F_{\text{fus}} = kN, \qquad B_{\text{fus}} = 8N
+          \quad\Longrightarrow\quad
+          I_{\text{fus}} = \frac{kN}{8N} = \frac{k}{8}.$$
+        Since $t = \max(F/P, B/\beta)$ and both forms are far below the ridge point
+        $P/\beta$, the runtime is $B/\beta$ in each case and
+        $$\frac{t_{\text{unf}}}{t_{\text{fus}}}
+          = \frac{8kN/\beta}{8N/\beta} = k.$$
+      prose: >-
+        The intensity of the unfused form contains no k at all: adding passes adds
+        flops and bytes in the same proportion, so the ratio to the ridge point
+        never improves. Fusion is the only transformation that changes the ratio,
+        and its ceiling is exactly k. Measured on the 32-op chain tabulated above, the
+        slowdown against a single pass was 37.9x rather than the predicted 32x,
+        because the one-pass baseline sustained 32 GB/s while the long chain
+        sustained 27 GB/s. That 19% per-pass difference is allocator and cache
+        behaviour, not arithmetic: the ratio of *passes* is 32, the ratio of *times*
+        is 37.9, and only the first is the law.
+
+    - title: "Why sqrt(n) is the optimal checkpoint interval"
+      latex: |
+        Store every $k$-th of $n$ layer boundaries and recompute the rest. The
+        retained set is the stored boundaries plus the segment currently being
+        recomputed:
+        $$M(k) = \frac{n}{k} + k.$$
+        Differentiate and set to zero:
+        $$\frac{dM}{dk} = -\frac{n}{k^2} + 1 = 0
+          \quad\Longrightarrow\quad k = \sqrt{n},
+          \qquad M(\sqrt{n}) = 2\sqrt{n}.$$
+        For $n = 32$: $k = 5.66$, so store every 6th boundary, giving
+        $32/6 + 6 = 11.3$ tensors instead of 32. The compute cost is one extra
+        forward pass over each segment, i.e. a total of two forwards and one
+        backward instead of one and one; with the usual $C_b \approx 2C_f$,
+        $$\frac{C_{\text{ckpt}}}{C_{\text{plain}}}
+          = \frac{2C_f + C_b}{C_f + C_b} \approx \frac{4}{3}.$$
+      prose: >-
+        The two terms pull in opposite directions — more storage means fewer
+        recomputations — and their sum is minimised where they are equal, which is
+        the definition of a square root. The 2.8x memory reduction for 33% more
+        compute is the best exchange rate available in training, and it is why
+        checkpointing is the first lever anyone reaches for after OOM.
+
+    - title: "The softmax Jacobian has V-squared entries; its VJP has V"
+      latex: |
+        For logits $z \in \mathbb{R}^V$ and $p = \operatorname{softmax}(z)$,
+        $$\frac{\partial p_i}{\partial z_j} = p_i(\delta_{ij} - p_j),
+          \qquad J = \operatorname{diag}(p) - p p^\top \in \mathbb{R}^{V \times V}.$$
+        At $V = 50{,}257$ that is $V^2 = 2{,}525{,}766{,}049$ entries, 10.1 GB in
+        fp32. But the loss is a scalar, so all that is ever needed is the VJP
+        $g^\top J$ for a cotangent $g \in \mathbb{R}^V$:
+        $$\left(g^\top J\right)_j
+          = \sum_i g_i p_i (\delta_{ij} - p_j)
+          = g_j p_j - p_j \sum_i g_i p_i
+          = p_j\left(g_j - \langle g, p\rangle\right).$$
+        For cross-entropy, $L = -\log p_y$ gives $g_i = -\delta_{iy}/p_y$, so
+        $$\frac{\partial L}{\partial z_j} = p_j - \delta_{jy},$$
+        and averaged over a batch of $N$ rows, $\partial L/\partial z = (p - y)/N$.
+      prose: >-
+        The Jacobian is never formed, and that is the entire reason a fused
+        softmax-cross-entropy exists: it computes p once, subtracts the one-hot,
+        and returns a V-vector per row — 201 KB instead of 10.1 GB at a 50,257-way
+        vocabulary. Any implementation that materialises log-softmax and then
+        differentiates through it is doing V times more work than the mathematics
+        requires.
+
+  implementations:
+    - language: python
+      title: "A graph executor: fuse, plan memory, and measure the difference"
+      note: >-
+        Numerically WRONG in four ways, and each one is a real limitation of the
+        model rather than a bug to patch. (1) `peak_live` releases a buffer the
+        instant its last consumer's step ends, assuming the allocator can hand any
+        freed block to the next allocation — real pools round to 512-byte
+        boundaries, cannot always reuse a block because of alignment or stream
+        ordering, and hold workspace for reductions, so the true peak is higher and
+        this number is a lower bound. (2) Fusion is greedy and ignores recompute
+        cost: it refuses every fan-out edge, which is correct for bandwidth but
+        wrong when a 2-op producer is cheaper to recompute than to re-read. (3)
+        There is no dtype, layout, or vectorisation model, so every element costs
+        exactly its size in bytes and every op is one pass — real kernels process
+        4-16 elements per instruction and their effective traffic is not the
+        theoretical minimum. (4) The timing includes Python loop overhead, which at
+        0.458 us per op is a measurable share of a 2 ms pass.
+      code: |
+        import time
+        import numpy as np
+
+        def fusion_groups(kinds, inputs):
+            """Maximal single-consumer elementwise chains. Everything else is a singleton."""
+            n = len(kinds)
+            consumers = [[] for _ in range(n)]
+            for c in range(n):
+                for p in inputs[c]:
+                    consumers[p].append(c)
+
+            parent = list(range(n))
+
+            def find(a):
+                while parent[a] != a:
+                    parent[a] = parent[parent[a]]
+                    a = parent[a]
+                return a
+
+            for c in range(n):
+                if kinds[c] != "elementwise":
+                    continue
+                for p in inputs[c]:
+                    # Fan-out is the barrier: fusing p into both consumers would
+                    # compute p twice, so the edge is not fusible.
+                    if kinds[p] == "elementwise" and len(consumers[p]) == 1:
+                        ra, rb = find(p), find(c)
+                        if ra != rb:
+                            parent[max(ra, rb)] = min(ra, rb)
+
+            groups = {}
+            for i in range(n):
+                groups.setdefault(find(i), []).append(i)
+            return sorted((sorted(g) for g in groups.values()), key=lambda g: g[0])
+
+        def peak_live(sizes, inputs, order):
+            """Peak bytes under one schedule. Allocate the output, then free dead inputs."""
+            n = len(sizes)
+            consumers = [0] * n
+            for c in range(n):
+                for p in inputs[c]:
+                    consumers[p] += 1
+
+            live = peak = 0
+            for i in order:
+                live += sizes[i]
+                peak = max(peak, live)
+                for p in inputs[i]:
+                    consumers[p] -= 1
+                    if consumers[p] == 0:
+                        live -= sizes[p]
+            return peak
+
+        def chain(k, x, reps=3):
+            """k elementwise passes over one array: the canonical memory-bound shape.
+
+            Best of `reps`, because the first run pays page faults on a fresh 32 MiB
+            buffer and would otherwise report half the steady-state bandwidth.
+            """
+            best = float("inf")
+            for _ in range(reps):
+                t0 = time.perf_counter()
+                y = x
+                for _ in range(k):
+                    y = y * 1.000001 + 0.000001
+                best = min(best, time.perf_counter() - t0)
+            return best, 2 * k * x.nbytes
+
+        if __name__ == "__main__":
+            # Allocate outside the timer: generation costs ~5 ms and would swamp k=1.
+            x = np.random.default_rng(0).standard_normal(4 * 1024 * 1024)
+            for k in (1, 4, 16, 32):
+                dt, moved = chain(k, x)
+                print(f"k={k:2d}  {dt*1e3:7.2f} ms  {moved/dt/1e9:5.1f} GB/s  "
+                      f"{moved/2**20:7.1f} MiB moved")
+
+            print(fusion_groups(
+                ["elementwise", "elementwise", "elementwise", "elementwise"],
+                [[], [0], [0], [1, 2]]))            # [[0], [1, 2, 3]]: 0 fans out
+
+            sizes = [500, 500, 500, 500, 400, 400, 100]
+            inputs = [[], [0], [0], [1, 2], [], [4], [3, 5]]
+            print(peak_live(sizes, inputs, [0, 1, 2, 3, 4, 5, 6]))   # 1500
+            print(peak_live(sizes, inputs, [4, 5, 0, 1, 2, 3, 6]))   # 1900: 27% worse
+
+    - language: python
+      title: "Fused softmax-cross-entropy: the forward and the VJP in one place"
+      note: >-
+        Numerically WRONG in four ways. (1) `np.float32` accumulation over 50,257
+        classes loses about 1e-4 relative precision in the sum, which is fine for
+        training and wrong for a loss you intend to compare across runs; accumulate
+        the reduction in float64 or use a pairwise sum. (2) A fully masked row
+        (all `-inf`, as attention produces when a sequence is entirely padding)
+        gives `-inf - -inf = nan`; a production kernel returns 0 for that row and
+        zero gradient. (3) It is called "fused" but it is two passes over the row —
+        max, then exp-and-sum — because the max must be known before the sum. True
+        single-pass versions use an online/streaming log-sum-exp with a running
+        maximum, which is the same trick that makes flash attention possible. (4)
+        `g[...] -= 1.0` is an in-place write on a buffer that, in a captured graph,
+        is exactly the kind of alias a version counter or a functional rewrite
+        exists to catch.
+      code: |
+        import numpy as np
+
+        def fused_softmax_xent(logits, targets):
+            """Returns (loss, grad) with grad = (softmax(z) - onehot(y)) / N.
+
+            The V x V Jacobian is never formed: exp/sum gives p, and the VJP of
+            cross-entropy through softmax is just p - onehot, divided by the batch.
+            """
+            z = np.asarray(logits, dtype=np.float32)
+            n, v = z.shape
+            t = np.asarray(targets, dtype=np.int64)
+
+            # Row max first. Without it, exp(1000) overflows to inf and the
+            # subtraction inf - inf poisons the whole row with nan.
+            m = z.max(axis=1, keepdims=True)
+            e = np.exp(z - m)
+            s = e.sum(axis=1, keepdims=True)
+            p = e / s
+
+            # log-sum-exp, assembled from pieces already in registers.
+            loss = float(np.mean(np.log(s[:, 0]) + m[:, 0] - z[np.arange(n), t]))
+
+            grad = p
+            grad[np.arange(n), t] -= 1.0
+            grad /= n
+            return loss, grad
+
+        if __name__ == "__main__":
+            loss, g = fused_softmax_xent([[1.0, 2.0, 3.0]], [2])
+            print(loss)     # 0.4076058864593506 (fp32; fp64 gives 0.4076059644443806)
+            print(g)        # [[ 0.09003057  0.24472847 -0.33475904]]
+
+            # The overflow case: no max subtraction would give nan here.
+            loss, g = fused_softmax_xent([[1000.0, 0.0, -1000.0]], [1])
+            print(loss, g)              # 1000.0  [[1.0, -1.0, 0.0]]
+
+  checkpoints:
+    - id: cp-fuse-reduction
+      question: >-
+        Why can a compiler fuse `exp` into the `sum` that follows it, but not the
+        `max` that precedes it into the `exp`?
+      answerKind: short_text
+      hint: "What does each op need before it can start, and what shape does its output have?"
+      solution: >-
+        `exp` is elementwise and its consumer `sum` can consume elements as they are
+        produced, so one kernel can keep a running accumulator in a register and
+        never write the exponentiated row to memory — that is exactly what
+        `logsumexp` does internally. `max` is different in kind: `exp` needs the
+        final row maximum before it can process element one, so the max must
+        complete a full pass over the row before the second pass begins. You can
+        fuse a reduction *into its consumer* (the accumulator stays in a register),
+        but you cannot fuse a consumer into a reduction that gates it. The practical
+        consequence is that softmax-cross-entropy has a hard lower bound of two
+        passes over the row unless you use an online algorithm.
+    - id: cp-order
+      question: >-
+        A seven-node graph has peak live bytes 1500 under one topological order and
+        1900 under another. Nothing about the graph changed. What decides the
+        difference, and which branch should run first?
+      answerKind: short_text
+      hint: "Think about what is sitting on the counter while the other branch runs."
+      solution: >-
+        The order decides which results are alive *simultaneously*. Running the
+        deep branch first means that when the shallow-but-large branch runs, only
+        the deep branch's result (500 bytes) is waiting; running the large branch
+        first means its 400-byte result waits through the deep branch's internal
+        peak of 1500, giving 1900. So evaluate the subtree with the larger
+        peak first and leave the smaller result live — Sethi-Ullman. Note that this
+        is also the order that makes the memory planner's job easy: lifetimes are
+        short for everything except the value being carried.
+    - id: cp-jacobian
+      question: >-
+        At a 50,257-way vocabulary, the softmax Jacobian has 2.5 billion entries.
+        Why does the backward pass never need it, and what does it compute instead?
+      answerKind: short_text
+      hint: "The loss is a scalar. What does a scalar output need from a Jacobian?"
+      solution: >-
+        Reverse mode only ever needs the VJP $g^\top J$, a row vector times the
+        Jacobian, which contracts the $V \times V$ matrix down to a $V$-vector in
+        one step: $(g^\top J)_j = p_j(g_j - \langle g, p\rangle)$. For
+        cross-entropy the cotangent collapses further to $p_j - \delta_{jy}$. So the
+        fused kernel computes $p$, subtracts the one-hot, and returns 50,257
+        numbers — 201 KB — where materialising the Jacobian would need 10.1 GB.
+        This is the same "sweep from the small side" argument that made reverse mode
+        the right choice in the first place, applied one level down.
+    - id: cp-graph-break
+      question: >-
+        You add a logging line that calls `.item()` on a loss in the middle of a
+        compiled model. It still runs, but the step is slower than eager. Why?
+      answerKind: short_text
+      hint: "What has to happen before Python can read a scalar off the device?"
+      solution: >-
+        `.item()` is data-dependent from the compiler's point of view: it cannot be
+        recorded, so it ends the captured region. The model becomes two compiled
+        segments with an eager gap between them. The gap forces a device
+        synchronisation — the GPU must finish everything queued before the value can
+        be copied to the host — and every tensor crossing the boundary must be
+        materialised rather than kept in a fused kernel's registers. The result can
+        be slower than pure eager, because you paid the capture and compile cost and
+        then broke the graph anyway.
+    - id: cp-amdahl
+      question: >-
+        A profile says 30% of your step is elementwise and normalisation ops, and
+        you make all of them 4x faster with fusion. What is the step-level speedup,
+        and what does that tell you about where to look next?
+      answerKind: short_text
+      hint: "Use Amdahl's law with the *unchanged* 70%."
+      solution: >-
+        $1/(0.7 + 0.3/4) = 1.29$x. Even a perfect fusion pass over 30% of the step
+        cannot give you more than 1.43x, and 4x on that fraction gives 1.29x. If the
+        remaining 70% is matmul, the next lever is not another compiler pass: it is
+        precision (bf16/fp8), a better kernel for the specific shape, or a different
+        algorithm. This is why teams that only tune fusion plateau around 1.3x.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Separate three questions that feel like one. *What is the derivative?* is
+        autograd, and you already have it. *In what order does the work run, and
+        what can be merged?* is scheduling and fusion. *What must stay in memory
+        while it runs?* is lifetime planning. A graph is a program, and these are
+        the compiler's decisions — made by the executor, not by the Python that
+        wrote the expression.
+      blocks:
+        - kind: checklist
+          body: |
+            - Traffic, not flops, sets the cost of elementwise and reduction code
+            - Fusing k passes into one deletes (k-1) round trips, never more
+            - Fan-out blocks fusion because the shared value would be recomputed
+            - Peak memory depends on the order, not only on tensor sizes
+            - Graph mode buys whole-program optimisation for static shapes
+      checkpoint: >-
+        Before reading on: if a chain of 32 elementwise ops takes 38x longer than
+        one op on the same array, what exactly did the extra 31 ops cost you —
+        arithmetic, memory traffic, launch overhead, or all three?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Measure bytes first: if a kernel's arithmetic intensity is far below the
+        machine's ridge point, the only fix is to move less memory, which means
+        fusion. Then look at the graph's shape to see what may fuse — single-consumer
+        elementwise edges, stopping at reductions and fan-out. Then treat memory as
+        a scheduling problem: compute tensor lifetimes for a candidate order and
+        minimise the peak. Only after those three does capture-and-replay pay, and
+        only if your shapes are stable.
+      blocks:
+        - kind: checklist
+          body: |
+            - Compute: flops / bytes. Below the ridge? You are bandwidth-bound.
+            - Fuse: maximal runs of single-consumer elementwise ops
+            - Stop at: reductions, matmuls, and any value with two consumers
+            - Plan: simulate lifetimes, minimise peak live bytes, then reuse buffers
+            - Capture: only with stable shapes, no `.item()`, no data-dependent flow
+      checkpoint: >-
+        Why does the ordering advice ("fuse single-consumer chains") protect
+        *compute* while the roofline advice protects *bandwidth*? Which one wins
+        when a producer is cheap to recompute?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three passes over the graph, each linear. Fusion is a union-find over
+        eligible edges. Memory is a lifetime simulation. Capture is a separate
+        concern you add only after the first two.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. Fusion: connected components of single-consumer elementwise edges
+            consumers[v] = number of ops that read v
+            for each edge p -> c:
+                if kind[p] == elementwise and kind[c] == elementwise
+                   and consumers[p] == 1:
+                    union(p, c)
+            groups = components, sorted by smallest index
+
+            # 2. Memory: simulate one schedule
+            live = 0; peak = 0
+            for op in order:
+                live += size[op]           # output allocated first
+                peak = max(peak, live)
+                for p in inputs[op]:
+                    remaining[p] -= 1
+                    if remaining[p] == 0:
+                        live -= size[p]    # freed only after its LAST consumer
+            return peak
+
+            # 3. Execution: one kernel launch per fused group, in topological order
+      checkpoint: >-
+        In step 2, why must the output be allocated *before* the inputs are freed?
+        What would change in the answer if you swapped those two lines?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Two formulas do most of the work: the arithmetic-intensity ratio that sets
+        fusion's ceiling, and the square-root law that sets checkpointing's
+        exchange rate.
+      blocks:
+        - kind: math
+          body: |
+            Unfused chain of $k$ elementwise ops over $N$ fp32 elements:
+            $$B_{\text{unf}} = 2k \cdot 4N = 8kN,\quad F = kN
+              \quad\Longrightarrow\quad I_{\text{unf}} = \frac{1}{8}$$
+            Fused:
+            $$B_{\text{fus}} = 8N \quad\Longrightarrow\quad I_{\text{fus}} = \frac{k}{8}$$
+            Below the ridge point $t = B/\beta$, so
+            $$\frac{t_{\text{unf}}}{t_{\text{fus}}} = k.$$
+
+            Checkpointing, $n$ layers, store every $k$-th:
+            $$M(k) = \frac{n}{k} + k,\qquad
+              \frac{dM}{dk} = -\frac{n}{k^2} + 1 = 0
+              \quad\Longrightarrow\quad k = \sqrt{n},\; M = 2\sqrt{n}.$$
+
+            Fused cross-entropy VJP, $p = \operatorname{softmax}(z)$:
+            $$\frac{\partial L}{\partial z_j}
+              = \sum_i \frac{\partial L}{\partial p_i} p_i(\delta_{ij} - p_j)
+              = p_j - \delta_{jy}.$$
+      checkpoint: >-
+        The fusion ceiling is $k$ passes, so a 32-op chain should be at most 32x
+        slower than one op. The measured ratio was 37.9x. Can a fusion ceiling be
+        violated, or is one of those two numbers measuring something else? Say
+        precisely what each ratio is a ratio *of*.
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete planner and executor, plus the measurement harness that makes the
+        claims checkable on your own machine.
+      blocks:
+        - kind: warning
+          body: >-
+            Write the planner yourself before reading this. The algorithm is twenty
+            lines, and the bugs it teaches — allocating before freeing, counting
+            consumers instead of edges, fusing a fan-out — are exactly the ones that
+            survive code review because the output still runs.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def plan(kinds, inputs, sizes):
+                """Return (fusion_groups, peak_bytes_of_naive_order)."""
+                n = len(kinds)
+                consumers = [0] * n
+                for c in range(n):
+                    for p in inputs[c]:
+                        consumers[p] += 1
+
+                parent = list(range(n))
+                def find(a):
+                    while parent[a] != a:
+                        parent[a] = parent[parent[a]]
+                        a = parent[a]
+                    return a
+
+                for c in range(n):
+                    if kinds[c] != "elementwise":
+                        continue
+                    for p in inputs[c]:
+                        if kinds[p] == "elementwise" and consumers[p] == 1:
+                            ra, rb = find(p), find(c)
+                            if ra != rb:
+                                parent[max(ra, rb)] = min(ra, rb)
+
+                groups = {}
+                for i in range(n):
+                    groups.setdefault(find(i), []).append(i)
+                groups = sorted((sorted(g) for g in groups.values()), key=lambda g: g[0])
+
+                remaining = consumers[:]
+                live = peak = 0
+                for i in range(n):                 # forward order == topological here
+                    live += sizes[i]
+                    peak = max(peak, live)
+                    for p in inputs[i]:
+                        remaining[p] -= 1
+                        if remaining[p] == 0:
+                            live -= sizes[p]
+                return groups, peak
+
+            def traffic(kinds, inputs, sizes, fused):
+                """Bytes moved: one read + one write per kernel, one kernel per group.
+
+                Assumes every tensor is the same size, which is true for the demo
+                below and false for any real model.
+                """
+                if not fused:
+                    return 2 * sum(sizes)
+                groups, _ = plan(kinds, inputs, sizes)
+                return 2 * len(groups) * sizes[0]
+
+            if __name__ == "__main__":
+                kinds = ["elementwise"] * 4 + ["matmul"]
+                inputs = [[], [0], [0], [2], [1, 3]]
+                sizes = [32 << 20] * 5
+                groups, peak = plan(kinds, inputs, sizes)
+                print("groups", groups)           # [[0], [1], [2, 3], [4]]
+                print("peak MiB", peak / 2**20)
+                print("unfused MiB", traffic(kinds, inputs, sizes, False) / 2**20)
+      checkpoint: >-
+        The planner refuses to fuse node 0 into nodes 1 and 2 because it has two
+        consumers. Construct a case where recomputing node 0 twice would be cheaper
+        than materialising it — what has to be true about its size relative to the
+        consumers' — and explain why no production compiler tries to decide this
+        automatically.
+
+  problems:
+    - id: p-fusion-groups
+      title: "Fusion planner for a graph"
+      difficulty: medium
+      prompt: >-
+        Implement `fusion_groups(kinds, inputs)`. Ops are indexed `0..n-1` and
+        `inputs[i]` lists the indices of the ops whose outputs op `i` consumes
+        (always smaller than `i`). `kinds[i]` is one of `elementwise`, `reduction`,
+        `matmul`, `softmax`.
+
+
+        An edge `p -> c` is **fusible** when `kinds[p] == "elementwise"`,
+        `kinds[c] == "elementwise"`, and `p` has exactly one consumer across the
+        whole graph (count consumer *slots*: an op that lists the same parent twice
+        counts twice). Groups are the connected components of the undirected graph
+        formed by fusible edges; every op belongs to exactly one group, and a
+        non-elementwise op is always a singleton. Return the groups sorted by their
+        smallest index, each group sorted ascending.
+
+
+        Example: four elementwise ops with `inputs = [[], [0], [0], [1, 2]]` — op 0
+        fans out, so it cannot be fused into either consumer, and the answer is
+        `[[0], [1, 2, 3]]`.
+      starter: |
+        def fusion_groups(kinds, inputs):
+            # your implementation here
+            pass
+      language: python
+      entry: fusion_groups
+      testCases:
+        - input: '{"kinds": ["elementwise", "elementwise", "elementwise"], "inputs": [[], [0], [1]]}'
+          expected: "[[0, 1, 2]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"kinds": ["elementwise", "elementwise", "reduction", "elementwise"], "inputs": [[], [0], [1], [2]]}'
+          expected: "[[0, 1], [2], [3]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"kinds": ["elementwise", "elementwise", "elementwise", "elementwise"], "inputs": [[], [0], [0], [1, 2]]}'
+          expected: "[[0], [1, 2, 3]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"kinds": ["elementwise", "elementwise", "elementwise", "elementwise", "matmul"], "inputs": [[], [0], [], [2], [1, 3]]}'
+          expected: "[[0, 1], [2, 3], [4]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"kinds": ["matmul", "reduction", "softmax"], "inputs": [[], [0], [1]]}'
+          expected: "[[0], [1], [2]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"kinds": ["elementwise", "elementwise", "elementwise", "elementwise", "elementwise"], "inputs": [[], [0], [1], [2], [3]]}'
+          expected: "[[0, 1, 2, 3, 4]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def fusion_groups(kinds, inputs):
+            n = len(kinds)
+            consumers = [[] for _ in range(n)]
+            for c in range(n):
+                for p in inputs[c]:
+                    consumers[p].append(c)
+
+            parent = list(range(n))
+
+            def find(a):
+                while parent[a] != a:
+                    parent[a] = parent[parent[a]]
+                    a = parent[a]
+                return a
+
+            for c in range(n):
+                if kinds[c] != "elementwise":
+                    continue
+                for p in inputs[c]:
+                    if kinds[p] != "elementwise" or len(consumers[p]) != 1:
+                        continue
+                    ra, rb = find(p), find(c)
+                    if ra != rb:
+                        parent[max(ra, rb)] = min(ra, rb)
+
+            groups = {}
+            for i in range(n):
+                groups.setdefault(find(i), []).append(i)
+            return sorted((sorted(g) for g in groups.values()), key=lambda g: g[0])
+      solutionExplanation: >-
+        Fusion eligibility is an edge property, not a node property: a single
+        producer may fuse into its unique consumer, and that is the whole rule.
+        Union-find then turns the eligible edges into maximal groups in near-linear
+        time, which is why the third case comes out as `[[0], [1, 2, 3]]` — op 0 has
+        two consumers, so both of its edges are ineligible, while op 3 has a single
+        consumer and absorbs both of its parents. The reduction case shows the other
+        barrier: `reduction` is not elementwise, so it neither accepts nor donates a
+        fusible edge, and op 3 (whose only producer is the reduction) stays a
+        singleton. Sorting each group and then sorting the groups makes the output
+        canonical, because union-find's root choice is an implementation detail.
+      complexity: "O(V + E) time with path compression, O(V) space"
+      tags: [fusion, union-find, graph-compiler, kernels]
+
+    - id: p-peak-live
+      title: "Peak live bytes under a schedule"
+      difficulty: hard
+      prompt: >-
+        Implement `peak_live(sizes, inputs, order)`. `sizes[i]` is the size in bytes
+        of tensor `i`, `inputs[i]` lists the tensors consumed to produce tensor `i`,
+        and `order` is a valid topological order of all `n` tensors.
+
+
+        Simulate the schedule: executing op `i` allocates `sizes[i]` bytes, then
+        frees each input whose **last** consumer has just run. Tensor lifetimes begin
+        at allocation and end after the final consumer completes, so the peak must be
+        measured *after* the allocation and *before* those frees. A tensor that is
+        never consumed stays live to the end. Return the peak as an integer.
+
+
+        The same graph under two different orders can have different peaks — that is
+        the point of the exercise.
+      starter: |
+        def peak_live(sizes, inputs, order):
+            # your implementation here
+            pass
+      language: python
+      entry: peak_live
+      testCases:
+        - input: '{"sizes": [10, 10, 10, 10], "inputs": [[], [0], [1], [2]], "order": [0, 1, 2, 3]}'
+          expected: "20"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"sizes": [100, 100, 300, 300, 500], "inputs": [[], [], [0, 1], [0, 1], [2, 3]], "order": [0, 1, 2, 3, 4]}'
+          expected: "1100"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"sizes": [500, 500, 500, 500, 400, 400, 100], "inputs": [[], [0], [0], [1, 2], [], [4], [3, 5]], "order": [0, 1, 2, 3, 4, 5, 6]}'
+          expected: "1500"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"sizes": [500, 500, 500, 500, 400, 400, 100], "inputs": [[], [0], [0], [1, 2], [], [4], [3, 5]], "order": [4, 5, 0, 1, 2, 3, 6]}'
+          expected: "1900"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"sizes": [10, 20, 30], "inputs": [[], [0], []], "order": [0, 1, 2]}'
+          expected: "50"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"sizes": [10, 10], "inputs": [[], [0, 0]], "order": [0, 1]}'
+          expected: "20"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def peak_live(sizes, inputs, order):
+            n = len(sizes)
+            remaining = [0] * n
+            for c in range(n):
+                for p in inputs[c]:
+                    remaining[p] += 1
+
+            live = 0
+            peak = 0
+            for i in order:
+                live += sizes[i]          # allocate the output first
+                if live > peak:
+                    peak = live
+                for p in inputs[i]:
+                    remaining[p] -= 1
+                    if remaining[p] == 0:
+                        live -= sizes[p]  # free only after the LAST consumer
+            return peak
+      solutionExplanation: >-
+        The counter `remaining[p]` is the number of consumer slots still to run, so
+        a buffer is released at exactly the last reader rather than the first — the
+        difference between a planner that works and one that frees a residual stream
+        value while a second branch still needs it. Allocating before freeing is why
+        a four-node chain of 10-byte tensors peaks at 20 and not 10: a real allocator
+        needs the output to exist while the input still does. The two seven-node cases
+        differ only in `order` and produce 1500 versus 1900: running the deep branch
+        first means only its 500-byte result waits, while running the 400-byte branch
+        first makes that result survive the deep branch's 1500-byte internal peak.
+        The last case lists the same parent twice; counting slots means the buffer is
+        released exactly once, on the second decrement, rather than on the first.
+      complexity: "O(V + E) time, O(V) space"
+      tags: [memory-planning, scheduling, lifetimes, graph-execution]
+
+    - id: p-fused-xent
+      title: "Fused softmax-cross-entropy with its gradient"
+      difficulty: medium
+      prompt: >-
+        Implement `fused_softmax_xent(logits, targets)`. `logits` is an `n x V`
+        array of row-wise scores and `targets` is a list of `n` class indices.
+        Return `{"loss": float, "grad": n x V nested list}` where `loss` is the mean
+        cross-entropy and `grad` is the gradient of that mean with respect to the
+        logits.
+
+
+        The gradient must be computed from `p = softmax(logits)` directly — do not
+        build or loop over the `V x V` Jacobian. Subtract the row maximum before
+        exponentiating so that logits around 1000 do not overflow.
+      starter: |
+        import numpy as np
+
+        def fused_softmax_xent(logits, targets):
+            # your implementation here
+            pass
+      language: python
+      entry: fused_softmax_xent
+      testCases:
+        - input: '{"logits": [[1.0, 2.0, 3.0]], "targets": [2]}'
+          expected: '{"loss": 0.4076059644443806, "grad": [[0.09003057317038046, 0.24472847105479764, -0.3347590442251782]]}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"logits": [[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]], "targets": [2, 0]}'
+          expected: '{"loss": 0.7531091265562452, "grad": [[0.04501528658519023, 0.12236423552739882, -0.1673795221125891], [-0.33333333333333337, 0.16666666666666666, 0.16666666666666666]]}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"logits": [[1000.0, 0.0, -1000.0]], "targets": [1]}'
+          expected: '{"loss": 1000.0, "grad": [[1.0, -1.0, 0.0]]}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"logits": [[0.0, 0.0, 0.0, 0.0]], "targets": [0]}'
+          expected: '{"loss": 1.3862943611198906, "grad": [[-0.75, 0.25, 0.25, 0.25]]}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def fused_softmax_xent(logits, targets):
+            z = np.asarray(logits, dtype=np.float64)
+            t = np.asarray(targets, dtype=np.int64)
+            n, v = z.shape
+
+            # Row max first: exp(1000) is inf, and inf - inf is nan. This single
+            # line is the difference between a kernel and a production incident.
+            m = z.max(axis=1, keepdims=True)
+            e = np.exp(z - m)
+            s = e.sum(axis=1, keepdims=True)
+
+            # log-sum-exp assembled from the pieces already computed.
+            logsumexp = np.log(s) + m
+            picked = z[np.arange(n), t][:, None]
+            loss = float((logsumexp - picked).mean())
+
+            # d/dz of mean cross-entropy is (softmax - onehot) / n. No V x V
+            # Jacobian is ever formed: this is the VJP, not the Jacobian.
+            grad = e / s
+            grad[np.arange(n), t] -= 1.0
+            grad /= n
+
+            return {"loss": loss, "grad": [[float(x) for x in row] for row in grad]}
+      solutionExplanation: >-
+        Three lines carry the mathematics. Subtracting the row max makes the largest
+        exponent zero, so every `exp` is at most 1 and the sum cannot overflow; the
+        loss is then `log(s) + m - z[y]`, log-sum-exp with the max added back once,
+        which never forms the target's probability and so never underflows it to
+        `log(0) = -inf`. The gradient is
+        the VJP derived above, `p - onehot`, divided by the batch size: for the
+        1000-versus-0 case it evaluates to `[1, -1, 0]` exactly, which is the check
+        that the max subtraction happened at all — without it, `exp(1000)` is `inf`
+        and the row is `nan`. The uniform-logit case gives `log(4) = 1.386294...` and
+        a gradient of `-0.75` on the target, `0.25` elsewhere, which is
+        `(1/4 - 1)/1` and `(1/4)/1` — the smallest possible sanity check on the sign
+        convention.
+      complexity: "O(nV) time, O(nV) space (one probability row per example)"
+      tags: [softmax, cross-entropy, fusion, numerical-stability, vjp]
+
+  visualizers:
+    - id: vs-fusion-groups
+      kind: computation_graph
+      title: "Watch fan-out stop a fusion"
+      description: >-
+        Four elementwise ops with a shared parent. Toggle the fan-out and see the
+        planner collapse `[[0], [1, 2, 3]]` into a single `[[0, 1, 2, 3]]` group —
+        the same arithmetic, one fewer kernel boundary and one fewer pass over
+        memory.
+      params:
+        nodes: ["x", "mul", "add", "tanh", "y"]
+        edges: [["x", "mul"], ["x", "add"], ["mul", "tanh"], ["add", "tanh"], ["tanh", "y"]]
+        fanout: true
+
+  try_it: >-
+    Write a five-op elementwise chain — scale, add, GELU, scale, add — on a 16 MiB float32
+    tensor, time it, then time the same chain written as one expression. Compute FLOP/byte for
+    both and explain why the fused version wins when the multiply count is identical.
+  interview_questions:
+    - question: 'Why is a chain of elementwise ops memory-bound no matter how many ops it contains?'
+      level: mid
+      key_points:
+        - 'Each unfused op reads and writes N elements, so k ops move 8kN bytes for kN flops.'
+        - 'The ratio is 0.125 flop/byte at fp32 and it does not improve with k, because there is no reuse to amortise.'
+        - 'Fusion collapses passes: it reduces the 8kN term, not the kN term, so the arithmetic is unchanged by construction.'
+        - 'This is why peak bandwidth, not peak FLOP/s, predicts the runtime of a normalisation-and-activation chain.'
+    - question: 'torch.compile gives you 1.9x on a model with a single .item() in the middle. Why is it not 3x, and what would you change?'
+      level: senior
+      key_points:
+        - 'A graph break is all-or-nothing per region: one .item() splits a 50-layer model into two compiled regions and one eager gap.'
+        - 'The eager region forces a device sync and materialises every boundary tensor, so the win is lost at the boundary rather than spread evenly.'
+        - 'Amdahl then bounds you: a 30% eager share caps the speedup at about 3.3x however good the compiler is.'
+        - 'The fix is to move the sync and the logging out of the step, or to accumulate on device and read once per logging interval.'
+      follow_up: 'What does torch.compile do about the dynamic shapes that a variable-length batch introduces, and what does that cost?'
+    - question: 'Two schedules for the same seven-node graph use 1500 and 1900 bytes of peak memory. How is that possible?'
+      level: mid
+      key_points:
+        - 'Peak memory is a property of the order, not of the graph: the live set at each step depends on what has been consumed.'
+        - 'Evaluating the shallow-but-large branch before the deep one leaves 27% more live at the peak.'
+        - 'The rule is Sethi-Ullman: evaluate the subtree with the larger peak first, so the smaller one overlaps with it.'
+        - 'Activation checkpointing applies the same idea across depth, storing every k-th boundary and recomputing: n/k + k tensors, minimised at k = sqrt(n), which is 11.3 tensors against 32 for n = 32.'
+  common_mistakes:
+    - 'Rewriting the model to optimise a 30% share of LayerNorm, GELU, dropout and residual adds, when each is a separate pass over a 128 MiB tensor and the fix is fusion rather than algebra.'
+    - 'Fusing across the residual stream: the stream value has two consumers by construction, so fusing into both recomputes the whole branch.'
+    - 'Explaining elementwise latency with FLOP counts, where intensity is 0.125 flop/byte and the arithmetic is effectively free.'
+  further_reading:
+    - label: "Sethi & Ullman, The Generation of Optimal Code for Arithmetic Expressions (JACM 1970)"
+    - label: "Chen, Xu, Zhang & Guestrin, Training Deep Nets with Sublinear Memory Cost (2016)"

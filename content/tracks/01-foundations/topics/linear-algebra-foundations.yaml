@@ -1,0 +1,1496 @@
+id: linear-algebra-foundations
+slug: linear-algebra-foundations
+title: "Linear Algebra: Four Decompositions, One Coordinate Change"
+summary: >-
+  Vectors, matrices, and the four decompositions that every modern ML system is
+  built on. This module derives eigendecomposition and SVD from scratch, shows
+  exactly why PCA is a special case of SVD, and connects each idea to a
+  concrete failure mode you will meet in production.
+kind: lesson
+difficulty: intro
+position: 1
+estMinutes: 32
+prerequisites: []
+body:
+  summary: >-
+    Most ML curricula teach linear algebra as a checklist of formulas. That
+    approach fails because the formulas are not what you need in practice — you
+    need the *reason* each decomposition exists and the failure mode each one
+    causes. This module derives everything from the spectral theorem outward.
+
+  big_idea: >-
+    Every decomposition is one move — change coordinates until the matrix is trivial to
+    act on — and the right choice follows from a single fact: symmetric, positive
+    definite, or neither.
+
+  problem:
+    - "A matrix lands on your desk: `eig`, `svd` or `cholesky`? A formula list gives no way to choose, and the wrong choice costs stability."
+    - "Nearly every scaling bug traces to forming $X^\\top X$ instead of taking an SVD, which silently squares your condition number."
+    - "Every layer of a neural network is a matrix operation, so this is not academic — it is the layer you are optimising."
+
+  analogy: |
+    A matrix is a machine that pushes on a vector. A decomposition finds new
+    rulers — a coordinate system — in which the machine only stretches, never
+    mixes, so it scales each new direction by its own factor. The catch: not
+    every machine admits this. SVD is the general instrument; the
+    eigen-decomposition is the one for symmetric machines.
+
+  concept_points:
+    - "**The reason every decomposition exists is to make a matrix cheap to act on.** A dense $n \\times n$ matrix costs $O(n^2)$ per matrix-vector product; if it were diagonal the same product would cost $O(n)$ — one scale per coordinate. Every factorisation writes $A$ as a product whose expensive part changes coordinates and whose cheap part only scales."
+    - "**$\\sigma_i^2 = \\lambda_i(A^\\top A)$ is the load-bearing fact of the whole module.** Singular values are the square roots of the eigenvalues of $A^\\top A$. PCA, the Eckart–Young theorem, and the condition number of a network layer are all that one statement in different clothes."
+    - "**Use `eigh`, never `eig`, on a symmetric matrix.** `numpy.linalg.eig` makes no orthogonality guarantee, so its eigenvectors may not form an orthonormal basis; `eigh` exploits the symmetry and returns real eigenvalues with orthonormal eigenvectors. Cholesky is the cheap solve for SPD input — half of LU's constant — and it fails on a negative pivot, which is correct behaviour."
+    - "**Forming $X^\\top X$ before an SVD is the most common numerical mistake in ML.** It squares the condition number: if $X$ has $\\sigma_1 = 1$ and $\\sigma_2 = 10^{-8}$, then $X^\\top X$ has eigenvalues $1$ and $10^{-16}$ — at the edge of double precision, with an eigenvector that is noise. The SVD route keeps relative error near $\\epsilon$."
+    - "**The best rank-$k$ approximation needs no search.** Truncating the SVD *is* the Eckart–Young optimal solution, with error $\\sqrt{\\sum_{i>k}\\sigma_i^2}$. There is no optimisation problem to solve and no approximation quality to tune — which is why PCA is a truncation, not a training loop."
+    - "**Condition number is the number that predicts your error.** A backward-stable algorithm can still return a wildly wrong answer when the problem is ill-conditioned: relative error in the output is bounded by $\\kappa(A)\\cdot\\epsilon$. Know your data's condition number before trusting a result, and never invert a matrix where you could solve against a factorisation."
+
+  definitions:
+    - { term: "Eigenvalue", meaning: "A scalar $\\lambda$ such that $Av = \\lambda v$ for some non-zero vector $v$. It is the factor by which $A$ stretches one particular direction." }
+    - { term: "Eigenvector", meaning: "A non-zero vector $v$ with $Av = \\lambda v$. For a symmetric matrix, the eigenvectors of distinct eigenvalues are orthogonal and form an orthonormal basis." }
+    - { term: "Singular value", meaning: "The square root of an eigenvalue of $A^\\top A$: $\\sigma_i = \\sqrt{\\lambda_i(A^\\top A)}$. Always real and non-negative, unlike eigenvalues, which may be negative or complex." }
+    - { term: "Orthogonal matrix", meaning: "A matrix $Q$ with $Q^\\top Q = I$. It preserves lengths and angles — a pure rotation or reflection. The $Q$ in an eigendecomposition is orthogonal." }
+    - { term: "Singular vectors", meaning: "The left and right singular vectors, $u_i$ and $v_i$, with $Av_i = \\sigma_i u_i$. For a square symmetric positive definite matrix these coincide with the eigenvectors." }
+    - { term: "Condition number", meaning: "$\\kappa(A) = \\sigma_{\\max}/\\sigma_{\\min}$. The factor by which the input must be perturbed to explain the error in the output." }
+    - { term: "Cholesky decomposition", meaning: "$A = LL^\\top$ for symmetric positive definite $A$, with $L$ lower triangular. Exists if and only if $A$ is positive definite." }
+    - { term: "Rank", meaning: "The dimension of the column space — the number of linearly independent directions in $A$. The rank of $A$ equals the number of non-zero singular values." }
+    - { term: "Power iteration", meaning: "An iterative method for the dominant eigenpair: repeatedly multiply by $A$ and renormalise. Converges at a rate set by the spectral gap $\\lambda_2/\\lambda_1$." }
+    - { term: "Rayleigh quotient", meaning: "$v^\\top A v$ for unit $v$. It is an estimate of an eigenvalue of $A$ even when $v$ is not yet an eigenvector, and it is maximised exactly at the eigenvectors." }
+
+  diagrams:
+    - type: compare
+      title: "Which decomposition do I reach for?"
+      left_label: "Symmetric / SPD matrix"
+      left_points:
+        - "Need the eigen-directions → `eigh(A)` (never `eig`)"
+        - "Need to solve $Ax = b$ → `cholesky(A)`, then forward/back substitution"
+        - "Want the best low-rank approximation → still take the SVD; it is valid for any matrix"
+      right_label: "Anything else"
+      right_points:
+        - "Square, non-symmetric → `svd(A)`; the singular values are always well-behaved"
+        - "Rectangular → `svd(A)`; use `full_matrices=False` to avoid the huge $U$"
+        - "Ill-conditioned → `svd(A)`, and never form $A^\\top A$ on the way there"
+    - type: architecture
+      title: "Where each decomposition lives in a training pipeline"
+      nodes:
+        - { id: data, x: 0, y: 1, label: "Raw data", kind: client, detail: "The raw matrix $X$ of shape $(n, p)$. Nothing has been assumed about its conditioning yet." }
+        - { id: center, x: 1, y: 1, label: "Centring", kind: server, detail: "Subtract the column means. Not optional: uncentred PCA finds the direction of the mean, not the direction of maximum variance." }
+        - { id: svd, x: 2, y: 1, label: "SVD", kind: model, detail: "$X_c = U\\Sigma V^\\top$. This single call gives you the principal components, the explained variance, and the rank of the data." }
+        - { id: pca, x: 3, y: 0, label: "Components $V_k$", kind: database, detail: "The top $k$ right singular vectors. Each is a unit-norm direction in feature space." }
+        - { id: var, x: 3, y: 2, label: "Explained variance", kind: cache, detail: "$\\sigma_i^2 / \\sum_j \\sigma_j^2$. Deciding $k$ is choosing how much variance to discard — a judgement call, not a formula." }
+        - { id: proj, x: 4, y: 1, label: "Projection $X_cV_k$", kind: server, detail: "The reduced representation. Everything downstream now operates in $k$ dimensions instead of $p$." }
+      edges:
+        - { from: data, to: center, label: "subtract mean" }
+        - { from: center, to: svd }
+        - { from: svd, to: pca, label: "V[:, :k]" }
+        - { from: svd, to: var, label: "S²" }
+        - { from: pca, to: proj, label: "× V_k" }
+    - type: pipeline
+      title: "The order of operations that keeps your numerics honest"
+      nodes:
+        - label: "Centre the data"
+          note: "Xc = X - X.mean(axis=0)"
+          detail: "Skipping this makes PCA find the mean direction rather than the maximum-variance direction. It is the single most common PCA bug."
+        - label: "Take the SVD of Xc"
+          note: "U, S, Vt = np.linalg.svd(Xc, full_matrices=False)"
+          detail: "Never `svd(X.T @ X)`. The Gram matrix costs an extra O(np²) and squares your condition number."
+        - label: "Read the singular values"
+          note: "S is already sorted descending"
+          detail: "The spectrum tells you the numerical rank and the explained-variance profile in one glance — no separate variance computation needed."
+        - label: "Truncate"
+          note: "k components → Vt[:k]"
+          detail: "Truncation IS the optimal rank-k approximation. There is no search to run."
+        - label: "Project"
+          note: "Z = Xc @ Vt[:k].T"
+          detail: "The reduced matrix. From here, everything downstream is cheaper and better conditioned."
+    - type: stack
+      title: "The four layers of the problem, bottom to top"
+      layers:
+        - "Numerics: how accurately can this even be computed in float64?"
+        - "Conditioning: how much does a small input error move the answer?"
+        - "Structure: is the matrix symmetric? positive definite? rank-deficient?"
+        - "Choice: which decomposition do I therefore reach for?"
+    - type: graph
+      title: "One fact, five consequences"
+      nodes:
+        - { id: fact, label: "σ² = λ(AᵀA)" }
+        - { id: pca, label: "PCA" }
+        - { id: ey, label: "Eckart–Young" }
+        - { id: cond, label: "Condition number" }
+        - { id: "null", label: "Null space" }
+        - { id: ridge, label: "Ridge spectrum" }
+      edges:
+        - { from: fact, to: pca, label: "top eigenvector" }
+        - { from: fact, to: ey, label: "truncation is optimal" }
+        - { from: fact, to: cond, label: "κ = σmax/σmin" }
+        - { from: fact, to: "null", label: "zero eigenvalues" }
+        - { from: fact, to: ridge, label: "eigenvalues σ²+λ" }
+    - type: cycle
+      title: "How power iteration converges"
+      steps:
+        - "Multiply: w = A · v"
+        - "Renormalise: v = w / ‖w‖"
+        - "Estimate: λ = vᵀAv (Rayleigh quotient)"
+        - "Check the gap: |λ_new − λ| < tol?"
+        - "Repeat — convergence rate is set by λ₂/λ₁"
+    - type: plot
+      title: "Condition number explodes when you square the matrix"
+      chart: "line"
+      xLabel: "σ₂ / σ₁"
+      yLabel: "κ(AᵀA) relative to κ(A)"
+      series:
+        - name: "κ(XᵀX) = κ(X)²"
+          points:
+            - { x: 0.1, y: 1.0 }
+            - { x: 0.2, y: 4.0 }
+            - { x: 0.4, y: 16.0 }
+            - { x: 0.6, y: 36.0 }
+            - { x: 0.8, y: 64.0 }
+            - { x: 1.0, y: 100.0 }
+        - name: "κ(X) — unchanged"
+          points:
+            - { x: 0.1, y: 10.0 }
+            - { x: 0.2, y: 10.0 }
+            - { x: 0.4, y: 10.0 }
+            - { x: 0.6, y: 10.0 }
+            - { x: 0.8, y: 10.0 }
+            - { x: 1.0, y: 10.0 }
+
+  markdown: |
+    ## Why this module is longer than it needs to be
+
+    You will meet four decompositions in this module: eigen-decomposition, the
+    singular value decomposition, the Cholesky factorization, and PCA. The
+    temptation is to memorise each as a formula. Resist it. Each one exists to
+    solve a specific problem, and if you understand the problem, the formula is
+    recoverable.
+
+    The unifying thread is this: **all of them are ways of making a matrix
+    easier to act on.**
+
+    - A general matrix $A \in \mathbb{R}^{n \times n}$ is expensive to work
+      with: multiplying by it is $O(n^2)$, and it has no structure to exploit.
+    - If $A$ were diagonal, acting on it would be $O(n)$ — just scale each
+      coordinate.
+    - So every decomposition here asks: *can I write this matrix as a product
+      of simpler matrices, one of which is diagonal or triangular?*
+
+    ## 1. Vectors: the data structure of ML
+
+    A vector $v \in \mathbb{R}^n$ is a column of $n$ reals. You will meet three
+    kinds, and conflating them causes real bugs:
+
+    | Kind | Shape | What it means | Example |
+    |---|---|---|---|
+    | **Column** | $n \times 1$ | a single data point | one image's pixels |
+    | **Row** | $1 \times n$ | a feature description | "this sample is 3 tall" |
+    | **Batch (row-major)** | $B \times n$ | many points stacked | a minibatch |
+
+    In code (NumPy), the distinction is the difference between `v` of shape
+    `(n,)` and `v` of shape `(n, 1)`. This is not pedantry. Broadcasting
+    semantics differ: `A @ v` with `v` shape `(n,)` gives shape `(m,)`, but with
+    `v` shape `(n, 1)` gives shape `(m, 1)`. The second is almost never what you
+    want in a forward pass, and the resulting bug is silent.
+
+    ### The three operations that matter
+
+    **Dot product.** $u \cdot v = \sum_{i} u_i v_i$. Geometrically it is
+    $\|u\|\|v\|\cos\theta$, so it measures alignment. In ML it is how a neuron
+    measures agreement between an input and a weight vector — and the sign
+    tells you whether the activation is excitatory or inhibitory.
+
+    **Norm.** $\|v\|_2 = \sqrt{v \cdot v}$. The Euclidean norm. Also important:
+    $\|v\|_1 = \sum_i |v_i|$, and the *infinity norm* $\|v\|_\infty =
+    \max_i |v_i|$. These are not interchangeable, and the difference matters for
+    robustness (see §7).
+
+    **Cosine similarity.**
+    $$
+    \cos(\theta) = \frac{u \cdot v}{\|u\|_2 \|v\|_2}
+    $$
+    Scale-invariant: it ignores magnitude and keeps only direction. This is
+    exactly why retrieval systems and recommendation engines use it — a query
+    and a document of very different lengths should still be comparable.
+
+    ### Span, rank, and why dimensionality matters
+
+    The **span** of a set of vectors is the set of all linear combinations of
+    them. The **rank** of a matrix is the dimension of its column space (equal
+    to the dimension of its row space — a theorem worth knowing, since it means
+    you never have to check both).
+
+    Rank deficiency is not an edge case in ML; it is the norm. Consider the
+    famous Anscombe's quartet: four datasets with identical means, variances,
+    and linear regression lines, wildly different plots. Three are linear with
+    different noise; one is a curve with a single influential outlier. A
+    dataset can be full-rank and still be nothing but noise.
+
+    Concretely, in ML rank deficiency shows up as:
+    - **Perfectly collinear features.** Two features where one is a linear
+      combination of others. The design matrix $X$ becomes singular, $X^\top X$
+      is singular, and the normal equations break.
+    - **More features than samples.** $n < p$, so $X$ has rank at most $n < p$.
+      You cannot uniquely recover $p$ coefficients. This is why regularisation
+      and dimensionality reduction exist at all.
+
+    ## 2. Matrices and the four factorisations
+
+    A matrix $A \in \mathbb{R}^{m \times n}$ is a linear map
+    $\mathbb{R}^n \to \mathbb{R}^m$. Composition of maps is matrix
+    multiplication; that is the entire reason matrix multiplication is
+    associative and non-commutative.
+
+    ### 2.1 LU decomposition — Gaussian elimination, packaged
+
+    Every invertible square matrix factors as $A = LU$ (or $PA = LU$ with
+    partial pivoting). $L$ is lower triangular, $U$ is upper triangular.
+
+    Why you care: solving $Ax = b$ becomes forward and back substitution, each
+    $O(n^2)$ instead of $O(n^3)$ for inversion. This is the workhorse of
+    numerical linear algebra, and it is what `scipy.linalg.lu_factor` gives you.
+
+    ### 2.2 Cholesky decomposition — positive definite matrices
+
+    If $A$ is symmetric positive definite (SPD), then
+    $$
+    A = LL^\top
+    $$
+    with $L$ lower triangular and having positive diagonal.
+
+    **Derivation sketch.** Assume $A = LL^\top$ and match entries:
+    $A_{ij} = \sum_{k \le \min(i,j)} L_{ik}L_{jk}$. For $i \ge j$ this gives
+    the forward recursion
+    $$
+    L_{ij} = \frac{A_{ij} - \sum_{k<j} L_{ik}L_{jk}}{L_{jj}},
+    \qquad
+    L_{jj} = \sqrt{A_{jj} - \sum_{k<j} L_{jk}^2}
+    $$
+    with $L_{ii} = \sqrt{A_{ii}}$ on the diagonal.
+
+    **Why you care.** Cholesky is $O(n^3)$ but with a tiny constant, roughly
+    half the cost of LU, and it is *numerically stable* — guaranteed for SPD
+    matrices. It appears in:
+    - **Gaussian processes**: the kernel matrix $K$ is SPD, and the predictive
+      distribution requires solving $K\alpha = y$ and computing
+      $\log\det K = 2\sum_i \log L_{ii}$.
+    - **Sampling from Gaussians**: if $\Sigma = LL^\top$ then $z = L\epsilon$
+      with $\epsilon \sim \mathcal{N}(0, I)$ gives $z \sim \mathcal{N}(0, \Sigma)$.
+    - **Newton's method in optimisation**: the Hessian of a log-likelihood is
+      often SPD, and the Newton update is $H^{-1}g$, computed by Cholesky.
+
+    ## 3. Spectral theory — eigenvalues and eigenvectors
+
+    ### The definition and the geometric meaning
+
+    $v \in \mathbb{R}^n$ is an **eigenvector** of $A$ with **eigenvalue**
+    $\lambda$ if
+    $$
+    Av = \lambda v, \qquad v \neq 0
+    $$
+
+    Read it geometrically: $A$ acts on $v$ by stretching it by $\lambda$ (and
+    flipping its sign if $\lambda < 0$). If $|\lambda| > 1$ it stretches;
+    if $|\lambda| < 1$ it contracts; if $\lambda = 1$ it is a fixed direction;
+    if $\lambda = 0$ the vector is annihilated.
+
+    ### Deriving the characteristic polynomial
+
+    $Av = \lambda v$ rearranges to $(A - \lambda I)v = 0$. A non-trivial
+    solution $v \neq 0$ exists exactly when the matrix is singular:
+    $$
+    \det(A - \lambda I) = 0
+    $$
+    This is the **characteristic equation**. Its roots are the eigenvalues.
+
+    Worked example, $A = \begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix}$:
+    $$
+    \det(A - \lambda I) = (2-\lambda)^2 - 1 = \lambda^2 - 4\lambda + 3
+      = (\lambda - 1)(\lambda - 3)
+    $$
+    So $\lambda_1 = 1$, $\lambda_2 = 3$.
+
+    For $\lambda = 3$: $(A - 3I)v = 0$ gives $-v_1 + v_2 = 0$, so
+    $v_1 = v_2$, and $v_1 = (1, 1)^\top$.
+    For $\lambda = 1$: $(A - I)v = 0$ gives $v_1 + v_2 = 0$, so
+    $v_1 = (1, -1)^\top$.
+
+    Check: $A(1,1)^\top = (3, 3)^\top = 3 \cdot (1,1)^\top$ ✓.
+
+    ### The spectral theorem
+
+    **Theorem.** $A$ is real symmetric ($A^\top = A$) if and only if it has an
+    orthonormal basis of eigenvectors. Equivalently, there exists an orthogonal
+    matrix $Q$ and a diagonal matrix $\Lambda$ with
+    $$
+    A = Q\Lambda Q^\top
+    $$
+
+    This is the single most important theorem in applied linear algebra,
+    because it says: *a symmetric matrix is just a rotation into a coordinate
+    system where it does nothing but scale each axis.*
+
+    **Proof sketch.** If $Av_i = \lambda_i v_i$ and the $v_i$ form a basis,
+    then $A = V\Lambda V^{-1}$ (expand $A$ in the eigenbasis). For symmetric
+    $A$, different eigenvectors are orthogonal: $v_i^\top v_j \neq 0$ implies
+    $\lambda_i = \lambda_j$, so we can choose an orthonormal basis, $V^{-1} =
+    V^\top$, giving $A = V\Lambda V^\top$.
+
+    ### Why symmetry shows up everywhere in ML
+
+    Nearly every matrix you will differentiate against in a loss is symmetric,
+    because it came from $X^\top X$, $WW^\top$, or $K = XX^\top$:
+
+    | Matrix | Origin | Symmetric? |
+    |---|---|---|
+    | $X^\top X$ (Gram / $X^\top X$ matrix) | any design matrix | yes |
+    | $W^\top W$ | any weight matrix | yes |
+    | $WW^\top$ | any weight matrix | yes |
+    | $K$ (RBF kernel) | Gaussian kernel | yes (PSD) |
+    | $H$ (Hessian of a log-likelihood) | smooth objective | often |
+
+    This is not a coincidence — it is a consequence of $B^\top A B$ being
+    symmetric when $A$ is. It is why you can use `eigh` and not `eig`, and why
+    the covariance matrix is always symmetric.
+
+    ### Power iteration — and why it is the whole story of PCA training
+
+    You rarely need *all* eigenvectors. You usually need the top one or two.
+    Power iteration finds the dominant eigenpair:
+    $$
+    v_{k+1} = \frac{Av_k}{\|Av_k\|_2}
+    $$
+    Starting from a random $v_0$, this converges to the eigenvector of the
+    largest-magnitude eigenvalue.
+
+    **Why it converges.** Write $v_0 = \sum_i c_i v_i$ in the eigenbasis. Then
+    $A^k v_0 = \sum_i c_i \lambda_i^k v_i$, and after normalisation the terms
+    with largest $|\lambda_i|$ dominate. Convergence rate depends on the ratio
+    $|\lambda_2| / |\lambda_1|$ — a *spectral gap*. When the gap is small,
+    convergence is slow, which is exactly the ill-conditioning that makes PCA
+    unstable in practice.
+
+    ### Condition number — the number that tells you when to distrust a result
+
+    For an SPD matrix, the condition number in the 2-norm is
+    $$
+    \kappa_2(A) = \frac{\sigma_{\max}}{\sigma_{\min}}
+    $$
+    where $\sigma$ are the singular values. It measures how much the output
+    can be amplified relative to the input.
+
+    - $\kappa = 1$: perfectly conditioned (orthogonal matrices).
+    - $\kappa$ large: small input perturbations produce large output
+      perturbations.
+
+    **This is the number to watch when you normalise features, and the reason
+    ridge regression exists.** In the normal equations $X^\top X w = X^\top y$,
+    the condition number of $X^\top X$ is $\kappa(X)^2$ — squaring the
+    condition number. Ridge regression adds $\lambda I$:
+    $$
+    (X^\top X + \lambda I)w = X^\top y
+    $$
+    whose eigenvalues are $\sigma_i^2 + \lambda$, all at least $\lambda$. The
+    condition number collapses to $\frac{\sigma_{\max}^2 + \lambda}{\sigma_{\min}^2
+    + \lambda}$, which is bounded and well-behaved for $\lambda > 0$. Ridge
+    does not "improve" the model; it makes the *numerics* of solving the
+    system well-posed.
+
+    ## 4. The singular value decomposition
+
+    ### Definition
+
+    Every real $m \times n$ matrix $A$ has an SVD
+    $$
+    A = U\Sigma V^\top
+    $$
+    where $U \in \mathbb{R}^{m \times m}$ and $V \in \mathbb{R}^{n \times n}$ are
+    orthogonal, and $\Sigma \in \mathbb{R}^{m \times n}$ is diagonal with
+    non-negative entries $\sigma_1 \ge \sigma_2 \ge \cdots \ge \sigma_r > 0$,
+    with $r = \operatorname{rank}(A)$.
+
+    ### Deriving SVD from the eigendecomposition of $A^\top A$
+
+    This is worth doing carefully, because it reveals what SVD *is*.
+
+    Consider $A^\top A$. It is symmetric positive semi-definite (for any $x$,
+    $x^\top A^\top A x = \|Ax\|^2 \ge 0$). By the spectral theorem:
+    $$
+    A^\top A = V\Lambda V^\top
+    $$
+
+    Take the eigenvector equation $A^\top A v_i = \lambda_i v_i$. Multiply by
+    $A$:
+    $$
+    A(A^\top A v_i) = \lambda_i (Av_i)
+    $$
+    and note $A^\top A v_i = \lambda_i v_i$ implies $A^\top(Av_i) = \lambda_i v_i$,
+    so $Av_i$ is an eigenvector of $AA^\top$ with eigenvalue $\lambda_i$.
+
+    Define $u_i = Av_i / \sigma_i$ where $\sigma_i = \sqrt{\lambda_i}$. Then
+    $Av_i = \sigma_i u_i$, and substituting:
+    $$
+    AA^\top \left(\frac{Av_i}{\sigma_i}\right) = \lambda_i \frac{Av_i}{\sigma_i}
+    \quad\Longrightarrow\quad
+    AA^\top u_i = \lambda_i u_i = \sigma_i^2 u_i
+    $$
+    So $u_i$ is an eigenvector of $AA^\top$.
+
+    Now reconstruct $A$. Since $Av_i = \sigma_i u_i$, we have $A = \sum_i
+    \sigma_i u_i v_i^\top$, which is exactly $A = U\Sigma V^\top$ with
+    $U = [u_1 \dots u_r]$, $\Sigma = \operatorname{diag}(\sigma_1 \dots
+    \sigma_r)$, $V = [v_1 \dots v_r]$.
+
+    **Key structural fact:** the right singular vectors $v_i$ are eigenvectors of
+    $A^\top A$, and the left singular vectors $u_i$ are eigenvectors of
+    $AA^\top$.
+
+    ### The four fundamental subspaces
+
+    This is the payoff of the derivation:
+
+    | Subspace | Definition | Dimension |
+    |---|---|---|
+    | Column space | $\operatorname{span}(A)$ | $r$ |
+    | Row space | $\operatorname{span}(A^\top)$ | $r$ |
+    | Null space | $\ker(A)$, $Ax = 0$ | $n - r$ |
+    | Left null space | $\ker(A^\top)$ | $m - r$ |
+
+    - **Row space** is spanned by the left singular vectors $u_1 \dots u_r$.
+    - **Column space** is spanned by the right singular vectors $v_1 \dots v_r$.
+    - **Null space** is spanned by $v_{r+1} \dots v_n$ — the right singular
+      vectors with *zero* singular value. These are the directions that $A$
+      destroys.
+    - **Left null space** is spanned by $u_{r+1} \dots u_m$.
+
+    The orthogonal complements are related:
+    $$
+    \operatorname{col}(A) = \operatorname{row}(A)^\perp,
+    \qquad
+    \operatorname{null}(A) = \operatorname{row}(A)^\perp
+    $$
+
+    **ML significance.** The null space of $X$ is the space of input
+    perturbations that leave the predictions unchanged. If your model has a
+    null direction, then it cannot distinguish two inputs that differ along
+    it — a genuine loss of information, and sometimes a fairness problem.
+
+    ### SVD as the best rank-$k$ approximation
+
+    **Eckart–Young theorem.** The best rank-$k$ approximation to $A$ in the
+    Frobenius norm is $A_k = U_k \Sigma_k V_k^\top$, with
+    $$
+    \|A - A_k\|_F = \sqrt{\sum_{i>k} \sigma_i^2}
+    $$
+
+    The proof is a one-line argument: any rank-$k$ matrix $B$ has
+    $B = \tilde{U}\tilde{\Sigma}\tilde{V}^\top$ with $k$ non-zero singular
+    values, and
+    $$
+    \|A - B\|_F^2 = \sum_{i=1}^{k}(\sigma_i - \tilde{\sigma}_i)^2 + \sum_{i>k}\sigma_i^2 + \text{(extra terms)} \ge \sum_{i>k}\sigma_i^2
+    $$
+    with equality precisely when $B$ keeps the top-$k$ components.
+
+    **This is the theoretical justification for truncated SVD** — the
+    low-rank approximation you use in LSA, in LoRA, and in almost every
+    "compress the weights" trick.
+
+    ### SVD vs. eigendecomposition — when to use which
+
+    | | Eigen-decomposition | SVD |
+    |---|---|---|
+    | Requires | Square, and (for real results) symmetric | Any $m \times n$ |
+    | Eigenvalues | Can be complex, can be negative | Singular values always $\ge 0$ |
+    | Condition number | Needs symmetric/positive-definite | Always available |
+    | Cost | $O(n^3)$ | $O(mn\min(m,n))$ |
+    | Use when | The matrix is SPD and you want a spectral view | You want robustness, or a non-square matrix |
+
+    ## 5. PCA, derived properly
+
+    ### The problem PCA solves
+
+    Given centred data $X \in \mathbb{R}^{n \times p}$ ($n$ samples, $p$
+    features), find the direction $w \in \mathbb{R}^p$ (unit norm) that
+    captures the most variance in the projected data $Xw$.
+
+    The variance of the projection is
+    $$
+    \operatorname{Var}(Xw) = w^\top X^\top X w
+    $$
+    (using $\|Xw\|^2 = w^\top X^\top X w$, and since $w$ is unit norm the
+    squared norm equals the variance).
+
+    So we solve
+    $$
+    \max_{w^\top w = 1} w^\top (X^\top X) w
+    $$
+
+    ### The Lagrange multiplier solution
+
+    The constraint is enforced with a multiplier $\lambda$:
+    $$
+    \mathcal{L}(w, \lambda) = w^\top X^\top X w - \lambda(w^\top w - 1)
+    $$
+    Differentiate and set to zero:
+    $$
+    \frac{\partial \mathcal{L}}{\partial w} = 2X^\top X w - 2\lambda w = 0
+    $$
+    hence
+    $$
+    X^\top X w = \lambda w
+    $$
+
+    **This is the eigenvector equation for $X^\top X$.** So the optimal $w$ is
+    the top eigenvector of $X^\top X$, and the maximum variance achieved is
+    $\lambda$ — the corresponding eigenvalue.
+
+    ### Why PCA is a special case of SVD
+
+    Since $X^\top X$ is symmetric PSD, write $X^\top X = V\Sigma^2 V^\top$. Then
+    for a unit vector $w$:
+    $$
+    w^\top X^\top X w = \sum_{i=1}^{p} \sigma_i^2 (v_i^\top w)^2
+    $$
+    With $\sum_i (v_i^\top w)^2 = 1$, this is maximised by putting all the weight
+    on the largest $\sigma_i$. So the top eigenvector of $X^\top X$ is $v_1$,
+    the top right singular vector of $X$.
+
+    **Therefore: PCA via SVD is identical to PCA via $X^\top X$ — but
+    numerically far better.**
+
+    Here is why. The "covariance" route requires forming $X^\top X$, which
+    *squares* the condition number. If $X$ has singular values
+    $\sigma_1 = 1$ and $\sigma_2 = 10^{-8}$, then $X^\top X$ has eigenvalues
+    $1$ and $10^{-16}$ — at the edge of double precision. The eigenvector for
+    the tiny direction is numerically garbage.
+
+    The SVD route never forms $X^\top X$. It works with $\sigma_i$ directly, so
+    the relative error in $\sigma_2$ is about $\epsilon$, not
+    $\epsilon/\sigma_2^2$.
+
+    **Practical consequence:** always use `sklearn.decomposition.PCA(svd_solver='full')`
+    or `np.linalg.svd`, never the `covariance_eigh` solver, on ill-conditioned
+    data. This is not a micro-optimisation; it is the difference between a
+    correct answer and numerical noise.
+
+    ### Centring is not optional
+
+    PCA finds directions of maximum variance. If you forget to centre $X$, the
+    first principal component will point along the *mean*, not along the
+    variation. Concretely: a dataset where feature 2 is `feature 1 + 100`
+    (perfectly correlated, shifted) has essentially no variance structure of
+    its own, and uncentred PCA will happily return the mean vector as the
+    "principal direction".
+
+    ### The projection and reconstruction
+
+    - Scores (projected data): $Z = X V_k$
+    - Reconstruction: $\hat{X} = Z V_k^\top = X V_k V_k^\top$
+    - Explained variance ratio for component $i$:
+      $$
+      \frac{\sigma_i^2}{\sum_j \sigma_j^2}
+      $$
+
+    ## 6. Putting it together: the geometry of a linear layer
+
+    A dense layer computes $y = Wx + b$ with $W \in \mathbb{R}^{m \times n}$.
+
+    - The **singular values of $W$** determine how the layer transforms
+      directions. Directions aligned with the top singular vectors are
+      amplified; those aligned with the bottom are suppressed.
+    - The **condition number $\kappa(W)$** determines how much a perturbation
+      in $x$ is amplified. $\kappa(W) \approx 1$ means the layer is
+      well-conditioned.
+    - **Layer normalisation** rescales activations to control exactly this
+      scale mismatch — it is a direct response to the spectral properties of
+      the weight matrix.
+
+    This is the bridge between linear algebra and practice: modern networks are
+    not just stacking linear maps, they are stacking maps whose *spectra* you
+    must keep under control.
+
+    ## 7. Numerical reality: what actually breaks
+
+    Everything above assumes exact arithmetic. In floating point:
+
+    | Symptom | Cause | Mitigation |
+    |---|---|---|
+    | `LinAlgError: Eigenvalues did not converge` | ill-conditioned matrix | scale features; add ridge $\lambda I$ |
+    | PCA components with tiny variance but huge weights | $X^\top X$ squared the condition number | use SVD, not covariance |
+    | Negative variances from `np.var` | catastrophic cancellation | use a stable algorithm (Welford) |
+    | Exploding gradients | $\prod W^{(l)}$ amplifies if $\sigma_{\max}(W) > 1$ | normalisation layers, careful init |
+    | Vanishing gradients | $\sigma_{\min}$ shrinks layer over layer | residual connections, ReLU-family |
+
+    **A concrete failure worth internalising.** Consider a layer with
+    $W = 0.9 I$ repeated 50 times. Each layer scales a signal by 0.9, so the
+    output is scaled by $0.9^{50} \approx 0.005$ — the signal nearly vanishes.
+    Now $W = 1.1 I$ repeated 50 times: $1.1^{50} \approx 117$. The signal
+    explodes. Neither layer has an eigenvalue outside $[0.9, 1.1]$ — each is
+    "close to identity" — yet 50 layers amplify by 117×. This is the spectral
+    reason why deep networks need normalisation, and why "keep the weights
+    near 1" is a genuinely dangerous heuristic on its own.
+
+    ## The longer version
+
+    The remaining statements, verbatim: why inverting a matrix is the wrong
+    reflex, and how ridge regularises the numerics of the solve rather than only
+    the estimator.
+
+    ### Failure modes, in full
+
+    - You will be handed a matrix and asked what to do with it. `eig`? `svd`? `cholesky`? A formula list gives you no way to choose, and choosing wrong costs you accuracy or numerical stability.
+    - Nearly every scaling bug in production ML traces back to forming $X^\top X$ when you should have taken an SVD, which silently squares your condition number.
+    - Interviewers ask "why SVD?" and "why not eig?" because the answer reveals whether you understand the machinery or have memorised a list.
+    - Every layer of a neural network is a matrix operation. The mathematics here is not academic — it is the layer you are optimising.
+
+    ### The mechanisms, in full
+
+    - **The reason every decomposition exists is to make a matrix cheap to act on.** A dense $n \times n$ matrix costs $O(n^2)$ per matrix-vector product. If it were diagonal, the same product would cost $O(n)$ — one scale per coordinate. Every factorisation writes $A$ as a product whose expensive part changes coordinates and whose cheap part only scales.
+    - **$\sigma_i^2 = \lambda_i(A^\top A)$ is the load-bearing fact of the whole module.** The singular values are the square roots of the eigenvalues of $A^\top A$. PCA, the Eckart–Young theorem, and the condition number of a network layer are all this one statement in different clothes.
+    - **Use `eigh`, never `eig`, on a symmetric matrix.** `numpy.linalg.eig` returns arbitrary complex eigenvalues for symmetric input and makes no orthogonality guarantee, so the eigenvectors it returns may not form an orthonormal basis. `eigh` exploits the symmetry and returns real eigenvalues with orthonormal eigenvectors.
+    - **Forming $X^\top X$ to save time before an SVD is the most common numerical mistake in ML.** It squares the condition number: if $X$ has $\sigma_1 = 1$ and $\sigma_2 = 10^{-8}$, then $X^\top X$ has eigenvalues $1$ and $10^{-16}$ — the second is at the edge of double precision and its eigenvector is numerical noise. The SVD route works with $\sigma_i$ directly and keeps relative error near $\epsilon$.
+    - **Never invert a matrix.** `np.linalg.inv` is almost never what you want: it is numerically unstable, it is slower than factorising and solving against the factorisation, and inverting a singular matrix produces inf and nan rather than an error you would notice.
+    - **Ridge regularises the numerics of the solve, not just the estimator.** The normal equations have matrix $X^\top X$ with condition number $\kappa(X)^2$ — note the square. Ridge replaces it with $X^\top X + \lambda I$, whose eigenvalues are all at least $\lambda$, so adding $\lambda$ can fix a fit that diverges even when you expect no overfitting.
+    - **The best rank-$k$ approximation needs no search.** Truncating the SVD *is* the Eckart–Young optimal solution, with error $\sqrt{\sum_{i>k}\sigma_i^2}$. There is no optimisation problem to solve and no approximation quality to tune.
+    - **Cholesky is the cheap, stable way to solve a system — but only for symmetric positive definite matrices.** It costs roughly half of LU's constant factor. Attempt it on a matrix that is merely symmetric and it will fail on a negative pivot, which is the correct behaviour.
+    - **Condition number is the number that predicts your error.** A backward-stable algorithm can still produce a wildly wrong answer when the problem is ill-conditioned: relative error in the output is bounded by $\kappa(A) \cdot \epsilon$. Know your data's condition number before trusting a result.
+
+
+  derivations:
+    - title: "Eigenvalues of a symmetric 2x2"
+      prose: >-
+        For $A = \begin{pmatrix} a & b \\ b & d \end{pmatrix}$ the
+        characteristic polynomial is
+        $\lambda^2 - (a+d)\lambda + (ad - b^2)$, so
+        $\lambda = \frac{(a+d) \pm \sqrt{(a-d)^2 + 4b^2}}{2}$. Note the
+        discriminant is a sum of two squares, so real symmetric matrices always
+        have real eigenvalues.
+      latex: |
+        $$\det(A - \lambda I) = (a-\lambda)(d-\lambda) - b^2 = 0$$
+        $$\lambda_{1,2} = \frac{a+d \pm \sqrt{(a-d)^2 + 4b^2}}{2}$$
+
+    - title: "SVD from the eigendecomposition of A^T A"
+      latex: |
+        $$A^\top A = V\Lambda V^\top, \qquad \sigma_i = \sqrt{\lambda_i}$$
+        $$u_i = \frac{Av_i}{\sigma_i} \quad\Longrightarrow\quad
+          AA^\top u_i = \sigma_i^2 u_i$$
+        $$\boxed{A = \sum_{i=1}^{r}\sigma_i u_i v_i^\top = U\Sigma V^\top}$$
+      prose: >-
+        The zero-eigenvalue directions of $A^\top A$ span the null space of
+        $A$; the corresponding left singular vectors are zero, which is why the
+        SVD of a rank-deficient matrix has fewer than $\min(m,n)$ non-zero
+        singular values.
+
+    - title: "PCA optimality via the Lagrange multiplier"
+      latex: |
+        $$\max_{w^\top w = 1} \; w^\top X^\top X w$$
+        $$\nabla_w \mathcal{L} = 2X^\top X w - 2\lambda w = 0
+          \quad\Longrightarrow\quad X^\top X w = \lambda w$$
+      prose: >-
+        The optimal direction is the top eigenvector of $X^\top X$; the maximum
+        variance is the corresponding eigenvalue.
+
+    - title: "Ridge regression's effect on the spectrum"
+      latex: |
+        $$\text{eig}(X^\top X + \lambda I) = \{\sigma_i^2 + \lambda\}_{i=1}^p$$
+        $$\kappa(X^\top X + \lambda I) = \frac{\sigma_{\max}^2 + \lambda}{\sigma_{\min}^2 + \lambda}$$
+      prose: >-
+        The condition number of the normal-equations matrix collapses from
+        $\kappa(X)^2$ to a bounded value. Ridge regularises the *numerics* of
+        the solve as much as the bias of the estimator.
+
+  implementations:
+    - language: python
+      title: "Eigendecomposition and SVD from scratch (NumPy)"
+      note: >-
+        Written without `np.linalg.eig` or `np.linalg.svd` for the
+        eigendecomposition path, so the mechanism is visible. The power
+        iteration is the implementation you would actually use in training.
+      code: |
+        import numpy as np
+
+        def power_iteration(A, n_iter=1000, tol=1e-12):
+            """Find the dominant eigenpair of a symmetric matrix."""
+            n = A.shape[0]
+            v = np.ones(n) / np.sqrt(n)          # deterministic start
+            lam = 0.0
+            for _ in range(n_iter):
+                w = A @ v
+                norm = np.linalg.norm(w)
+                if norm < 1e-300:                # degenerate: A is ~zero
+                    return np.zeros(n), 0.0
+                v_next = w / norm
+                lam_next = float(v_next @ A @ v_next)
+                if abs(lam_next - lam) < tol:
+                    return v_next, lam_next
+                v, lam = v_next, lam_next
+            return v, lam
+
+        def power_iteration_deflation(A, k, **kw):
+            """Top-k eigenpairs via deflated power iteration."""
+            A = A.copy()
+            vectors, values = [], []
+            for _ in range(k):
+                v, lam = power_iteration(A, **kw)
+                if lam < 1e-12:
+                    break
+                vectors.append(v)
+                values.append(lam)
+                # Deflate: remove this direction from the operator.
+                A = A - lam * np.outer(v, v)
+            return np.array(values), np.array(vectors).T
+
+        def gram_spectrum(X):
+            """Eigenvalues of X^T X, computed stably via SVD."""
+            # singular values of X == sqrt(eigenvalues of X^T X)
+            sigma = np.linalg.svd(X, compute_uv=False)
+            return sigma ** 2
+
+        def pca_svd(X, k):
+            """PCA via SVD. Returns (mean, components, explained_variance_ratio)."""
+            mu = X.mean(axis=0)
+            Xc = X - mu
+            U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+            components = Vt[:k]                       # (k, p)
+            total = (S ** 2).sum()
+            ratios = (S[:k] ** 2) / total if total > 0 else np.zeros(k)
+            return mu, components, ratios
+
+        def pca_covariance(X, k):
+            """PCA via the covariance matrix. Numerically inferior -- see notes."""
+            mu = X.mean(axis=0)
+            Xc = X - mu
+            C = (Xc.T @ Xc) / (Xc.shape[0] - 1)
+            vals, vecs = np.linalg.eigh(C)           # symmetric -> eigh
+            order = np.argsort(vals)[::-1][:k]
+            return mu, vecs[:, order].T, vals[order] / vals.sum()
+
+        # ── Demo ────────────────────────────────────────────────────────────
+        if __name__ == "__main__":
+            # A matrix with a near-degenerate spectrum: the covariance route
+            # loses the small direction, the SVD route keeps it.
+            rng = np.random.default_rng(0)
+            X = rng.normal(size=(200, 3)) @ np.diag([1.0, 1e-4, 1e-4])
+
+            mu, comps, ratios = pca_svd(X, 3)
+            print("SVD      ratios:", np.round(ratios, 6))
+
+            mu2, comps2, ratios2 = pca_covariance(X, 3)
+            print("covariance ratios:", np.round(ratios2, 6))
+            print("max |component difference|:",
+                  np.abs(comps - comps2).max())
+
+    - language: python
+      title: "Cholesky, and sampling from a multivariate Gaussian"
+      note: >-
+        Cholesky is $O(n^3/3)$ flops versus $O(n^3)$ for LU, and is
+        numerically stable for SPD matrices. The
+        `log_det` trick — summing log-diagonals rather than forming the
+        determinant — is the standard way to get a Gaussian log-density without
+        overflow.
+      code: |
+        import numpy as np
+
+        def cholesky(A, tol=1e-12):
+            """Cholesky decomposition A = L L^T by the outer-product form."""
+            A = np.asarray(A, dtype=float)
+            n = A.shape[0]
+            L = np.zeros_like(A)
+            for i in range(n):
+                for j in range(i + 1):
+                    s = A[i, j] - L[i, :j] @ L[j, :j]
+                    if i == j:
+                        if s <= tol:
+                            raise np.linalg.LinAlgError(
+                                "Matrix is not positive definite "
+                                f"(leading minor {i} is {s:.3e})"
+                            )
+                        L[i, j] = np.sqrt(s)
+                    else:
+                        L[i, j] = s / L[j, j]
+            return L
+
+        def sample_gaussian(mu, Sigma, n=1000, rng=None):
+            """Draw from N(mu, Sigma) via the Cholesky factor."""
+            rng = rng or np.random.default_rng(0)
+            L = cholesky(Sigma)
+            z = rng.standard_normal((n, len(mu)))
+            return mu + z @ L.T
+
+        def gaussian_logpdf(x, mu, Sigma):
+            """Log-density of N(mu, Sigma) without forming det(Sigma)."""
+            d = len(mu)
+            L = cholesky(Sigma)
+            diff = x - mu
+            # Solve L y = diff (forward substitution).
+            y = np.zeros(d)
+            for i in range(d):
+                y[i] = (diff[i] - L[i, :i] @ y[:i]) / L[i, i]
+            quad = y @ y
+            log_det = 2.0 * np.sum(np.log(np.diag(L)))
+            return -0.5 * (d * np.log(2 * np.pi) + log_det + quad)
+
+        if __name__ == "__main__":
+            Sigma = np.array([[2.0, 0.8, 0.3],
+                              [0.8, 1.5, 0.2],
+                              [0.3, 0.2, 1.0]])
+            L = cholesky(Sigma)
+            print("L L^T matches Sigma:",
+                  np.allclose(L @ L.T, Sigma))
+
+            mu = np.zeros(3)
+            draws = sample_gaussian(mu, Sigma, n=200_000)
+            print("empirical mean :", np.round(draws.mean(axis=0), 3))
+            print("empirical cov  :\n", np.round(np.cov(draws.T), 3))
+            print("logpdf at zero :", round(gaussian_logpdf(np.zeros(3), mu, Sigma), 4))
+
+  checkpoints:
+    - id: cp-vector-shape
+      question: >-
+        You write `y = W @ x` where `W` is `(128, 64)` and `x` is `(64,)`.
+        What is the shape of `y`, and what would it be if `x` were `(64, 1)`?
+      answerKind: short_text
+      solution: >-
+        `(128,)` and `(128, 1)` respectively. The second is almost never
+        intended — reshaping to `(64,)` is the fix. This is the single most
+        common silent shape bug in NumPy code.
+      hint: >-
+        Matrix-matrix multiplication contracts the last axis of the left
+        operand with the first axis of the right.
+
+    - id: cp-power-iteration
+      question: >-
+        Why does power iteration converge to the eigenvector of the largest
+        eigenvalue, and what happens when the two largest eigenvalues are
+        nearly equal?
+      answerKind: short_text
+      solution: >-
+        Each iteration multiplies by $A$, so a component along $v_i$ is scaled
+        by $\lambda_i^k$. After normalisation the largest $|\lambda_i|$
+        dominates. When the top two are nearly equal, the convergence rate
+        (governed by $\lambda_2/\lambda_1$) is slow — this is the spectral gap
+        problem, and it is the numerical reason PCA components can be unstable.
+      hint: >-
+        Write $v_0$ in the eigenbasis and apply $A$ repeatedly.
+
+    - id: cp-pca-vs-svd
+      question: >-
+        When would using `eigh(cov(X))` give a materially different (and worse)
+        answer than `svd(X)`?
+      answerKind: short_text
+      solution: >-
+        When $X$ is ill-conditioned. The covariance route forms $X^\top X$,
+        squaring the condition number, so directions with tiny variance get
+        destroyed by floating-point error. The SVD route never forms $X^\top X$
+        and keeps relative accuracy in the small singular values.
+      hint: >-
+        Think about what matrix each method actually computes.
+
+    - id: cp-ridge-spectral
+      question: >-
+        Ridge regression adds $\lambda I$ to $X^\top X$. What does it do to the
+        eigenvalues, and what does that fix?
+      answerKind: short_text
+      solution: >-
+        Eigenvalues become $\sigma_i^2 + \lambda$, all at least $\lambda$, so the
+        condition number becomes bounded. It fixes the numerical conditioning
+        of the normal equations, not just the statistical bias.
+      hint: >-
+        Write the eigenvalues of $X^\top X$ in terms of $\sigma_i$.
+
+    - id: cp-null-space
+      question: >-
+        Your regression model has a null direction in its design matrix. What
+        does that mean about the model, and why might it be a fairness problem?
+      answerKind: short_text
+      solution: >-
+        The model cannot distinguish inputs differing along that direction — the
+        information is destroyed. If the null direction correlates with a
+        protected attribute, the model is structurally unable to treat
+        individuals differently along it.
+      hint: >-
+        The null space is spanned by the zero singular vectors.
+
+  visualizers:
+    - id: vs-eigen
+      kind: tensor
+      title: "Eigenvector action on a 2D matrix"
+      description: >-
+        Watch $Av$ for different $v$ and $\lambda$. The matrix stretches along
+        eigenvector directions and leaves them fixed; it rotates or shears
+        everything else.
+      params:
+        matrix: [[2, 1], [1, 2]]
+        vector: [1, 1]
+
+    - id: vs-pca-projection
+      kind: tensor
+      title: "PCA projection and the variance it captures"
+      description: >-
+        Slide the projection angle and watch the projected variance. The
+        maximum is at the top eigenvector of the covariance matrix.
+      params:
+        seed: 7
+        n: 200
+        p: 2
+
+    - id: vs-svd-spectrum
+      kind: tensor
+      title: "Singular value spectrum and the Eckart–Young curve"
+      description: >-
+        The singular values sorted descending, and the residual Frobenius error
+        of the best rank-$k$ approximation.
+      params:
+        seed: 11
+        m: 20
+        n: 12
+        rank: 6
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Every decomposition in this module answers one question: **how do I make
+        this matrix cheaper to act on?**
+
+        A general $A \in \mathbb{R}^{n\times n}$ costs $O(n^2)$ per
+        matrix-vector product and has no exploitable structure. If $A$ were
+        diagonal, the same product would cost $O(n)$ — you would just scale
+        each coordinate. So every factorisation here is a way of writing $A$
+        as a product where one factor is diagonal (or triangular), and paying
+        the $O(n^2)$ cost only once to change coordinates.
+
+        That reframing gives you the whole map:
+        - **Eigen-decomposition** $A = Q\Lambda Q^\top$ — works when $A$ is
+          symmetric; $Q$ is a rotation, $\Lambda$ only scales.
+        - **SVD** $A = U\Sigma V^\top$ — works for *any* matrix; $U$ and $V$ are
+          rotations, $\Sigma$ only scales. It is the general case, and the
+          eigen-decomposition is a special case of it.
+        - **Cholesky** $A = LL^\top$ — works when $A$ is positive definite, and
+          is the cheapest way to solve $Ax = b$.
+
+        The thing to hold onto: the singular values $\sigma_i$ are *not*
+        arbitrary. They are the eigenvalues of $A^\top A$ under a square
+        root. That single fact is why PCA, the Eckart–Young theorem, and the
+        condition number of a layer are all the same statement in different
+        clothes.
+
+        Before going further, be able to answer this in one sentence: *what
+        problem does the SVD solve that the eigen-decomposition cannot?*
+      blocks:
+        - kind: math
+          body: |
+            $$A = U\Sigma V^\top,\qquad \Sigma = \operatorname{diag}(\sigma_1,\dots,\sigma_r)$$
+            $$A^\top A = V\Sigma^2 V^\top \qquad\Longrightarrow\qquad \sigma_i^2 = \lambda_i(A^\top A)$$
+      checkpoint: >-
+        In one sentence: what is the single property of a matrix that decides
+        whether you can eigendecompose it, and what do you fall back to when
+        that property fails?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Now pick the technique. There are only four questions, and each has
+        one right answer:
+
+        **"I want to understand what a matrix does to directions."**
+        → Find the eigen-decomposition. If $A$ is symmetric, use
+        `numpy.linalg.eigh` (never `eig` — it returns arbitrary complex
+        eigenvalues for symmetric input and does not guarantee orthogonality).
+        If $A$ is not symmetric, look at $A^\top A$ instead: its eigenvectors
+        are the right singular vectors.
+
+        **"I want the best low-rank approximation."**
+        → SVD, then truncate. Eckart–Young guarantees
+        $\|A - A_k\|_F = \sqrt{\sum_{i>k}\sigma_i^2}$, and truncating the SVD
+        *is* the best rank-$k$ approximation. There is no search involved.
+
+        **"I want to project data onto its principal directions."**
+        → PCA via SVD. Do **not** go through the covariance matrix: `PCA(covariance_eigh)`
+        forms $X^\top X$, which squares the condition number and destroys
+        small-variance directions on ill-conditioned data. Use
+        `PCA(svd_solver='full')`.
+
+        **"I want to solve $Ax = b$ and $A$ is symmetric positive definite."**
+        → Cholesky: $A = LL^\top$, then forward/back substitution. $O(n^3)$ but
+        with a constant roughly half of LU's, and it is numerically stable.
+
+        A useful decision rule: **if you are not sure whether the matrix is
+        symmetric, use the SVD.** It is always valid, always returns
+        non-negative singular values, and its cost is the same order. The
+        eigen-decomposition is the specialisation, not the general case.
+
+        Two things to avoid, both of which look like micro-optimisations and
+        are not:
+        1. Forming $X^\top X$ to "save time" before an SVD. It costs an extra
+           $O(np^2)$ and destroys accuracy.
+        2. Explicitly inverting a matrix. `np.linalg.inv` is almost never what
+           you want — solve the system instead. Inversion is numerically
+           unstable and slower than a factorisation you then solve against.
+      blocks:
+        - kind: checklist
+          body: |
+            - Symmetric? → `eigh(A)`
+            - Not sure / non-square / want low-rank? → `svd(A)`
+            - SPD and solving a system? → `cholesky(A)`, then solve
+            - Feature matrix for PCA? → `svd(X)`, never `X.T @ X`
+            - Need `A⁻¹b`? → Solve. Never invert.
+      checkpoint: >-
+        You have a design matrix `X` of shape `(20000, 500)` whose columns have
+        wildly different scales. Which single call do you make to get the
+        principal components, and which one do you explicitly avoid?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Here are the three skeletons you will write by hand. Get the structure
+        right first; the syntax is easy.
+
+        **Power iteration** (dominant eigenpair of a symmetric matrix):
+
+        ```
+        v ← arbitrary unit vector
+        λ ← 0
+        repeat:
+            w ← A · v                 # one matrix-vector product
+            if ‖w‖ ≈ 0: stop         # A is essentially zero
+            v ← w / ‖w‖              # renormalise
+            λ_new ← vᵀ A v           # Rayleigh quotient
+            if |λ_new − λ| < tol: break
+            λ ← λ_new
+        return (v, λ)
+        ```
+
+        Note the invariant: after each step, `v` is a unit vector and `λ` is
+        its Rayleigh quotient, so `λ` is always an *estimate* of an eigenvalue
+        of `A` even when `v` is not yet an eigenvector.
+
+        **SVD-based PCA:**
+
+        ```
+        μ ← column_means(X)              # centring is not optional
+        Xc ← X − μ
+        (U, S, Vt) ← svd(Xc)
+        components ← Vt[0:k]              # rows are the principal directions
+        ratios ← S[0:k]² / sum(S²)
+        return (μ, components, ratios)
+        ```
+
+        **Ridge regression without inverting:**
+
+        ```
+        A ← [ X ; √λ · I ]               # stack √λ·I rows underneath X
+        b ← [ y ; 0 ]
+        w ← least_squares_solve(A, b)     # never form (XᵀX + λI)⁻¹
+        return w
+        ```
+
+        The ridge trick is worth internalising: appending $\sqrt{\lambda}I$
+        to $X$ and $\mathbf{0}$ to $y$ produces a least-squares problem whose
+        normal equations are *exactly* the ridge equations. You get the
+        answer without ever forming or inverting the penalised Gram matrix.
+      blocks:
+        - kind: pseudocode
+          body: |
+            function power_iteration(A, tol):
+                v ← unit_vector(dim(A))
+                λ ← 0
+                while true:
+                    w ← A · v
+                    if ‖w‖ < ε: return (0, 0)
+                    v ← w / ‖w‖
+                    λ_new ← vᵀ A v
+                    if |λ_new − λ| < tol: return (v, λ_new)
+                    λ ← λ_new
+      checkpoint: >-
+        In the power-iteration skeleton, why do we compute the Rayleigh
+        quotient `vᵀAv` *after* renormalising `v` rather than reusing `‖w‖`?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        **Where the SVD comes from.** Start from $A^\top A$. It is symmetric
+        positive semi-definite, because for any $x$,
+        $x^\top A^\top A x = \|Ax\|^2 \ge 0$. By the spectral theorem it has
+        an orthonormal eigenbasis:
+        $$
+        A^\top A = V\Lambda V^\top,\qquad \lambda_i \ge 0
+        $$
+        Now multiply the eigenvector equation by $A$:
+        $$
+        A(A^\top A v_i) = \lambda_i (A v_i)
+        $$
+        and since $A^\top A v_i = \lambda_i v_i$, the left side is
+        $\lambda_i A v_i$. So $Av_i$ is an eigenvector of $AA^\top$ with
+        eigenvalue $\lambda_i$. Define
+        $$
+        u_i = \frac{Av_i}{\sigma_i}, \qquad \sigma_i = \sqrt{\lambda_i}
+        $$
+        (well-defined whenever $\sigma_i > 0$). Then $Av_i = \sigma_i u_i$, and
+        reconstructing $A$ in the right singular basis gives
+        $$
+        A = \sum_{i=1}^{r}\sigma_i u_i v_i^\top = U\Sigma V^\top
+        $$
+        **The null space falls out for free:** the eigenvectors of $A^\top A$
+        with $\lambda_i = 0$ span $\ker(A)$, so the right singular vectors
+        with zero singular value are exactly the directions $A$ destroys.
+
+        **Where PCA comes from.** Maximise the variance of the projection
+        $Xw$ subject to $\|w\| = 1$:
+        $$
+        \max_{w^\top w=1} w^\top X^\top X w
+        $$
+        Lagrange multipliers:
+        $$
+        \nabla_w\left(w^\top X^\top X w - \lambda(w^\top w - 1)\right) = 0
+        \quad\Longrightarrow\quad
+        X^\top X w = \lambda w
+        $$
+        So the optimal direction is the top eigenvector of $X^\top X$ — and by
+        the result above, that is precisely the top right singular vector of
+        $X$. **PCA *is* truncated SVD.** The only difference is which
+        computation you do first, and the SVD version never forms $X^\top X$.
+
+        **Why that matters numerically.** The eigenvalues of $X^\top X$ are
+        $\sigma_i^2$. If $X$ has $\sigma_1 = 1$ and $\sigma_2 = 10^{-8}$, then
+        $X^\top X$ has eigenvalues $1$ and $10^{-16}$ — the square of the
+        smallest singular value is at the edge of double precision
+        ($\epsilon \approx 2.2\times10^{-16}$). The corresponding eigenvector
+        is numerical noise. The SVD route works with $\sigma_i$ directly, so
+        its relative error stays around $\epsilon$ instead of
+        $\epsilon/\sigma_i^2$.
+
+        **Where ridge comes from.** The normal equations are
+        $(X^\top X)w = X^\top y$, whose matrix has condition number
+        $\kappa(X)^2$ — note the square. Ridge replaces it with
+        $X^\top X + \lambda I$, whose eigenvalues are $\sigma_i^2 + \lambda$,
+        all at least $\lambda$:
+        $$
+        \kappa(X^\top X + \lambda I)
+          = \frac{\sigma_{\max}^2 + \lambda}{\sigma_{\min}^2 + \lambda}
+        $$
+        Bounded and well-behaved. Ridge regularises the *numerics of the
+        solve* as much as it regularises the estimator — which is why adding
+        $\lambda$ can fix a fit that diverges even when you expect no
+        overfitting.
+      blocks:
+        - kind: math
+          body: |
+            $$\sigma_i^2 = \lambda_i(A^\top A)$$
+            $$\max_{w^\top w = 1} w^\top X^\top X w \quad\Longrightarrow\quad X^\top X w = \lambda w$$
+            $$\kappa(X^\top X) = \kappa(X)^2 \qquad \text{(note the square)}$$
+      checkpoint: >-
+        A matrix $X$ has singular values $1$ and $10^{-8}$. Compute the
+        condition number of $X^\top X$, then of $X^\top X + 10^{-12}I$. What
+        does the second number tell you about whether ridge can rescue this
+        system?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        Here is a complete, from-scratch implementation. Note what it does
+        *not* do: it never forms $X^\top X$, and it never inverts a matrix.
+
+        ```python
+        import numpy as np
+
+        def power_iteration(A, n_iter=1000, tol=1e-12):
+            \"\"\"Dominant eigenpair of a symmetric matrix, computed from scratch.\"\"\"
+            A = np.asarray(A, dtype=float)
+            n = A.shape[0]
+            v = np.ones(n) / np.sqrt(n)      # deterministic start
+            lam = 0.0
+            for _ in range(n_iter):
+                w = A @ v
+                norm = np.linalg.norm(w)
+                if norm < 1e-300:            # A is essentially zero
+                    return np.zeros(n), 0.0
+                v = w / norm
+                lam_new = float(v @ A @ v)   # Rayleigh quotient
+                if abs(lam_new - lam) < tol:
+                    return v, lam_new
+                lam = lam_new
+            return v, lam
+
+        def pca_svd(X, k):
+            \"\"\"PCA via SVD. Never forms X.T @ X.\"\"\"
+            X = np.asarray(X, dtype=float)
+            mu = X.mean(axis=0)
+            Xc = X - mu
+            U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+            components = Vt[:k]
+            total = float((S ** 2).sum())
+            ratios = [(float(s) ** 2 / total if total > 0 else 0.0) for s in S[:k]]
+            return mu, components, ratios
+
+        def ridge_solve(X, y, lam):
+            \"\"\"Ridge regression without forming (X.T X + lam I) or inverting it.\"\"\"
+            X = np.asarray(X, dtype=float)
+            y = np.asarray(y, dtype=float)
+            p = X.shape[1]
+            A = np.vstack([X, np.sqrt(lam) * np.eye(p)])
+            b = np.concatenate([y, np.zeros(p)])
+            w, *_ = np.linalg.lstsq(A, b, rcond=None)
+            return w
+
+        def cholesky(A, tol=1e-12):
+            \"\"\"A = L L^T via the outer-product form.\"\"\"
+            A = np.asarray(A, dtype=float)
+            n = A.shape[0]
+            L = np.zeros_like(A)
+            for i in range(n):
+                for j in range(i + 1):
+                    s = A[i, j] - L[i, :j] @ L[j, :j]
+                    if i == j:
+                        if s <= tol:
+                            raise np.linalg.LinAlgError("matrix is not positive definite")
+                        L[i, j] = np.sqrt(s)
+                    else:
+                        L[i, j] = s / L[j, j]
+            return L
+        ```
+
+        **How to use each one:**
+
+        - `power_iteration` — use it when you need only the top few
+          eigenpairs of a *large* symmetric matrix and an exact SVD is too
+          expensive. It converges at a rate governed by the spectral gap
+          $\lambda_2/\lambda_1$; if the top two eigenvalues are close, use
+          `eigh` instead.
+
+        - `pca_svd` — this is the one you will use most. Its numerical
+          advantage over the covariance route is not subtle: it is the
+          difference between a correct component and noise on
+          ill-conditioned data.
+
+        - `ridge_solve` — note that `np.linalg.lstsq` is SVD-based under the
+          hood, so the whole path avoids forming $X^\top X$ entirely. For
+          large problems, prefer solving the ridge system directly with
+          `scipy.linalg.solve` on the augmented matrix or with a Cholesky
+          factorisation of $X^\top X + \lambda I$ when $p$ is small.
+
+        - `cholesky` — the explicit loops are $O(n^3)$ with a terrible
+          constant; use `np.linalg.cholesky` in production and keep this
+          version for understanding the recursion
+          $L_{ij} = \frac{A_{ij} - \sum_{k<j}L_{ik}L_{jk}}{L_{jj}}$.
+
+        **One last caution.** Every complexity claim about *your* code should
+        come from the AST profiler, not from your intuition — that is exactly
+        the discipline the profiler exists to impose. Run the analysis, read
+        the derivation, and only then decide whether the code is good enough.
+      blocks:
+        - kind: warning
+          body: >-
+            A reference implementation is only useful after you have attempted
+            the problem. Reveal this tier only after you have written
+            something — even something wrong — and can say why it fails.
+      checkpoint: >-
+        Close this answer. Re-implement `pca_svd` and `ridge_solve` from
+        memory in under five minutes. Which one is harder to recall correctly,
+        and what does that tell you about which one you should reach for
+        reflexively?
+
+  problems:
+    - id: pca-on-rank-deficient
+      title: "PCA of a rank-deficient matrix"
+      difficulty: medium
+      language: python
+      entry: solve
+      prompt: >-
+        Given a data matrix `X` of shape `(n, p)` (already centred), compute the
+        top-`k` principal components using the SVD, and return the explained
+        variance ratio for each. Because the data may be rank-deficient, use
+        the SVD rather than the covariance matrix — forming `X.T @ X` squares
+        the condition number and destroys small-variance directions.
+
+        Return a list of `k` floats: the ratio of variance explained by each
+        component, in descending order.
+      starter: |
+        import numpy as np
+
+        def solve(X, k):
+            # X: numpy array of shape (n, p), already centred.
+            # Return: list of k floats (explained variance ratios).
+            pass
+      testCases:
+        - input: "[[[1.0, 2.0], [2.0, 1.0], [3.0, 0.0], [4.0, -1.0]], 1]"
+          expected: "[1.0]"
+          mode: json
+          tolerance: 0.000001
+        - input: "[[[1.0, 2.0], [2.0, 1.0], [3.0, 0.0], [4.0, -1.0]], 2]"
+          expected: "[1.0, 0.0]"
+          mode: json
+          tolerance: 0.000001
+      solution: |
+        import numpy as np
+
+        def solve(X, k):
+            X = np.asarray(X, dtype=float)
+            # Centring is mandatory: uncentred PCA finds the direction of the
+            # mean, not the direction of maximum variance.
+            mu = X.mean(axis=0)
+            Xc = X - mu
+            # SVD of the centred data: never form X.T @ X.
+            U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+            var = S ** 2
+            total = var.sum()
+            if total <= 0:
+                return [0.0] * k
+            ratios = var / total
+            return [float(r) for r in ratios[:k]]
+      solutionExplanation: >-
+        The explained variance ratio for component $i$ is
+        $\sigma_i^2 / \sum_j \sigma_j^2$, because $\sigma_i^2$ are the
+        eigenvalues of $X^\top X$. Taking them straight from the SVD avoids
+        the squaring of the condition number that the covariance route incurs.
+        For the test data the columns are perfectly anti-correlated, so all
+        the variance is in one direction and the second ratio is exactly zero.
+      complexity: "O(n p min(n, p))"
+      tags: ["linear-algebra", "pca", "svd"]
+
+    - id: solve-least-squares-ridge
+      title: "Ridge regression via the normal equations"
+      difficulty: medium
+      language: python
+      entry: solve
+      prompt: >-
+        Solve ridge regression
+        $\hat{w} = (X^\top X + \lambda I)^{-1} X^\top y$ for a design matrix
+        `X` of shape `(n, p)` and target `y` of shape `(n,)`.
+
+        Compute it in a numerically stable way: form the augmented system
+        `[X; sqrt(lambda) I]` and solve the least-squares problem, rather than
+        explicitly inverting `X.T @ X + lambda * I`.
+
+        Return the coefficient vector as a list of `p` floats.
+      starter: |
+        import numpy as np
+
+        def solve(X, y, lam):
+            # X: (n, p), y: (n,), lam: float
+            # Return: list of p floats.
+            pass
+      testCases:
+        - input: "[[[1.0, 1.0], [1.0, 2.0], [1.0, 3.0]], [1.0, 2.0, 3.0], 0.0]"
+          expected: "[0.0, 1.0]"
+          mode: json
+          tolerance: 0.000001
+        - input: "[[[1.0, 1.0], [1.0, 2.0], [1.0, 3.0]], [1.0, 2.0, 3.0], 1.0]"
+          expected: "[0.25, 0.8333333333333334]"
+          mode: json
+          tolerance: 0.000001
+      solution: |
+        import numpy as np
+
+        def solve(X, y, lam):
+            X = np.asarray(X, dtype=float)
+            y = np.asarray(y, dtype=float)
+            p = X.shape[1]
+            A = np.vstack([X, np.sqrt(lam) * np.eye(p)])
+            b = np.concatenate([y, np.zeros(p)])
+            w, *_ = np.linalg.lstsq(A, b, rcond=None)
+            return [float(v) for v in w]
+      solutionExplanation: >-
+        Appending $\sqrt{\lambda} I$ rows and $\mathbf{0}$ targets to $X$ and $y$
+        yields a least-squares problem whose normal equations are exactly
+        $(X^\top X + \lambda I)w = X^\top y$. Using `lstsq` (which is
+        SVD-based under the hood) avoids forming and inverting the normal
+        equations, which squares the condition number. With $\lambda = 0$ the
+        ordinary least-squares fit is recovered.
+      complexity: "O(n p^2)"
+      tags: ["linear-algebra", "ridge", "regularisation"]
+
+    - id: power-iteration-dominant
+      title: "Dominant eigenpair by power iteration"
+      difficulty: easy
+      language: python
+      entry: solve
+      prompt: >-
+        Given a symmetric matrix `A` as a list of lists, use power iteration to
+        find the dominant eigenvalue: repeatedly multiply a starting vector by
+        `A` and renormalise, until the Rayleigh quotient stops changing.
+
+        Return the dominant eigenvalue as a float.
+      starter: |
+        import numpy as np
+
+        def solve(A, n_iter=1000, tol=1e-12):
+            # A: list of lists (symmetric). Return: float eigenvalue.
+            pass
+      testCases:
+        - input: "[[[2.0, 1.0], [1.0, 2.0]], 1000, 1e-12]"
+          expected: "3.0"
+          mode: json
+          tolerance: 0.000001
+        - input: "[[[4.0, 0.0], [0.0, 1.0]], 1000, 1e-12]"
+          expected: "4.0"
+          mode: json
+          tolerance: 0.000001
+      solution: |
+        import numpy as np
+
+        def solve(A, n_iter=1000, tol=1e-12):
+            A = np.asarray(A, dtype=float)
+            n = A.shape[0]
+            v = np.ones(n) / np.sqrt(n)
+            lam = 0.0
+            for _ in range(n_iter):
+                w = A @ v
+                norm = np.linalg.norm(w)
+                if norm < 1e-300:
+                    return 0.0
+                v = w / norm
+                lam_new = float(v @ A @ v)
+                if abs(lam_new - lam) < tol:
+                    return lam_new
+                lam = lam_new
+            return lam
+      solutionExplanation: >-
+        Each iteration multiplies by $A$, so the component of $v$ along the
+        eigenvector with the largest $|\lambda|$ grows fastest relative to the
+        others. After normalisation the vector converges to that eigenvector,
+        and the Rayleigh quotient $v^\top A v$ converges to its eigenvalue.
+        For the symmetric matrix $\begin{pmatrix}2&1\\1&2\end{pmatrix}$ the
+        eigenvalues are $1$ and $3$, so the dominant one is $3$.
+      complexity: "O(n_iter * n^2)"
+      tags: ["linear-algebra", "eigenvalues", "iterative"]
+
+  try_it: >-
+    Take a design matrix with singular values $\sigma = (1, 10^{-8})$ and work out
+    $\kappa(X)$ and $\kappa(X^\top X)$ by hand before touching a keyboard, then
+    check both with `numpy.linalg.cond`. State how many of float64's 15.7 digits
+    survive a solve through the Gram matrix, and which of `eigh`, `svd` or
+    `cholesky` you would call on that matrix and why.
+  interview_questions:
+    - question: "Why do you reach for `numpy.linalg.eigh` rather than `eig` on a symmetric matrix?"
+      level: mid
+      key_points:
+        - "`eigh` is guaranteed to return real eigenvalues and an orthonormal eigenvector basis; `eig` makes neither promise and can return a complex dtype."
+        - "It exploits the symmetry — roughly half the flops and a smaller backward error than the general routine."
+        - "Orthonormality is what makes the reconstruction $A = Q\\Lambda Q^\\top$ usable: without it you cannot project onto the eigenvectors and read off components."
+        - "For an indefinite symmetric matrix the eigenvalues are signed, so if you want singular values you still need `svd` or `abs(eigvals)`."
+      follow_up: "A is symmetric but only positive semi-definite. Which routine, and what changes about the condition number you report?"
+    - question: "You are given a $50{,}000 \\times 2{,}000$ design matrix and asked for its top 10 components. Form $X^\\top X$ or take the SVD of $X$? Defend the choice numerically."
+      level: senior
+      key_points:
+        - "$\\kappa(X^\\top X) = \\kappa(X)^2$, so a design with $\\kappa(X) = 10^4$ becomes $10^8$ and loses 8 of the 15.7 float64 digits before you start."
+        - "The Gram matrix costs $O(np^2)$ and the SVD of $X$ also costs $O(np^2)$, so the square buys no asymptotic time — only lost accuracy."
+        - "For $k \\ll p$ a randomised SVD gets a rank-10 basis in $O(npk)$ and never forms either dense factor."
+        - "The rank-$k$ truncation is Eckart–Young optimal, so the cheap route produces the same best approximation, not a worse heuristic."
+      follow_up: "What does randomised SVD assume about the spectrum, and which single number would you look at to decide it is safe here?"
+    - question: "What does the Eckart–Young theorem actually licence you to claim about a truncated SVD?"
+      level: mid
+      key_points:
+        - "Truncating to $k$ singular values is the best rank-$k$ approximation in both the Frobenius and the spectral norm — there is no search and no tuning."
+        - "The Frobenius error is exactly $\\sqrt{\\sum_{i>k} \\sigma_i^2}$ and the spectral error is $\\sigma_{k+1}$."
+        - "PCA is this statement applied to the centred data matrix, which is why 'explained variance' and 'reconstruction error' are the same number."
+        - "It says nothing about whether rank $k$ is enough for your task — that is a question about the labels, which the SVD never saw."
+  common_mistakes:
+    - "Calling `np.linalg.inv` to solve $Ax = b$: slower than factor-and-solve, less accurate, and it returns `inf`/`nan` on a singular matrix instead of raising."
+    - "Using `eig` on a symmetric matrix, assuming the eigenvectors are orthonormal, then projecting and getting a reconstruction that does not match."
+    - "Comparing the smallest eigenvalue of $X^\\top X$ against a tolerance meant for singular values — the tolerance lives on $\\sigma_i$, not $\\sigma_i^2$."
+  further_reading:
+    - label: "Trefethen & Bau, Numerical Linear Algebra, Lectures 4–5 and 25"
+    - label: "Golub & Van Loan, Matrix Computations, 4th edition, Chapters 2 and 5"

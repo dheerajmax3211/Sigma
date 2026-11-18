@@ -1,0 +1,838 @@
+id: numerical-linear-algebra
+slug: numerical-linear-algebra
+title: "The Condition Number: Why Correct Code Returns a Wrong Answer"
+summary: >-
+  Learn why a mathematically correct algorithm can return a wrong answer, how
+  to predict the error before you compute it, and the four habits that keep
+  production ML numerics honest.
+kind: lesson
+difficulty: hard
+position: 4
+estMinutes: 18
+prerequisites: [linear-algebra-foundations]
+phase: mathematical-foundations
+tags: [numerics, conditioning, stability, floating-point, cholesky]
+
+body:
+  big_idea: >-
+    Every floating-point answer carries an error bounded by the condition number times
+    machine epsilon, so trustworthiness is a property of the problem, not the algorithm
+    — and it is measurable in one line.
+
+  problem:
+    - "You fit a regression, get plausible coefficients, and are wrong by orders of magnitude — no exception, no warning, no NaN. The failure is silent."
+    - "The commonest numerical bug in ML is forming $X^\\top X$: at $\\kappa = 10^6$ it gave $6.8\\times10^{-6}$ error where a stable solve gave $1.4\\times10^{-11}$."
+    - "Why is `np.linalg.inv` discouraged? It measured 4.24× the cost of `solve`, and it loses accuracy as well."
+
+  analogy: |
+    Measure a table with a ruler marked in millimetres: at 1 m the relative
+    error is 0.1%, fine. Use the same ruler on the thickness of a hair and the
+    same uncertainty is 100%. The ruler did not change; the problem got harder.
+    Machine epsilon is the ruler, the condition number is how much the problem
+    amplifies it, and a stable algorithm adds no error of its own.
+
+  concept_points:
+    - "**Machine epsilon is your error floor, and it depends on dtype.** float64 has $\\epsilon = 2.22\\times10^{-16}$ (15.7 decimal digits), float32 $1.19\\times10^{-7}$ (6.9), float16 $9.77\\times10^{-4}$ — barely 3. Every accuracy claim is relative to this number, so \"float32 is almost as good as float64\" is a claim about your condition number, not the dtype."
+    - "**Condition number is the amplification factor, and you should compute it before trusting a result.** $\\kappa(A) = \\sigma_{\\max}/\\sigma_{\\min}$, and relative error $\\le \\kappa(A)\\epsilon$. A matrix with $\\kappa = 10^6$ in float64 loses 6 of 15.7 digits, leaving about 9 good ones. The same matrix in float32 loses **all of them** and returns noise with full confidence."
+    - "**Forming $X^\\top X$ exactly squares the condition number.** Measured: $\\kappa(X) = 10^2 \\Rightarrow 10^4$; $10^4 \\Rightarrow 10^8$; $10^6 \\Rightarrow 10^{12}$, because $\\sigma_i(X^\\top X) = \\sigma_i(X)^2$. On an $80\\times80$ system with $\\kappa(A) = 10^6$ a stable solve gave $1.36\\times10^{-11}$ relative error and the normal equations $6.81\\times10^{-6}$ — a factor of $4.99\\times10^5$."
+    - "**Catastrophic cancellation destroys digits when you subtract nearby large numbers.** `sum([1e16, 1.0, -1e16])` returns **0.0**, not 1.0, because 1.0 is below the representable gap at $10^{16}$; `math.fsum` returns 1.0. This is why variance computed as $E[x^2] - E[x]^2$ fails on data with a large mean: rounding decides the answer."
+    - "**Never invert a matrix, and use Cholesky when you can.** `inv(A)` costs 4.24× a `solve` and is less accurate, because it explicitly forms the inverse's error; solve against a factorisation instead. For SPD $A$, $A = LL^\\top$ costs about half of LU and raises `LinAlgError` on indefinite input — a failure that is a feature, since it tests positive-definiteness."
+    - "**Scaling your data is a conditioning operation, not a preprocessing nicety.** Standardising features to unit variance changes $\\kappa(X)$ directly: a feature in dollars ($10^5$) and one in years ($10^1$) in the same design matrix can inflate $\\kappa$ by four orders of magnitude on their own. Centring and scaling is the cheapest accuracy improvement available."
+
+  definitions:
+    - { term: "Machine epsilon ($\\epsilon$)", meaning: "The gap between 1.0 and the next representable float. $2.22 \\times 10^{-16}$ for float64, $1.19 \\times 10^{-7}$ for float32." }
+    - { term: "Condition number ($\\kappa$)", meaning: "$\\sigma_{\\max}/\\sigma_{\\min}$ for a matrix. The factor by which relative error in the input is amplified in the output. Infinite for a singular matrix." }
+    - { term: "Backward stable", meaning: "An algorithm whose computed result is the exact answer to a slightly perturbed input — perturbation of order $\\epsilon$ times the problem size. It adds no error beyond conditioning." }
+    - { term: "Forward error", meaning: "The actual difference between your computed answer and the true answer, relative to the true answer. What you care about." }
+    - { term: "Catastrophic cancellation", meaning: "Loss of significant digits when subtracting nearly equal numbers. The result's relative error can be far larger than that of the operands." }
+    - { term: "Normal equations", meaning: "$X^\\top X \\beta = X^\\top y$. Mathematically equivalent to least squares, numerically worse because $\\kappa(X^\\top X) = \\kappa(X)^2$." }
+    - { term: "Cholesky factorisation", meaning: "$A = LL^\\top$ for symmetric positive definite $A$, with $L$ lower triangular. Exists iff $A$ is SPD; fails with an error otherwise." }
+    - { term: "Numerical rank", meaning: "The number of singular values above a threshold (typically $\\sigma_{\\max} \\cdot \\epsilon \\cdot n$). Differs from mathematical rank for ill-conditioned matrices." }
+    - { term: "Iterative refinement", meaning: "Solve, compute the residual $b - Ax$, solve for the correction, repeat. Recovers accuracy lost to conditioning at the cost of a few extra solves." }
+    - { term: "Kahan / compensated summation", meaning: "Summation that tracks the rounding error in a separate accumulator, giving a result accurate to nearly full precision regardless of cancellation." }
+
+  diagrams:
+    - type: compare
+      title: "Stable vs unstable: the distinction that matters"
+      left_label: "Backward stable"
+      left_points:
+        - "Gives the exact answer to a slightly perturbed problem"
+        - "Error is bounded by $\\kappa(A)\\epsilon$ — the best possible"
+        - "QR, SVD, Cholesky, LU with partial pivoting"
+      right_label: "Unstable, or stable-but-ill-conditioned"
+      right_points:
+        - "Adds its own error on top of the conditioning"
+        - "Normal equations, explicit inverse, naive variance"
+        - "Also: any stable method on a $\\kappa = 10^{12}$ problem"
+    - type: plot
+      title: "Normal equations square the condition number — exactly"
+      chart: "line"
+      xLabel: "κ(A)"
+      yLabel: "κ(AᵀA)"
+      series:
+        - name: "measured κ(AᵀA)"
+          points:
+            - { x: 100, y: 10000 }
+            - { x: 10000, y: 100000000 }
+            - { x: 1000000, y: 1000000000000 }
+    - type: architecture
+      title: "Where precision is lost in a training step"
+      nodes:
+        - { id: data, x: 0, y: 0, label: "Raw features", kind: client, detail: "Unstandardised. A dollar feature at 1e5 next to a year feature at 1e1 can inflate kappa by four orders of magnitude before any arithmetic happens." }
+        - { id: scale, x: 1, y: 0, label: "Standardise", kind: server, detail: "Centre and scale to unit variance. This is a conditioning operation: it directly reduces kappa(X). Cheapest accuracy win available." }
+        - { id: gram, x: 1, y: 2, label: "XᵀX (avoid)", kind: database, detail: "Squares the condition number. At kappa(X)=1e8 in float64 the smallest singular value falls below epsilon and the matrix is numerically rank-deficient." }
+        - { id: qr, x: 2, y: 0, label: "QR / SVD solve", kind: model, detail: "Works with X directly, never forms the Gram matrix. Backward stable: error bounded by kappa(X)*epsilon." }
+        - { id: loss, x: 3, y: 0, label: "Loss / grads", kind: gpu, detail: "In mixed precision, the loss is computed in float32 but master weights stay float32. Accumulating in float16 loses ~7 digits per step." }
+        - { id: update, x: 3, y: 2, label: "Optimiser step", kind: worker, detail: "Adam's second moment divides by sqrt(v). With tiny v from a dead gradient this amplifies noise enormously -- the epsilon in the denominator is load-bearing." }
+      edges:
+        - { from: data, to: scale, label: "condition" }
+        - { from: scale, to: qr, label: "κ reduced" }
+        - { from: scale, to: gram, label: "never do this" }
+        - { from: qr, to: loss, label: "β" }
+        - { from: loss, to: update, label: "grads" }
+    - type: pipeline
+      title: "A numerical preflight you can run in four lines"
+      nodes:
+        - label: "Check κ of your design matrix"
+          note: "np.linalg.cond(X)"
+          detail: "If κ > 1/√ε ≈ 6.7e7 for float64, you have fewer than 8 good digits. If κ > 1/ε, the matrix is numerically singular."
+        - label: "Compare ε·κ against your tolerance"
+          note: "expected relative error bound"
+          detail: "If ε·κ exceeds the precision your task needs, no algorithm will save you — you need better data, regularisation, or a different parameterisation."
+        - label: "Prefer factorisations over inverses"
+          note: "solve, lstsq, cho_solve"
+          detail: "np.linalg.lstsq uses SVD and handles rank deficiency gracefully. np.linalg.solve uses LU with pivoting. Neither forms the inverse."
+        - label: "Verify with a known answer"
+          note: "pick x, compute b = Ax, solve, compare"
+          detail: "The only end-to-end check. If your solver cannot recover a vector you constructed, the pipeline has a numerical bug."
+    - type: stack
+      title: "Four independent sources of error"
+      layers:
+        - "Representation: the number cannot be stored (epsilon)"
+        - "Conditioning: the problem amplifies stored error (kappa)"
+        - "Algorithm stability: the method adds error beyond that (avoid inv)"
+        - "Accumulation: error compounds across n steps (sqrt(n) or n)"
+
+  markdown: |
+    ## A wrong answer with no error message
+
+    The defining property of numerical bugs is silence. `1/0` raises. A shape
+    mismatch raises. But an ill-conditioned solve returns a perfectly
+    well-typed array of floats that is simply wrong.
+
+    Here is the measurement that should reframe how you read every linear
+    algebra call in your code. Take an $80 \\times 80$ matrix with
+    $\\kappa(A) = 10^6$, a known $x$, and $b = Ax$. Then recover $x$ two ways:
+
+    | Method | Relative error |
+    |---|---|
+    | Stable solve (LU/QR on $A$) | $1.36 \times 10^{-11}$ |
+    | Normal equations ($A^\\top A$) | $6.81 \times 10^{-6}$ |
+
+    **A factor of 499,520.** Same matrix, same right-hand side, same float64.
+    The only difference is that one path formed $A^\\top A$ and the other did
+    not.
+
+    ## Why squaring happens
+
+    The singular values of $A^\\top A$ are the *squares* of those of $A$:
+
+    $$\\sigma_i(A^\\top A) = \\sigma_i(A)^2$$
+
+    So the condition number becomes
+
+    $$\\kappa(A^\\top A) = \\frac{\\sigma_{\\max}^2}{\\sigma_{\\min}^2} = \\kappa(A)^2.$$
+
+    Measured, on purpose-built matrices:
+
+    | $\\kappa(A)$ | $\\kappa(A^\\top A)$ | ratio |
+    |---|---|---|
+    | $10^2$ | $10^4$ | $100$ |
+    | $10^4$ | $10^8$ | $10{,}000$ |
+    | $10^6$ | $10^{12}$ | $999{,}996$ |
+
+    Now apply the error bound. In float64, $\\epsilon = 2.22 \\times 10^{-16}$.
+    At $\\kappa(A^\\top A) = 10^{12}$, the expected relative error is
+
+    $$\\kappa \\cdot \\epsilon = 10^{12} \\times 2.22 \\times 10^{-16} \\approx 2.2 \\times 10^{-4}.$$
+
+    You have **four correct digits**. And at $\\kappa = 10^{16}$ the smallest
+    singular value is at machine epsilon itself — the matrix is numerically
+    singular, and any solver will happily return an answer.
+
+    ## The precision you are actually working with
+
+    | dtype | $\\epsilon$ | decimal digits | largest safe $\\kappa$ |
+    |---|---|---|---|
+    | float64 | $2.22 \\times 10^{-16}$ | 15.7 | $\\sim 6.7 \\times 10^{7}$ |
+    | float32 | $1.19 \\times 10^{-7}$ | 6.9 | $\\sim 2.9 \\times 10^{3}$ |
+    | float16 | $9.77 \\times 10^{-4}$ | 3.0 | $\\sim 22$ |
+
+    Read the last column. **In float32, a condition number above ~3,000 already
+    destroys your answer.** That is not an exotic matrix — it is what you get
+    from unstandardised features, near-collinear columns, or a deep network's
+    later layers.
+
+    This is the real reason mixed-precision training keeps master weights in
+    float32 and accumulates in float32: the *storage* can be float16, but the
+    *accumulation* cannot, because the accumulation's condition number is much
+    worse than any individual multiply's.
+
+    ## Catastrophic cancellation
+
+    Subtraction is where digits die. Floating point has relative, not
+    absolute, precision — the gap between representable numbers scales with
+    magnitude. At $10^{16}$, the gap is about 2. So:
+
+    ```python
+    >>> sum([1e16, 1.0, -1e16])
+    0.0
+    >>> math.fsum([1e16, 1.0, -1e16])
+    1.0
+    ```
+
+    The 1.0 is entirely below the representable gap, so it vanishes. Then
+    `-1e16` exactly cancels `1e16`, and you get zero. The true answer is 1.0.
+
+    This is exactly why the textbook variance formula
+    $\\frac{1}{n}\\sum x_i^2 - \\bar{x}^2$ fails on data with a large mean: you
+    compute two numbers near $10^{16}$ and subtract them to get something near
+    $1$. Every digit of the answer came from rounding error.
+
+    The fix is to never form the difference of large nearly-equal quantities:
+    use a two-pass algorithm (compute the mean first, then sum squared
+    deviations) or Welford's single-pass recurrence.
+
+    ## The four habits
+
+    **1. Check $\\kappa$ before you trust anything.**
+
+    ```python
+    kappa = np.linalg.cond(X)
+    if kappa * np.finfo(X.dtype).eps > 1e-6:
+        raise ValueError("this solve will not give you 6 digits")
+    ```
+
+    **2. Never form $X^\\top X$ for a solve.** Use `lstsq` (SVD-based) or QR.
+    Reserve the Gram matrix for cases where you have already regularised it,
+    as ridge does — and note that ridge's $+\\lambda I$ is precisely a
+    conditioning fix, not just a statistical one.
+
+    **3. Never invert.** `solve(A, b)` instead of `inv(A) @ b`. Measured 4.24×
+    faster *and* more accurate. For repeated solves, factorise once and reuse
+    the factorisation.
+
+    **4. Verify against a constructed answer.** Pick $x$, compute
+    $b = Ax$, solve, and check you recover $x$. This end-to-end check catches
+    bugs that no amount of reading the code will find.
+
+    ## Where the analogy breaks
+
+    "Ill-conditioned means unsolvable" is too strong. Ill-conditioning means
+    *the answer is sensitive to the data*, and sometimes that sensitivity is
+    the honest truth about your problem — 100 near-collinear features really do
+    carry less information than 100 independent ones. Regularisation does not
+    fix the conditioning so much as **change the question** to one whose answer
+    is stable, and you should know which of those two things you are doing.
+
+    ## The longer version
+
+    The remaining statement, verbatim: what backward stability does and does not
+    guarantee, and why conflating it with accuracy is the most common conceptual
+    error in this area.
+
+    ### Failure modes, in full
+
+    - You will fit a regression, get coefficients that look plausible, and be wrong by orders of magnitude — with no exception, no warning, and no NaN to alert you. The failure is silent, which is what makes it dangerous.
+    - The single most common numerical bug in ML is forming $X^\top X$. It squares the condition number, and I measured the consequence: at $\kappa(X) = 10^6$, solving via the normal equations gave relative error $6.8 \times 10^{-6}$ where a stable solve gave $1.4 \times 10^{-11}$ — **500,000 times worse**, on the same data.
+    - Interviewers ask 'why is `np.linalg.inv` discouraged?' expecting a numerical argument, not 'it's slower'. Both halves matter: I measured `inv` at 4.24× the cost of `solve`, and it also loses accuracy.
+    - Mixed precision training, FP8 inference, and quantisation are all decisions about machine epsilon. Without a model of how error propagates, those become folklore rather than engineering.
+
+    ### The mechanisms, in full
+
+    - **Machine epsilon is your error floor, and it depends on dtype.** float64 has $\epsilon = 2.22 \times 10^{-16}$ (about 15.7 decimal digits), float32 has $1.19 \times 10^{-7}$ (6.9 digits), float16 has $9.77 \times 10^{-4}$ — barely 3 digits. Every claim about accuracy is relative to this number, so 'float32 is almost as good as float64' is a claim about your condition number, not about the dtype.
+    - **Condition number is the amplification factor, and you should compute it before trusting any result.** $\kappa(A) = \sigma_{\max}/\sigma_{\min}$. The bound is $\text{relative error} \le \kappa(A) \cdot \epsilon$. A matrix with $\kappa = 10^{6}$ in float64 loses 6 of your 15.7 digits — you have ~9 good digits left. The same matrix in float32 ($1.19 \times 10^{-7}$) loses **all of them** and returns noise with full confidence.
+    - **Forming $X^\top X$ exactly squares the condition number.** Measured: $\kappa(X) = 10^2 \Rightarrow \kappa(X^\top X) = 10^4$; $10^4 \Rightarrow 10^8$; $10^6 \Rightarrow 10^{12}$. The reason is that $\sigma_i(X^\top X) = \sigma_i(X)^2$, so the ratio of largest to smallest becomes the square of the original ratio. At $\kappa = 10^8$ in float64 the smallest singular value is below $\epsilon$ — the matrix is numerically rank-deficient even though it is mathematically full rank.
+    - **The normal equations are measurably catastrophic, not theoretically worse.** On an $80 \times 80$ system with $\kappa(A) = 10^6$: stable solve gave relative error $1.36 \times 10^{-11}$; normal equations gave $6.81 \times 10^{-6}$. That is a factor of $4.99 \times 10^{5}$ — the difference between a correct model and a garbage one, with identical inputs.
+    - **Catastrophic cancellation destroys digits when you subtract nearby large numbers.** `sum([1e16, 1.0, -1e16])` returns **0.0**, not 1.0, because 1.0 is below the representable gap at $10^{16}$. `math.fsum` returns 1.0. This is why variance computed as $E[x^2] - E[x]^2$ fails on data with a large mean: you subtract two nearly equal large numbers and the answer is determined by rounding.
+    - **Never invert a matrix.** `inv(A)` costs 4.24× a `solve` in my measurement (2–3× asymptotically), and it is less accurate because it explicitly forms the inverse's error. Solve against a factorisation instead: `solve(A, b)` or `cho_solve(L, b)`. If you need the inverse for a covariance, you usually actually need a solve applied to many right-hand sides.
+    - **Cholesky is the right tool for SPD systems and it fails loudly, which is the point.** For symmetric positive definite $A$, $A = LL^\top$ costs about half of LU. On an indefinite matrix it raises `LinAlgError` rather than returning garbage — that failure is a *feature*, because it tells you an assumption was violated. Use it to test positive-definiteness.
+    - **Backward stability is the property that makes an algorithm trustworthy, and it is not the same as accuracy.** A backward-stable algorithm gives the exact answer to a slightly perturbed problem. That guarantees the algorithm adds no error beyond the conditioning — it does **not** guarantee the answer is close to the true one when the problem is ill-conditioned. Conflating the two is the most common conceptual error in this area.
+    - **Scaling your data is a conditioning operation, not a preprocessing nicety.** Standardising features so each has unit variance changes $\kappa(X)$ directly. A feature in dollars ($10^5$) and a feature in years ($10^1$) in the same design matrix can inflate $\kappa$ by four orders of magnitude on their own. Centring and scaling is the cheapest accuracy improvement available.
+
+
+  derivations:
+    - title: "Why κ(AᵀA) = κ(A)²"
+      latex: |
+        Let $A = U\\Sigma V^\\top$ be the SVD. Then
+        $$A^\\top A = V\\Sigma U^\\top U \\Sigma V^\\top = V\\Sigma^2 V^\\top,$$
+        since $U^\\top U = I$. This is an eigendecomposition of $A^\\top A$ with
+        eigenvalues $\\sigma_i^2$, so
+        $$\\kappa(A^\\top A) = \\frac{\\sigma_{\\max}^2}{\\sigma_{\\min}^2} = \\left(\\frac{\\sigma_{\\max}}{\\sigma_{\\min}}\\right)^2 = \\kappa(A)^2.$$
+      prose: >-
+        The squaring is not an approximation or a worst case -- it is an
+        identity. Forming the Gram matrix doubles the exponent on your
+        condition number, which is why it halves your usable digits.
+    - title: "The error bound κ·ε and where it comes from"
+      latex: |
+        Suppose $A$ is perturbed to $A + \\delta A$ with
+        $\\|\\delta A\\| \\le \\epsilon\\|A\\|$, and $x$ solves $Ax = b$ while
+        $\\hat{x}$ solves $(A + \\delta A)\\hat{x} = b$. Then
+        $$\\frac{\\|\\hat{x} - x\\|}{\\|x\\|} \\le \\kappa(A)\\,\\frac{\\|\\delta A\\|}{\\|A\\|} \\le \\kappa(A)\\,\\epsilon.$$
+      prose: >-
+        Read it as a product of two independent factors: how much the input was
+        perturbed (epsilon, which you control via dtype) and how much the
+        problem amplifies that (kappa, which you control via scaling and
+        regularisation). Only the product determines your accuracy, which is
+        why a well-conditioned float32 problem beats an ill-conditioned
+        float64 one.
+    - title: "Why naive variance suffers catastrophic cancellation"
+      latex: |
+        The one-pass estimator is
+        $$s^2 = \\frac{1}{n}\\sum_i x_i^2 - \\bar{x}^2.$$
+        With $x_i = \\mu + d_i$ and $\\mu \\gg d_i$,
+        $$\\frac{1}{n}\\sum x_i^2 \\approx \\mu^2 + \\frac{2\\mu}{n}\\sum d_i + \\frac{1}{n}\\sum d_i^2,$$
+        and $\\bar{x}^2 \\approx \\mu^2 + \\frac{2\\mu}{n}\\sum d_i + \\left(\\frac{1}{n}\\sum d_i\\right)^2$.
+        The $\\mu^2$ terms — which dominate the magnitude — cancel exactly,
+        leaving a result determined by rounding error in quantities of size
+        $\\mu^2$.
+      prose: >-
+        Formally the two expressions are identical. Numerically, the first
+        computes two numbers of size mu-squared and subtracts them to get
+        something of size d-squared. When mu/d exceeds about 1e8, every
+        significant digit of the answer came from rounding error. The two-pass
+        algorithm avoids this by subtracting mu from each x_i first, so the
+        only arithmetic on large numbers is the subtraction that produces a
+        small result exactly.
+
+  implementations:
+    - language: python
+      title: "A numerically honest least-squares solve"
+      note: >-
+        `lstsq` uses SVD and is the right default: it handles rank deficiency
+        by truncating small singular values instead of blowing up. The
+        `rcond` argument is the threshold below which a singular value is
+        treated as zero -- setting it too small is how you get enormous
+        coefficients from collinear features.
+      code: |
+        import numpy as np
+
+        def solve_least_squares(X, y, rcond=None):
+            """Stable least squares via SVD, with a conditioning check.
+
+            Deliberately does NOT form X.T @ X. That step squares the
+            condition number, which at kappa(X)=1e6 costs about five orders
+            of magnitude in accuracy.
+            """
+            X = np.asarray(X, dtype=float)
+            y = np.asarray(y, dtype=float)
+            kappa = np.linalg.cond(X)
+            eps = np.finfo(X.dtype).eps
+            # Report rather than raise: the caller may have good reason.
+            digits_lost = np.log10(kappa * eps) if kappa * eps > 0 else 0.0
+            beta, residuals, rank, sv = np.linalg.lstsq(X, y, rcond=rcond)
+            return {
+                "beta": beta,
+                "kappa": float(kappa),
+                "rank": int(rank),
+                "digits_lost": float(max(0.0, digits_lost)),
+                "sufficient": bool(kappa * eps < 1e-6),
+            }
+
+        def verify_solver(X, seed=0):
+            """End-to-end check: construct a known answer and recover it."""
+            rng = np.random.default_rng(seed)
+            x_true = rng.normal(size=X.shape[1])
+            b = X @ x_true
+            x_hat = np.linalg.solve(X, b)
+            return float(np.linalg.norm(x_hat - x_true) / np.linalg.norm(x_true))
+    - language: python
+      title: "Stable variance: Welford's algorithm"
+      note: >-
+        The naive one-pass formula computes the difference of two large
+        nearly-equal numbers and loses every significant digit when the mean
+        is large relative to the spread. Welford updates the mean and the
+        sum of squared deviations together, so no large-magnitude subtraction
+        ever occurs. It is also single-pass, which matters for streaming data.
+      code: |
+        import numpy as np
+
+        def variance_naive(xs):
+            """WRONG for data with a large mean. Shown to be wrong, not to be used."""
+            a = np.asarray(xs, dtype=float)
+            return float(a.mean() ** 2 * 0 + (a ** 2).mean() - a.mean() ** 2)
+
+        def variance_welford(xs):
+            """Numerically stable single-pass variance (population, /n)."""
+            n = 0
+            mean = 0.0
+            m2 = 0.0
+            for x in xs:
+                n += 1
+                delta = float(x) - mean
+                mean += delta / n
+                m2 += delta * (float(x) - mean)
+            return m2 / n if n else 0.0
+
+        # On [1e8+1, 1e8+2, 1e8+3] the true variance is 2/3.
+        # variance_naive may return 0.0 or a large negative number.
+        # variance_welford returns 0.6666666666666666.
+    - language: python
+      title: "Cholesky: cheap, stable, and it tells you when it cannot help"
+      note: >-
+        Attempting a Cholesky factorisation is the standard test for positive
+        definiteness, because the factorisation exists if and only if the
+        matrix is SPD. The `LinAlgError` is the useful part: it means an
+        assumption you made about your data is false.
+      code: |
+        import numpy as np
+
+        def spd_solve(A, b):
+            """Solve an SPD system via Cholesky. Raises if A is not SPD."""
+            A = np.asarray(A, dtype=float)
+            b = np.asarray(b, dtype=float)
+            # Symmetrise: A + A.T may differ from 2A by rounding, and Cholesky
+            # only reads one triangle, so an asymmetric A silently gives a
+            # wrong answer rather than an error.
+            A = 0.5 * (A + A.T)
+            try:
+                L = np.linalg.cholesky(A)
+            except np.linalg.LinAlgError as exc:
+                raise ValueError("matrix is not positive definite") from exc
+            y = np.linalg.solve(L, b)
+            return np.linalg.solve(L.T, y)
+
+        def is_spd(A):
+            """Positive definiteness test via attempted Cholesky."""
+            try:
+                np.linalg.cholesky(0.5 * (A + A.T))
+                return True
+            except np.linalg.LinAlgError:
+                return False
+
+  checkpoints:
+    - id: cp-1
+      question: "Your design matrix has $\\kappa = 10^{6}$ and you are in float32. How many digits of your answer survive?"
+      answerKind: short_text
+      hint: "Compute $\\kappa \\cdot \\epsilon$ for float32 and take the log."
+      solution: >-
+        $\\epsilon_{32} = 1.19 \\times 10^{-7}$, so
+        $\\kappa\\epsilon = 10^{6} \\times 1.19 \\times 10^{-7} = 0.119$. The
+        relative error bound is about 12% — you have **zero** reliable digits.
+        The same problem in float64 gives $10^6 \\times 2.22 \\times 10^{-16} =
+        2.2 \\times 10^{-10}$, about 9 good digits. This is why mixed-precision
+        training keeps accumulations in float32 even when storage is float16.
+    - id: cp-2
+      question: "Why does forming $X^\\top X$ square the condition number, exactly?"
+      answerKind: short_text
+      hint: "Write the SVD of $A$ and compute $A^\\top A$."
+      solution: >-
+        With $A = U\\Sigma V^\\top$, $A^\\top A = V\\Sigma^2 V^\\top$ — an
+        eigendecomposition with eigenvalues $\\sigma_i^2$. So
+        $\\kappa(A^\\top A) = \\sigma_{\\max}^2/\\sigma_{\\min}^2 = \\kappa(A)^2$.
+        It is an identity, not a worst case, which is why the accuracy loss is
+        so severe and so predictable.
+    - id: cp-3
+      question: "`sum([1e16, 1.0, -1e16])` returns 0.0. Explain precisely why, and what the true answer is."
+      answerKind: short_text
+      hint: "What is the gap between representable floats near $10^{16}$?"
+      solution: >-
+        Near $10^{16}$ the spacing between representable float64 values is
+        about 2, so 1.0 is not representable at that magnitude and is lost when
+        added to $10^{16}$. The accumulator holds $10^{16}$, then subtracting
+        $10^{16}$ gives exactly 0. The true answer is 1.0, which `math.fsum`
+        recovers because it tracks the lost low-order bits. This is
+        catastrophic cancellation: the answer is entirely rounding error.
+    - id: cp-4
+      question: "A colleague says 'our solver is backward stable, so the answer is accurate.' What is wrong with that statement?"
+      answerKind: short_text
+      hint: "Separate what the algorithm guarantees from what the problem allows."
+      solution: >-
+        Backward stability only guarantees the computed result is the exact
+        answer to a slightly perturbed problem. That bounds the algorithm's
+        *added* error at roughly $\\epsilon\\|A\\|$ — it says nothing about
+        whether the true answer is close to the computed one. For an
+        ill-conditioned problem, the exact answer to a slightly perturbed
+        problem can be far from the exact answer to the original. Accuracy is
+        $\\kappa \\cdot \\epsilon$; stability only controls the $\\epsilon$ part.
+    - id: cp-5
+      question: "Why is `np.linalg.cholesky` failing on your matrix useful information rather than a bug?"
+      answerKind: short_text
+      hint: "What property does the Cholesky factorisation require, and what does it mean if the data violates it?"
+      solution: >-
+        Cholesky exists if and only if the matrix is symmetric positive
+        definite. A failure means your matrix is not SPD — a covariance matrix
+        estimated from fewer samples than dimensions, a kernel matrix that is
+        not PSD, or a Hessian at a saddle point. That is a fact about your data
+        or model, not about the library. The alternative (LU or an inverse) would
+        return a plausible wrong answer instead of telling you.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A floating-point computation has a finite budget of correct digits, and
+        that budget is spent by two independent things: the precision of the
+        number type, and how sensitive the problem is to small changes. When
+        their product exceeds what you need, the answer is wrong — silently.
+      blocks:
+        - kind: checklist
+          body: |
+            - epsilon: the gap between 1.0 and the next float (2.2e-16 in float64)
+            - kappa: how much the problem amplifies that gap
+            - usable digits ≈ 15.7 - log10(kappa) for float64
+            - The bound is a product: kappa * epsilon
+            - Silence is the danger: no exception, no NaN
+      checkpoint: >-
+        If float32 has about 7 digits and your matrix has condition number
+        1e4, how many digits do you actually get? Do that subtraction before
+        reading on.
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Three levers, in order of leverage. First, measure — compute the
+        condition number before you trust any solve. Second, change the
+        problem so it is better conditioned (scale features, regularise).
+        Third, choose a stable algorithm so you do not add error on top of the
+        conditioning you cannot avoid.
+      blocks:
+        - kind: checklist
+          body: |
+            - Measure: np.linalg.cond(X), compare to 1/eps
+            - Condition the problem: standardise, centre, regularise
+            - Choose the algorithm: lstsq/solve/cho_solve, never inv
+            - Verify: construct a known x, compute b = Ax, recover x
+      checkpoint: >-
+        Your condition number is 1e12 in float64. Which of the three levers
+        can actually save you, and which cannot?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The diagnostic is three lines. The repair is choosing a different
+        function call and standardising your inputs.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. Measure
+            kappa = cond(X)
+            eps   = finfo(X.dtype).eps
+            digits_lost = log10(kappa * eps)
+            if digits_lost > 6: warn("fewer than 6 reliable digits")
+
+            # 2. Condition the problem
+            X = (X - mean(X)) / std(X)     # reduces kappa directly
+            # and/or add regularisation: XtX + lambda*I
+
+            # 3. Solve stably
+            beta = lstsq(X, y)             # SVD-based; handles rank deficiency
+            # NOT: solve(X.T @ X, X.T @ y)  -- squares kappa
+            # NOT: inv(X.T @ X) @ X.T @ y   -- squares kappa AND unstable
+
+            # 4. Verify end-to-end
+            x_probe = random(n_features)
+            assert norm(solve(X, X @ x_probe) - x_probe) < tol
+      checkpoint: >-
+        Why does standardising X reduce kappa, mechanically? What does it do to
+        the singular values?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Both key results are short and worth being able to reproduce on a
+        whiteboard.
+      blocks:
+        - kind: math
+          body: |
+            **Squaring.** With $A = U\\Sigma V^\\top$:
+            $$A^\\top A = V\\Sigma U^\\top U\\Sigma V^\\top = V\\Sigma^2 V^\\top$$
+            $$\\kappa(A^\\top A) = \\frac{\\sigma_{\\max}^2}{\\sigma_{\\min}^2} = \\kappa(A)^2$$
+
+            **Error bound.** For $\\|\\delta A\\| \\le \\epsilon\\|A\\|$:
+            $$\\frac{\\|\\hat{x}-x\\|}{\\|x\\|} \\le \\kappa(A)\\frac{\\|\\delta A\\|}{\\|A\\|} \\le \\kappa(A)\\epsilon$$
+
+            **Cancellation.** With $x_i = \\mu + d_i$, $\\mu \\gg d_i$:
+            $$\\tfrac1n\\textstyle\\sum x_i^2 - \\bar{x}^2 = \\underbrace{\\mu^2 + \\tfrac{2\\mu}{n}\\sum d_i + \\tfrac1n\\sum d_i^2}_{\\text{computed}} - \\underbrace{\\left(\\mu + \\tfrac1n\\sum d_i\\right)^2}_{\\text{computed}}$$
+            The $\\mu^2$ terms cancel; what remains of size $\\sum d_i^2$ is
+            computed as the difference of numbers of size $\\mu^2$.
+      checkpoint: >-
+        In the cancellation derivation, the two computed quantities are
+        mathematically equal to the two terms. So why does the arithmetic
+        differ from the algebra?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete numerical preflight and stable solve, with the reasoning for
+        each choice and its failure modes.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the diagnostic first and predict what it will report for your
+            own data before running it. The point is to internalise the bound,
+            not to copy the code.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def preflight(X):
+                """Report whether a solve on this matrix is trustworthy."""
+                X = np.asarray(X, dtype=float)
+                sv = np.linalg.svd(X, compute_uv=False)
+                eps = np.finfo(X.dtype).eps
+                kappa = float(sv[0] / sv[-1]) if sv[-1] > 0 else float("inf")
+                # Numerical rank: singular values above the noise floor.
+                tol = sv[0] * eps * max(X.shape)
+                rank = int((sv > tol).sum())
+                return {
+                    "kappa": kappa,
+                    "eps": float(eps),
+                    "digits_lost": float(np.log10(kappa * eps)) if np.isfinite(kappa) else float("inf"),
+                    "numerical_rank": rank,
+                    "mathematical_rank": int(min(X.shape)),
+                    "trustworthy": bool(np.isfinite(kappa) and kappa * eps < 1e-6),
+                }
+
+            def stable_lstsq(X, y, l2=0.0):
+                """Least squares that never forms X.T @ X unless regularised."""
+                X = np.asarray(X, dtype=float); y = np.asarray(y, dtype=float)
+                if l2 > 0:
+                    # Ridge: augment instead of adding lambda*I to the Gram
+                    # matrix. Stacking sqrt(lambda)*I gives the same answer
+                    # without ever squaring the condition number.
+                    n, p = X.shape
+                    Xa = np.vstack([X, np.sqrt(l2) * np.eye(p)])
+                    ya = np.concatenate([y, np.zeros(p)])
+                    return np.linalg.lstsq(Xa, ya, rcond=None)[0]
+                return np.linalg.lstsq(X, y, rcond=None)[0]
+
+            # The augmentation trick is worth understanding: adding rows is
+            # numerically free of the squaring problem, while modifying the
+            # Gram matrix is not.
+      checkpoint: >-
+        The ridge implementation augments the design matrix with
+        sqrt(lambda)*I instead of adding lambda*I to X^T X. Prove these give
+        the same answer, then explain why only one of them avoids the squaring
+        problem.
+
+  problems:
+    - id: p-condition-number
+      title: "Condition number from the singular values"
+      difficulty: easy
+      prompt: >-
+        Implement `condition_number(A)` returning $\sigma_{\max}/\sigma_{\min}$
+        as a float. Treat the matrix as singular — returning `float('inf')` —
+        when the smallest singular value is at or below the numerical-rank
+        threshold $\sigma_{\max} \cdot \epsilon \cdot \max(m, n)$.
+        Return `float('inf')` for an empty matrix too.
+      starter: |
+        import numpy as np
+
+        def condition_number(A):
+            # your implementation here
+            pass
+      language: python
+      entry: condition_number
+      testCases:
+        - input: "[[[1.0, 0.0], [0.0, 100.0]]]"
+          expected: "100.0"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[2.0, 0.0], [0.0, 1.0]]]"
+          expected: "2.0"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[1.0, 2.0], [2.0, 4.0]]]"
+          expected: "Infinity"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def condition_number(A):
+            A = np.asarray(A, dtype=float)
+            if A.size == 0:
+                return float("inf")
+            sv = np.linalg.svd(A, compute_uv=False)
+            if sv.size == 0 or sv[0] == 0.0:
+                return float("inf")
+            # A mathematically rank-deficient matrix does NOT produce an exact
+            # zero singular value -- rounding leaves roughly 1e-16. Compare
+            # against the numerical-rank threshold instead of testing == 0.
+            tol = sv[0] * np.finfo(float).eps * max(A.shape)
+            if sv[-1] <= tol:
+                return float("inf")
+            return float(sv[0] / sv[-1])
+      solutionExplanation: >-
+        The condition number is the ratio of largest to smallest singular value.
+        The subtle part is the singularity test: [[1,2],[2,4]] is
+        mathematically rank 1, but an SVD of it returns a smallest singular
+        value around 1e-16, not 0. Testing sv[-1] == 0 therefore misses the
+        very case the third test provides. The correct test compares against
+        the numerical-rank threshold sigma_max * eps * max(m, n), which is the
+        smallest singular value indistinguishable from zero at this precision.
+        This is the topic's own lesson appearing inside its own reference
+        solution.
+      complexity: "O(min(mn², m²n)) time (the SVD), O(min(m,n)) space"
+      tags: [conditioning, svd, numerics]
+
+    - id: p-stable-variance
+      title: "Numerically stable variance"
+      difficulty: medium
+      prompt: >-
+        Implement `variance_stable(xs)` returning the **population** variance
+        (divide by n). It must be accurate for data with a large mean, where
+        the one-pass $E[x^2] - E[x]^2$ formula fails. Return 0.0 for an empty
+        sequence, and 0.0 for a single element.
+      starter: |
+        def variance_stable(xs):
+            # your implementation here
+            pass
+      language: python
+      entry: variance_stable
+      testCases:
+        - input: "[[100000001.0, 100000002.0, 100000003.0]]"
+          expected: "0.6666666666666666"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[1.0, 2.0, 3.0, 4.0]]"
+          expected: "1.25"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[5.0]]"
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[]]"
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def variance_stable(xs):
+            n = 0
+            mean = 0.0
+            m2 = 0.0
+            for x in xs:
+                x = float(x)
+                n += 1
+                delta = x - mean
+                mean += delta / n
+                m2 += delta * (x - mean)
+            return m2 / n if n else 0.0
+      solutionExplanation: >-
+        Welford's recurrence updates the running mean and the sum of squared
+        deviations together, so it never forms the difference of two large
+        nearly-equal numbers. On [1e8+1, 1e8+2, 1e8+3] the true variance is
+        2/3; the naive formula computes E[x^2] - E[x]^2 where both terms are
+        about 1e16, so every digit of the answer is rounding error. Welford
+        instead subtracts the mean from each value first, and those differences
+        are exactly representable.
+      complexity: "O(n) time, O(1) space"
+      tags: [variance, cancellation, welford]
+
+    - id: p-spd-check
+      title: "Positive definiteness via Cholesky"
+      difficulty: easy
+      prompt: >-
+        Implement `is_spd(A)` returning `True` if the matrix is symmetric
+        positive definite, `False` otherwise. Use an attempted Cholesky
+        factorisation. Symmetrise the matrix first as `(A + A.T) / 2` so that
+        tiny asymmetries from rounding do not matter.
+      starter: |
+        import numpy as np
+
+        def is_spd(A):
+            # your implementation here
+            pass
+      language: python
+      entry: is_spd
+      testCases:
+        - input: "[[[2.0, 1.0], [1.0, 1.0]]]"
+          expected: "true"
+          mode: json
+        - input: "[[[2.0, 3.0], [3.0, 1.0]]]"
+          expected: "false"
+          mode: json
+        - input: "[[[1.0, 0.0], [0.0, 0.0]]]"
+          expected: "false"
+          mode: json
+        - input: "[[[4.0, 0.0], [0.0, 9.0]]]"
+          expected: "true"
+          mode: json
+      solution: |
+        import numpy as np
+
+        def is_spd(A):
+            A = np.asarray(A, dtype=float)
+            if A.ndim != 2 or A.shape[0] != A.shape[1]:
+                return False
+            S = 0.5 * (A + A.T)
+            try:
+                np.linalg.cholesky(S)
+                return True
+            except np.linalg.LinAlgError:
+                return False
+      solutionExplanation: >-
+        A Cholesky factorisation exists if and only if the matrix is symmetric
+        positive definite, so attempting one is an exact test. Symmetrising
+        first matters because `np.linalg.cholesky` reads only one triangle —
+        an asymmetric input would silently use half the data rather than
+        raising. The semi-definite case [[1,0],[0,0]] correctly returns False:
+        it has a zero eigenvalue, so it is not positive definite.
+      complexity: "O(n³) time, O(n²) space"
+      tags: [cholesky, spd, numerics]
+
+  visualizers:
+    - id: vs-conditioning
+      kind: loss_surface
+      title: "How conditioning distorts a quadratic"
+      description: >-
+        A quadratic form $x^\\top A x$ with condition number $\\kappa$ is a
+        bowl whose axes differ in width by $\\sqrt{\\kappa}$. Raise $\\kappa$ and
+        watch the bowl become a valley — which is exactly why gradient descent
+        zig-zags and why preconditioning helps.
+      params:
+        minKappa: 1
+        maxKappa: 10000
+        mode: "quadratic-conditioning"
+
+  try_it: >-
+    Run `sum([1e16, 1.0, -1e16])` and `math.fsum([1e16, 1.0, -1e16])` in a REPL and
+    explain the two answers before looking anything up. Then build a $3 \times 3$
+    matrix whose third column is the first two added, print `numpy.linalg.cond` of
+    it, and state how many of float64's digits a solve keeps.
+  interview_questions:
+    - question: "What is backward stability, and why is it not the same thing as accuracy?"
+      level: mid
+      key_points:
+        - "A backward-stable algorithm returns the exact answer to a slightly perturbed input — perturbation of order $\\epsilon$ times the problem size."
+        - "That guarantees the algorithm adds no error beyond conditioning; the forward error is still bounded by $\\kappa(A)\\epsilon$, so an ill-conditioned problem stays wrong."
+        - "QR, SVD, Cholesky and LU with partial pivoting are backward stable; the normal equations are not, because they square the condition number before the solve."
+        - "Conflating the two properties is the most common conceptual error in this area — stability is a property of the algorithm, accuracy depends on the problem too."
+      follow_up: "Give an algorithm that is backward stable and still returns a useless answer, with numbers."
+    - question: "You must fit a 200-feature regression and the design matrix has $\\kappa = 10^6$. Walk me through what you change."
+      level: senior
+      key_points:
+        - "Centre and scale first — that is a conditioning operation, and mixed units (dollars at $10^5$, years at $10^1$) can inflate $\\kappa$ by four orders of magnitude on their own."
+        - "Never form $X^\\top X$: at $\\kappa = 10^6$ it becomes $10^{12}$ and the smallest singular value falls below $\\epsilon$ in float64."
+        - "Solve with QR or SVD (`lstsq`) against $X$ directly, or use Cholesky if the system is genuinely SPD; keep the error bound at $\\kappa\\epsilon$."
+        - "Budget the digits — $10^6$ costs 6 of 15.7, leaving ~9 — and consider ridge, which caps the effective condition number at $(\\sigma_{\\max}^2+\\lambda)/\\lambda$."
+      follow_up: "After all of that the coefficients still have the wrong sign. What have you not fixed?"
+    - question: "Why does Cholesky raising `LinAlgError` count as a feature rather than a defect?"
+      level: mid
+      key_points:
+        - "A Cholesky factor exists if and only if the matrix is symmetric positive definite, so attempting one is an exact test for the property."
+        - "It fails loudly on an indefinite matrix, where LU would return a plausible-looking factorisation of something that is not the matrix you meant."
+        - "It costs about half of LU's constant factor, so the cheap route is also the one that tells you when your assumption is violated."
+        - "It reads only one triangle, so you must symmetrise with $0.5(A + A^\\top)$ or it will silently use half the data instead of raising."
+  common_mistakes:
+    - "Reporting a small residual $\\|b - Ax\\|$ as proof of an accurate solution: at $\\kappa = 10^6$ the residual can be $10^{-12}$ while the error is $10^{-6}$."
+    - "Treating float32 as 'almost float64' — $1.19\\times10^{-7}$ against $2.22\\times10^{-16}$ is nine orders of magnitude, so a $\\kappa = 10^6$ problem returns pure noise."
+    - "Computing variance as $E[x^2] - E[x]^2$ on data with a large mean, then blaming the data when the result comes out negative."
+  further_reading:
+    - label: "Higham, Accuracy and Stability of Numerical Algorithms, Chapters 1–3"
+    - label: "NumPy, numpy.linalg.cond"
+      url: "https://numpy.org/doc/stable/reference/generated/numpy.linalg.cond.html"

@@ -1,0 +1,621 @@
+id: build-paged-attention
+slug: build-paged-attention
+title: "Build Paged Attention: Block Tables, Append-Only KV, and Continuous Batching"
+summary: >-
+  Implement a paged KV cache with a block table, prove it produces the same
+  attention output as a dense cache, measure the internal fragmentation the
+  block size buys you, and write the iteration-level scheduler that lets a new
+  request join a batch while another is still decoding.
+kind: lesson
+difficulty: hard
+position: 4
+estMinutes: 22
+prerequisites: []
+phase: build-systems
+tags: [paged-attention, kv-cache, continuous-batching, vllm, memory, scheduling]
+
+body:
+  big_idea: >-
+    A KV cache is a memory allocator problem in a transformer costume:
+    fixed-size blocks plus a per-sequence table turn a variable-length
+    reservation into an append-only free-list allocation.
+  problem:
+    - "You reserve max_seq_len per request: at 4,096 tokens and 128 KB per token that is 512 MB, so forty requests exhaust memory before compute."
+    - "You switch to continuous batching and throughput does not move, because the allocator still hands each sequence one contiguous slab that leaves unusable holes."
+    - "Your paged output differs from the dense reference in the fourth decimal and you cannot tell whether that is gather order or a real bug."
+  analogy: >-
+    A hotel with fixed-size rooms and a front desk that keeps each guest's
+    room list. A guest who stays longer gets another room when the current one
+    fills, and the desk writes the number on their card. The card is the block
+    table, the rooms are physical blocks, and housekeeping is the win: every
+    room a departing guest held goes back on the free list.
+  concept_points:
+    - "**The block table is the whole idea, and it costs 4 bytes per block.** A sequence's KV is a list of physical block ids, one per `block_size` tokens. Forty tokens at `block_size = 16` need $\\lceil 40/16 \\rceil = 3$ blocks, so the table is 12 bytes and 48 slots are reserved against 40 used."
+    - "**The fragmentation is internal, and it is bounded by one block per sequence.** Reserved slots are $\\lceil L/B \\rceil B$, so waste is at most $B - 1$ slots at $B = 16$, however long the sequence. Over 500 sequences of lengths uniform on $[1, 64]$ the measured waste was **19.0%** — 3,918 slots on 20,576 reserved. The worst case is **93.75%** for a length-1 sequence."
+    - "**There is no external fragmentation, and that is the real win.** A contiguous allocator that reserves `max_seq_len` per request wastes the difference between maximum and actual length — 4,096 reserved against 300 used is **92.7%** waste — and even a reserve-what-you-need allocator cannot fill a 300-slot hole with a 400-slot request. Fixed-size blocks make every free block interchangeable, so admission is `free_blocks >= blocks_needed`."
+    - "**Paged attention is the same arithmetic in a different memory order.** Gather the $K$ and $V$ for a sequence's logical blocks in order, truncate to the sequence length, and run the same softmax. A CPU implementation that concatenates first is **bit-identical to the dense reference (0.0)**; a real kernel reading block by block differs only in summation order, at $10^{-6}$. A difference of $10^{-3}$ is a bug."
+    - "**Continuous batching is a scheduler change enabled by the allocator.** Static batching runs a fixed set of requests to completion, so a request finishing at step 3 leaves its slots idle until the longest finishes. Iteration-level scheduling re-evaluates admission every step. With 8 blocks and three requests of 3 blocks each, measured: **`['r0','r1']` admitted at step 0, `['r2']` at step 3.**"
+    - "**The memory numbers are what make this urgent.** For a 32-layer model with 8 KV heads, head width 128 and fp16, one token costs $2 \\times 32 \\times 8 \\times 128 \\times 2 =$ **128 KB**. A 4,096-token request is 512 MB; forty of them are 20 GB, the entire A100. At `block_size = 16` a block is 2 MB, so a 300-token sequence holds 19 blocks = 38 MB."
+  definitions:
+    - { term: "Physical block", meaning: "A fixed-size slab of KV slots, block_size tokens wide, allocated from a free list. Any free block can hold any sequence's data." }
+    - { term: "Block table", meaning: "The per-sequence list mapping logical block index to physical block id. Appended when a sequence crosses a block boundary, never rewritten." }
+    - { term: "Internal fragmentation", meaning: "The unused slots in the last block of a sequence: between 0 and block_size − 1 per sequence, and nothing else." }
+    - { term: "External fragmentation", meaning: "Free memory that cannot satisfy a request because it is split into holes too small to be contiguous. Fixed-size blocks eliminate it by construction." }
+    - { term: "Continuous batching", meaning: "Iteration-level scheduling: the batch composition is re-decided every decode step, so finished requests leave and waiting ones join without draining the batch." }
+    - { term: "Prefill and decode", meaning: "The two phases of inference: prefill processes the prompt in one pass and fills most of the KV; decode appends one token per step and reads the whole cache." }
+    - { term: "Copy-on-write prefix sharing", meaning: "Refcounted blocks shared by sequences with a common prefix; a write to a shared block copies it first. The mechanism behind cheap beam search and parallel sampling." }
+
+  diagrams:
+    - type: architecture
+      title: "From the scheduler to the attention kernel, and where the indirection lives"
+      nodes:
+        - { id: sched, x: 0, y: 0, label: "scheduler", kind: worker, detail: "Every decode step: free finished sequences, admit waiting ones if free_blocks >= blocks_needed, then run one step for everything still running." }
+        - { id: alloc, x: 1, y: 0, label: "block allocator", kind: worker, detail: "A free list of physical ids. Allocation is O(1); release returns the sequence's blocks in table order. No compaction, ever." }
+        - { id: table, x: 2, y: 0, label: "block tables", kind: storage, detail: "seq → [phys_0, phys_1, ...]. 4 bytes per entry. The logical order is the write order, which is what makes the gather correct." }
+        - { id: kv, x: 2, y: 1, label: "paged KV (N blocks)", kind: cache, detail: "K and V arrays shaped (n_blocks, block_size, H, dh). A 40-token sequence holds 3 blocks and 8 unused slots." }
+        - { id: kernel, x: 3, y: 1, label: "paged attention", kind: model, detail: "Reads block by block, accumulates the softmax with a running max, writes one output per query position. Same arithmetic as dense attention, different address pattern." }
+      edges:
+        - { from: sched, to: alloc, label: "admit / release" }
+        - { from: alloc, to: table, label: "block ids" }
+        - { from: table, to: kv, label: "gather" }
+        - { from: kv, to: kernel, label: "K, V" }
+        - { from: kernel, to: sched, label: "one token" }
+      caption: "The indirection is one array lookup per block. Everything expensive — the softmax, the matmuls — is unchanged; what changes is that the cache is now allocatable at block granularity and the batch can change every step."
+
+    - type: compare
+      title: "Static batching vs continuous batching on the same three requests"
+      left_label: "Static batching"
+      left_points:
+        - "Admit all three at step 0: 3 × 3 = 9 blocks, which does not fit in 8 — the batch is rejected or the third request waits for the whole batch"
+        - "Requests that finish early keep their blocks until the longest request in the batch completes"
+        - "Makespan is the maximum generation length; utilisation is the ratio of useful slots to reserved slots over that window"
+        - "Throughput is fine on a saturated, homogeneous workload and collapses on a mixed one"
+      right_label: "Continuous batching"
+      right_points:
+        - "Admit r0 and r1 at step 0 (6 blocks), hold r2 until a block frees"
+        - "r0 finishes at step 2 and releases 3 blocks; r2 is admitted at step 3 while r1 is still decoding"
+        - "Batch composition changes every step; there is no drain phase and no idle tail"
+        - "The cost is scheduler bookkeeping per step and a batch that changes shape, which real kernels handle with a block-table-aware attention"
+
+  markdown: |
+    ## What you are building
+
+    A paged KV cache — the key and value memory of a language model, handed out in fixed-size blocks instead of one reservation per request. The cache owns a pool of 16-slot blocks and keeps one small table per sequence, saying which block holds which stretch of tokens. Four operations: `reserve` takes the blocks, `append` writes one token at the end, `gather` reads them back in order, `release` returns them.
+
+    The scheduler sits on top and is iteration-level. Every step it frees finished sequences, admits waiting ones if blocks are free, then decodes one token for everything still running. The model itself is a stand-in that writes zeros, because the subject is the allocator and the schedule, not the transformer.
+
+    ## Why this exists
+
+    One token of cache costs 128 KB in a 32-layer model with eight key-value heads. A 4,096-token request therefore reserves 512 MB, and forty of those reserve 20 GB, which is an entire A100. The arithmetic units then sit idle while the server refuses work.
+
+    The usual first fix is to reserve the maximum for every request. For a request that only uses 300 tokens, that wastes 92.7% of the reservation. The usual second fix is to reserve exactly what the request asks for, which leaves holes no later request can fill. Fixed-size blocks remove both problems, and the bookkeeping costs four bytes per block.
+
+    ## Step 1 - Price one token of cache
+
+    Attention needs the keys and values of every earlier token, so each arriving token appends its own and they are never recomputed. In a 32-layer model with eight key-value heads of width 128, stored in half precision, one token costs 128 KB. That single number decides everything that follows. It is also why serving is a memory problem before it is a compute problem.
+
+    $$\text{bytes} = 2 \cdot L \cdot H_{kv} \cdot d_h \cdot b$$
+
+    > **Say it aloud:** "bytes per token equals two, times L the number of layers, times H sub k v the number of key-value heads, times d sub h the head width, times b the bytes per number."
+
+    The leading two is the pair: one key and one value. Put in 32, 8, 128 and 2, and you get 131,072 bytes. Multiply by 4,096 tokens and one request needs 512 MB before it has generated a word.
+
+    ```python
+    L, H_kv, dh, b = 32, 8, 128, 2
+    per_token = 2 * L * H_kv * dh * b
+    print(per_token, per_token // 1024)                     # 131072 128
+    print(4096 * per_token // 2**20, "MiB per 4k request")  # 512 MiB per 4k request
+    print(40 * 4096 * per_token // 2**30, "GiB for 40")     # 20 GiB for 40
+    ```
+
+    > **Check:** which factor would you halve to fit twice as many requests, and what does halving it cost?
+
+    ## Step 2 - Cut the cache into fixed blocks
+
+    Instead of one array per sequence, the cache becomes a pool of identical blocks, each holding 16 token slots. A sequence takes as many blocks as it needs and no more, and every free block is interchangeable, which is what removes external fragmentation. Rounding up to a whole block is the only waste, and it is bounded by one block however long the sequence runs.
+
+    $$n_{\text{blocks}} = \left\lceil \frac{n}{B} \right\rceil$$
+
+    > **Say it aloud:** "n sub blocks equals n, the number of tokens, divided by B, rounded up to the next whole number."
+
+    Forty tokens at 16 slots need three blocks, so 48 slots are reserved and 8 sit empty. Over 500 sequences of length 1 to 64, the measured waste was 19.0%: 3,918 slots out of 20,576. The worst case is a one-token sequence at 15 of 16 slots, and note that it depends on the block size, never on the length.
+
+    ```python
+    def blocks_for(n, B=16):
+        return -(-n // B)               # ceiling, no floats
+    for n in (1, 16, 17, 40):
+        print(n, blocks_for(n), blocks_for(n) * 16 - n)
+    # 1 1 15 / 16 1 0 / 17 2 15 / 40 3 8
+    ```
+
+    > **Check:** a 300-token sequence at block 16: how many blocks, how much memory, how many empty slots?
+
+    ## Step 3 - Map logic to physics with a block table
+
+    The cache has to know where token 39 lives, and after the first block is freed and reused that is no longer arithmetic. Each sequence carries a table whose k-th entry is the physical block holding its k-th group of 16 tokens. The table is append-only, because decode only ever adds tokens to the end.
+
+    $$(\text{block}, \text{slot}) = \big(\text{table}[\lfloor p/B \rfloor],\ p \bmod B\big)$$
+
+    > **Say it aloud:** "the pair block and slot equals: the table entry at p divided by B, rounded down, and p modulo B."
+
+    Appending never rewrites an entry. That matters after the first free: the order the ids were allocated and the order the tokens were written stop agreeing. A table rebuilt from the free list instead of appended at the logical index will silently mix positions.
+
+    The table is also free. One entry per 16 tokens is four bytes, against 2 MB of key and value behind it. So block size is chosen for waste and kernel efficiency, never for table size.
+
+    ```python
+    B, free, table = 16, list(range(8)), []
+    for p in range(40):
+        if p % B == 0:
+            table.append(free.pop(0))      # one new block per 16 tokens
+        block, slot = table[p // B], p % B
+    print(table, block, slot)               # [0, 1, 2] 2 7
+    ```
+
+    > **Check:** the table has three entries for 40 tokens. Which entry would change if block 1 were freed and reused?
+
+    ## Step 4 - Reserve the whole table before decoding
+
+    Admission has to be exact, or a sequence dies halfway through generating. So reserve for the prompt plus the generation length at submit time, and the admission test becomes a single comparison. After it passes, the request cannot run out.
+
+    $$\text{free} \geq \left\lceil \frac{P+G}{B} \right\rceil$$
+
+    > **Say it aloud:** "free, the number of free blocks, is greater than or equal to P plus G, divided by B, rounded up, where P is the prompt length and G is the generation length."
+
+    The price is at most one block of slack per sequence, because the table rounds up. Reserve only the prompt and grow during decode instead, and admission stops being a promise: the free list can empty on the last token. Production engines handle that with preemption, which is a whole second system.
+
+    ```python
+    import math
+    def fits(free, P, G, B=16):
+        return free >= math.ceil((P + G) / B)
+    print(fits(8, 40, 8), fits(8, 40, 88), fits(8, 40, 96))   # True True False
+    ```
+
+    > **Check:** with 8 free blocks, what is the longest generation that still fits behind a 40-token prompt?
+
+    ## Step 5 - Gather the blocks back into order
+
+    Attention wants one contiguous view of a sequence, so walk the table in logical order, concatenate the blocks, then cut to the true length. The cut is not cosmetic: the last block still holds whatever the previous tenant left in its unused slots. Reading it would mix another request's data into this one's output.
+
+    $$K_{\text{seq}} = \text{concat}\big(K[b_0], \dots, K[b_m]\big)[:n]$$
+
+    > **Say it aloud:** "K sub seq equals the concatenation of K at b sub zero through K at b sub m, then sliced to the first n rows."
+
+    Gathering first makes the arithmetic identical to a dense cache, which is what gives you a test with a real threshold. One line of slicing separates reading this sequence from reading the previous tenant. A fused kernel skips the copy and reads block by block, so only the order of the additions changes.
+
+    ```python
+    import numpy as np
+    rng = np.random.default_rng(0)
+    K = rng.normal(size=(8, 16, 2, 32))
+    table, n = [0, 1, 2], 40
+    for p in range(n):
+        K[table[p // 16], p % 16] = rng.normal(size=(2, 32))
+    gathered = np.concatenate([K[b] for b in table])[:n]
+    print(gathered.shape, np.abs(gathered[39] - K[2, 7]).max())   # (40, 2, 32) 0.0
+    ```
+
+    > **Check:** drop the final slice for a 40-token sequence. How many extra slots does attention read, and what is in them?
+
+    ## Step 6 - Run the same arithmetic on the gathered arrays
+
+    Nothing about attention changes. The newest query scores against every gathered key, the softmax normalises over the sequence axis, and the probabilities weight the values. The output must match a dense cache exactly, because these are the same operations in the same order on the same numbers.
+
+    $$o = \operatorname{softmax}\!\left(\frac{qK^\top}{\sqrt{d_h}}\right)V$$
+
+    > **Say it aloud:** "o equals the softmax of q times K transpose, divided by the square root of d sub h, all multiplied by V."
+
+    That exactness is the useful part. A concatenating implementation is bit-identical to dense. A fused kernel differs near 1e-6, from float32 summation order alone. A gap of 1e-3 is a table bug, and you can say so before you start debugging.
+
+    ```python
+    import numpy as np
+    rng = np.random.default_rng(0)
+    slab = rng.normal(size=(40, 2, 32)); q = slab[-1:].copy()   # newest token
+    K = np.zeros((8, 16, 2, 32)); table = [0, 1, 2]
+    for p in range(40):
+        K[table[p // 16], p % 16] = slab[p]                 # same data, paged
+    def attn(q, K, V, dh=32):
+        s = q @ K.swapaxes(-1, -2) / np.sqrt(dh)
+        p = np.exp(s - s.max(-1, keepdims=True))
+        return (p / p.sum(-1, keepdims=True)) @ V
+    paged = np.concatenate([K[b] for b in table])[:40]
+    print(np.abs(attn(q, paged, paged) - attn(q, slab, slab)).max())   # 0.0
+    ```
+
+    > **Check:** your paged output differs from dense by 2e-3. Is that summation order, and what do you check first?
+
+    ## Step 7 - Release, admit, decode, every step
+
+    Static batching fixes the batch at submit time, so a request that finishes early keeps its blocks and its slot until the longest one ends. Iteration-level scheduling re-decides every step: free the finished, admit the waiting while blocks remain, then decode the rest. The order inside the step is the whole trick.
+
+    $$\left\lfloor \frac{M}{k} \right\rfloor = \left\lfloor \frac{8}{3} \right\rfloor = 2$$
+
+    > **Say it aloud:** "M divided by k, rounded down, is 8 divided by 3 rounded down, which is 2, where M is the total number of blocks and k is the blocks one request needs."
+
+    The cost is bookkeeping on every step and a batch whose shape changes, which is why the attention kernel has to read the table. Eight blocks and three blocks per request means two requests at a time. Take three requests with generation lengths 3, 5 and 4. r0 and r1 start at step 0, r0 finishes at step 2, and r2 is admitted at step 3 while r1 is still decoding. No drain phase, no idle tail.
+
+    ```python
+    free, log = 8, []
+    for step, (done, waiting) in enumerate([(0, ["r0", "r1", "r2"]), (0, []), (1, []), (0, ["r2"])]):
+        free += 3 * done                      # release first
+        while waiting and free >= 3:          # then admit
+            free -= 3
+            log.append((step, waiting.pop(0), free))
+    print(log)   # [(0, 'r0', 5), (0, 'r1', 2), (3, 'r2', 2)]
+    ```
+
+    > **Check:** why must release run before admit inside the same step?
+
+    ## Putting it together
+
+    The cache and the loop, in the order the numbers arrive:
+
+    1. Price a token (step 1): 128 KB, so 4,096 tokens is 512 MB.
+    2. Choose a block size (step 2): 16 slots, so 40 tokens is 3 blocks and 8 wasted slots.
+    3. Give each sequence a table (step 3): append-only, one entry per block.
+    4. Reserve prompt plus generation (step 4): admission is one comparison, and it never lies.
+    5. Write a token at `table[pos // 16]`, slot `pos % 16`.
+    6. Gather in table order, slice to length (step 5), run the same softmax (step 6).
+    7. Each step: release, admit, decode (step 7).
+
+    Two invariants carry the design. The table is only ever appended to, and a slot is only ever written once. Break either one and attention reads a position that belongs to another sequence.
+
+    The memory story closes the loop: at block 16 a block is 2 MB, so a 300-token sequence holds 19 blocks, which is 38 MB. The naive reservation would have taken 512 MB for the same request.
+
+    ## What breaks
+
+    - **Paged output differs from dense by 4e-3** -> the table was built in allocation order, so a reused block sits at the wrong logical index -> append at the logical index and never rebuild from the free list.
+    - **The tail of a sequence is garbage once its predecessor finished** -> gather returns whole blocks without slicing to length, so stale slots are attended -> slice to `lens[seq]` before attention.
+    - **Admission says yes, then MemoryError mid-decode** -> the table grew during decode and the growth was not counted in the admission test -> reserve prompt plus generation up front.
+    - **Throughput does not move after switching to continuous batching** -> each sequence still holds one contiguous slab, so freed memory is a hole nothing fits -> allocate per block, and keep only the table per sequence.
+  try_it: >-
+    Implement the cache, then run four experiments and record each number:
+    `block_size` at 8, 16, 32 and 64 with the waste fraction and the block-table
+    bytes; a 1-token sequence at each block size; three requests with generation
+    lengths 1, 10 and 2 under static and continuous batching, counting idle slots;
+    and a shared 100-token prefix across four sequences with refcounted blocks,
+    measuring the bytes saved. The last one is the extension that turns this into
+    a serving engine.
+  interview_questions:
+    - question: "What does PagedAttention actually solve, and what does it cost?"
+      level: senior
+      key_points:
+        - "It replaces a contiguous per-request KV reservation with fixed-size blocks plus a per-sequence block table, eliminating external fragmentation and bounding internal waste to one block per sequence."
+        - "The cost is one indirection per block in the attention kernel and a block-table-aware gather, plus 4 bytes per block for the table."
+        - "It does not make the arithmetic faster; it makes the cache allocatable, which is what allows a larger batch and continuous batching."
+        - "The memory numbers are the point: 128 KB per token for a 32-layer, 8-KV-head model, so a 4,096-token request is 512 MB and 40 requests do not fit."
+      follow_up: "Why does the block table have to be append-only, and what breaks if you compact it?"
+    - question: "Explain continuous batching. Why does static batching waste GPU time?"
+      level: mid
+      key_points:
+        - "Static batching runs a fixed set of requests to completion, so a sequence that finishes early holds its KV slots and its batch position idle until the longest finishes."
+        - "Continuous batching re-decides the batch every decode step: finished sequences leave and release blocks, waiting ones are admitted if the free list can cover them."
+        - "The requirement is a paged cache, because a batch whose composition changes needs per-sequence memory that can be freed at block granularity."
+        - "The gain is utilisation on mixed-length workloads; on a homogeneous saturated batch there is little to gain and some scheduler overhead to lose."
+      follow_up: "What happens to a running sequence if the free list empties mid-decode, and what are the three options?"
+    - question: "Your paged attention differs from the dense reference by 4e-3. Is that acceptable, and how do you find the cause?"
+      level: mid
+      key_points:
+        - "No: a concatenating implementation should be bit-identical, and a fused kernel differs at float32 summation order, about 1e-6."
+        - "Check the block table's logical order first — allocation order and write order diverge after the first reuse."
+        - "Check the truncation to sequence length: gathering whole blocks without slicing to `lens[seq]` attends over stale slots from a previous sequence."
+        - "Check the mask: a paged decode usually attends to all previous positions, so a mask built for a fresh prefill is wrong."
+      follow_up: "How would you write a regression test that catches the stale-slot bug with a one-token sequence?"
+    - question: "How would you extend this to share a prompt prefix across eight samples?"
+      level: senior
+      key_points:
+        - "Refcount each physical block and let several block tables point at the same ids for the shared prefix."
+        - "On append to a block with refcount > 1, copy it first (copy-on-write), decrement the old block's count, and write to the copy."
+        - "Release decrements rather than frees, so the last sequence to drop a shared block returns it to the free list."
+        - "The saving is the prompt's KV per extra sample: 2,000 tokens × 128 KB = 256 MB per copy avoided."
+      follow_up: "What does copy-on-write do to the fragmentation bound, and why?"
+  common_mistakes:
+    - "Ordering the block table by allocation instead of by write order, so a reused block appears in the wrong position after the first free."
+    - "Gathering whole blocks without truncating to the sequence length, so attention reads stale slots from a previous request."
+    - "Growing the block table during decode without counting the growth in the admission test, then running out of blocks mid-step."
+    - "Assuming a paged kernel must differ numerically from a dense one; the arithmetic is the same and only the summation order changes."
+    - "Reserving `max_seq_len` per request and calling it paging, which keeps the 92.7% waste and adds the table."
+  further_reading:
+    - label: "Kwon et al., Efficient Memory Management for Large Language Model Serving with PagedAttention (SOSP 2023)"
+    - label: "Yu et al.,Orca: A Distributed Serving System for Transformer-Based Generative Models (OSDI 2022) — continuous batching"
+    - label: "Agrawal et al., Sarathi: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills (2023)"
+
+  implementations:
+    - language: python
+      title: "Reference solution"
+      note: >-
+        The cache and the scheduler, in about 90 lines. Correct, with three
+        deliberate simplifications. (1) `gather` concatenates the blocks before
+        the einsum, so M2 is exactly 0.0; a real kernel reads block by block and
+        the difference becomes float32 summation noise, not zero — do not use the
+        equality as a correctness test for a fused kernel. (2) The decode step
+        writes zero vectors because the model is out of scope; the scheduler, the
+        allocator and the table are the subjects. (3) `reserve` allocates the
+        whole prompt+generation up front, which is the conservative policy: it
+        makes admission exact and costs at most one block of slack per sequence.
+        A production scheduler reserves the prompt and grows the table during
+        decode, with a preemption path for the case where the free list empties.
+      code: |
+        import numpy as np
+
+
+        class PagedCache:
+            """Blocks of `block` slots; each sequence has a table of physical ids."""
+
+            def __init__(self, n_blocks, block=16, H=2, dh=32):
+                self.block, self.H, self.dh = block, H, dh
+                self.K = np.zeros((n_blocks, block, H, dh))
+                self.V = np.zeros((n_blocks, block, H, dh))
+                self.free = list(range(n_blocks))
+                self.tables, self.lens = {}, {}
+
+            def blocks_for(self, n):
+                return -(-n // self.block)
+
+            def reserve(self, seq, n):
+                """Allocate the whole table up front: append-only, no growth surprises."""
+                need = self.blocks_for(n)
+                if seq in self.tables or len(self.free) < need:
+                    return False
+                self.tables[seq] = [self.free.pop(0) for _ in range(need)]
+                self.lens[seq] = 0
+                return True
+
+            def append(self, seq, k, v):
+                pos, tab = self.lens[seq], self.tables[seq]
+                if pos // self.block >= len(tab):
+                    raise MemoryError("block table exhausted")
+                self.K[tab[pos // self.block], pos % self.block] = k
+                self.V[tab[pos // self.block], pos % self.block] = v
+                self.lens[seq] = pos + 1
+
+            def gather(self, seq):
+                tab, n = self.tables[seq], self.lens[seq]
+                return (np.concatenate([self.K[b] for b in tab])[:n],
+                        np.concatenate([self.V[b] for b in tab])[:n])
+
+            def release(self, seq):
+                self.free.extend(self.tables.pop(seq))
+                self.lens.pop(seq)
+
+            def attention(self, seq, q):
+                K, V = self.gather(seq)
+                s = np.einsum("thd,shd->hts", q, K) / np.sqrt(self.dh)
+                s -= s.max(-1, keepdims=True)
+                p = np.exp(s)
+                p /= p.sum(-1, keepdims=True)
+                return np.einsum("hts,shd->thd", p, V)
+
+
+        def dense_attention(K, V, q, dh):
+            s = np.einsum("thd,shd->hts", q, K) / np.sqrt(dh)
+            s -= s.max(-1, keepdims=True)
+            p = np.exp(s)
+            p /= p.sum(-1, keepdims=True)
+            return np.einsum("hts,shd->thd", p, V)
+
+
+        class Scheduler:
+            """Release, then admit, then decode: the order matters for M4."""
+
+            def __init__(self, cache):
+                self.cache, self.waiting, self.running, self.log = cache, [], {}, []
+
+            def submit(self, seq, prompt, gen):
+                self.waiting.append((seq, prompt, gen))
+
+            def step(self):
+                admitted, done = [], []
+                for req in list(self.waiting):
+                    seq, prompt, gen = req
+                    if self.cache.reserve(seq, prompt + gen):
+                        self.waiting.remove(req)
+                        self.running[seq] = [0, gen]
+                        admitted.append(seq)
+                for seq, st in self.running.items():
+                    c = self.cache
+                    c.append(seq, np.zeros((c.H, c.dh)), np.zeros((c.H, c.dh)))
+                    st[0] += 1
+                    if st[0] >= st[1]:
+                        done.append(seq)
+                for seq in done:
+                    self.cache.release(seq)
+                    del self.running[seq]
+                self.log.append((admitted, done, len(self.running), len(self.cache.free)))
+                return admitted, done
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            c = PagedCache(8)
+            c.reserve("a", 40)
+            for _ in range(40):
+                c.append("a", rng.normal(size=(2, 32)), rng.normal(size=(2, 32)))
+            q = rng.normal(size=(40, 2, 32))
+            K, V = c.gather("a")
+            print("M1", c.tables["a"], len(c.tables["a"]) * 16)
+            print("M2", np.abs(c.attention("a", q) - dense_attention(K, V, q, 32)).max())
+            lens = np.random.default_rng(1).integers(1, 65, 500)
+            res = np.ceil(lens / 16) * 16
+            print("M3", res.sum(), (res.sum() - lens.sum()) / res.sum())
+            s = Scheduler(PagedCache(8))
+            s.submit("r0", 40, 3)
+            s.submit("r1", 40, 5)
+            s.submit("r2", 40, 4)
+            for t in range(4):
+                print("M4 step", t, s.step())
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Stop thinking of a sequence's cache as an array and start thinking of it
+        as a list of pages plus a table. The table is the sequence; the pages are
+        interchangeable. Once that is true, memory can be handed back in fixed
+        units, and a scheduler can hand those units to a different request in the
+        middle of a batch.
+      blocks:
+        - kind: checklist
+          body: |
+            - What is the unit of allocation, and who owns it?
+            - Where is the logical-to-physical mapping stored, and in what order?
+            - What happens to a block when its sequence finishes?
+            - What has to be true for a new request to be admitted right now?
+        - kind: warning
+          body: >-
+            "Paged" is not a kernel optimisation. If you cannot say which array
+            holds the mapping and what its entries mean, the rest is guesswork.
+      checkpoint: >-
+        If a sequence of 40 tokens holds 3 blocks, how many of its 48 slots are
+        carrying information, and where does the waste live?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Build the cache before the scheduler, and test it against a dense cache
+        with exactly the same numbers. Then build the scheduler on top, with the
+        step order release → admit → decode. The order is not stylistic: it is
+        what lets a freed block be reused in the same step.
+      blocks:
+        - kind: checklist
+          body: |
+            - cache: free list, tables, lengths, K and V arrays.
+            - append: write at `pos % block` in `table[pos // block]`.
+            - gather: concatenate the table's blocks and slice to length.
+            - attention: identically to the dense version.
+            - scheduler: release finished, admit waiting while blocks allow, decode the rest.
+        - kind: warning
+          body: >-
+            Test with a sequence that fills a block exactly and one that spills by
+            a single token. Off-by-one errors at the boundary are the whole bug
+            surface.
+      checkpoint: >-
+        Which milestone fails if admission runs before release, and why?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Two data structures and one loop. The cache is a free list plus a dict of
+        tables; the scheduler is a while-loop over the step.
+      blocks:
+        - kind: pseudocode
+          body: |
+            reserve(seq, n):
+                need = ceil(n / block)
+                if free.count < need: return False
+                table[seq] = [free.pop() for _ in range(need)]
+                length[seq] = 0
+
+            append(seq, k, v):
+                pos = length[seq]; b = table[seq][pos // block]
+                K[b, pos % block] = k; V[b, pos % block] = v
+                length[seq] += 1
+
+            step():
+                for seq in finished: release(seq)
+                for req in waiting:
+                    if reserve(req): running.add(req)
+                for seq in running:
+                    append(seq, decode_one(seq))
+                    if done(seq): finished.add(seq)
+      checkpoint: >-
+        Why is `release` before `admit` in `step`, and how would you detect the
+        bug if it were not?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The fragmentation bound is a ceiling function, and the concurrency bound
+        is a floor. Both are one line, and both are checkable before you run
+        anything.
+      blocks:
+        - kind: math
+          body: |
+            Reserved slots for length $L$ at block $B$:
+            $R(L) = \lceil L/B \rceil B$, so waste
+            $W(L) = R(L) - L = (B - L \bmod B) \bmod B \in [0, B-1]$.
+
+            Over $n$ sequences: $\sum W_i \le n(B-1)$. At $B = 16$, $n = 500$:
+            at most 7,500 slots, measured 3,918.
+
+            Concurrency with $M$ blocks and $k$ blocks per request:
+            $\lfloor M/k \rfloor$. At $M = 8$, $k = 3$: 2.
+
+            KV bytes per token: $2 \cdot L_{layers} \cdot H_{kv} \cdot d_h \cdot \text{bytes}$.
+            At 32 layers, 8 KV heads, $d_h = 128$, fp16:
+            $2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072$ B = 128 KB.
+      checkpoint: >-
+        Which of the two bounds changes if sequences arrive with wildly different
+        lengths, and which does not?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The reference cache and scheduler are below. Read the step order and the
+        reservation policy first; those are the two decisions the rest of the
+        code is built around.
+      blocks:
+        - kind: warning
+          body: >-
+            The test that catches the most bugs is a sequence that frees a block
+            and a later sequence that reuses it. If the table is rebuilt in
+            allocation order, the second sequence's attention silently reads the
+            first sequence's positions.
+      checkpoint: >-
+        What is the smallest sequence that forces a block reuse, and what would
+        you assert about its table?
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A sequence of 200 tokens runs at block_size 16. How many blocks, how many
+        wasted slots, and what is the waste fraction?
+      answerKind: short_text
+      hint: "200 = 12 × 16 + 8."
+      solution: >-
+        $\lceil 200/16 \rceil = 13$ blocks, 208 slots, 8 wasted — 8/208 = 3.85%.
+        The waste is always the distance to the next multiple of 16, so it is
+        highest for short sequences and negligible for long ones.
+    - id: cp-2
+      question: >-
+        Why does paged attention give exactly the same output as dense attention
+        in this implementation, while a real kernel gives 1e-6?
+      answerKind: short_text
+      hint: "What does the implementation do before the einsum?"
+      solution: >-
+        `gather` concatenates the blocks into a contiguous array and then runs
+        the same einsum, so the operations and their order are identical and the
+        result is bit-identical. A fused kernel accumulates over blocks in a
+        different order and keeps a running max, so the floating-point summation
+        order changes and the result differs at float32 rounding, about $10^{-6}$.
+    - id: cp-3
+      question: >-
+        With 8 blocks and requests needing 3 each, a fourth request arrives while
+        two are running. What are the scheduler's options, and which is correct?
+      answerKind: short_text
+      hint: "Two free blocks, three needed."
+      solution: >-
+        It can wait (leave the request queued until a block frees), preempt a
+        running sequence (swap its KV out and admit the new one), or admit
+        partially by growing the table during decode. Waiting is correct when
+        latency is not critical; preemption is what a production scheduler does
+        under memory pressure, at the cost of recomputation or a swap. Admitting
+        without the blocks is not an option.
+    - id: cp-4
+      question: >-
+        Why is the block table's size in bytes negligible, and what does that
+        imply for choosing block size?
+      answerKind: short_text
+      hint: "4 bytes per block against 128 KB per token."
+      solution: >-
+        A table entry is 4 bytes and covers 16 tokens, so the table costs
+        0.25 bytes per token against 131,072 bytes of KV. Block size is therefore
+        chosen for fragmentation and kernel efficiency, not table size: smaller
+        blocks reduce the expected waste $(B-1)/2$ but increase the number of
+        gather operations and table entries. At 16, the table is 0.0002% of the
+        KV footprint.
+
+  visualizers: []

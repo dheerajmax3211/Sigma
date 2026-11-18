@@ -1,0 +1,666 @@
+id: cs-agent-platform
+slug: cs-agent-platform
+title: "Case Study: A High-Concurrency Tool-Calling Agent Platform"
+summary: >-
+  Run a million agent runs a day where every turn is 10,000 prompt tokens and
+  every action is a sandboxed tool call — and find that the design is a warm
+  pool of 3,500 microVMs, a 54% prompt-cache discount, and an idempotency key on
+  every side effect.
+kind: case_study
+difficulty: expert
+position: 14
+estMinutes: 21
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [agents, tool-calling, sandboxing, prompt-caching, idempotency, concurrency, capacity]
+
+body:
+  big_idea: >-
+    An agent platform is a prefill bill with a control loop: ten turns of
+    10,000 prompt tokens dominate cost, so prompt caching and context layout
+    matter more than the model does.
+  problem:
+    - "You size from output tokens and the bill is 4x: a turn sends 10,000 prompt tokens to produce 500, a 20:1 ratio."
+    - "You skip prompt caching because the system prompt is only 6,000 tokens, and pay 16,200 USD a day that a stable prefix would have removed."
+    - "Every tool call spins a fresh container: at 1,400 calls per second and 1.2 s cold start the pool needs 1,680 spare machines."
+  analogy: >-
+    A hotel concierge. The guest asks, the concierge thinks, dispatches a
+    bellhop, waits, thinks again with the answer in hand, and repeats:
+    thinking is expensive and happens ten times, dispatching is cheap but must
+    be reliable, because a bellhop who delivers the same suitcase twice is
+    worse than a slow one. The briefing book stays open — re-reading it per
+    guest is a prompt without caching.
+  concept_points:
+    - "**Agent traffic is prefill-dominated, and that inverts the serving assumptions.** A turn sends 10,000 prompt tokens and emits 500, a 20:1 ratio against chat's roughly 4:1. At 350 turns/s that is 3.5M prompt tokens/s; at 20,000 tokens/s of prefill per H100 that is **175 GPUs**, against 13 for the decode side. The cluster is 13x larger because of the prompts."
+    - "**Prompt caching is the single largest cost lever, and it is arithmetic.** A 6,000-token stable prefix of 10,000, billed at 10% of the input price, gives an effective prompt of $6{,}000 \\times 0.1 + 4{,}000 = 4{,}600$ tokens — **54% off** every turn. At 10M turns a day and 0.30 USD per million input tokens that is **16,200 USD a day**, more than the sandbox fleet."
+    - "**Cache hits require byte-identical prefixes, so context layout is a correctness requirement.** Tool definitions must serialise deterministically, the system prompt must carry no timestamp, and per-turn content must be appended after the stable block. One fluctuating field at the top invalidates the cache for every turn and silently returns you to full price."
+    - "**Tool concurrency is Little's law on sandboxes.** At 1,400 tool calls/s and 2.5 s per execution, **3,500 sandboxes must be live at once**. At 128 MB and one vCPU each that is 448 GB of RAM and 3,500 vCPUs — **88 forty-core hosts** before redundancy. The pool size is a multiplication, not a guess."
+    - "**Idempotency keys belong on the effect, not on the request.** A key derived from (run id, turn index, tool name, arguments hash) is stable across retries and unique across runs, so the downstream service can deduplicate. With 3% transient failure on 40M daily calls, 6,000 duplicate side effects a day follow writes that actually succeeded. A per-attempt UUID is worse than nothing."
+    - "**Conversation state is an append-only log, and its size is the storage bill.** Ten turns at 8 KB of events plus 40 tool results at 4 KB is **240 KB per run**; a million runs a day is 240 GB a day, 7.2 TB for a 30-day window, and 21.6 TB with three-way replication."
+  definitions:
+    - { term: "Turn", meaning: "One model invocation in an agent loop: it reads the conversation, emits either a tool call or a final answer, and appends to the log." }
+    - { term: "Tool call", meaning: "A structured invocation the model requests, executed in an isolated sandbox, whose result is appended to the conversation." }
+    - { term: "Prompt caching", meaning: "Reusing the computed KV state of an unchanged prompt prefix, billed at a discount. Requires a byte-identical prefix in a stable order." }
+    - { term: "Warm pool", meaning: "Pre-started sandboxes kept idle so dispatch is milliseconds rather than a cold boot. Its size is concurrency minus in-flight starts." }
+    - { term: "MicroVM", meaning: "A hardware-virtualised sandbox with its own kernel, booting in tens of milliseconds. Stronger isolation than a container at a small cost in memory." }
+    - { term: "Idempotency key", meaning: "A stable identifier for an intended effect, so a retry can be deduplicated by the downstream service instead of executed twice." }
+    - { term: "At-least-once delivery", meaning: "The only guarantee a network gives you: every request arrives one or more times. Exactly-once is built on top of it with deduplication." }
+    - { term: "Event log", meaning: "The append-only record of turns, tool calls and results that constitutes the agent's state. Replayable, auditable, and the source of truth." }
+    - { term: "Retry storm", meaning: "A failure that causes many clients to retry at once, multiplying load on a service that is already failing." }
+    - { term: "Token bucket", meaning: "A per-tenant rate limiter that permits bursts up to a bucket size and enforces a sustained rate. The standard defence against one tenant consuming the fleet." }
+    - { term: "Context window growth", meaning: "The conversation grows every turn, so turn 10 costs more than turn 1. Budgeting per run, not per turn, is the only honest accounting." }
+    - { term: "Poison tool", meaning: "A tool whose output reliably breaks the loop — malformed JSON, an enormous payload, or an error the model retries forever." }
+
+  diagrams:
+    - type: architecture
+      title: "Control plane, sandbox pool, and the log that holds it together"
+      nodes:
+        - { id: api, x: 0, y: 1, label: "Run API", kind: load_balancer, detail: "Accepts a run, assigns a run id, enforces per-tenant token buckets. 1M runs a day, 350 turns/s at peak." }
+        - { id: orch, x: 1, y: 1, label: "Orchestrator", kind: server, detail: "Runs the loop: build prompt, call model, dispatch tools, append to log. Stateless, so it can be restarted mid-run and resume from the log." }
+        - { id: llm, x: 2, y: 0, label: "Model pool (175 GPUs)", kind: model, detail: "Prefill-dominated: 3.5M prompt tokens/s at peak. A 6,000-token cached prefix turns 10,000 tokens of billing into 4,600." }
+        - { id: pool, x: 2, y: 2, label: "Sandbox pool (3,500)", kind: worker, detail: "MicroVMs at 128 MB and 1 vCPU, 2.5 s per tool call. Warm pool keeps dispatch at 150 ms instead of a 1.2 s cold boot." }
+        - { id: log, x: 3, y: 1, label: "Event log", kind: storage, detail: "240 KB per run, append-only, replayed on resume. The only state: sandboxes are disposable and orchestrators are stateless." }
+      edges:
+        - { from: api, to: orch, label: "run" }
+        - { from: orch, to: llm, label: "prompt" }
+        - { from: orch, to: pool, label: "tool call" }
+        - { from: pool, to: log, label: "result", style: "async" }
+        - { from: orch, to: log, label: "append" }
+
+    - type: compare
+      title: "Cold containers versus a warm microVM pool"
+      left_label: "Container per call, cold start"
+      left_points:
+        - "1.2 s of startup on every tool call, so a 300 ms execution is 20% of the wait"
+        - "At 1,400 calls/s that is 1,680 sandboxes existing only to boot"
+        - "Cheapest idle cost: nothing runs when nothing is called"
+        - "Weak isolation: a shared kernel means one escape is every tenant's problem"
+      right_label: "Warm microVM pool"
+      right_points:
+        - "150 ms dispatch, so the 300 ms execution is the dominant term and p99 is predictable"
+        - "3,500 live sandboxes at peak, 448 GB of RAM and 3,500 vCPUs"
+        - "~60 machines of idle capacity held as insurance against tail latency"
+        - "Own kernel per sandbox, which is the isolation boundary an enterprise will ask about"
+
+    - type: pipeline
+      title: "One turn: 1.8 s, and where it goes"
+      nodes:
+        - label: "Assemble prompt"
+          note: "12 ms"
+          detail: "Stable prefix first, then history, then the new observation. Order is a correctness requirement for the cache, not a style choice."
+        - label: "Model TTFT"
+          note: "400 ms"
+          detail: "10,000 tokens of prefill against an 8B model. With a cache hit on 6,000 of them, the prefill compute falls by 54% and so does this term."
+        - label: "Dispatch tool"
+          note: "150 ms"
+          detail: "Warm-pool checkout, credential injection, argument validation. A cold start here is 1.2 s and is the single biggest tail-latency contributor."
+        - label: "Execute tool"
+          note: "300 ms"
+          detail: "The actual work: an API call, a shell command, a browser action. Bounded by a per-tool timeout so a hung tool cannot hold a sandbox forever."
+        - label: "Second model call"
+          note: "400 ms"
+          detail: "The answer turn, with tool results in context. Two rounds of two parallel tools plus two model calls is 1.8 s; serialising the tools makes it 3.3 s."
+
+  markdown: |
+    ## The bill is prompt tokens, not completions
+
+    A chat turn is roughly 1,000 prompt tokens to 400 output. An agent turn is
+    different: a 6,000-token system prompt with tool schemas, 4,000 tokens of
+    history, and 500 output. Ten turns per run means the run sends 100,000
+    prompt tokens to produce 5,000.
+
+    $$T_{\text{prompt}} = R_{\text{turns}} \times S_{\text{turn}} = 350 \times 10{,}000
+    = 3.5\times10^{6}\ \text{tokens/s}.$$
+
+    Prefill at 20,000 tokens/s per H100 is 175 GPUs; decode at 13,000 tokens/s
+    per GPU for the 175,000 output tokens/s is 13 GPUs. **The cluster is 13×
+    larger because of the prompts**, which is the opposite of the chat-serving
+    intuition where decode dominates.
+
+    | quantity | per turn | per run (10 turns) | per day (1M runs) |
+    |---|---|---|---|
+    | prompt tokens | 10,000 | 100,000 | 1e11 |
+    | output tokens | 500 | 5,000 | 5e9 |
+    | tool calls | 4 | 40 | 4e7 |
+    | state written | 24 KB | 240 KB | 240 GB |
+
+    ## Prompt caching is 54% of the input bill
+
+    $$S_{\text{effective}} = S_{\text{cached}} \cdot 0.1 + (S_{\text{turn}} - S_{\text{cached}})
+    = 6{,}000 \times 0.1 + 4{,}000 = 4{,}600.$$
+
+    That is a 54% reduction on every turn, and it holds only while the prefix is
+    byte-identical. This is where most implementations lose the money: a
+    `timestamp` field in the system prompt, a tool list serialised from a Python
+    dict whose key order varies, or a retrieved-memory block injected at the top
+    instead of appended at the bottom. Each of those is a 100% cache miss rate
+    that no dashboard reports.
+
+    The check is mechanical: hash the first $N$ tokens of every request and
+    alert when the distinct-hash rate exceeds the expected number of prefixes.
+    At 54% of input spend, a cache regression is a five-figure daily event.
+
+    ## Sandboxes are a Little's law problem
+
+    $$N_{\text{live}} = \lambda \times W = 1{,}400\ \text{calls/s} \times 2.5\ \text{s}
+    = 3{,}500.$$
+
+    At 128 MB and one vCPU that is 448 GB and 3,500 vCPUs, or 88 forty-core
+    hosts, and that is before redundancy and before the warm pool's headroom. Add
+    a 1.2 s cold start and the pool needs another
+    $1{,}400 \times 1.2 = 1{,}680$ machines to cover the boot window — which is
+    why warm pools are not a latency optimisation but a 60-machine capacity
+    decision.
+
+    Isolation is the other half. A container shares a kernel, so a kernel exploit
+    is a cross-tenant escape; a microVM has its own, and boots in tens of
+    milliseconds. For an agent that executes model-generated code, that boundary
+    is the product.
+
+    ## Retries are where correctness goes to die
+
+    Every network call is at-least-once. With 3% transient failure over 40M tool
+    calls a day, 1.2M calls retry. If 0.5% of those follow a write that actually
+    landed before the timeout, **6,000 duplicate effects per day** — refunds,
+    emails, tickets, rows.
+
+    The fix is a key derived from the intent, not the attempt:
+
+    $$\text{key} = H(\text{run\_id} \,\|\, \text{turn} \,\|\, \text{tool} \,\|\, \text{args}).$$
+
+    Stable across retries, unique across runs, and cheap for the downstream
+    service to deduplicate on. A per-attempt UUID is the anti-pattern: it looks
+    like idempotency and guarantees the opposite.
+
+    Retry policy is also a load-shedding control. Immediate retries on a 429
+    triple offered load against a service that is already failing, which is how a
+    90-second provider hiccup becomes a 20-minute incident. Exponential backoff
+    with full jitter, plus a per-tenant token bucket, converts a storm into a
+    queue.
+
+    ## State is a log, and the log is the product
+
+    Sandboxes are disposable and orchestrators are stateless, so the only durable
+    thing is the append-only log: turn index, prompt hash, tool call, arguments,
+    result, model version, token counts. 240 KB per run, 240 GB a day, 7.2 TB for
+    a 30-day window.
+
+    The log buys three things at once: resume after a crash (replay to the last
+    committed turn), audit (which document, which tool, which model version
+    produced this answer), and cost attribution (tokens per run per tenant). A
+    platform that stores only the final answer can do none of them, and
+    reconstructing the log later is impossible because the model is not
+    deterministic.
+
+    ## The loop is a state machine, and the state machine is the product
+
+    Every turn has four possible outcomes: call a tool, answer, ask the user, or
+    fail. Modelling those explicitly — rather than as branches inside a Python
+    function — is what makes the platform resumable, testable and auditable. A
+    run that hits a tool timeout is not an exception, it is a state with a retry
+    edge and a budget. A run that loops is not a bug in the model, it is a state
+    machine with a missing repeat cap.
+
+    ## Where the tail actually comes from
+
+    The p50 turn is 1.8 s and decomposes cleanly. The p99 is 6 s and decomposes
+    into three things that are all queueing: sandbox dispatch when the warm pool
+    is empty, model queueing when the prefill pool is saturated, and retry
+    backoff when a provider is shedding. None of them is a slow function. All
+    three are capacity terms, and all three get worse when clients retry into the
+    same saturated resource.
+
+    That is why the platform's most useful metric is not latency but the ratio of
+    queue time to service time, per dependency. A dependency whose queue time
+    exceeds its service time is saturated, and the correct response is to shed
+    load rather than to add workers — the workers take minutes to arrive and the
+    queue doubles in seconds.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    An agent platform is **a prefill bill wearing a control loop**: ten turns of 10,000 prompt tokens cost ten times what a chat message costs, so the design is dominated by prompt caching and context layout, while the tool calls force a warm sandbox pool of 3,500 machines and an idempotency key on every side effect that must survive a retry.
+
+    ### The analogy, in full
+
+    A hotel concierge desk. The guest asks for something, the concierge thinks, then dispatches a bellhop, waits, thinks again with the answer in hand, and repeats. Thinking is the expensive part and it happens ten times per request; dispatching is cheap but must be reliable, because a bellhop who delivers the same suitcase twice is worse than one who is slow. The concierge also keeps a standard briefing book — hotel policies, room types, the list of services — open on the desk. Re-reading it for every guest would be absurd, and that is exactly what a prompt without caching does: it re-sends the same 6,000 tokens on every turn. Where the analogy breaks: the bellhops run in sandboxes with no memory of each other, so the *only* state is the conversation log the concierge carries. And the desk serves thousands of guests concurrently, so a bellhop shortage does not slow one guest down — it makes every guest's request queue behind the same pool, which is how a small capacity error becomes a platform-wide latency incident.
+
+    ### Failure modes, in full
+
+    - You size the platform from the model's output tokens and the bill is 4x the estimate, because an agent turn sends 10,000 prompt tokens to produce 500 — a 20:1 ratio, where a chat turn is closer to 4:1.
+    - You skip prompt caching because 'the system prompt is only 6,000 tokens', and pay full price for it on every one of ten million turns a day: 16,200 USD a day that a stable prefix would have removed.
+    - Every tool call spins up a fresh container. At 1,400 calls per second and 1.2 s of cold start, the pool needs 1,680 extra machines just to absorb the startup time, and the queue that forms makes p99 latency a function of traffic rather than of work.
+    - A provider returns 429s for ninety seconds. Your retry logic retries immediately, tripling load on a service that is already shedding, and the incident lasts twenty minutes instead of two.
+    - A payment tool times out after succeeding. The retry charges the customer twice, and the postmortem finds no idempotency key anywhere in the call path — because 'the SDK retries for us' was the design.
+
+    ### The mechanisms, in full
+
+    - **Agent traffic is prefill-dominated, and that inverts the serving assumptions.** A turn sends 10,000 prompt tokens and emits 500, a 20:1 ratio against chat's roughly 4:1. At 350 turns/s that is 3.5M prompt tokens/s; at 20,000 tokens/s of prefill per H100 that is **175 GPUs**, and only 13 would be needed for the decode side. The cluster is 13× larger because of the prompts.
+    - **Prompt caching is the single largest cost lever, and it is arithmetic.** A 6,000-token stable prefix out of 10,000 tokens, billed at 10% of the input price, gives an effective prompt of $6{,}000 \times 0.1 + 4{,}000 = 4{,}600$ tokens — **54% off** every turn. At 10M turns a day and 0.30 USD per million input tokens that is 16,200 USD a day, which is more than the entire sandbox fleet costs.
+    - **Cache hits require byte-identical prefixes, so context layout is a correctness requirement.** Tool definitions must be serialised deterministically, the system prompt must not contain a timestamp, and per-turn content must be appended after the stable block. A single fluctuating field at the top of the prompt invalidates the cache for every turn and silently returns you to full price.
+    - **Tool concurrency is Little's law on sandboxes.** At 1,400 tool calls/s and 2.5 s per execution, **3,500 sandboxes must be live at once**. At 128 MB and one vCPU each that is 448 GB of RAM and 3,500 vCPUs, or 88 forty-core hosts — before redundancy. The pool size is a multiplication, not a guess.
+    - **Cold start is a capacity multiplier.** A 1.2 s cold start at 1,400 calls/s means 1,680 additional sandboxes exist only to cover the time they are not yet useful. A warm pool at 150 ms of dispatch removes 80% of that, which is why "pre-warm microVMs" is a capacity decision worth 60 machines.
+    - **Retries without idempotency are a correctness bug that looks like a reliability feature.** With 3% transient failure on 40M tool calls a day, that is 1.2M retries; if 0.5% of them follow a write that actually succeeded, 6,000 duplicate side effects happen per day, and each one is a support ticket or a refund.
+    - **Idempotency keys belong on the effect, not on the request.** A key derived from (run id, turn index, tool name, arguments hash) is stable across retries and unique across runs, so the downstream service can deduplicate. A UUID generated per attempt is worse than nothing: it makes every retry a new operation while looking like a fix.
+    - **Conversation state is an append-only log, and its size is the storage bill.** Ten turns at 8 KB of events plus 40 tool results at 4 KB is **240 KB per run**; a million runs a day is 240 GB a day, 7.2 TB for a 30-day window, and 21.6 TB with three-way replication.
+    - **Latency is the sum of two serialised phases, not of four tool calls.** Model TTFT 400 ms, then two rounds of two parallel tool calls at 500 ms each, then a final model call at 400 ms: 1.8 s p50. Serialising the four calls turns that into 3.3 s, which is the difference between a usable product and a spinner.
+    - **Failure amplifies through the retry path, so the retry policy is a capacity control.** A 429 storm plus immediate retries triples offered load and turns a 90-second provider hiccup into a 20-minute outage. Exponential backoff with jitter and a per-tenant token bucket is the difference between shedding load and amplifying it.
+  problem_statement: >-
+    Design a platform that runs one million tool-calling agent runs per day, each
+    with ten turns and four tool calls per turn, at p95 turn latency under 3
+    seconds, with sandboxed execution of model-generated code, exactly-once
+    semantics for side effects, and a cost per run under 0.03 USD. State the
+    token, sandbox, storage and retry arithmetic.
+
+  requirements:
+    functional:
+      - "Execute model-generated code and HTTP calls in an isolated sandbox with no network access except an explicit allowlist"
+      - "Persist an append-only event log per run that supports resume, audit and replay"
+      - "Guarantee at-most-once external side effects across retries via idempotency keys"
+      - "Enforce per-tenant rate limits, token budgets and concurrency caps"
+      - "Expose per-run token counts, tool latencies and failure reasons"
+    non_functional:
+      - "p95 turn latency <= 3 s and p99 <= 6 s at 350 turns/s"
+      - "Sandbox escape isolation at the virtual-machine boundary, not the container boundary"
+      - "Zero duplicate side effects per million retries, verified by an adversarial test"
+      - "Cost per run <= 0.03 USD at the stated mix"
+      - "No run lost on orchestrator restart; resume from the last committed turn"
+
+  clarifying_questions:
+    - question: "Do agents execute generated code, or only call typed APIs?"
+      why_it_matters: "Code execution forces a real isolation boundary (microVM or gVisor) and a network egress policy; typed APIs allow a much cheaper sandbox and a static allowlist. This single answer changes the fleet by a factor of two."
+    - question: "What is the tool latency distribution, and are tools third-party?"
+      why_it_matters: "A third-party API with a 2 s p99 sets the turn latency floor and the timeout budget; an internal 20 ms service does not. Third-party tools also mean retries you do not control and rate limits you must respect."
+    - question: "Is a run allowed to pause for minutes between turns?"
+      why_it_matters: "Human-in-the-loop approval or a long-running batch job means state must be durable and the sandbox released, which is an event-sourced design. Continuous runs can keep a sandbox warm and skip the log write per turn."
+    - question: "How long must the event log be retained, and does it contain PII?"
+      why_it_matters: "Tool outputs often carry customer data. Retention of 30 days at 240 GB a day is 7.2 TB; retention of a year is 88 TB, and redaction at write time is far cheaper than retrofitting it."
+    - question: "What is the per-tenant concentration?"
+      why_it_matters: "One tenant running batch jobs can consume the entire sandbox pool. Per-tenant concurrency caps are the difference between a degraded tenant and a degraded platform."
+
+  capacity_estimation:
+    assumptions:
+      - "Volume: 1,000,000 runs/day, 10 turns per run, 4 tool calls per turn, peak hour at 12% of daily traffic (a 3x peak-to-average ratio)"
+      - "Tokens: 6,000-token stable prefix (system prompt plus tool schemas), 4,000 tokens of history per turn, 500 output tokens"
+      - "Serving: 8B model, 20,000 prefill tokens/s per H100, 13,000 decode tokens/s per GPU at agent batch sizes"
+      - "Sandbox: 128 MB RAM, 1 vCPU, 2.5 s average tool execution, 150 ms warm dispatch, 1.2 s cold start"
+      - "Pricing: 0.30 USD per million input tokens, 1.20 USD per million output tokens, 90% discount on cached prefix tokens; 2.50 USD per GPU-hour"
+
+    arithmetic:
+      - label: "Turns and tool calls per second at peak"
+        calculation: "1e6 runs/day x 10 turns = 1e7 turns/day. Peak hour = 12% of daily = 1.2e6 turns/hour = 333 turns/s; round to 350. Tool calls = 350 turns/s x 4 = 1,400 calls/s; daily tool calls = 1e7 x 4 = 4e7."
+        conclusion: "350 turns/s and 1,400 tool calls/s at peak. Every later number is this pair multiplied by a per-unit cost."
+
+      - label: "Prompt tokens and GPU count"
+        calculation: "Prompt tokens/s = 350 turns/s x 10,000 tokens = 3.5e6. Prefill capacity per H100 at 20,000 tokens/s -> 3.5e6 / 2e4 = 175 GPUs. Output tokens/s = 350 x 500 = 1.75e5; at 13,000 tokens/s per GPU -> 13.5 GPUs for decode."
+        conclusion: "175 GPUs for prefill against 13 for decode: agent serving is 13x more prefill-heavy than chat, and the prompt is the cluster."
+
+      - label: "Prompt-cache saving"
+        calculation: "Uncached input cost per turn = 10,000 x 0.30e-6 = 0.003 USD. Cached: 6,000 tokens at 10% of price plus 4,000 at full price = (6,000 x 0.1 + 4,000) x 0.30e-6 = 4,600 x 0.30e-6 = 0.00138 USD. Saving per turn = 0.00162 USD (54%). Daily saving = 1e7 turns x 0.00162 = 16,200 USD."
+        conclusion: "16,200 USD a day, which is larger than the entire sandbox fleet's compute bill. Cache hit rate is a financial metric with an owner, not an optimisation."
+
+      - label: "Sandbox concurrency and fleet size"
+        calculation: "Little's law: 1,400 calls/s x 2.5 s = 3,500 live sandboxes. At 128 MB and 1 vCPU: 3,500 x 128 MB = 448 GB RAM and 3,500 vCPUs. At 40 vCPUs per host: 3,500/40 = 88 hosts. A 1.2 s cold start adds 1,400 x 1.2 = 1,680 sandboxes of boot-time overlap; a 150 ms warm dispatch reduces that to 210."
+        conclusion: "88 hosts at the steady state, plus warm-pool headroom. Cold starts would add 60 machines of pure boot overlap, which is the price of not pre-warming."
+
+      - label: "Event log storage"
+        calculation: "Per turn: 8 KB of events + 4 tool results x 4 KB = 24 KB. Per run: 10 x 24 KB = 240 KB. Daily: 1e6 x 240 KB = 240 GB. 30-day retention: 7.2 TB; with 3x replication: 21.6 TB."
+        conclusion: "240 GB/day and 21.6 TB at 30-day retention with replication. The log is the largest storage line item and the only source of truth for resume and audit."
+
+      - label: "Retry volume and duplicate effects"
+        calculation: "Transient failure rate 3% on 4e7 tool calls/day = 1.2e6 retries/day. If 0.5% of retries follow a write that had already succeeded: 1.2e6 x 0.005 = 6,000 duplicate effects/day. At an average remediation cost of 3 USD per duplicate, that is 18,000 USD/day."
+        conclusion: "6,000 duplicates a day is the cost of omitting idempotency keys — 18,000 USD/day, or 6.6M USD a year, against a dedupe table that costs almost nothing."
+
+      - label: "Turn latency budget"
+        calculation: "Assemble 12 ms + model TTFT 400 ms + 2 rounds of 2 parallel tool calls at (150 dispatch + 300 exec + 50 overhead) = 1,000 ms + final model 400 ms = 1,812 ms. Serialising all four tool calls: 4 x 500 = 2,000 ms, total 3,300 ms."
+        conclusion: "1.8 s p50 with parallel tool calls against 3.3 s serialised. Parallel dispatch is worth 1.5 s per turn and costs nothing but a fan-out limit."
+
+      - label: "Cost per run"
+        calculation: "Per turn: input 4,600 effective tokens x 0.30e-6 = 0.00138 USD; output 500 x 1.20e-6 = 0.0006 USD -> 0.00198 USD. Per run (10 turns) = 0.0198 USD. Sandbox: 40 calls x 2.5 s = 100 vCPU-seconds per run; fleet of 88 hosts x 40 vCPU = 3,520 vCPU at 2.50 USD per host-hour = 88 x 2.50 x 24 = 5,280 USD/day; 5,280 / 1e6 runs = 0.00528 USD per run. Total = 0.0198 + 0.0053 = 0.0251 USD."
+        conclusion: "About 0.025 USD per run, of which tokens are 79% and sandboxes 21%. Tokens dominate unit economics, which is why cache hit rate and context layout get the engineering time."
+
+  architecture_summary: >-
+    A stateless orchestrator runs the agent loop against a prefill-heavy model
+    pool and a warm pool of 3,500 microVM sandboxes, writing every turn to an
+    append-only event log that is the only durable state. Prompt prefixes are
+    assembled in a fixed order for cacheability, tool calls carry
+    intent-derived idempotency keys, and retries use exponential backoff with
+    jitter behind per-tenant token buckets.
+
+  deep_dives:
+    - topic: "Sandbox isolation boundary"
+      explanation: >-
+        The sandbox executes code a model wrote, which means the threat model
+        includes code that is actively trying to escape. The options differ by an
+        order of magnitude in startup cost and by a lot in blast radius, and the
+        choice is a security decision that has a capacity consequence.
+      tradeoffs:
+        - option: "Container with a seccomp profile"
+          pros: "Millisecond start, minimal memory overhead, and the simplest operational story; fine for typed API calls with no code execution."
+          cons: "Shares the host kernel, so a kernel exploit is a cross-tenant escape; unacceptable for model-generated code in a multi-tenant product."
+        - option: "MicroVM per tool call"
+          pros: "Own kernel, hardware virtualisation boundary, tens of milliseconds to boot, and 128 MB per instance is cheap enough for a 3,500-instance pool."
+          cons: "A hypervisor to operate, slower cold start than a container (1.2 s fully cold), and device or GPU passthrough is awkward when a tool needs one."
+        - option: "gVisor user-space kernel"
+          pros: "Strong syscall interception with container-like startup, and no hypervisor to run."
+          cons: "System-call-heavy workloads (compilers, package installs) run markedly slower, and compatibility gaps surface as mysterious tool failures rather than clean errors."
+
+    - topic: "State persistence model"
+      explanation: >-
+        Agents are long-running and multi-step, so the state model decides what
+        happens on a crash, a deploy, or a tool that takes four minutes. The three
+        viable shapes are an event log replayed by a stateless orchestrator, a
+        durable workflow engine, and in-memory state with a periodic snapshot.
+      tradeoffs:
+        - option: "Append-only event log, replay on resume"
+          pros: "Auditable by construction, supports time-travel debugging, and the orchestrator can be killed at any point without losing a run."
+          cons: "Every turn pays a write (24 KB) before the next model call, and replaying a long run re-executes tool calls unless they are recorded as results rather than re-run."
+        - option: "Durable workflow engine (Temporal-style)"
+          pros: "Retries, timers and human-approval waits are first-class; the engine owns the hard parts of at-least-once execution."
+          cons: "Another distributed system to operate, and its determinism constraints leak into application code in ways that are hard to debug at 3 a.m."
+        - option: "In-memory state with periodic snapshots"
+          pros: "Fastest per turn, no write on the critical path, and simple code."
+          cons: "A crash loses every run in flight on that pod; at 350 turns/s a rolling deploy drops hundreds of runs, which is not acceptable for paid work."
+
+    - topic: "Prompt caching and context layout"
+      explanation: >-
+        Caching is a contract with the serving stack: the prefix must be
+        byte-identical and stable, and everything variable must come after it.
+        Most platforms build the prompt in the natural order (instructions, then
+        retrieved context, then history) and lose the discount because the
+        retrieved block changes every turn and sits in the middle.
+      tradeoffs:
+        - option: "Stable prefix first: tools, system prompt, then variable content appended"
+          pros: "Maximal cache hit rate and the 54% saving computed here; the prefix can be shared across every tenant that uses the same tool set."
+          cons: "Constrain the prompt design: no timestamps, no per-request IDs, deterministic tool serialisation, and retrieved context can only be appended."
+        - option: "Put retrieved context near the instruction for 'attention' reasons"
+          pros: "Some models follow instructions better when the instruction is adjacent to the evidence, and quality can improve measurably."
+          cons: "Invalidates the cache on every turn because the retrieved block changes, returning the full 10,000-token bill — a quality gain paid for at 2.2x the price."
+        - option: "Cache at the application layer with a semantic answer cache"
+          pros: "Skips the model entirely for repeated questions, which is a bigger saving than any prefix discount."
+          cons: "Answers go stale against tool state and document versions, and it interacts badly with per-tenant permissions unless the key includes them."
+
+    - topic: "Retry and idempotency design"
+      explanation: >-
+        Every hop is at-least-once, so the platform must make effects idempotent
+        rather than pretend delivery is exactly-once. The mechanism is a key
+        derived from intent, stored by the downstream service with the result, so
+        a retry returns the original outcome instead of performing the work again.
+      tradeoffs:
+        - option: "Intent-derived idempotency key on every mutating tool"
+          pros: "A retry is a lookup, not a second effect; the key survives process restarts because it is derived, not generated."
+          cons: "Every downstream tool must honour the key, which means adapters for third-party APIs that do not support one, and a dedupe store with its own retention policy."
+        - option: "Two-phase: reserve, then commit"
+          pros: "Works with services that have no idempotency support, because the reservation is the dedupe point."
+          cons: "Doubles the round trips and introduces a stuck-reservation state that needs a reaper — more failure modes than the problem it solves in most cases."
+        - option: "At-most-once: never retry a mutating call"
+          pros: "No duplicates by construction and the simplest possible semantics."
+          cons: "Turns every transient failure into a failed run, which at a 3% failure rate means 3 in 100 runs end in an error the user has to notice."
+
+  bottlenecks:
+    - failure: "Sandbox pool exhaustion under a traffic spike"
+      symptom: "Dispatch queue depth rises, tool calls time out at the per-tool deadline, runs fail, clients retry, and the queue deepens — a spiral where the retry traffic is caused by the queue it is making worse."
+      mitigation: "Per-tenant concurrency caps, a bounded queue with explicit shedding (reject fast with a retry-after rather than queueing past the deadline), and autoscaling on queue depth rather than on CPU."
+    - failure: "Retry storm after a provider 429"
+      symptom: "Error rate spikes for 90 seconds, then stays elevated for 15 minutes; offered load triples while success rate falls; the provider's rate limiter keeps rejecting because the retries never back off."
+      mitigation: "Exponential backoff with full jitter, a circuit breaker per provider, and a shared token bucket so all tenants back off together instead of independently amplifying."
+    - failure: "Prompt cache invalidation from a non-deterministic prefix"
+      symptom: "Input token cost per turn jumps 54% overnight with no code review to explain it; cache hit rate falls to near zero; latency rises because prefill grew."
+      mitigation: "Hash the prompt prefix and alert on distinct-prefix cardinality, freeze tool-schema serialisation order, forbid timestamps and request ids in the stable block, and pin the cache key to the prompt template version."
+    - failure: "Poison tool output breaking the loop"
+      symptom: "One run type loops between the same two tool calls until the turn cap; token spend per run is 10x the median; the model keeps retrying because the tool returns a 200 with an error body."
+      mitigation: "Validate tool outputs against a schema, cap identical (tool, args) repeats at two, surface a typed error to the model instead of a 200 with an error payload, and alert on runs exceeding 2x the p99 turn count."
+
+  what_to_steal:
+    - "Count prompt tokens per turn before anything else. A 10,000-token turn at 350 turns/s is 175 GPUs of prefill, and no amount of decode optimisation touches it."
+    - "Turn prompt caching into a currency figure: cached_prefix x 0.1 + uncached, times price, times turns per day. Here it is 16,200 USD a day, which is a budget line, not a nice-to-have."
+    - "Size the sandbox pool with Little's law and add the cold-start overlap explicitly: lambda x W plus lambda x cold_start. It is the difference between 88 hosts and 148."
+    - "Derive idempotency keys from intent — run, turn, tool, arguments — never from a per-attempt UUID, and quote the duplicate count (6,000/day here) that the omission costs."
+    - "Make the event log the only state. Disposable sandboxes plus a stateless orchestrator plus an append-only log is the combination that survives deploys, crashes and audits."
+
+  try_it: >-
+    Recompute the platform at 5 turns per run instead of 10, holding runs per day
+    fixed. Turns per second halves, so the GPU count halves — but state per run
+    halves too, and cache reuse per run falls because each run sends the prefix
+    fewer times. Work out which changes linearly, which stays flat, and why the
+    cost per run does not halve.
+
+  interview_questions:
+    - question: "Why is an agent platform 13x more prefill-heavy than a chat service, and what do you do about it?"
+      level: staff
+      key_points:
+        - "An agent turn sends 10,000 prompt tokens to produce 500, a 20:1 ratio; chat is closer to 4:1, so the same output rate needs far more prefill."
+        - "At 350 turns/s that is 3.5M prompt tokens/s, or 175 GPUs at 20,000 tokens/s each, against 13 GPUs for decode."
+        - "The levers are prompt caching (54% off here), a smaller stable prefix, and truncating or summarising history rather than resending it."
+        - "Decode optimisations are almost irrelevant until the prompt bill is under control, which inverts the usual serving intuition."
+      follow_up: "How would you cut the 4,000-token history without losing task quality, and what would you measure?"
+
+    - question: "A payment tool times out. Walk me through what must happen."
+      level: staff
+      key_points:
+        - "The call may have succeeded; a timeout is not a failure, it is an unknown outcome, so the platform must not treat it as one."
+        - "The retry carries a key derived from run id, turn index, tool name and an arguments hash, so the downstream service can return the original result instead of charging twice."
+        - "The dedupe store must persist the key with the result and the outcome status, or a retry after a crash cannot distinguish success from never-happened."
+        - "Without the key, 3% transient failure over 40M calls a day yields 6,000 duplicate effects a day at 0.5% write-then-timeout — a correctness bug that presents as a support queue."
+      follow_up: "The third-party payment API has no idempotency support. What do you do?"
+
+    - question: "Your p99 turn latency is 6 seconds and p50 is 1.8. Where is the tail?"
+      level: senior
+      key_points:
+        - "The p50 is the sum of model TTFT, two tool rounds and a final model call; the tail is almost always sandbox dispatch, not model time."
+        - "A cold start is 1.2 s against a 150 ms warm dispatch, so the p99 is really a measurement of pool hit rate under burst."
+        - "Per-tool deadlines and a bounded queue convert an unbounded wait into a fast failure, which is better for the tail even though it looks worse for the error rate."
+        - "Instrument dispatch wait separately from execution time, because they have completely different fixes."
+      follow_up: "How large does the warm pool have to be to keep p99 dispatch under 200 ms at 1,400 calls/s?"
+
+    - question: "How do you keep exactly-once semantics for side effects on an at-least-once network?"
+      level: staff
+      key_points:
+        - "You do not: exactly-once is at-least-once plus deduplication, and the dedupe point must live where the effect happens."
+        - "The key is derived from intent, not generated per attempt, so every retry of the same intent produces the same key."
+        - "The downstream service stores key and result atomically with the effect, and returns the stored result on a repeat."
+        - "Reserve-then-commit is the fallback when the downstream has no idempotency support, at the cost of a stuck-reservation reaper."
+      follow_up: "How long do you retain dedupe keys, and what breaks if you get that wrong?"
+
+  common_mistakes:
+    - "Sizing the platform from output tokens and discovering the prompt is 20x the completion, so the GPU bill is 13x what the decode arithmetic predicted."
+    - "Skipping prompt caching, or breaking it with a timestamp or a non-deterministic tool schema order, and losing 54% of the input bill with no alert."
+    - "Generating a fresh UUID per retry attempt and calling it idempotency, which guarantees every retry is a new effect while looking like a fix."
+    - "Serialising tool calls that could run in parallel, turning a 1.8 s turn into 3.3 s and paying the latency on every turn of every run."
+    - "Keeping agent state in the orchestrator's memory, so a rolling deploy silently drops every run in flight and the on-call engineer sees failures with no run ids."
+
+  further_reading:
+    - label: "Anthropic, Prompt Caching documentation: prefix caching semantics, cache breakpoints and pricing"
+    - label: "Agache, Brooker, Florescu, Edelman, Firecracker: Secure and Fast MicroVMs for Serverless Computing (NSDI 2020)"
+    - label: "Kleppmann, Designing Data-Intensive Applications, chapter 11 on exactly-once and idempotence"
+    - label: "Yao, Zhao, Yu, Du, Shafran, Narasimhan, Cao, ReAct: Synergizing Reasoning and Acting in Language Models (ICLR 2023)"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Three budgets that do not interact: tokens (mostly prompt, mostly
+        cacheable), sandboxes (Little's law plus cold-start overlap), and effects
+        (at-least-once plus a dedupe key). Get the units right and each one is a
+        single multiplication.
+      blocks:
+        - kind: checklist
+          body: |
+            - Turns/s = runs/day x turns/run / 86,400 x peak factor
+            - Prompt tokens/s = turns/s x tokens/turn
+            - GPUs = prompt tokens/s / prefill per GPU
+            - Sandboxes = calls/s x seconds per call
+            - Duplicates = calls x failure rate x write-then-timeout rate
+      checkpoint: >-
+        Which of those five would double if you doubled the number of turns per
+        run, and which would not change?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Start with the token bill because it dominates unit economics, then size
+        the sandbox pool because it dominates the tail, then fix idempotency
+        because it is the only one that produces wrong answers rather than slow
+        ones. In that order, because that is the order of magnitude of the money.
+      blocks:
+        - kind: warning
+          body: >-
+            Do not design the loop before designing the state. An agent loop whose
+            state lives in memory cannot survive a deploy, and retrofitting an
+            event log after launch means rewriting the orchestration layer.
+      checkpoint: >-
+        If you could only fix one of cache hit rate, pool warm rate, or
+        idempotency, which produces the largest change in a week, and which
+        prevents the worst day?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The loop, the pool, and the key.
+      blocks:
+        - kind: pseudocode
+          body: |
+            for turn in range(max_turns):
+                prompt = stable_prefix + history + observation
+                out    = model(prompt)                # 400 ms TTFT
+                if out.is_tool_call:
+                    key = H(run_id, turn, tool, args)
+                    res = sandbox_pool.run(tool, args, key, timeout=2.0)
+                    log.append(turn, tool, args, key, res)
+                else:
+                    log.append(turn, "answer", out.text)
+                    break
+      checkpoint: >-
+        Which line, if it were missing, would produce a duplicate charge rather
+        than a wrong answer or a slow turn?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Token throughput, cache saving, sandbox count.
+      blocks:
+        - kind: math
+          body: |
+            **Prefill load.**
+            $$T = R_{\text{turns}} S_{\text{turn}}, \qquad
+              G = \frac{T}{P_{\text{gpu}}}$$
+
+            **Cached effective prompt.**
+            $$S_{\text{eff}} = 0.1 S_c + (S - S_c)$$
+
+            **Sandboxes.**
+            $$N = \lambda W + \lambda t_{\text{cold}}$$
+      checkpoint: >-
+        With S=10,000, S_c=6,000 and a 10% cache price, do you get 4,600 effective
+        tokens and a 54% saving?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The 175-GPU, 3,500-sandbox, 240-GB-a-day platform.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            runs, turns, tools = 1e6, 10, 4
+            peak = 0.12
+            rps = runs * turns / 86400 * 3
+            calls = rps * tools
+            prefill = rps * 10_000
+            gpus = prefill / 20_000
+            sandboxes = calls * 2.5 + calls * 0.15
+            cached = (6000*0.1 + 4000) * 0.30e-6
+            per_run = (cached + 500*1.20e-6) * turns
+            print(round(rps), round(calls), round(gpus), round(sandboxes), round(per_run,4))
+      checkpoint: >-
+        The per-run cost printed is about 0.02 USD. Which term would you attack
+        first to halve it, and what would that do to answer quality?
+  implementations:
+    - language: python
+      title: "Prompt-cache billing and the sandbox pool: three capacity calculations"
+      note: >-
+        Three models from the case study, each computed from first principles: the 6,000-token cached prefix is billed at 10% and cuts prompt cost 54%; Little's law sizes the warm pool at 3,500 live microVMs; a 3% retry rate changes attempts but not the number of applied effects. The cost model assumes a byte-identical prefix, which is the operational requirement the case study spends most of its words on.
+      code: |
+        import numpy as np
+
+        TURNS, PROMPT = 10, 10_000
+        STABLE_PREFIX, CACHE_DISCOUNT = 6_000, 0.10
+        RUNS_PER_DAY, TOOL_QPS, TOOL_SECONDS, VCPU_PER_HOST = 1_000_000, 1_400, 2.5, 40
+
+
+        def effective_prompt(prompt=PROMPT, prefix=STABLE_PREFIX, discount=CACHE_DISCOUNT):
+            """Tokens billed per turn: the cached prefix at `discount`, the tail at full price."""
+            return prefix * discount + (prompt - prefix)
+
+
+        def sandbox_pool(qps=TOOL_QPS, service_s=TOOL_SECONDS):
+            """Little's law: concurrency = arrival rate x time in system."""
+            return qps * service_s
+
+
+        def state_per_run(turns=TURNS, event_bytes=8_000, tool_bytes=4_000, tools=40):
+            return turns * event_bytes + tools * tool_bytes
+
+
+        def idempotent_calls(turns, retry_rate):
+            """Retries re-send the request; a stable key makes the effect happen once."""
+            attempts = turns * (1 + retry_rate)
+            return attempts, turns
+
+
+        def main():
+            eff = effective_prompt()
+            saving = 1 - eff / PROMPT
+            print(f"billed prompt per turn: {eff:,.0f} tokens ({saving:.1%} cheaper)")
+
+            live = sandbox_pool()
+            hosts = int(np.ceil(live / VCPU_PER_HOST))
+            print(f"live sandboxes: {live:,.0f}; 40-vCPU hosts: {hosts}")
+
+            per_run = state_per_run()
+            print(f"state per run: {per_run/1000:.0f} KB; 30 days at 1M runs/day: "
+                  f"{per_run*RUNS_PER_DAY*30/1e12:.1f} TB")
+
+            attempts, unique = idempotent_calls(RUNS_PER_DAY * TURNS, 0.03)
+            print(f"tool attempts: {attempts:,.0f}; unique effects: {unique:,.0f}")
+
+            assert abs(eff - 4_600) < 1e-9
+            assert 0.53 < saving < 0.55
+            assert live == 3_500 and hosts == 88
+            assert per_run == 240_000
+            assert unique < attempts
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-agent-platform-cached-prompt
+      title: "Price the cached prefix"
+      difficulty: easy
+      prompt: >-
+        A turn carries a 6,000-token stable prefix billed at 10% of the input price and a
+        4,000-token tail billed at full price. Return the billed prompt tokens. The function
+        takes the prefix and tail lengths plus the discount, so the same arithmetic works for
+        another context layout.
+      language: python
+      entry: effective_prompt
+      testCases:
+        - input: '{}'
+          expected: "4600"
+          tolerance: 1e-6
+        - input: '{"prefix": 6000, "tail": 2000}'
+          expected: "2600"
+          tolerance: 1e-6
+      solution: |
+        def effective_prompt(prefix=6000, tail=4000, discount=0.10):
+            return prefix * discount + tail
+      solutionExplanation: >-
+        6000 * 0.10 + 4000 = 4600, a 54% cut against 10,000. Making the prefix length and
+        discount arguments lets you re-price a different layout without editing the formula.
+      tags: [serving, caching]

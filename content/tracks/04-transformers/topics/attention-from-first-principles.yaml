@@ -1,0 +1,1299 @@
+id: attention-from-first-principles
+slug: attention-from-first-principles
+title: "Attention from First Principles: Q, K, and V"
+summary: >-
+  Build scaled dot-product attention from a dictionary lookup: three learned
+  projections, a bilinear score whose variance forces the $1/\sqrt{d_k}$
+  divisor, a softmax whose Jacobian you already derived, and a convex
+  combination of values — then pay the $O(n^2)$ bill and learn why a causal
+  mask has to be applied before the normalisation rather than after it.
+kind: lesson
+difficulty: medium
+position: 1
+estMinutes: 27
+prerequisites: [mlp-from-scratch, matrix-calculus]
+phase: attention-core
+tags: [attention, qkv, scaled-dot-product, softmax, causal-mask, quadratic-cost, transformers]
+
+body:
+  big_idea: >-
+    Attention is a soft dictionary lookup: a query scored against every key by
+    inner product, normalised by $\sqrt{d_k}$, then used to average values, so
+    each output is a convex combination of the sequence.
+
+  problem:
+    - >-
+      Your MLP classifies one vector at a time, and nothing lets token 900
+      change what token 12 means through a fixed-width recurrent state.
+    - >-
+      You copy `scores = Q @ K.T` with no divisor; it trains at 128 tokens and
+      flattens at 2048, and no learning rate explains why.
+    - >-
+      You mask after the softmax, and two hundred steps later the model
+      reproduces the prompt verbatim, because position 0 read its own target.
+
+  analogy: |
+    A library with a soft card catalogue: you arrive with a question (the
+    query), every book has an index card (the key), and the books are the
+    values. Match one card exactly and you get that book; ask vaguely and you
+    get a weighted blend of every book. But the catalogue has no order —
+    shuffle the cards and nothing changes.
+
+  concept_points:
+    - >-
+      **Attention is a dictionary lookup whose lookup is graded, and both extremes are exact.**
+      Weights as a one-hot give exactly `V[argmax]`; weights as a uniform
+      vector give exactly the mean of the values (measured
+      `max|P@V - mean(V)| = 0.0`). Rows are non-negative and sum to one(
+      `max|rowsum - 1| = 2.2e-16`), so every output is a convex combination
+      and $\|out_i\| \le \max_j\|v_j\|$ — measured ratio 0.131.
+    - >-
+      **The score is a bilinear form, and its rank is bounded by $d_k$.**
+      $q_i^\top k_j = x_i^\top (W_Q^\top W_K) x_j$, so the $n \times n$ score
+      matrix has rank at most $d_k$: measured exactly **64** for a 512×512
+      matrix at $d_k = 64$. But the attention matrix itself has rank **512** —
+      `exp` and row normalisation fill it back up. "Attention is low-rank" is
+      a wrong inference.
+    - >-
+      **The $1/\sqrt{d_k}$ divisor is derived from the variance of a dot product, not tuned.**
+      For unit-variance coordinates $\operatorname{Var}(q^\top k) = d_k$, so
+      logit std is $\sqrt{d_k}$: measured **4.010** at 16, **8.008** at 64,
+      **22.38** at 512. Dividing makes it 1 (1.003, 1.001, 0.989), and the
+      effective number of attended positions moves from **90.8 / 2.39 / 1.23**
+      unscaled to **322.6 / 309.7 / 312.2** at $d_k$ 4/64/512.
+    - >-
+      **The backward pass is one line, and it is the softmax Jacobian you already have.**
+      For weights $p$ and upstream gradient $g$:
+      $\partial L/\partial z = p \odot (g - (p^\top g)\mathbf{1})$ — subtract
+      the $p$ -weighted mean, then scale elementwise. Every row of the result
+      sums to exactly zero, which is $J\mathbf{1}=0$ as a conservation law.
+      Drop the mean term and training still works, just slower.
+    - >-
+      **A causal mask must be applied before the softmax, and "after" fails in two ways.**
+      For logits $[1,2,3,4]$ the row sums after a masked-without-renormalising
+      softmax become **0.03206, 0.11920, 0.35609, 1.0** — the first row scaled
+      by **31.2x**, as a function of *future* logits. Two tokens with key
+      norms 1 and 10 should return $v_0 = 1.0$ at position 0 and return
+      **0.00172**: a **582x** error with a plausible loss curve.
+    - >-
+      **The bill is $4n^2d$ FLOPs and $n^2$ numbers, and the memory is what kills you.**
+      Per head: $n=2048$ is 4,194,304 entries — **16 MiB** in fp32 and 1.07
+      GFLOP at $d=64$; $n=32768$ is 1,073,741,824 entries, **4 GiB**, 274.9
+      GFLOP. That 4 GiB is per head: 32 heads across 32 layers is **4 TiB**
+      for one sequence. Arithmetic intensity 32 FLOP/byte against an H100
+      ridge of 148.
+
+  definitions:
+    - term: "Query (q)"
+      meaning: >-
+        The vector a position uses to ask its question: $q_i = W_Q x_i$. It is
+        compared against every key by an inner product, so its direction — not
+        its length — decides what the position attends to.
+    - term: "Key (k)"
+      meaning: >-
+        The vector a position advertises so that other positions can find it:
+        $k_j = W_K x_j$. Keys and queries share a dimension $d_k$ because they
+        are dotted together; values need not.
+    - term: "Value (v)"
+      meaning: >-
+        The vector a position contributes once it is attended to:
+        $v_j = W_V x_j$, of dimension $d_v$. The output is a weighted average of
+        values, so $d_v$ is the width of what attention can pass on.
+    - term: "Score / logit"
+      meaning: >-
+        The pre-softmax number $\operatorname{score}_{ij} = q_i^\top k_j / \sqrt{d_k}$.
+        Called a logit because the softmax turns it into a log-probability up to
+        a per-row constant; its absolute level is meaningless, only differences
+        within a row matter.
+    - term: "Scale factor"
+      meaning: >-
+        The $1/\sqrt{d_k}$ divisor on the scores. It is not a hyperparameter: it
+        is the constant that makes $\operatorname{Var}(q^\top k) = 1$ regardless
+        of head width, and therefore makes the sharpness of the attention
+        distribution independent of $d_k$.
+    - term: "Attention weights (P)"
+      meaning: >-
+        The row-stochastic matrix $\operatorname{softmax}(QK^\top/\sqrt{d_k})$,
+        shape $(n_q, n_k)$, non-negative with every row summing to 1. Each row
+        is the answer to "given my query, how much of each value do I take".
+    - term: "Context vector"
+      meaning: >-
+        One row of the output $PV$: the convex combination of value rows picked
+        out by that row of the attention weights. It is the only thing the rest
+        of the network ever sees, which is why information a row assigns no
+        weight to is irrecoverable downstream.
+    - term: "Causal mask"
+      meaning: >-
+        The constraint that position $i$ may only attend to $j \le i$, imposed
+        by setting the disallowed scores to $-\infty$ *before* the softmax so
+        their weights come out exactly zero and the row still sums to 1. It is
+        what makes next-token prediction a well-posed training objective.
+    - term: "Head"
+      meaning: >-
+        One independent $(W_Q, W_K, W_V)$ triple operating at width $d_k$, with
+        its own softmax and its own output. Several heads concatenated and
+        projected give multi-head attention; the point of more than one is that
+        a single inner product can only express one direction of interest.
+    - term: "Attention matrix"
+      meaning: >-
+        The $n \times n$ matrix of weights, or loosely the score matrix before
+        the softmax. The score matrix has rank at most $d_k$; the attention
+        matrix does not, because the softmax is applied elementwise and is
+        dense.
+    - term: "Softmax temperature"
+      meaning: >-
+        The scalar $\beta$ in $\operatorname{softmax}(\beta z)$. Attention's
+        $1/\sqrt{d_k}$ is a temperature chosen to normalise variance, not to
+        optimise any objective: $\beta \to 0$ gives the mean of the values,
+        $\beta \to \infty$ gives a hard nearest-key lookup, and the useful range
+        is where the weights are neither uniform nor one-hot.
+    - term: "Permutation equivariance"
+      meaning: >-
+        The property that permuting the input tokens permutes the output rows
+        identically and changes nothing else. Attention has it by construction
+        — it is a weighted average over a set — which is exactly why position
+        information has to be added separately.
+
+  diagrams:
+    - type: architecture
+      title: "One attention layer, and the only two operations that touch every pair"
+      nodes:
+        - { id: x, x: 0, y: 1, label: "X  (n, d_model)", kind: client, detail: "One row per token. Nothing here knows about order, and nothing downstream will either." }
+        - { id: proj, x: 1, y: 0, label: "W_Q, W_K, W_V", kind: storage, detail: "Three (d_k or d_v, d_model) matrices, 3 x 768 x 768 = 1,769,472 parameters at d_model=768 with 12 heads. Learned, not fixed: the same token is a different vector depending on which role it is playing." }
+        - { id: qkv, x: 1, y: 1, label: "Q, K, V", kind: model, detail: "Q and K must share d_k because they are dotted; V is independent at d_v. With 12 heads at d_model=768, each head's d_k is 64." }
+        - { id: s, x: 2, y: 1, label: "S = QK^T / sqrt(d_k)  (n, n)", kind: model, detail: "The only O(n^2) object in the layer. Rank at most d_k = 64, so a 512x512 score matrix carries 64 independent directions out of 512." }
+        - { id: mask, x: 2, y: 0, label: "mask: S -> -inf", kind: worker, detail: "Set disallowed entries to -inf BEFORE the softmax. In a fused kernel this is a branch that skips the block entirely, which is why causal attention costs half." }
+        - { id: sm, x: 3, y: 1, label: "P = softmax(S)  (n, n)", kind: server, detail: "Row-stochastic. Jacobian diag(p) - p p^T, rank n-1. Subtract the row max first or float32 overflows at logit 88.72." }
+        - { id: out, x: 3, y: 2, label: "out = P V  (n, d_v)", kind: client, detail: "A convex combination per row: every output lies inside the convex hull of the value rows, which is why rank(out) is at most min(n, d_v)." }
+      edges:
+        - { from: x, to: proj, label: "same X, three projections" }
+        - { from: proj, to: qkv, label: "project" }
+        - { from: qkv, to: s, label: "Q K^T" }
+        - { from: s, to: mask, label: "before softmax" }
+        - { from: mask, to: sm, label: "-inf, then exp" }
+        - { from: sm, to: out, label: "weights" }
+        - { from: qkv, to: out, label: "V", style: async }
+
+    - type: plot
+      title: "Effective attended positions out of 512 keys: the divisor removes the dependence on d_k"
+      chart: line
+      xLabel: "head width d_k"
+      yLabel: "exp(entropy of the weight row)"
+      series:
+        - name: "no divisor"
+          points:
+            - { x: 4, y: 90.75 }
+            - { x: 16, y: 7.06 }
+            - { x: 64, y: 2.39 }
+            - { x: 512, y: 1.23 }
+        - name: "divided by sqrt(d_k)"
+          points:
+            - { x: 4, y: 322.64 }
+            - { x: 16, y: 299.67 }
+            - { x: 64, y: 309.74 }
+            - { x: 512, y: 312.25 }
+        - name: "uniform attention (512)"
+          points:
+            - { x: 4, y: 512.0 }
+            - { x: 512, y: 512.0 }
+
+    - type: compare
+      title: "Causal masking: measured, on four tokens with logits [1, 2, 3, 4]"
+      left_label: "Mask before (correct)"
+      left_points:
+        - "Scores above the diagonal set to -inf, then one softmax pass"
+        - "Row 0 weights: [1.0, 0, 0, 0] — the whole row's mass on the only visible token"
+        - "Every row sums to 1 within 2.2e-16, so every output is a convex combination"
+        - "Output at position 0 is exactly v_0; perturbing k_3 changes it by exactly 0.0"
+        - "In a blocked kernel the upper triangle is never read: 0.49976 of the matrix skipped at n=2048"
+      right_label: "Mask after (broken in two different ways)"
+      right_points:
+        - "Softmax first, then zero the future: row sums become 0.03206, 0.11920, 0.35609, 1.0"
+        - "Row 0 is scaled by 1/0.03206 = 31.2x too small, and the factor depends on future logits"
+        - "Perturbing k_3 moves out_0 by [-5.2e-4, 1.5e-3, 5.5e-3] instead of 0.0"
+        - "Worst case measured: 0.00172 returned where the answer is 1.0 — a 582x error"
+        - "Masking after P@V leaves the future values in the output: ||diff|| = 1.13 on a 4x3 case"
+
+    - type: plot
+      title: "The score matrix is the wall: memory for one head, one layer"
+      chart: bar
+      xLabel: "context length n"
+      yLabel: "GiB"
+      series:
+        - name: "fp32 score matrix"
+          points:
+            - { x: 2048, y: 0.0156 }
+            - { x: 8192, y: 0.25 }
+            - { x: 32768, y: 4.0 }
+        - name: "fp16 score matrix"
+          points:
+            - { x: 2048, y: 0.0078 }
+            - { x: 8192, y: 0.125 }
+            - { x: 32768, y: 2.0 }
+
+    - type: graph
+      title: "One idea, five consequences"
+      nodes:
+        - { id: lookup, label: "soft dictionary lookup" }
+        - { id: bilinear, label: "score = x^T (W_Q^T W_K) y" }
+        - { id: var, label: "Var(q.k) = d_k" }
+        - { id: scale, label: "divide by sqrt(d_k)" }
+        - { id: softmax, label: "softmax over keys" }
+        - { id: jac, label: "J = diag(p) - p p^T" }
+        - { id: convex, label: "convex combination of values" }
+        - { id: cost, label: "O(n^2) time and memory" }
+      edges:
+        - { from: lookup, to: bilinear, label: "compare query to key" }
+        - { from: bilinear, to: var, label: "what is its scale?" }
+        - { from: var, to: scale, label: "normalise to unit variance" }
+        - { from: scale, to: softmax, label: "turn scores into weights" }
+        - { from: softmax, to: jac, label: "what does it pass backward?" }
+        - { from: softmax, to: convex, label: "weights x values" }
+        - { from: convex, to: cost, label: "n x n matrix" }
+
+  markdown: |
+    ## A dictionary that answers with a mixture
+
+    A Python `dict` does one thing: given a key, return the value stored under
+    it. Attention is the same operation with two changes — the lookup is graded
+    rather than exact, and the keys and values are learned projections rather
+    than fixed constants.
+
+    With $X \in \mathbb{R}^{n \times d_{\text{model}}}$,
+
+    $$Q = XW_Q^\top, \qquad K = XW_K^\top, \qquad V = XW_V^\top$$
+
+    and then
+
+    $$\operatorname{Attn}(X) = \operatorname{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V.$$
+
+    Three matrices because the lookup needs three views of the same token: what
+    it is asking for ($q$), what it advertises ($k$), and what it hands over
+    ($v$). The score $q_i^\top k_j$ is the answer to "how relevant is $j$ to
+    $i$", and the softmax turns a row of those answers into a distribution.
+
+    The two extremes are exactly the two things a dictionary can do. One-hot
+    weights return `V[argmax]` — an exact lookup. Uniform weights return the
+    arithmetic mean of every value row, because a constant row vector averaging
+    columns is a mean. On a 64x8 value matrix the difference between uniform
+    attention and `V.mean(axis=0)` is exactly `0.0`. Every real attention row
+    lives between those two, which means every output is a **convex
+    combination** of the value rows: weights non-negative, rows summing to 1
+    (measured $2.2\times10^{-16}$ from 1), so the output can never be longer
+    than the longest value.
+
+    ## The score is a bilinear form you have already differentiated
+
+    Substitute the projections:
+
+    $$q_i^\top k_j = x_i^\top W_Q^\top W_K x_j = x_i^\top A x_j,
+      \qquad A = W_Q^\top W_K.$$
+
+    This is the bilinear form behind the $\tfrac12 x^\top A x$ you differentiated
+    in *Matrix Calculus*: hold $x_j$ fixed and the gradient with respect to
+    $x_i$ is $Ak_j$ — the same object, applied to a different pair of vectors.
+    It also inherits the rank bound:
+    $\operatorname{rank}(A) \le \min(d_k, d_{\text{model}})$, so the $n \times n$
+    score matrix has rank at most $d_k$.
+
+    | object | shape | rank | non-zero directions |
+    |---|---|---|---|
+    | scores $QK^\top/\sqrt{d_k}$ | 512 x 512 | 64 | 12.5% |
+    | attention weights $P$ | 512 x 512 | 512 | 100% |
+
+    That table is a warning: the score matrix is genuinely low-rank, and people
+    who notice try to factor it. The softmax is applied *elementwise* and
+    is dense, so it fills the matrix back up: $P$ has full rank 512. Low rank
+    buys you nothing after the normalisation, which is why every efficient
+    attention variant works on the *schedule* — never materialise the matrix —
+    rather than on a factorisation.
+
+    ## Why the divisor is $\sqrt{d_k}$
+
+    Take $q, k \in \mathbb{R}^{d_k}$ with iid zero-mean unit-variance
+    coordinates, independent of each other. Then
+
+    $$\operatorname{Var}(q^\top k) = \sum_{i=1}^{d_k}
+      \mathbb{E}[q_i^2]\,\mathbb{E}[k_i^2] = d_k,$$
+
+    because the cross terms are zero-mean and independent. So
+    $\operatorname{std}(q^\top k) = \sqrt{d_k}$: measured 4.010 at $d_k=16$,
+    8.008 at 64, 22.38 at 512 against $\sqrt{d_k} = 4$, 8, 22.63. Divide by
+    $\sqrt{d_k}$ and the variance is 1 at every width — measured 1.003, 1.001,
+    0.989 after division.
+
+    What that buys is not "stability" in the abstract, it is *invariance of the
+    attention distribution to head width*:
+
+    | $d_k$ | effective positions, no divisor | with $1/\sqrt{d_k}$ |
+    |---|---|---|
+    | 4 | 90.8 | 322.6 |
+    | 16 | 7.1 | 299.7 |
+    | 64 | 2.4 | 309.7 |
+    | 512 | 1.2 | 312.2 |
+
+    (512 keys total; "effective positions" is $\exp$ of the weight entropy.)
+    Without the divisor, a $d_k=512$ head is a near-hard lookup attending to
+    1.23 positions, and a $d_k=4$ head is nearly uniform. You would have to
+    retune every other hyperparameter when you change the head width. With it,
+    the number is flat at about 310 out of 512 — the same implementation at
+    every width.
+
+    The cost of getting it wrong is visible in the Jacobian. $J = \operatorname{diag}(p) - pp^\top$
+    has $n-1$ non-zero eigenvalues, but *effective* rank — how many directions
+    carry more than $10^{-3}$ of the largest — collapses with saturation:
+    **2.8 of 511** at $d_k=512$ unscaled, against **510.5 of 511** scaled. A
+    saturated softmax still passes gradient; it passes it in one direction.
+
+    ## Backward, in one line
+
+    For one row, with weights $p$ and upstream gradient $g$:
+
+    $$\frac{\partial L}{\partial z} = p \odot \left(g - (p^\top g)\mathbf{1}\right).$$
+
+    Subtract the $p$-weighted mean of the incoming gradient, then scale
+    elementwise by $p$. Each row of the result sums to exactly zero, which is
+    $J\mathbf{1} = 0$ — the statement that adding a constant to every logit
+    cannot change the loss. This is the softmax Jacobian from *Matrix Calculus*
+    applied to a row instead of a classifier, and the mean-subtraction term is
+    the part people drop.
+
+    ## Causal masking: before, not after
+
+    Next-token prediction requires that position $i$ see only $j \le i$. There
+    are three ways to write that, and only one is right.
+
+    | approach | row sums | output at position 0 |
+    |---|---|---|
+    | set future scores to $-\infty$, then softmax | 1.0 exactly | exactly $v_0$ |
+    | softmax, zero the future, renormalise | 1.0 exactly | exactly $v_0$ |
+    | softmax, zero the future, no renormalise | 0.032, 0.119, 0.356, 1.0 | $0.032\,v_0$ |
+
+    With logits $[1,2,3,4]$ the third row is the trap. The first row of the
+    matrix is scaled by $1/0.03206 = 31.2$, and — this is the part that matters
+    — the scale factor is computed from logits at positions the model is not
+    allowed to see. Perturb $k_3$ and the correct output at position 0 changes
+    by exactly zero; the unnormalised version moves. In the sharp case (keys of
+    norm 1 and 10, so logits 0.707 and 7.071) the bug returns 0.00172 where the
+    answer is 1.0: a 582x error, and the training signal happily teaches the
+    model to reproduce the token it is predicting.
+
+    Note the honest qualification: zero-then-renormalise is *mathematically*
+    identical to masking before (measured difference 0.0). The practical rule
+    exists because a fused kernel computes the row maximum and the row sum in
+    the same pass as the exponentials; there is no second pass to renormalise
+    with, and the upper triangle is never even loaded.
+
+    ## The bill
+
+    Per head, per layer, for $n$ tokens and head width $d$: the two matmuls are
+    $4n^2d$ FLOPs and the score matrix is $n^2$ numbers.
+
+    | $n$ | score entries | fp32 | FLOPs at $d=64$ | causal waste |
+    |---|---|---|---|---|
+    | 2,048 | 4,194,304 | 16 MiB | 1.07e9 | 49.98% |
+    | 8,192 | 67,108,864 | 256 MiB | 1.72e10 | 49.99% |
+    | 32,768 | 1,073,741,824 | 4 GiB | 2.75e11 | 50.00% |
+
+    Four times the context is sixteen times the work; 2048 to 32768 is 256x.
+    That 4 GiB is one head in one layer. At 32 heads and 32 layers it is 4 TiB
+    for a single 32k sequence — which is why the KV cache and FlashAttention are
+    separate topics rather than footnotes.
+
+    The arithmetic intensity is $2d/4 = 32$ FLOP/byte at $d_k=64$, against an
+    H100 ridge point of $494.5/3.35 \approx 148$ FLOP/byte. Attention is 4.6x
+    below the roofline: it is bound by writing the score matrix, not by the
+    multiplications. Every optimisation you will meet — blocking, recomputation,
+    online softmax — is an attack on that one fact.
+
+    ## The longer version
+
+    Attention is a soft dictionary lookup — each token's query is scored
+    against every token's key by an inner product, normalised into a
+    distribution whose sharpness is fixed by dividing by $\sqrt{d_k}$, and used
+    to average the values — so the output at every position is a convex
+    combination of the whole sequence rather than a summary squeezed through a
+    fixed-size state.
+
+    A library with a soft card catalogue. You arrive with a question — that is
+    your query. Every book has an index card describing what it is about — those
+    are the keys. The books themselves are the values. If your question matches
+    one card exactly, you get that book. If your question is vague, you get a
+    weighted blend of every book's contents, weighted by how well each card
+    matched. Nothing in the mechanism decides *which* books exist; the catalogue
+    was built by projection, and every token contributes one card and one book.
+
+    Two things break the analogy, and both are the actual content of this topic.
+    First, a card catalogue has no notion of order: shuffle the cards and the
+    answer does not change. Attention over a set is permutation-equivariant —
+    permute the tokens and the outputs permute with them — which is why position
+    has to be injected as a separate signal two topics from now. Second, a
+    single inner product measures alignment along *one* direction, so a query
+    can only express one kind of interest at a time: "is this about money" or
+    "is this about the previous verb", not both. That limitation is what
+    multiple heads exist to remove.
+
+    ### What goes wrong
+
+    - You have an MLP that classifies one vector at a time, and the moment the
+      input is a *sequence* the architecture has no way to let token 900
+      change what token 12 means. A recurrent layer can carry information
+      forward but only through a fixed-width state, so the gradient from token
+      900 to token 12 has to survive 888 multiplications.
+    - You copy a reference implementation and it reads `scores = Q @ K.T` with
+      no divisor. It trains on 128-token batches. On 2048-token batches the
+      loss curve flattens at a level that depends on sequence length, and
+      nothing about the learning rate explains why.
+    - You write the causal mask as `weights = weights * mask` *after* the
+      softmax, the loss falls for two hundred steps, and then the model starts
+      reproducing the prompt verbatim — because at position 0 it was quietly
+      reading the token it was supposed to predict.
+    - Someone asks what a 128k-token context costs per layer and you say "it's
+      quadratic" without a number. The number is 64 GiB of score matrix per
+      head, and it is the reason every serving stack you will meet in this
+      track is organised around not materialising it.
+    - An interviewer asks why the divisor is $\sqrt{d_k}$ and you say "to keep
+      the gradients stable". That is the consequence, not the reason. The
+      reason is one line of variance arithmetic, and it also tells you exactly
+      when the constant stops being right.
+
+    ### The full treatment
+
+    **Attention is a dictionary lookup whose lookup is graded, and both
+    extremes are exact.** Give the weights as a one-hot vector and the output
+    is exactly `V[argmax]` — a plain `dict` lookup. Give them as a uniform
+    vector and the output is exactly the arithmetic mean of the values
+    (measured: `max|P@V - mean(V)| = 0.0` on a 64x8 value matrix). Everything
+    between is the useful part. The weights are non-negative and sum to one
+    (measured `max|rowsum - 1| = 2.2e-16`), so every output is a convex
+    combination of the value rows and $\|out_i\| \le \max_j \|v_j\|$ —
+    measured ratio 0.131 on random data. The trap is reading "soft" as a
+    hedge: softness is the only reason the lookup is differentiable at all,
+    because a hard `argmax` has zero gradient almost everywhere.
+
+    **The score is a bilinear form, and its rank is bounded by $d_k$.** With
+    $q_i = W_Q x_i$ and $k_j = W_K x_j$, the score is
+    $q_i^\top k_j = x_i^\top (W_Q^\top W_K) x_j$ — the bilinear form behind the
+    quadratic $\tfrac12 x^\top A x$ you differentiated in *Matrix Calculus*,
+    with $A = W_Q^\top W_K$. Since $\operatorname{rank}(A) \le \min(d_k, d_{model})$,
+    the $n \times n$ score matrix has rank at most $d_k$: measured exactly
+    **64** for a 512x512 score matrix at $d_k = 64$, so 87.5% of its singular
+    directions are structurally zero. The trap is assuming that survives the
+    softmax. The attention matrix itself has rank **512** — `exp` and the
+    row normalisation are elementwise and dense, so they fill the matrix back
+    up. "Attention is low-rank, let me factor it" is a wrong inference from a
+    true premise.
+
+    **The $1/\sqrt{d_k}$ divisor is derived from the variance of a dot
+    product, not tuned.** For zero-mean unit-variance coordinates,
+    $\operatorname{Var}(q^\top k) = d_k$, so the logits have standard
+    deviation $\sqrt{d_k}$: measured 4.010 at $d_k=16$, 8.008 at 64, 22.38 at
+    512, against $\sqrt{d_k} = 4, 8, 22.63$. Dividing by $\sqrt{d_k}$ makes
+    the logit variance 1 at every width — measured post-division std 1.003,
+    1.001, 0.989. The consequence is the number that matters: over 512 keys
+    the effective number of attended positions ($\exp$ of the weight entropy)
+    is **322.6 at $d_k=4$, 309.7 at 64, 312.2 at 512** with the divisor, and
+    **90.8, 2.39, 1.23** without it. The divisor is what makes one attention
+    implementation behave the same at every head width.
+
+    **Without the divisor the softmax saturates and the learning signal
+    collapses in rank.** The softmax Jacobian is
+    $J = \operatorname{diag}(p) - pp^\top$, so its usefulness is not its norm
+    but how many directions it leaves alive. At $d_k=512$ with unit-variance
+    inputs, the mean top weight is **0.819** unscaled and the number of
+    Jacobian eigenvalues above $10^{-3}$ of the largest is **2.8 of 511**;
+    with the divisor, the top weight is **0.033** and **510.5 of 511**
+    directions survive. A saturated softmax is a step function wearing a
+    smooth costume: it still passes gradient, but only in the one direction
+    that says "more of the same".
+
+    **The backward pass is one line, and it is the softmax Jacobian you
+    already have.** For a row of weights $p$ and upstream gradient $g$,
+    $\partial L/\partial z = p \odot (g - (p^\top g)\mathbf{1})$: subtract the
+    $p$-weighted mean of the incoming gradient, then multiply elementwise by
+    $p$. Every row of the result sums to exactly zero — that is $J\mathbf{1}=0$
+    showing up as a conservation law, and it is why adding a constant to all
+    logits cannot change the loss. The trap is treating softmax as elementwise:
+    drop the mean term and the gradient is wrong by a per-row constant that
+    still points roughly downhill, so training "works" and converges slower.
+
+    **The output is a convex combination, and that fixes the shape algebra.**
+    $(n_q \times d_k)(d_k \times n_k) \to (n_q \times n_k)$, then
+    $(n_q \times n_k)(n_k \times d_v) \to (n_q \times d_v)$. The output rows
+    live in the span of the value rows, so
+    $\operatorname{rank}(out) \le \min(n_q, n_k, d_v)$ — attention can mix
+    information across positions but it cannot invent a direction the values
+    do not contain. The parameter count is small and constant in $n$:
+    four $d_{model}\times d_{model}$ matrices is **2,359,296** parameters at
+    $d_{model}=768$, against **4,718,592** for the 768→3072→768 MLP that
+    follows it. Attention is exactly one third of a block's parameters and all
+    of its context dependence.
+
+    **A causal mask must be applied before the softmax, and "after" has two
+    distinct failure modes with numbers.** Take four tokens with logits
+    $[1,2,3,4]$: the full-row softmax is
+    $[0.03206, 0.08714, 0.23688, 0.64391]$. Zero the future *after* the
+    softmax without renormalising and the row sums become
+    **0.03206, 0.11920, 0.35609, 1.0** — the first row is scaled down by
+    **31.2x**, and worse, that scale factor is a function of the *future*
+    logits. Measured: perturb $k_3$ and the correct
+    $\partial out_0/\partial k_3 = 0$ exactly, while the buggy version moves
+    by $[-5.21\times10^{-4}, 1.54\times10^{-3}, 5.51\times10^{-3}]$. The
+    second failure mode is masking after the value product, which leaves the
+    future values inside the output: measured $\|diff\| = 1.13$ on a 4x3
+    example. The worst case is not subtle: two tokens with keys of norm 1 and
+    10 give logits $[0.707, 7.071]$, the correct causal output at position 0
+    is exactly $v_0 = 1.0$, and masking after the softmax without
+    renormalising returns **0.00172** because 99.83% of the row's mass went
+    to a token position 0 cannot see — a **582x** error that still produces a
+    plausible-looking loss curve. Note what *is* true: mask-after-then-
+    renormalise is mathematically identical to mask-before (measured
+    difference exactly 0.0). So the bug is never the ordering alone; it is the
+    missing normalisation, and the reason practitioners still say "mask
+    before" is that a fused or streaming kernel computes the normaliser in the
+    same pass as the exponentials and cannot go back and fix it afterwards.
+
+    **The bill is $4n^2d$ FLOPs and $n^2$ numbers, and the memory is what
+    kills you.** Per head: $n=2048$ gives 4,194,304 score entries, **16 MiB**
+    in fp32 and 1.07 GFLOP at $d=64$; $n=8192$ gives 67,108,864 entries,
+    **256 MiB**, 17.2 GFLOP; $n=32768$ gives 1,073,741,824 entries, **4 GiB**,
+    274.9 GFLOP. Quadrupling the context multiplies work by 16, so 2048 to
+    32768 is **256x**. That 4 GiB is per head: 32 heads across 32 layers is
+    **4 TiB** for one 32k sequence. The arithmetic intensity is
+    $2d/4 = 32$ FLOP/byte at $d_k=64$ against an H100 ridge point of
+    **148** FLOP/byte, so the kernel is 4.6x below the line — bound by writing
+    the score matrix, not by the arithmetic. That single number is the entire
+    motivation for FlashAttention, six topics from now.
+
+    **Half of a causal score matrix is dead on arrival, and that is a
+    measurable 50% discount.** The fraction above the diagonal is
+    $(n^2 - n(n+1)/2)/n^2$: **0.49976** at $n=2048$, **0.49994** at 8192,
+    **0.49999** at 32768. A naive implementation computes all of it and
+    discards half after the mask; a blocked causal kernel never visits the
+    upper triangle at all, which is why causal attention is roughly twice as
+    fast as bidirectional attention at the same length. If your causal model
+    is not faster than your bidirectional one, the mask is being applied after
+    the work rather than instead of it.
+
+    **Numerical stability is a float32 fact with a threshold: 88.72.** The
+    largest finite float32 is $3.4\times10^{38}$ and
+    $\ln(3.4\times10^{38}) = 88.72$, so `exp` overflows above that. Over 4096
+    tokens at $d_k=1024$ with no divisor, the largest logit is **110.63** and
+    a naive softmax returns **NaN** in float32; with the divisor the same row
+    peaks at **3.46**. Subtracting the row maximum first makes the largest
+    exponent 0 and the row sum at most $n$ — and it changes the answer by
+    exactly nothing, because softmax is invariant to a constant shift. The
+    trap is testing in float64, where the overflow threshold is 709.78 and
+    every one of these cases passes.
+
+
+  derivations:
+    - title: "Variance of the dot product, and why the divisor is sqrt(d_k)"
+      latex: |
+        Let $q, k \in \mathbb{R}^{d_k}$ have iid coordinates with
+        $\mathbb{E}[q_i] = \mathbb{E}[k_i] = 0$ and
+        $\operatorname{Var}(q_i) = \operatorname{Var}(k_i) = 1$, mutually
+        independent. Expand the square:
+
+        $$\mathbb{E}\left[(q^\top k)^2\right]
+          = \sum_{i=1}^{d_k}\sum_{j=1}^{d_k}
+            \mathbb{E}[q_i k_i q_j k_j].$$
+
+        For $i \ne j$ the four factors are independent and each has mean zero, so
+        the term vanishes. Only $i = j$ survives:
+
+        $$\mathbb{E}\left[(q^\top k)^2\right]
+          = \sum_{i=1}^{d_k} \mathbb{E}[q_i^2]\,\mathbb{E}[k_i^2] = d_k.$$
+
+        Since the mean is zero, this is the variance, so
+        $\operatorname{std}(q^\top k) = \sqrt{d_k}$. Dividing by $\sqrt{d_k}$:
+
+        $$\operatorname{Var}\!\left(\frac{q^\top k}{\sqrt{d_k}}\right)
+          = \frac{d_k}{d_k} = 1 \quad \text{for every } d_k.$$
+
+        Measured on $2\times10^4$ Gaussian pairs: std 4.010 at $d_k=16$, 8.008 at
+        64, 22.38 at 512, against $\sqrt{d_k} = 4, 8, 22.63$; after division,
+        1.003, 1.001, 0.989.
+      prose: >-
+        The sum is what forces the square root, exactly as it did for the
+        initialisation scale in the previous track: variances add over the
+        $d_k$ coordinates, so the standard deviation grows like $\sqrt{d_k}$ and
+        the divisor has to undo precisely that. The payoff is not a vague
+        "stability" claim but an invariance: the logits have unit variance at
+        every head width, so the attention distribution has the same sharpness
+        whether $d_k$ is 4 or 512 — measured as 322.6 and 312.2 effective
+        attended positions out of 512, against 90.8 and 1.23 without it.
+    - title: "The softmax Jacobian, and the attention backward pass"
+      latex: |
+        With $s = \operatorname{softmax}(z)$, $S = \sum_j e^{z_j}$, and
+        $\partial S/\partial z_j = e^{z_j} = s_j S$:
+
+        $$\frac{\partial s_i}{\partial z_j}
+          = \frac{\delta_{ij} e^{z_i} S - e^{z_i} e^{z_j}}{S^2}
+          = s_i \delta_{ij} - s_i s_j,$$
+
+        so $J = \operatorname{diag}(s) - ss^\top$: symmetric, dense, rank $n-1$,
+        with $J\mathbf{1} = s - s(\mathbf{1}^\top s) = 0$. For a single row of
+        attention weights $p$ and an upstream gradient $g = \partial L/\partial p$:
+
+        $$\frac{\partial L}{\partial z} = J^\top g
+          = p \odot g - p\,(p^\top g)
+          = p \odot \left(g - (p^\top g)\mathbf{1}\right).$$
+
+        Every row of $\partial L/\partial z$ sums to zero, since
+        $\mathbf{1}^\top J = 0$. Measured spectral norms: 0.0324 with the
+        $1/\sqrt{d_k}$ divisor at $d_k=512$, 0.2136 without it; effective rank
+        (eigenvalues above $10^{-3}$ of the largest) 510.5 against 2.8.
+      prose: >-
+        The dense Jacobian is the reason softmax is not an elementwise
+        activation: changing one logit moves every probability in the row, and
+        the correction term $p^\top g$ is the shadow of that coupling. Drop it
+        and the gradient is wrong by a per-row constant that still points
+        roughly downhill — which is why the bug survives training and only shows
+        up as a model that converges slower than the paper's. The rank statement
+        is the useful diagnostic: $J$ always has $n-1$ non-zero eigenvalues, but
+        in the saturated regime almost all of them are numerically zero, so the
+        signal that would say "attend somewhere else" is annihilated.
+    - title: "The O(n^2 d) bill and the roofline it sits under"
+      latex: |
+        Per head, per layer, for $n$ tokens and head width $d$:
+
+        $$QK^\top: \; n^2 d \text{ multiply-adds}, \qquad
+          PV: \; n^2 d \text{ multiply-adds}, \qquad
+          \text{softmax}: \; 3n^2 \text{ scalar ops}.$$
+
+        Counting a multiply-add as two FLOPs, and dropping the $3n^2$ term
+        against $n^2 d$ for $d \gg 1$:
+
+        $$\text{FLOPs} \approx 4n^2 d, \qquad
+          \text{bytes written} = 4n^2 \text{ (fp32)}.$$
+
+        The ratio is the arithmetic intensity, and it is independent of $n$:
+
+        $$\frac{\text{FLOPs}}{\text{bytes}}
+          = \frac{4n^2 d}{8n^2} = \frac{d}{2} = 32
+          \quad \text{at } d_k = 64,$$
+
+        where the $8n^2$ counts one write and one read of the score matrix. An
+        H100 SXM has $494.5$ TFLOP/s dense fp16 and $3.35$ TB/s, so its ridge
+        point is $494.5/3.35 \approx 148$ FLOP/byte. Attention at $d_k=64$ is
+        4.6x below that line: memory-bound.
+      prose: >-
+        Two consequences follow directly. First, the cost is quadratic in the
+        thing users actually want to increase — 4x the context is 16x the work,
+        and 2048 to 32768 is 256x, or 1.07 GFLOP to 275 GFLOP per head per
+        layer. Second, because the intensity $d/2$ does not depend on $n$, you
+        cannot fix the problem by growing the context slowly; you can only fix
+        it by not writing the matrix. That is the entire content of
+        FlashAttention: tile the computation so the $n \times n$ matrix never
+        exists in HBM, and recompute it in the backward pass rather than storing
+        it.
+
+  implementations:
+    - language: python
+      title: "Scaled dot-product attention, with the two constants that matter"
+      note: >-
+        This is numerically correct forward, and deliberately incomplete in two
+        ways: it materialises the full $n \times n$ weight matrix (4 GiB at
+        $n=32768$ per head) and it has no backward pass. One real hazard is
+        visible in the code rather than hidden: masking with `-np.inf` and then
+        taking a row maximum gives `-inf`, so an entirely-masked row produces
+        `nan` rather than an error. That is a genuine design question (some
+        libraries return zeros, some raise), not a bug you can ignore.
+      code: |
+        import numpy as np
+
+        def softmax_rows(s):
+            """Row-wise softmax. The max subtraction is not an optimisation."""
+            s = s - s.max(axis=-1, keepdims=True)   # largest exponent is 0
+            e = np.exp(s)                            # e <= 1, no overflow
+            return e / e.sum(axis=-1, keepdims=True)
+
+        def scaled_dot_product_attention(Q, K, V, mask=None):
+            Q = np.asarray(Q, dtype=np.float64)
+            K = np.asarray(K, dtype=np.float64)
+            V = np.asarray(V, dtype=np.float64)
+
+            n_q, d_k = Q.shape
+            assert K.shape[-1] == d_k, "Q and K must share d_k"
+            assert V.shape[0] == K.shape[0], "one value per key"
+
+            S = Q @ K.T / np.sqrt(d_k)               # (n_q, n_k)
+            if mask is not None:
+                # BEFORE the softmax: disallowed entries get -inf, so their
+                # weights are exactly zero and the row still sums to one.
+                S = np.where(mask, S, -np.inf)
+            P = softmax_rows(S)                      # (n_q, n_k)
+            return P @ V, P                          # (n_q, d_v)
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            n, d = 512, 64
+            Q, K, V = (rng.standard_normal((n, d)) for _ in range(3))
+            out, P = scaled_dot_product_attention(Q, K, V)
+            print("row sums  ", np.abs(P.sum(1) - 1).max())      # 2.2e-16
+            H = -(P * np.log(P)).sum(1)
+            print("effective ", np.exp(H).mean())                # ~309.7 of 512
+            print("||out||max / ||V||max", np.linalg.norm(out, axis=1).max()
+                  / np.linalg.norm(V, axis=1).max())             # <= 1
+    - language: python
+      title: "The two classic bugs, side by side with the correct version"
+      note: >-
+        `mask_after` is numerically WRONG by construction: it normalises over
+        tokens the model is not allowed to see and then throws away 99.8% of the
+        row in the worst case. `naive_softmax` is also WRONG in float32 — with
+        no max subtraction, `exp` overflows at 88.72, and unscaled $d_k=1024$
+        logits reach 110.6 over 4096 tokens, so it returns `nan`. Both are
+        included so you can reproduce the failure, not so you can use them. Note
+        that `mask_then_renormalise` is exactly correct — the ordering alone is
+        not the bug; the missing normalisation is.
+      code: |
+        import numpy as np
+
+        def mask_after(Q, K, V):
+            """WRONG: softmax over the full row, then zero the future."""
+            S = Q @ K.T / np.sqrt(Q.shape[-1])
+            P = np.exp(S) / np.exp(S).sum(-1, keepdims=True)   # sees the future
+            P = P * np.tril(np.ones_like(P))                    # too late
+            return P @ V, P
+
+        def naive_softmax(Q, K, V):
+            """WRONG in float32: no max subtraction, and no divisor."""
+            S = Q @ K.T                                        # no /sqrt(d_k)
+            P = np.exp(S) / np.exp(S).sum(-1, keepdims=True)
+            return P @ V, P
+
+        def mask_then_renormalise(Q, K, V):
+            """Correct, but needs a second pass over the row."""
+            S = Q @ K.T / np.sqrt(Q.shape[-1])
+            P = np.exp(S) / np.exp(S).sum(-1, keepdims=True)
+            P = P * np.tril(np.ones_like(P))
+            return P @ V, P / P.sum(-1, keepdims=True)          # the fix
+
+        if __name__ == "__main__":
+            Q = np.array([[1.0, 0.0], [1.0, 0.0]])
+            K = np.array([[1.0, 0.0], [10.0, 0.0]])
+            V = np.array([[1.0], [2.0]])
+            print("correct   ", mask_then_renormalise(Q, K, V)[0].ravel())  # [1.0, 1.998]
+            print("mask-after", mask_after(Q, K, V)[0].ravel())             # [0.0017, 1.998]
+            # and the float32 overflow, which fp64 hides
+            rng = np.random.default_rng(0)
+            z = (rng.standard_normal((4096, 1024)) @ rng.standard_normal(1024))
+            z32 = z.astype(np.float32)
+            with np.errstate(over="ignore"):
+                e = np.exp(z32)
+            print("max logit", z32.max(), "nan?", np.isnan(e / e.sum()).any())  # 110.1, True
+
+  checkpoints:
+    - id: cp-1
+      question: "Your head width doubles from 64 to 128. What happens to the standard deviation of the raw scores $q^\\top k$, what happens to the attention distribution if you do not divide, and what does the divisor do?"
+      answerKind: short_text
+      hint: "Write the variance of a sum of $d_k$ independent products."
+      solution: >-
+        The raw score is a sum of $d_k$ independent zero-mean products, so its
+        variance is $d_k$ and its standard deviation grows from 8 to 11.3 —
+        measured 8.008 at $d_k=64$ and 22.38 at 512, matching $\sqrt{d_k}$ to
+        within 1%. Larger logits mean a sharper softmax: measured effective
+        attended positions out of 512 keys fall from 90.8 at $d_k=4$ to 2.39 at
+        64 to 1.23 at 512 with no divisor. Dividing by $\sqrt{d_k}$ pins the
+        logit variance at 1 regardless of width, so the distribution stays at
+        about 310 of 512 effective positions at every $d_k$ — 322.6 at 4, 309.7
+        at 64, 312.2 at 512.
+    - id: cp-2
+      question: "A 128k-token sequence, 32 heads, 32 layers, fp32. What is the memory for the score matrices alone if you materialise all of them, and what does that imply about the architecture of the code?"
+      answerKind: short_text
+      hint: "128k is $2^{17}$. The score matrix is $n^2$ entries at 4 bytes each; work out one head first."
+      solution: >-
+        $2^{17}$ squared is $2^{34} = 17{,}179{,}869{,}184$ entries, at 4 bytes
+        each that is $2^{36}$ = 68,719,476,736 bytes = **64 GiB per head per
+        layer**. Multiply by 32 heads and 32 layers: 64 GiB x 1024 = 65,536 GiB
+        = **64 TiB**. Nothing survives that, which is the point — the
+        implementation must be blocked so that a tile of the score matrix lives
+        in SRAM and is consumed before it is written, and the backward pass must
+        recompute rather than store. That is the design of every serious
+        attention kernel, and it is a consequence of one number: $n^2$.
+    - id: cp-3
+      question: "You write `P = softmax(S); P = P * tril_mask; out = P @ V` and the model trains but degenerates. Explain precisely what is wrong, using the row of logits $[1,2,3,4]$."
+      answerKind: short_text
+      hint: "What does that row sum to after the multiplication, and what does the sum depend on?"
+      solution: >-
+        The row no longer sums to 1. With logits $[1,2,3,4]$ the full-row softmax
+        is $[0.03206, 0.08714, 0.23688, 0.64391]$, so after zeroing the future the
+        four rows sum to 0.03206, 0.11920, 0.35609 and 1.0 — position 0's output
+        is 31.2x too small, and the scale factor is computed from logits at
+        positions it is not allowed to see. Measured: perturbing $k_3$ changes
+        the correct output at position 0 by exactly 0.0, and this version by
+        $[-5.2\times10^{-4}, 1.5\times10^{-3}, 5.5\times10^{-3}]$. In the sharp
+        case the error is 582x (0.00172 instead of 1.0). Setting the scores to
+        $-\infty$ before the softmax gives exactly zero weight to the future and
+        a row sum of 1 by construction.
+    - id: cp-4
+      question: "The 512x512 score matrix at $d_k=64$ has rank 64. Does the attention matrix have rank 64? What does your answer imply for anyone trying to speed attention up with a low-rank factorisation?"
+      answerKind: short_text
+      hint: "What kind of function is the softmax, and does an elementwise map preserve rank?"
+      solution: >-
+        No: the attention matrix has rank **512**. The score matrix is low-rank
+        because it is a bilinear form $X A X^\top$ with
+        $\operatorname{rank}(A) \le d_k$ — measured 64 of 512 directions, so 87.5%
+        of the spectrum is structurally zero. But the softmax applies `exp`
+        elementwise and divides by a row sum, and elementwise maps of low-rank
+        matrices are generically full rank. So the compressibility you can see
+        before the normalisation is gone immediately after it, which is why
+        low-rank *factorisations* of $P$ do not work while low-rank *schedules*
+        — `softmax(QK^T)V` computed in the right order without ever forming
+        $QK^T$ — do.
+    - id: cp-5
+      question: "For a row of attention weights $p$, why does every row of $\\partial L/\\partial z$ sum to exactly zero, and what would break if it did not?"
+      answerKind: short_text
+      hint: "Softmax is invariant to adding a constant to every logit. What does that imply about the gradient along $\\mathbf{1}$?"
+      solution: >-
+        Because $J = \operatorname{diag}(p) - pp^\top$ satisfies
+        $J\mathbf{1} = p - p(\mathbf{1}^\top p) = 0$: the direction that adds the
+        same constant to every logit changes nothing, so the gradient along it
+        must be zero. Concretely
+        $\partial L/\partial z = p \odot (g - (p^\top g)\mathbf{1})$ has row sum
+        $\sum_i p_i g_i - (p^\top g)\sum_i p_i = 0$. If it did not, gradient
+        descent would drift the whole row of logits up or down with no effect on
+        the loss — wasted steps at best, and in a mixed-precision setting a slow
+        drift of the logit scale that eventually saturates the softmax.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A dictionary maps a key to one value. Attention maps a *question* to a
+        *blend* of values, where the blend weights say how well the question
+        matches each entry's label. Three things have to be decided: how to
+        compare a question to a label, how sharp the blend should be, and what
+        gets blended. The sharpness is not a taste decision — it is dictated by
+        how the comparison score grows with the width of the vectors involved,
+        and getting it wrong makes the blend either a uniform average or a hard
+        argmax, both of which stop learning.
+      blocks:
+        - kind: checklist
+          body: |
+            - A lookup needs a question, a set of labels, and a set of payloads
+            - "How well does this label match" is an inner product, because an
+              inner product is the cheapest differentiable similarity there is
+            - A blend needs weights that are non-negative and sum to one
+            - The sharpness of the blend has a correct value, and it is set by
+              the dimension of the vectors being compared
+            - If the blend is too sharp or too flat, learning stops — for
+              different reasons
+      checkpoint: >-
+        Before reading on: if the weights were produced by a hard `argmax`
+        instead of a softmax, what would the gradient with respect to the keys
+        be, and how often would it be non-zero?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Do not tune the sharpness — derive it. Compute the variance of the raw
+        inner product under the assumption that its coordinates are independent
+        and standardised, and divide by whatever makes that variance 1. Then
+        handle the mask by making the disallowed scores so negative that their
+        exponential is exactly zero, which must happen *before* the
+        normalisation because the normaliser is what turns scores into a
+        distribution. For the backward pass, reach for the softmax Jacobian you
+        already derived: it is dense, rank $n-1$, and annihilates the all-ones
+        direction.
+      blocks:
+        - kind: checklist
+          body: |
+            - Derive the scale: variance of a sum of independent products
+            - Normalise per row, and subtract the row maximum first
+            - Mask by setting scores to -inf, never by zeroing probabilities
+            - Backward: subtract the p-weighted mean of the incoming gradient,
+              then multiply elementwise by p
+            - Verify: every weight row sums to 1, and every gradient row sums
+              to 0
+      checkpoint: >-
+        The gradient row summing to zero is a conservation law, not a
+        coincidence. Which invariance of the softmax does it correspond to?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Four steps, and the order of the third and fourth is the whole
+        difference between a working causal model and one that cheats.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # forward, one head
+            Q = X @ W_Q.T          # (n, d_k)
+            K = X @ W_K.T          # (n, d_k)
+            V = X @ W_V.T          # (n, d_v)
+
+            S = Q @ K.T / sqrt(d_k)          # (n, n), the only O(n^2) object
+            if causal:
+                S = where(lower_triangular_including_diagonal, S, -inf)
+            S = S - max(S, axis=rows)        # keeps exp in range
+            E = exp(S)
+            P = E / sum(E, axis=rows)        # rows sum to 1
+
+            out = P @ V                      # (n, d_v)
+
+            # backward, given g = dL/dout
+            dV = P.T @ g
+            dP = g @ V.T
+            dS = P * (dP - sum(P * dP, axis=rows))   # softmax VJP, rows sum to 0
+            dQ = dS @ K / sqrt(d_k)
+            dK = dS.T @ Q / sqrt(d_k)
+      checkpoint: >-
+        In the backward pass, why does `dS` get divided by `sqrt(d_k)` but `dV`
+        does not?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three lines of variance, one Jacobian, one roofline.
+      blocks:
+        - kind: math
+          body: |
+            Scores. With iid zero-mean unit-variance coordinates:
+
+            $$\mathbb{E}\left[(q^\top k)^2\right]
+              = \sum_i \mathbb{E}[q_i^2]\,\mathbb{E}[k_i^2] = d_k,
+              \qquad \operatorname{std}(q^\top k) = \sqrt{d_k}.$$
+
+            So divide by $\sqrt{d_k}$, giving unit variance at every width.
+
+            Weights. $p = \operatorname{softmax}(z)$ with
+            $J = \partial p/\partial z = \operatorname{diag}(p) - pp^\top$,
+            $\operatorname{rank} J = n-1$, $J\mathbf{1} = 0$.
+
+            Backward, per row:
+
+            $$\frac{\partial L}{\partial z}
+              = J^\top g = p \odot \left(g - (p^\top g)\mathbf{1}\right),
+              \qquad \mathbf{1}^\top \frac{\partial L}{\partial z} = 0.$$
+
+            Cost. Two matmuls of $n^2 d$ multiply-adds, $n^2$ fp32 entries:
+
+            $$\text{FLOPs} \approx 4n^2d, \quad
+              \text{bytes} = 4n^2 \text{ written}, \quad
+              \frac{\text{FLOPs}}{\text{bytes}} = \frac{d}{2}.$$
+
+            At $d_k=64$ that is 32 FLOP/byte against an H100 ridge point of 148.
+      checkpoint: >-
+        The score matrix is $n^2$ entries but only rank $d_k$. Why does that not
+        reduce the memory cost of computing it?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete forward pass with masking and a numerically stable softmax,
+        plus the diagnostic that tells you which of the two failure modes you
+        are looking at.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the diagnostic output before the code. A correct implementation
+            reports row sums within 1e-15 of 1, effective attended positions near
+            the value the divisor predicts, and an output norm strictly below the
+            largest value norm. A row sum below 1 means the mask was applied
+            after the normalisation; a row sum of `nan` means an entirely masked
+            row reached the max subtraction, which is a design decision you have
+            to make explicitly.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def attention(Q, K, V, causal=False):
+                Q, K, V = (np.asarray(a, dtype=np.float64) for a in (Q, K, V))
+                n_q, d_k = Q.shape
+                S = Q @ K.T / np.sqrt(d_k)
+                if causal:
+                    keep = np.tril(np.ones((n_q, K.shape[0]), dtype=bool))
+                    S = np.where(keep, S, -np.inf)
+                S = S - S.max(axis=-1, keepdims=True)
+                E = np.exp(S)
+                P = E / E.sum(axis=-1, keepdims=True)
+                return P @ V, P
+
+            def diagnose(Q, K, V):
+                out, P = attention(Q, K, V)
+                H = -(P * np.log(P + 1e-300)).sum(1)
+                return {
+                    "row_sum_error": float(np.abs(P.sum(1) - 1).max()),
+                    "effective_positions": float(np.exp(H).mean()),
+                    "max_weight": float(P.max(1).mean()),
+                    "output_norm_ratio": float(
+                        np.linalg.norm(out, axis=1).max()
+                        / np.linalg.norm(V, axis=1).max()),
+                }
+
+            if __name__ == "__main__":
+                rng = np.random.default_rng(0)
+                Q, K, V = (rng.standard_normal((512, 64)) for _ in range(3))
+                print(diagnose(Q, K, V))
+                # row_sum_error 2.2e-16, effective_positions 309.7,
+                # max_weight 0.029, output_norm_ratio 0.13
+      checkpoint: >-
+        `P + 1e-300` appears inside the log to stop `log(0)`. What does that do
+        to the entropy of a row that is exactly one-hot, and why is the measured
+        number still usable?
+
+  problems:
+    - id: p-scaled-dot-attention
+      title: "Scaled dot-product attention"
+      difficulty: medium
+      prompt: >-
+        Implement `scaled_dot_product_attention(Q, K, V)` returning the output
+        matrix only. `Q` has shape $(n_q, d_k)$, `K` has shape $(n_k, d_k)$ and
+        `V` has shape $(n_k, d_v)$; all arrive as nested lists and must be
+        treated as floats. Compute scores as $QK^\top / \sqrt{d_k}$, apply a
+        numerically stable row-wise softmax (subtract the row maximum before
+        exponentiating), and return $PV$ as a nested list of shape
+        $(n_q, d_v)$. `d_k` is `len(Q[0])`, not the number of rows.
+      starter: |
+        import numpy as np
+
+        def scaled_dot_product_attention(Q, K, V):
+            # your implementation here
+            pass
+      language: python
+      entry: scaled_dot_product_attention
+      testCases:
+        - input: '[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], [[1.0, 2.0], [3.0, 4.0]]]'
+          expected: "[[1.6604769013466862, 2.6604769013466862], [2.3395230986533138, 3.3395230986533138]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 2.0]], [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], [[1.0, 0.0], [0.0, 1.0], [2.0, 2.0]]]'
+          expected: "[[1.2919799354741017, 1.4359461001719838]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0], [0.0, 2.0]], [[1.0, 1.0], [2.0, 0.0]], [[1.0, -1.0], [0.5, 2.0]]]'
+          expected: "[[0.6651192253366716, 1.0092846479799706], [0.9022148412534785, -0.41328904752087064]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.5, 0.5, 1.0]], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [[2.0, 1.0], [1.0, 3.0], [4.0, 0.0]]]'
+          expected: "[[2.5005958964130652, 1.1995232828695483]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[3.0, 4.0]], [[1.0, 0.0], [0.0, 1.0]], [[1.0, 2.0], [3.0, 4.0]]]'
+          expected: "[[2.3395230986533138, 3.3395230986533138]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.0, 0.0], [0.0, 0.0]], [[1.0, 0.0], [0.0, 1.0]], [[1.0, 4.0], [3.0, 2.0]]]'
+          expected: "[[2.0, 3.0], [2.0, 3.0]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def scaled_dot_product_attention(Q, K, V):
+            Q = np.asarray(Q, dtype=np.float64)
+            K = np.asarray(K, dtype=np.float64)
+            V = np.asarray(V, dtype=np.float64)
+
+            d_k = Q.shape[-1]
+            S = Q @ K.T / np.sqrt(d_k)
+
+            # Stable softmax: the largest exponent becomes 0, so exp <= 1.
+            S = S - S.max(axis=-1, keepdims=True)
+            E = np.exp(S)
+            P = E / E.sum(axis=-1, keepdims=True)
+
+            return (P @ V).tolist()
+      solutionExplanation: >-
+        Two details decide whether this passes. First, `d_k` is the *column*
+        count of `Q` — using `len(Q)` happens to work whenever the inputs are
+        square, which is true of the first test case and false of the last one,
+        and that is the test designed to catch it: a 2x3 score matrix against a
+        2x2 one. Second, the row maximum must be subtracted before `exp`. The
+        values here are small enough that the naive version also passes, which is
+        exactly why the test cases cannot catch it — the guard is for the
+        logits you will meet in a real model, where unscaled $d_k=1024$ scores
+        reach 110 and `exp` overflows float32 at 88.72. The final test case has
+        all-zero queries, so every score is zero and every row is uniform: the
+        answer is the mean of the value rows, `[2.0, 3.0]`, which is the
+        dictionary-lookup limit from the lesson.
+      complexity: "O(n_q n_k d_k) time, O(n_q n_k) space for the weight matrix"
+      tags: [attention, scaled-dot-product, softmax, numerical-stability]
+
+    - id: p-causal-attention
+      title: "Causal attention, masked before the softmax"
+      difficulty: medium
+      prompt: >-
+        Implement `causal_attention(Q, K, V)` for self-attention, so `Q` and `K`
+        both have $n$ rows and $d_k$ columns and `V` has $n$ rows. Position $i$
+        may attend to positions $j \le i$ only. Set the disallowed scores to
+        $-\infty$ *before* the softmax so that their weights are exactly zero and
+        every row still sums to 1, then return the output matrix as nested
+        lists. The diagonal is included: token $i$ always sees itself.
+      starter: |
+        import numpy as np
+
+        def causal_attention(Q, K, V):
+            # your implementation here
+            pass
+      language: python
+      entry: causal_attention
+      testCases:
+        - input: '[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], [[1.0, 2.0], [3.0, 4.0]]]'
+          expected: "[[1.0, 2.0], [2.3395230986533138, 3.3395230986533138]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0], [1.0, 0.0]], [[1.0, 0.0], [10.0, 0.0]], [[1.0], [2.0]]]'
+          expected: "[[1.0], [1.9982804318220542]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], [[1.0, 0.0], [0.0, 1.0], [2.0, 2.0]]]'
+          expected: "[[1.0, 0.0], [0.3302384506733431, 0.6697615493266569], [1.2552347652268308, 1.2552347652268308]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[2.0, 1.0], [1.0, 1.0], [0.0, -1.0]], [[1.0, 0.0], [0.0, 2.0], [1.0, 1.0]], [[1.0, 0.0], [3.0, 2.0], [-1.0, 1.0]]]'
+          expected: "[[1.0, 0.0], [2.3395230986533138, 1.3395230986533138], [0.712067670604236, 0.564053899828016]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def causal_attention(Q, K, V):
+            Q = np.asarray(Q, dtype=np.float64)
+            K = np.asarray(K, dtype=np.float64)
+            V = np.asarray(V, dtype=np.float64)
+
+            n, d_k = Q.shape
+            S = Q @ K.T / np.sqrt(d_k)
+
+            # Mask BEFORE the softmax: -inf survives the subtraction below and
+            # exponentiates to exactly 0.0, so the row still sums to 1.
+            keep = np.tril(np.ones((n, n), dtype=bool))
+            S = np.where(keep, S, -np.inf)
+
+            S = S - S.max(axis=-1, keepdims=True)
+            E = np.exp(S)
+            P = E / E.sum(axis=-1, keepdims=True)
+
+            return (P @ V).tolist()
+      solutionExplanation: >-
+        The row maximum is taken *after* the mask, and that is fine because the
+        diagonal is always visible, so no row is entirely $-\infty$ and the max
+        is finite. The second test case is the one that separates this from the
+        classic bug: the two keys have norms 1 and 10, so the logits are 0.707
+        and 7.071, and the full-row softmax puts 99.83% of the mass on the token
+        that position 0 may not see. Masking after the softmax without
+        renormalising returns 0.00172 there instead of 1.0 — a 582x error that
+        still produces a plausible-looking loss curve. Masking after *and*
+        renormalising gives the identical answer to this solution, but needs a
+        second pass over the row, which a fused kernel does not have.
+      complexity: "O(n^2 d_k) time, O(n^2) space; a blocked kernel does half the work"
+      tags: [attention, causal-mask, autoregressive, numerical-stability]
+
+    - id: p-attention-score-grad
+      title: "The gradient through softmax: dL/dS from dL/dP"
+      difficulty: hard
+      prompt: >-
+        Implement `attention_score_grad(P, dP)`, the backward pass through the
+        softmax of an attention layer. `P` is the row-stochastic weight matrix
+        and `dP` is the upstream gradient $\partial L/\partial P$, both shape
+        $(n_q, n_k)$. Return $\partial L/\partial S$ of the same shape, where
+        $S$ is the pre-softmax score matrix, as nested lists. Do not build the
+        $n_k \times n_k$ Jacobian for each row; use the closed form.
+      starter: |
+        import numpy as np
+
+        def attention_score_grad(P, dP):
+            # your implementation here
+            pass
+      language: python
+      entry: attention_score_grad
+      testCases:
+        - input: '[[[0.5, 0.5]], [[1.0, -1.0]]]'
+          expected: "[[0.5, -0.5]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.2, 0.3, 0.5]], [[1.0, 0.0, -1.0]]]'
+          expected: "[[0.26, 0.09, -0.35]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.25, 0.25, 0.25, 0.25], [0.1, 0.2, 0.3, 0.4]], [[1.0, 2.0, 3.0, 4.0], [-1.0, 0.0, 1.0, 2.0]]]'
+          expected: "[[-0.375, -0.125, 0.125, 0.375], [-0.2, -0.2, 0.0, 0.4]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.7, 0.2, 0.1]], [[0.0, 0.0, 0.0]]]'
+          expected: "[[0.0, 0.0, 0.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.9, 0.1], [0.5, 0.5]], [[2.0, -2.0], [0.0, 0.0]]]'
+          expected: "[[0.35999999999999993, -0.36000000000000004], [0.0, 0.0]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def attention_score_grad(P, dP):
+            P = np.asarray(P, dtype=np.float64)
+            dP = np.asarray(dP, dtype=np.float64)
+
+            # J = diag(p) - p p^T per row, so J^T g = p * (g - p.g)
+            row_dot = (P * dP).sum(axis=-1, keepdims=True)
+            return (P * (dP - row_dot)).tolist()
+      solutionExplanation: >-
+        The softmax Jacobian for a row is $\operatorname{diag}(p) - pp^\top$, so
+        $\partial L/\partial z = p \odot (g - (p^\top g)\mathbf{1})$: subtract the
+        $p$-weighted mean of the incoming gradient, then scale elementwise by
+        $p$. The subtraction is not a detail — it is the rank-$n-1$ structure.
+        Drop it and every row of the result sums to $p^\top g$ instead of zero,
+        which is exactly the gradient component along the all-ones direction
+        that softmax cannot see. The fourth test case makes the point: a zero
+        upstream gradient gives a zero score gradient, whereas the version
+        without the mean term would give zero too — so the test that actually
+        catches the omission is the third, where the uniform row must produce
+        entries summing to zero and centred on the mean of `[1,2,3,4]`.
+      complexity: "O(n_q n_k) time and space, versus O(n_q n_k^2) for the explicit Jacobian"
+      tags: [attention, softmax-jacobian, backpropagation, chain-rule]
+
+  visualizers:
+    - id: vs-attention-shape
+      kind: attention
+      title: "One query row, four head widths"
+      description: >-
+        Watch a single attention row over 512 keys as $d_k$ goes from 4 to 512.
+        Without the divisor the effective number of attended positions collapses
+        from 90.8 to 1.23; with it, the row stays at roughly 310 of 512 at every
+        width, and the softmax Jacobian keeps 510 of its 511 directions.
+      params:
+        keys: 512
+        head_widths: [4, 16, 64, 512]
+        show_divisor: true
+
+  try_it: >-
+    Take four tokens with logits $[1, 2, 3, 4]$, compute the softmax, then zero the future
+    entries after the softmax without renormalising. The first row now sums to 0.03206 instead
+    of 1 — work out what the attention output becomes, and why the mask has to go in before the
+    normalisation.
+  interview_questions:
+    - question: 'Why divide the scores by sqrt(d_k), and when does that constant stop being right?'
+      level: mid
+      key_points:
+        - 'For zero-mean unit-variance coordinates Var(q^T k) = d_k, so the logits have standard deviation sqrt(d_k): measured 4.010 at 16, 8.008 at 64, 22.38 at 512.'
+        - 'Without the divisor the softmax saturates: at d_k = 512 the mean top weight is 0.819 and the Jacobian diag(p) - pp^T loses rank, so the learning signal collapses.'
+        - 'The derivation assumes unit-variance, uncorrelated coordinates, so a differently scaled input needs a different divisor — the constant is a consequence of an assumption, not a tuned value.'
+        - 'Numerical stability is the separate floor at ln(3.4e38) = 88.72, above which exp overflows; the max subtraction is what handles that, not the divisor.'
+    - question: 'Your attention produces NaN on a long sequence. Where do you look first?'
+      level: senior
+      key_points:
+        - 'Exp overflow: the largest finite float32 is 3.4e38 and ln of that is 88.72, so any logit above it overflows.'
+        - 'Over 4,096 tokens at d_k = 1024 with no divisor the largest logit measured 110.63, and a naive softmax returns NaN.'
+        - 'The fix is to subtract the row maximum or use the log-sum-exp form, which is exact because softmax is shift-invariant.'
+        - 'Then check the mask: a causal mask written as 0 instead of -inf before the softmax is a different bug with valid shapes and a distribution that sums to 1.'
+      follow_up: 'Does the max subtraction change the gradient, or only the floating-point path?'
+    - question: 'Write the backward pass for a softmax attention row and say what each term is.'
+      level: mid
+      key_points:
+        - 'For weights p and upstream gradient g, dL/dz = p * (g - (p^T g) * 1).'
+        - 'The subtracted term is the p-weighted mean of the incoming gradient, so the row is centred before the elementwise multiply.'
+        - 'It is exactly the softmax Jacobian diag(p) - p p^T applied to g, which is one line and needs no matrix formed.'
+        - 'The value gradient is P^T dO and the score gradient flows through the mask, so a masked entry must receive exactly zero.'
+  common_mistakes:
+    - 'Applying the causal mask after the softmax without renormalising, so each row sums to less than 1 and the output shrinks toward zero.'
+    - 'Treating 1/sqrt(d_k) as a tuned constant rather than a variance correction, which is wrong as soon as the inputs are not unit-variance.'
+    - 'Skipping the max subtraction and meeting NaN at logits above 88.72, which only shows up at the long context lengths you did not test.'
+  further_reading:
+    - label: "Vaswani, Shazeer, Parmar, Uszkoreit, Jones, Gomez, Kaiser & Polosukhin, Attention Is All You Need (NeurIPS 2017)"
+    - label: "Bahdanau, Cho & Bengio, Neural Machine Translation by Jointly Learning to Align and Translate (ICLR 2015)"

@@ -1,0 +1,652 @@
+id: build-agent-harness
+slug: build-agent-harness
+title: "Build an Agent Harness: Tools, Retries, and Exactly-Once Side Effects"
+summary: >-
+  Implement the loop that makes a model's plan executable — a tool registry with
+  argument checks, a plan/act executor, retries against a tool that fails one
+  time in three, and an idempotency journal at the effect boundary — then prove
+  with a counter that 304 attempts produced exactly 200 effects.
+kind: lesson
+difficulty: medium
+position: 5
+estMinutes: 21
+prerequisites: []
+phase: build-systems
+tags: [agents, tool-use, retries, idempotency, exactly-once, orchestration, evaluation]
+
+body:
+  big_idea: >-
+    An agent harness is a scheduler for side effects: a retry makes every
+    effect at-least-once, and the only way back to exactly-once is an
+    idempotency key at the effect.
+  problem:
+    - "Your agent sends the same email twice because the first attempt timed out after the send succeeded, and no prompt fixes a duplicate effect."
+    - "A tool fails one time in three and end-to-end success is 9%: you cannot tell whether the model plans badly or the harness gives up."
+    - "You add retries everywhere and p99 triples, because a retry after a 30-second timeout costs another 30 seconds and nothing bounds the total."
+  analogy: >-
+    A restaurant kitchen with order tickets. The waiter clips a ticket with a
+    number; the kitchen may lose it, the pass may drop the plate, and the
+    waiter may re-clip the same number. The number is the idempotency key: a
+    cook who sees ticket 47 twice checks the rail before cooking, so the
+    second arrival is a lookup, not a second meal.
+  concept_points:
+    - "**The registry is an allow-list, and argument validation is part of the interface.** A model can only call tools that exist, and a tool with a missing required argument should fail before it runs. The reason is not tidiness: a side-effecting tool that fails halfway leaves a partial effect, and a validation error at the boundary is the only failure guaranteed free of side effects."
+    - "**Retries are a geometric distribution, and the numbers are not close.** With $p = 1/3$ the attempt count has mean $1/(1-p) = 1.5$ and success within $n$ attempts is $1 - p^n$: 3 attempts gives 96.3%, 6 gives 99.86%. Measured over 200 steps: mean **1.52 attempts**, maximum 5. Over six steps that is $0.9986^6 = 99.2\\%$ against $(2/3)^6 = 8.8\\%$ — measured 99% versus 6%."
+    - "**A retry re-executes the tool, so the tool must be idempotent, not the loop.** If the first attempt committed an effect and then timed out, the second looks up a key that is already present and returns the stored result. That is check-and-set at the effect boundary, and it is the only correct place: a check above the tool leaves the window between check and effect open."
+    - "**Exactly-once is a property of effects, not of delivery.** A network can always lose the acknowledgement after the receiver committed, so delivery is at-least-once or at-most-once, never both. What you build is **effectively-once**: at-least-once delivery plus an idempotent receiver keyed by a deterministic id. The evidence is the measurement: **304 attempts produced 200 effects**, and the 200 keys are distinct."
+    - "**The key must be deterministic and content-addressed.** Build it from `(step_id, tool_name, canonical_json(args))`, not from a timestamp or a UUID generated inside the loop: a UUID per attempt defeats the mechanism by construction. Canonicalise the arguments — sorted keys, stable float formatting — or two identical calls produce two keys and two effects."
+    - "**Retries multiply the tail, and the budget is per task.** If one attempt costs 200 ms and fails a third of the time, expected latency is $1.5 \\times 200 = 300$ ms, but the p99 is bounded by the attempt cap: six attempts at a 2 s timeout is 12 s. A retry policy without a task-level deadline turns a transient failure into a hung request."
+  definitions:
+    - { term: "Tool registry", meaning: "The allow-list mapping a tool name to its implementation and required arguments. Unknown names and missing arguments fail before any side effect." }
+    - { term: "Plan/act loop", meaning: "The cycle that takes a plan of steps, executes each step through the registry, appends the observation, and re-plans when an observation invalidates the rest." }
+    - { term: "Idempotency key", meaning: "A deterministic id derived from the step, tool and canonical arguments, used to check-and-set at the effect boundary so a repeat is a lookup rather than a second effect." }
+    - { term: "At-least-once delivery", meaning: "The guarantee a retrying client can actually provide: every request is delivered one or more times. Duplicates are possible by construction." }
+    - { term: "Effectively-once", meaning: "At-least-once delivery plus an idempotent receiver. The effect happens once; the attempt may happen many times." }
+    - { term: "Journal", meaning: "The durable record of committed keys and their results. It is both the deduplication mechanism and the replay log." }
+    - { term: "Deterministic evaluator", meaning: "A check of final state that depends only on the task and the world, not on the agent's narration, so two runs with the same effects score identically." }
+
+  diagrams:
+    - type: sequence
+      title: "One step, with a failure after the effect and a retry that does not repeat it"
+      items:
+        - "Plan step: {key: 'note-7', tool: 'write_note', args: {doc: 7, text: '...'}}"
+        - "Attempt 0: registry validates args, calls write_note with key 'note-7'"
+        - "Tool: journal.commit('note-7', effect) → key absent, effect appended, result stored"
+        - "Tool: response times out after the commit (the dangerous failure)"
+        - "Harness: catches the timeout, increments attempt, retries with the SAME key"
+        - "Attempt 1: journal.commit('note-7', ...) → key present, returns the stored result"
+        - "Harness: records one observation, one effect, two attempts"
+
+    - type: architecture
+      title: "Where the idempotency check has to live"
+      nodes:
+        - { id: planner, x: 0, y: 0, label: "planner", kind: model, detail: "Emits steps with stable ids. A step id that changes on every replan makes the key non-deterministic and defeats the journal." }
+        - { id: exec, x: 1, y: 0, label: "executor + retry", kind: worker, detail: "Validates, calls, catches transient errors, retries with the same key, enforces the attempt cap and the task deadline." }
+        - { id: reg, x: 1, y: 1, label: "registry", kind: server, detail: "Name → (fn, required args). Unknown tool or missing arg raises before the tool body runs, so the failure is side-effect free." }
+        - { id: tool, x: 2, y: 1, label: "tool", kind: worker, detail: "Does the work and calls journal.commit(key, effect) — the check-and-set is inside the tool, next to the effect." }
+        - { id: journal, x: 3, y: 1, label: "journal (keys → results)", kind: database, detail: "Durable and transactional with the effect. In-memory here; in production, the same row insert that records the effect." }
+        - { id: eval, x: 3, y: 0, label: "evaluator", kind: client, detail: "Reads final state, not the transcript. Asserts one note per document and one notification per document." }
+      edges:
+        - { from: planner, to: exec, label: "steps" }
+        - { from: exec, to: reg, label: "call(name, args, key)" }
+        - { from: reg, to: tool, label: "validated" }
+        - { from: tool, to: journal, label: "commit" }
+        - { from: journal, to: eval, label: "state" }
+      caption: "The check is one layer below the retry loop, deliberately: any check above the tool leaves a window between the check and the effect, and that window is exactly where the duplicate is born."
+
+  markdown: |
+    ## What you are building
+
+    An agent harness: the loop that takes a model's plan, calls tools, and feeds the results back. Tools are the functions the model is allowed to ask for, like `write_note` or `notify`. You will build five pieces — a permit list of tools, a record that stops repeats, a failure injector, a retry loop, and a scorer. Then you run a six-step task where a tool fails one attempt in three, and prove that 304 attempts produced exactly 200 effects. The scorer is the piece most people skip, and it is the only one that notices a duplicate. None of it needs a language model to test.
+
+    ## Why this exists
+
+    An agent that sends email will one day send the same email twice. The first attempt times out after the mail server already accepted it; the loop retries; the tool runs again. No prompt fixes a duplicate. A retry makes every effect at-least-once, meaning delivered one or more times. The only way back to once is a key checked at the effect itself. The numbers are stark: a six-step task with a one-in-three failure rate succeeds 8.8% of the time without retries, and 99.2% with six attempts allowed.
+
+    ## Step 1 — Choose a key you can rebuild
+
+    Before a retry can be safe, the effect needs a name. That name is the idempotency key: a string built from what the step is trying to do, not from when it runs. Build it from the step's id, the tool name, and the arguments, so the same intention always produces the same key. A random id per attempt guarantees a duplicate, because the second attempt looks up a name nobody has seen. The key is a promise that two calls with the same name mean the same work.
+
+    $$k = h(\text{step}, \text{tool}, \text{args})$$
+
+    > **Say it aloud:** "k equals h of step, tool and args."
+
+    Here h is any stable hash, and the args are canonicalised first: keys sorted, numbers formatted the same way every time.
+
+    ```python
+    import hashlib, json
+
+    def make_key(step_id, tool, args):
+        blob = json.dumps(args, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(f"{step_id}|{tool}|{blob}".encode()).hexdigest()[:16]
+
+    print(make_key("s1", "write_note", {"doc": 7, "text": "hi"}))
+    print(make_key("s1", "write_note", {"text": "hi", "doc": 7}))   # identical
+    ```
+
+    > **Check:** both calls print the same key even though the dictionary is written in a different order. Why does that matter for a retry?
+
+    ## Step 2 — Make the repeat a lookup
+
+    The record of committed keys is the journal, and it is the only thing that can stop a duplicate. Its commit takes a key and a function. If the key is present it returns the stored value; if not, it runs the function and stores the result. That is check-and-set, and it has to live in the same place as the effect. A check in the retry loop leaves a window: the tool commits, the reply is lost, and the loop still believes nothing happened. That window is not theoretical; it is the timeout-after-commit case, and it is the one that ships.
+
+    $$E = K$$
+
+    > **Say it aloud:** "E equals K — the number of effects equals the number of distinct keys."
+
+    E is how many effects were performed and K is how many distinct keys were committed. The attempt count does not appear, which is the entire point.
+
+    ```python
+    class Journal:
+        def __init__(self):
+            self.entries, self.effects = {}, []
+
+        def commit(self, key, fn):
+            if key in self.entries:            # a retry, not a new effect
+                return self.entries[key], False
+            value = fn()
+            self.entries[key] = value
+            self.effects.append(key)
+            return value, True
+    ```
+
+    > **Check:** the first attempt commits and then times out. What does the second attempt return, and does the effect list grow?
+
+    ## Step 3 — Gate the tools with a registry
+
+    The registry is an allow-list: a name maps to a function plus the arguments that function cannot run without. Unknown names and missing arguments are rejected before the function body starts. That timing is the whole reason it exists. A tool that fails halfway has already written a file or opened a transaction, and a partial effect cannot be retried safely. A rejection at the boundary is the only failure guaranteed to leave nothing behind. It also bounds the blast radius: a model that invents a tool name gets an error, not a function call.
+
+    $$\text{missing} = R - \text{keys}(a)$$
+
+    > **Say it aloud:** "missing equals R minus the keys of a."
+
+    R is the set of required argument names and a is the argument dictionary the model produced.
+
+    ```python
+    class Registry:
+        def __init__(self):
+            self.tools = {}
+
+        def add(self, name, fn, required=()):
+            self.tools[name] = (fn, set(required))
+
+        def call(self, name, args, key, attempt=0):
+            if name not in self.tools:
+                raise KeyError(f"unknown tool {name}")
+            fn, required = self.tools[name]
+            missing = required - set(args)
+            if missing:
+                raise ValueError(f"{name} missing {sorted(missing)}")
+            return fn(_key=key, _attempt=attempt, **args)
+    ```
+
+    > **Check:** of the two failures, unknown tool and missing argument, which one could leave a partial effect if the check happened inside the tool instead?
+
+    ## Step 4 — Retry only what is transient
+
+    A retry is a bet that the failure was luck, not the request. Timeouts, rate limits and server errors are luck; a validation error is not, and retrying it triples latency for the same answer. With a per-attempt failure chance p, success within n attempts is one minus p to the n. At p equal to one third that is 96.3% in three attempts and 99.86% in six. Retrying everything is the common mistake, and it stays invisible until the latency graph.
+
+    $$P(\text{success in } n) = 1 - p^{n}$$
+
+    > **Say it aloud:** "the probability of success in n attempts equals one minus p to the n."
+
+    Here p is the chance that one attempt fails and n is the number of attempts allowed.
+
+    ```python
+    def execute(step, reg, journal, attempts=6):
+        for attempt in range(attempts):
+            try:
+                return reg.call(step["tool"], step["args"], step["key"], attempt), attempt + 1
+            except RuntimeError:          # a timeout or a 5xx, never a validation error
+                if attempt == attempts - 1:
+                    raise
+
+    obs = [execute(s, reg, journal) for s in plan]      # 200 steps
+    print(sum(o[1] for o in obs) / len(obs), max(o[1] for o in obs))
+    # 1.52  5
+    ```
+
+    > **Check:** the measured mean is 1.52 attempts against a theory of 1.5. Why is it near the theory rather than exactly on it?
+
+    ## Step 5 — Inject the failure deterministically
+
+    You cannot debug a duplicate that happens one run in three. So the test tool fails by a rule, not by a coin flip. It hashes the key together with the attempt number and fails when that hash divides by three. The same run therefore always fails in the same places, and re-running a bug re-runs the bug. The `after` flag decides where the failure lands: before the effect, or after it. Only the second one creates duplicates.
+
+    $$h(k, i) \bmod r = 0$$
+
+    > **Say it aloud:** "h of k and i, modulo r, equals zero."
+
+    k is the key, i is the attempt number and r is the failure rate, which is three here.
+
+    ```python
+    import zlib
+
+    def flaky(fn, rate=3, after=False):
+        def wrapped(_key, _attempt, **kw):
+            fail = zlib.crc32(f"{_key}|{_attempt}".encode()) % rate == 0
+            if fail and not after:
+                raise RuntimeError("transient")
+            out = fn(_key=_key, **kw)
+            if fail and after:
+                raise RuntimeError("timeout after commit")     # the dangerous one
+            return out
+        return wrapped
+    ```
+
+    > **Check:** if the flake never failed after the commit, which of the milestone tests would still pass and prove nothing?
+
+    ## Step 6 — Cap the attempts and the clock
+
+    An unbounded retry turns a slow tool into a hung request. Two limits fix that: an attempt cap, and a deadline for the whole task. The cap bounds the worst case, because a timeout costs its full duration every time it fires. Six attempts against a two-second timeout is twelve seconds, which is a number you can put in a budget. A cap without a deadline still hangs when a tool never answers.
+
+    $$L = n\,\tau$$
+
+    > **Say it aloud:** "L equals n times tau."
+
+    L is the worst-case latency, n is the attempt cap, and tau is the per-attempt timeout.
+
+    ```python
+    import time
+
+    def execute(step, reg, deadline, attempts=6):
+        for attempt in range(attempts):
+            if time.monotonic() > deadline:
+                raise TimeoutError("task budget exhausted")
+            try:
+                return reg.call(step["tool"], step["args"], step["key"], attempt)
+            except RuntimeError:
+                continue
+        raise RuntimeError(f"{step['key']} failed after {attempts} attempts")
+
+    print(6 * 2.0)   # 12.0 — the ceiling this policy allows
+    ```
+
+    > **Check:** the deadline is checked before the call rather than after. Why does that order matter for the worst case?
+
+    ## Step 7 — Measure the task, not the retry
+
+    A retry that works 99.86% of the time per step is not a task that works 99.86% of the time. A task of s independent steps needs all of them to land, so the per-step number is raised to the power s. Six steps at six attempts gives 99.2%; six steps at one attempt gives 8.8%. That gap is the argument for the retry: every step has to land, so one weak step sets the ceiling. A hundred measured tasks gave 99% against 6%.
+
+    $$P(\text{task}) = (1-p^{n})^{s}$$
+
+    > **Say it aloud:** "the probability of a whole task equals, one minus p to the n, all to the power s."
+
+    Here s is the number of steps in the task.
+
+    ```python
+    p, n, s = 1 / 3, 6, 6
+    per_step = 1 - p ** n
+    print(round(per_step, 4), round(per_step ** s, 4))     # 0.9986  0.9918
+    print(round((1 - p) ** s, 4))                          # 0.0878 — no retries
+    ```
+
+    > **Check:** the measured single-attempt rate was 6%, below the predicted 8.8%. Is that a bug in the harness or in the sample?
+
+    ## Step 8 — Score the world, not the transcript
+
+    "The agent said it wrote the note" is a sentence about text. The evaluator has to read the effect list and count. Each document needs one note and one notification. For d documents the only passing state is 2d effects, all distinct and all on the planned keys. This is what catches the failure the retry numbers cannot see: a task that finishes quickly and leaves a duplicate. It is also the only check that survives a model upgrade, because it never reads the model's words.
+
+    $$E = 2d$$
+
+    > **Say it aloud:** "E equals two d."
+
+    E is the number of committed effects and d is the number of documents in the task.
+
+    ```python
+    def evaluate(journal, plan):
+        want = {step["key"] for step in plan}
+        got = journal.effects
+        return len(got) == len(want) and len(set(got)) == len(got) and set(got) == want
+
+    print(evaluate(journal, plan))   # True — 200 effects, 200 distinct
+    ```
+
+    > **Check:** a task runs, throws no error, and reports success, yet the evaluator returns False. What are the two possible causes?
+
+    ## Putting it together
+
+    One step of the loop is five calls in a fixed order. Build the key once, outside the retry (1). Ask the registry for the tool, which validates before anything runs (3). Inside the tool, commit through the journal with that key (2). If the call fails transiently — the flake from step 5 — retry with the same key, inside the cap and the deadline (4, 6). Then score the effect list rather than the log (8).
+
+    ```python
+    plan, reg, journal = make_task(n_docs=100)        # 200 steps
+    obs = run(plan, reg, journal, attempts=6)
+    print(sum(o[2] for o in obs))                     # 304 attempts
+    print(len(journal.effects), len(set(journal.effects)))   # 200 200
+    print(evaluate(journal, plan))                    # True
+    ```
+
+    The 304-to-200 result is step 2 doing its job: 104 executions found their key already present and returned the stored value instead of acting again.
+
+    ## What breaks
+
+    - **Duplicate emails at a 99% task success rate** -> the idempotency check sits in the retry loop, not at the effect -> move it inside the tool, in the same call that commits.
+    - **Every retry creates a fresh effect** -> the key is built per attempt, from a counter or a UUID -> compute it once before the loop, from step, tool and canonical args.
+    - **p99 latency triples after adding retries** -> deterministic 4xx errors are being retried -> retry timeouts, 429 and 5xx only, and pass 4xx straight through.
+    - **A green suite over a broken run** -> the evaluator reads the agent's own report -> count effects in the journal and assert they are distinct.
+
+  try_it: >-
+    Run the same task with three harnesses: no retries, retries without a
+    journal, and retries with the journal. Record success rate, total attempts,
+    duplicate effects and p99 latency. Then break the key on purpose — generate
+    it from a counter instead of the step — and watch the duplicate count come
+    back while the success rate stays at 99%. That pair of numbers is the
+    argument for the design.
+  interview_questions:
+    - question: "How do you make a tool call exactly-once?"
+      level: senior
+      key_points:
+        - "You cannot, at the delivery layer: a timeout after the receiver commits is indistinguishable from a timeout before it."
+        - "You can make it effectively-once: at-least-once delivery plus an idempotent receiver keyed by a deterministic id derived from step, tool and canonical args."
+        - "The check must be a check-and-set at the effect boundary, in the same transaction as the effect, not in the retry loop above it."
+        - "The journal doubles as the replay log, so a crashed task can resume without re-performing effects."
+      follow_up: "What would you do for a tool you cannot make idempotent — a payment provider with no idempotency key?"
+    - question: "A tool fails 1 in 3 and your task has 6 steps. What is the success rate with 4 retries, and where does the latency go?"
+      level: mid
+      key_points:
+        - "Per-step success in 4 attempts is 1 − (1/3)⁴ = 98.77%; for six steps it compounds to 0.9877⁶ = 92.8%."
+        - "Expected attempts per step is 1/(1−p) = 1.5, so the expected latency is 1.5× the single-attempt latency."
+        - "The tail is bounded by the attempt cap times the timeout: 4 × 2 s = 8 s, which is why a task-level deadline is mandatory."
+        - "Retry only transient errors; a 4xx retried four times multiplies latency for a deterministic failure."
+      follow_up: "How would you set the attempt cap from a latency SLO rather than by feel?"
+    - question: "Your agent's task success rate is 40% and the model is strong. How do you find out whether it is the planner or the harness?"
+      level: senior
+      key_points:
+        - "Instrument per-step success and per-step attempt counts: a harness bug shows as steps that never succeed, a planner bug shows as steps that succeed on the wrong tool or arguments."
+        - "Replay the recorded plan with the model removed — if the plan executes, the harness is fine and the failure is planning."
+        - "Check the evaluator for shared assumptions with the planner, which can make a broken run look correct."
+        - "Separate tool errors from plan errors in the log; a single 'task failed' metric cannot distinguish them."
+      follow_up: "What would you record per step to make that replay possible six months later?"
+    - question: "What does a tool registry give you beyond a dictionary of functions?"
+      level: mid
+      key_points:
+        - "An allow-list: the model can only invoke registered tools, which bounds the blast radius of a bad plan."
+        - "Argument validation before execution, so a malformed call fails without a partial side effect."
+        - "A place to attach per-tool policy: timeout, retry class, idempotency requirement, cost."
+        - "A machine-readable description for the prompt, so the tool's schema and its implementation cannot drift apart."
+      follow_up: "Where would you put a tool that must never be retried, and why?"
+  common_mistakes:
+    - "Checking for a previous success in the retry loop instead of at the effect, leaving a window in which the effect commits and the check still says it did not."
+    - "Generating the idempotency key per attempt instead of per step, which guarantees a duplicate on every retry."
+    - "Retrying validation errors and 4xx responses, tripling latency for failures that are deterministic."
+    - "Evaluating the agent's own report of success instead of the final state of the world."
+    - "Setting an attempt cap without a task-level deadline, so a slow tool turns a transient failure into a hung request."
+  further_reading:
+    - label: "Helland, Idempotence Is Not a Medical Condition (ACM Queue, 2012)"
+    - label: "Kleppmann, Designing Data-Intensive Applications, ch. 11 — exactly-once and idempotence"
+    - label: "Yao et al., ReAct: Synergizing Reasoning and Acting in Language Models (ICLR 2023)"
+
+  implementations:
+    - language: python
+      title: "Reference solution"
+      note: >-
+        The registry, the journal, the retry loop and the evaluator in about 85
+        lines. Three honesty notes. (1) The journal is in memory; in production
+        the key and the effect must commit in one transaction — for a database
+        that is one row insert with a unique constraint, for an HTTP API it is
+        the provider's idempotency header, and for a filesystem it is a
+        write-then-rename. (2) The failure injector hashes `(key, attempt)` with
+        CRC32 rather than using an RNG, so the run is reproducible; that also
+        makes the measured success rates a fixed sample rather than an
+        expectation, which is why 6% sits below the theoretical 8.8%. (3) The
+        loop catches `RuntimeError` because the stand-in tool raises it; a real
+        harness must classify errors, retry timeouts and 5xx, and pass 4xx
+        straight through.
+      code: |
+        import zlib
+
+
+        class Registry:
+            """Allow-list plus argument checks; failures here have no side effects."""
+
+            def __init__(self):
+                self.tools = {}
+
+            def add(self, name, fn, required=()):
+                self.tools[name] = (fn, set(required))
+
+            def call(self, name, args, key, attempt=0):
+                if name not in self.tools:
+                    raise KeyError(f"unknown tool {name}")
+                fn, required = self.tools[name]
+                missing = required - set(args)
+                if missing:
+                    raise ValueError(f"{name} missing {sorted(missing)}")
+                return fn(_key=key, _attempt=attempt, **args)
+
+
+        class Journal:
+            """Check-and-set at the effect boundary: a retry is a lookup."""
+
+            def __init__(self):
+                self.entries, self.effects = {}, []
+
+            def commit(self, key, fn):
+                if key in self.entries:
+                    return self.entries[key], False
+                value = fn()
+                self.entries[key] = value
+                self.effects.append(key)
+                return value, True
+
+
+        def flaky(fn, rate=3, after=False):
+            """Deterministic per (key, attempt): 1 in `rate` fails, before or after the effect."""
+
+            def wrapped(_key, _attempt, **kw):
+                fail = zlib.crc32(f"{_key}|{_attempt}".encode()) % rate == 0
+                if fail and not after:
+                    raise RuntimeError("transient")
+                out = fn(_key=_key, **kw)
+                if fail and after:
+                    raise RuntimeError("timeout after commit")
+                return out
+
+            return wrapped
+
+
+        def execute(step, reg, journal, attempts=5):
+            for attempt in range(attempts):
+                try:
+                    return reg.call(step["tool"], step["args"], step["key"], attempt), attempt + 1
+                except RuntimeError:
+                    if attempt == attempts - 1:
+                        raise
+            raise AssertionError("unreachable")
+
+
+        def run(plan, reg, journal, attempts=5):
+            return [(s["key"],) + execute(s, reg, journal, attempts) for s in plan]
+
+
+        def make_task(n_docs=3, task=0):
+            journal = Journal()
+
+            def write_note(_key, doc, text):
+                return journal.commit(_key, lambda: f"note:{doc}:{text[:12]}")[0]
+
+            def notify(_key, doc, channel):
+                return journal.commit(_key, lambda: f"sent:{channel}:{doc}")[0]
+
+            reg = Registry()
+            reg.add("write_note", flaky(write_note, 3, after=True), ("doc", "text"))
+            reg.add("notify", flaky(notify, 3), ("doc", "channel"))
+            plan = []
+            for d in range(n_docs):
+                plan.append({"key": f"t{task}-note-{d}", "tool": "write_note",
+                             "args": {"doc": d, "text": f"summary {d}"}})
+                plan.append({"key": f"t{task}-notify-{d}", "tool": "notify",
+                             "args": {"doc": d, "channel": "email"}})
+            return plan, reg, journal
+
+
+        def evaluate(journal, n_docs, task=0):
+            want = [f"t{task}-note-{d}" for d in range(n_docs)] + [f"t{task}-notify-{d}" for d in range(n_docs)]
+            keys = journal.effects
+            return len(keys) == len(want) and len(set(keys)) == len(keys) and all(k in keys for k in want)
+
+
+        if __name__ == "__main__":
+            plan, reg, journal = make_task(100, task=7)
+            obs = run(plan, reg, journal, attempts=6)
+            tries = [o[2] for o in obs]
+            print("steps", len(obs), "mean attempts", round(sum(tries) / len(tries), 3), "max", max(tries))
+            print("attempts", sum(tries), "effects", len(journal.effects), "distinct", len(set(journal.effects)))
+            def rate(attempts, n=100):
+                ok = 0
+                for t in range(n):
+                    p, r, j = make_task(3, task=1000 + t)
+                    try:
+                        run(p, r, j, attempts=attempts)
+                        ok += int(evaluate(j, 3, task=1000 + t))
+                    except RuntimeError:
+                        pass
+                return ok / n
+
+            print("task success 1 attempt", rate(1), "6 attempts", rate(6))
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Separate three things that beginners fuse: the registry decides what may
+        be called, the executor decides how many times to try, and the journal
+        decides whether an effect already happened. Only the last one can prevent
+        a duplicate, and only if it sits at the effect.
+      blocks:
+        - kind: checklist
+          body: |
+            - What can be called, and what is checked before the call?
+            - What happens on a transient failure, and with what key?
+            - Where is the record of "this effect already happened"?
+            - What does the evaluator read — text, or state?
+        - kind: warning
+          body: >-
+            A retry loop with no journal is an at-least-once system pretending to
+            be exactly-once. It will look correct until the first timeout that
+            happens after a commit.
+      checkpoint: >-
+        If the tool commits and then the process crashes before returning, what
+        does the next attempt need to know, and where must that knowledge live?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Write the journal first, because it determines the tool signature: every
+        side-effecting tool takes a key and commits through it. Then the registry,
+        then the retry loop, then the evaluator. Test with a tool that fails after
+        committing — that is the only failure that distinguishes the designs.
+      blocks:
+        - kind: checklist
+          body: |
+            - key: deterministic from (step id, tool, canonical args).
+            - registry: name → (fn, required args); validate before calling.
+            - journal: commit(key, fn) returns (value, committed_now).
+            - execute: attempt 0..n-1, same key every time, cap and deadline.
+            - evaluator: count effects and check uniqueness.
+        - kind: warning
+          body: >-
+            If your flake fails only *before* the effect, every design passes and
+            the milestone tests nothing. Fail after the commit.
+      checkpoint: >-
+        Which milestone becomes vacuous if the flaky tool never fails after
+        committing?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Four small pieces. The only subtle line is that the key is computed once,
+        outside the attempt loop.
+      blocks:
+        - kind: pseudocode
+          body: |
+            key = hash(step.id, step.tool, canonical(step.args))   # once, outside the loop
+
+            execute(step):
+                for attempt in range(cap):
+                    try: return call(step.tool, step.args, key, attempt)
+                    except Transient: continue
+                raise
+
+            tool(key, args):
+                return journal.commit(key, lambda: perform(args))
+
+            journal.commit(key, fn):
+                if key in entries: return entries[key]
+                v = fn(); entries[key] = v; effects.append(key); return v
+      checkpoint: >-
+        Why must the key be computed before the first attempt rather than inside
+        `call`?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The retry arithmetic is a geometric distribution, and the task arithmetic
+        is a product. Both are one line and both are worth being able to state.
+      blocks:
+        - kind: math
+          body: |
+            With per-attempt failure probability $p$, attempts are geometric:
+            $\mathbb{E}[\text{attempts}] = 1/(1-p)$, and
+            $P(\text{success within } n) = 1 - p^n$.
+
+            For $p = 1/3$: $\mathbb{E} = 1.5$; $n = 4$ gives
+            $1 - (1/3)^4 = 98.77\%$; $n = 6$ gives $99.86\%$.
+
+            For a task of $s$ independent steps:
+            $P(\text{task}) = (1 - p^n)^s$. With $s = 6$, $n = 6$:
+            $0.9986^6 = 99.2\%$. With $n = 1$: $(2/3)^6 = 8.8\%$.
+
+            Effects: if the tool is idempotent, effects equal distinct keys
+            regardless of the attempt count; without it, expected effects are
+            $\mathbb{E}[\text{attempts}]$ per step, 1.5× the true work.
+      checkpoint: >-
+        Which grows faster with $s$ — the success rate or the duplicate rate —
+        and why?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The reference is below: registry, journal, deterministic flake,
+        executor, task builder and evaluator.
+      blocks:
+        - kind: warning
+          body: >-
+            The evaluator is not decoration. A harness that completes with a
+            duplicate side effect passes every retry assertion and fails the only
+            one that matters.
+      checkpoint: >-
+        If you removed the journal and kept the retries, which milestone number
+        would still pass, and what would the effect count become?
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A tool fails with probability 0.4. What is the expected number of
+        attempts, and the probability of success within 3?
+      answerKind: short_text
+      hint: "Geometric: 1/(1−p); success in n is 1 − pⁿ."
+      solution: >-
+        $\mathbb{E} = 1/0.6 = 1.67$ attempts. Success within 3 is
+        $1 - 0.4^3 = 1 - 0.064 = 93.6\%$. Within 5 it is 99.0%; the returns
+        fall off geometrically, which is why caps above 5 rarely pay.
+    - id: cp-2
+      question: >-
+        Why is a UUID generated inside the retry loop the wrong idempotency key?
+      answerKind: short_text
+      hint: "What does the journal look up?"
+      solution: >-
+        The journal is keyed by the id; a fresh UUID per attempt means the second
+        attempt looks up a key that has never been seen, so it performs the effect
+        again. The key has to be a deterministic function of the step, the tool
+        and the canonical arguments, computed once before the first attempt.
+    - id: cp-3
+      question: >-
+        Your harness reports a 99% task success rate but users complain about
+        duplicate emails. What is the most likely bug?
+      answerKind: short_text
+      hint: "Success is measured at the task level; duplicates are an effect-level property."
+      solution: >-
+        The retry loop is checking success above the tool, or the key is not
+        deterministic, so a timeout after the send causes a second send. The task
+        still completes (99%) and the effect count is 1.5× the intended one. The
+        evaluator should count effects per key, not just whether the task
+        finished.
+    - id: cp-4
+      question: >-
+        Why does the registry validate arguments before calling the tool, when
+        the tool could raise the same error itself?
+      answerKind: short_text
+      hint: "When is a partial effect possible?"
+      solution: >-
+        A tool that validates in its body may already have performed part of its
+        work when it raises — written a file, opened a transaction, sent half a
+        batch. Validation at the boundary is the only failure guaranteed to be
+        side-effect free, and it is also cheaper: no tool call, no timeout, no
+        retry decision.
+
+  visualizers: []

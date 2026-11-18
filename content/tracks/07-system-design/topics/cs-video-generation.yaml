@@ -1,0 +1,710 @@
+id: cs-video-generation
+slug: cs-video-generation
+title: "Case Study: Diffusion Transformer Video Service"
+summary: >-
+  Serve 720p, five-second video generation at scale: 108,000 latent tokens per
+  clip, 432 TFLOP per denoising step, and a bill that is decided by the step
+  count long before it is decided by the model.
+kind: lesson
+difficulty: expert
+position: 8
+estMinutes: 20
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [diffusion, video, gpu-capacity, attention, serving, cost]
+
+body:
+  big_idea: >-
+    Video generation is a token-count problem with a quadratic penalty: a
+    five-second 720p clip is 108,000 latent tokens after patching, attention
+    costs 4x the MLP, and serving cost is tokens × parameters × steps.
+  problem:
+    - "You extrapolate 100x tokens from image diffusion, but attention is quadratic: a naive 3D attention over 108,000 tokens needs 23 GB per head per layer."
+    - "You budget one GPU per clip: 108 seconds for a five-second video, and 100,000 daily clips is 208 GPUs at 60% utilisation."
+    - "You add classifier-free guidance and the bill doubles: CFG runs the model twice per step, a 2x cost no quality benchmark shows."
+  analogy: >-
+    An artist who paints by erasing. Each pass starts from static and removes
+    a little noise, and the picture only appears after fifty passes. Every
+    pass costs the same, so the price of a painting is one pass times the
+    number of passes, and the pass count is a quality decision. For video the
+    canvas also moves: thirty latent frames that must agree about what moved.
+  concept_points:
+    - "**The latent grid is arithmetic, and it is bigger than you think.** 1280/8 x 720/8 = 160 x 90 = **14,400 tokens per frame**; 5 s at 24 fps is 120 frames, temporally compressed 4x to **30 latent frames**, so 14,400 x 30 = **432,000 tokens** before any patching."
+    - "**Patchification is mandatory, not stylistic.** A DiT patch of 2 on the latent grid gives 80 x 45 = 3,600 tokens per frame and **108,000 per clip** — a 4x reduction that keeps the per-step cost inside a GPU. Without it the score matrix alone is 432,000 squared."
+    - "**Per-step cost is $2 \\times$ params $\\times$ tokens.** For a 2B DiT at 108,000 tokens: $2 \\times 2e9 \\times 1.08e5 = 4.32e14$ FLOP = **432 TFLOP per step**, which is **1.08 s** at a realistic 400 TFLOP/s. Multiply by steps and you have the clip."
+    - "**Full 3D attention is arithmetically excluded.** At 108,000 tokens the score tensor is 108,000 squared = **1.17e10 entries**, or **23.3 GB per head per layer** in fp16. Sixteen heads across 28 layers would need terabytes of workspace; factorised spatial-then-temporal attention is the only version that runs."
+    - "**Guidance doubles the bill.** Classifier-free guidance evaluates the model on a conditional and an unconditional branch and combines them, so one step is two forward passes. A 50-step CFG pipeline is **100 step equivalents**: **108 s per clip** on one GPU at 1.08 s per pass."
+    - "**Steps are the cheapest quality lever you can also sell.** 50 steps with CFG is 108 s; 30 steps with CFG is 65 s; a distilled 20-step student without CFG is **21.6 s** — a **5x** cost reduction for a quality change you must measure per prompt category, not in aggregate."
+  definitions:
+    - { term: "Latent diffusion", meaning: "Denoising in a compressed latent space produced by a VAE, rather than in pixels; the compression ratio sets the token count." }
+    - { term: "DiT", meaning: "Diffusion Transformer: replaces the U-Net with transformer blocks over patchified latents, so cost scales cleanly with tokens and parameters." }
+    - { term: "Patch size", meaning: "Side length of the latent patches merged into one token. Patch 2 quarters the token count and quarters per-step FLOPs." }
+    - { term: "Denoising step", meaning: "One model evaluation removing a slice of noise. Total cost is linear in step count and steps are the main quality dial." }
+    - { term: "CFG", meaning: "Classifier-free guidance: two forward passes per step, conditional and unconditional, combined with a guidance scale. Doubles cost." }
+    - { term: "Factorised attention", meaning: "Spatial attention within frames, then temporal attention across frames, turning an n-squared problem into two smaller ones." }
+    - { term: "Distillation", meaning: "Training a student to match a many-step teacher in fewer steps; the main lever for reducing GPU-seconds per clip." }
+    - { term: "GPU-second", meaning: "One GPU busy for one second. The unit of cost; fleet size is daily GPU-seconds divided by 86,400 and by utilisation." }
+    - { term: "Step-equivalent", meaning: "One full model forward pass over the clip's tokens. A 50-step CFG run is 100 step-equivalents." }
+    - { term: "Cascade", meaning: "Generate at low resolution, then refine at high resolution. Cheaper than generating high resolution from noise." }
+
+  diagrams:
+    - type: pipeline
+      title: "From 120 frames to 108,000 tokens"
+      nodes:
+        - label: "VAE encode"
+          note: "8x spatial, 4x temporal"
+          detail: "1280x720 becomes 160x90 per frame; 120 frames become 30. The compression ratio is the single biggest lever on cost and the hardest to change later."
+        - label: "Patchify"
+          note: "432,000 to 108,000 tokens"
+          detail: "Patch 2 merges 2x2 latent cells. Per-step FLOPs drop 4x; the ability to represent fine detail drops with it."
+        - label: "Denoise"
+          note: "50 steps x 2 for CFG"
+          detail: "100 step-equivalents at 432 TFLOP each = 1.08 s per pass, 108 s per clip at 400 TFLOP/s effective."
+        - label: "VAE decode"
+          note: "331.8M pixel values"
+          detail: "120 frames x 1280 x 720 x 3. About 0.3 s of arithmetic, 2-3 s in practice because it is memory-bound."
+        - label: "Mux"
+          note: "encode and deliver"
+          detail: "H.264/AV1 encode of a five-second clip is seconds of CPU and usually the cheapest stage — until it is the queue."
+    - type: plot
+      title: "Per-clip GPU-seconds versus denoising steps (720p, 2B DiT, patch 2)"
+      chart: "line"
+      xLabel: "denoising steps (with CFG, so 2 passes each)"
+      yLabel: "GPU-seconds per clip"
+      series:
+        - name: "50-step baseline"
+          points:
+            - { x: 20, y: 43.2 }
+            - { x: 30, y: 64.8 }
+            - { x: 50, y: 108.0 }
+        - name: "distilled, no CFG"
+          points:
+            - { x: 20, y: 21.6 }
+            - { x: 30, y: 32.4 }
+            - { x: 50, y: 54.0 }
+    - type: compare
+      title: "720p versus 1080p, same five seconds"
+      left_label: "720p (160x90 latent)"
+      left_points:
+        - "14,400 tokens per frame, 108,000 per clip after patch 2"
+        - "432 TFLOP per step, 1.08 s at 400 TFLOP/s"
+        - "108 s per clip at 50 steps with CFG"
+        - "208 GPUs for 100k clips/day at 60% utilisation"
+      right_label: "1080p (240x135 latent)"
+      right_points:
+        - "32,400 tokens per frame, 243,000 per clip"
+        - "972 TFLOP per step, 2.43 s at 400 TFLOP/s"
+        - "243 s per clip at the same 50 steps with CFG"
+        - "2.25x tokens but 5.06x attention entries"
+
+  problem_statement: >-
+    Design a hosted text-to-video service that produces five-second 720p clips
+    at 24 fps from a text prompt, with an optional first-frame image. Support
+    100,000 clips per day with an interactive tier (p99 under 90 s) and a batch
+    tier (under 15 minutes). The service must survive a 3x spike, expose
+    per-clip cost, and allow a premium 1080p tier without re-architecting.
+
+  requirements:
+    functional:
+      - "Generate a five-second 720p clip from a text prompt, optionally conditioned on a first frame."
+      - "Support seed control, negative prompts, and a guidance scale per request."
+      - "Provide an interactive queue and a batch queue with different SLOs and prices."
+      - "Expose per-clip GPU-seconds and a quality metric per prompt category."
+    non_functional:
+      - "Interactive p99 under 90 s end to end at 3x peak; batch within 15 minutes."
+      - "Per-clip cost under 0.10 USD at 720p in steady state."
+      - "No single clip can monopolise a GPU for more than 200 s of wall time."
+      - "Model rollouts must be A/B-able and reversible within one minute."
+
+  clarifying_questions:
+    - question: "Is the SLO wall-clock latency or queue-plus-compute?"
+      why_it_matters: "At 108 s of compute per clip, a 90 s p99 is only possible with distillation or a cascade. If the SLO includes queueing, the batch tier does not exist and the whole scheduling design changes."
+    - question: "How many steps and what guidance scale are acceptable?"
+      why_it_matters: "Steps and CFG multiply directly into cost: 50 steps with CFG is 100 step-equivalents, a distilled 20-step student is 20. That is a 5x range on the entire fleet size."
+    - question: "Does the premium tier need true 1080p generation or an upscale?"
+      why_it_matters: "Native 1080p is 2.25x the tokens; a 720p generation plus a learned upscaler is roughly 1.1x, which is the difference between a viable premium tier and a subsidised one."
+    - question: "Is the first-frame image a hard constraint or a soft hint?"
+      why_it_matters: "Hard conditioning needs an image encoder in the critical path and a VAE encode per request; soft conditioning can be cached per image and reused across prompts."
+    - question: "What is the acceptable quality regression for a distilled model?"
+      why_it_matters: "Distillation is the only 5x lever, and its cost is quality in specific categories (text rendering, fast motion). The decision needs a per-category eval, not an aggregate preference score."
+
+  capacity_estimation:
+    assumptions:
+      - "720p at 1280x720, 24 fps, 5 seconds; VAE compression 8x spatial and 4x temporal; DiT patch size 2."
+      - "2B-parameter DiT; 400 TFLOP/s effective per GPU (about 40% of peak); 80 GB HBM per device."
+      - "50 denoising steps with classifier-free guidance (2 passes per step) for the baseline pipeline."
+      - "100,000 clips per day; 60% target utilisation to absorb spikes and queueing."
+      - "GPU cost 2.50 USD per GPU-hour."
+    arithmetic:
+      - label: "Latent token count"
+        calculation: "(1280/8) x (720/8) = 160 x 90 = 14,400 tokens/frame; 120 frames / 4 = 30 latent frames; 14,400 x 30 = 432,000 tokens; patch 2 -> (160/2) x (90/2) x 30 = 108,000"
+        conclusion: "108,000 tokens per clip after patchification. Every later number is linear in this one, so patch size and duration are cost decisions."
+      - label: "Per-step FLOPs and time"
+        calculation: "2 x 2e9 params x 1.08e5 tokens = 4.32e14 FLOP; / 4e14 FLOP/s = 1.08 s"
+        conclusion: "432 TFLOP and 1.08 s per forward pass. The 2x factor is forward-pass arithmetic (multiply plus add), not a safety margin."
+      - label: "GPU-seconds per clip"
+        calculation: "50 steps x 2 (CFG) = 100 step-equivalents; 100 x 1.08 s = 108 s; + ~3 s VAE decode"
+        conclusion: "111 GPU-seconds per clip, call it 108 for planning. At 2.50 USD/GPU-hour that is 0.075 USD of compute per five-second clip."
+      - label: "Fleet for 100k clips per day"
+        calculation: "1e5 clips x 108 s = 1.08e7 GPU-s/day; / 86,400 = 125 GPU-days per day; / 0.60 utilisation = 208 GPUs"
+        conclusion: "208 GPUs at 60% utilisation, or 417 GPUs at 30% if you want plenty of interactive headroom. The number is set by steps, not by model size."
+      - label: "1080p scaling"
+        calculation: "(1920/8) x (1080/8) = 240 x 135 = 32,400 tokens/frame; x 30 = 972,000; / 4 (patch 2) = 243,000; 2 x 2e9 x 2.43e5 = 9.72e14 FLOP; / 4e14 = 2.43 s/step"
+        conclusion: "2.25x the tokens and 2.25x per-step FLOPs, so 243 s per clip — while attention entries grow 5.06x, which is where the tail latency and memory pressure come from."
+      - label: "Draft-then-refine cascade"
+        calculation: "Draft at 512x288: (512/16) x (288/16) = 32 x 18 = 576 tokens/frame x 30 = 17,280, i.e. 16% of 108,000; 40 step-equivalents x 0.173 s = 6.9 s. Refine at 720p: 15 steps x 1.08 s = 16.2 s"
+        conclusion: "23.1 s per clip versus 108 s — 21% of the cost, at the price of a quality ceiling set by the draft and a second model to maintain."
+
+  architecture_summary: >-
+    A request lands in one of two queues (interactive, batch) with a prompt and
+    optional first frame. A scheduler packs clips into step-synchronous batches
+    across a pool of GPUs, prioritising by queue and by remaining step count. The
+    text encoder runs once per request and is cached by prompt hash; the VAE
+    encodes a conditioning image once and caches by image hash. The DiT denoises
+    in a factorised loop: spatial attention within each latent frame, temporal
+    attention across frames at pooled resolution, with CFG implemented as a
+    doubled batch dimension rather than two sequential passes so the two branches
+    share the same kernel launch. A VAE decoder and a hardware encoder finish the
+    clip, which is written to object storage and served by CDN.
+
+  deep_dives:
+    - topic: "Factorised attention and the memory wall"
+      explanation: >-
+        Full 3D attention over 108,000 tokens has a score tensor of 1.17e10
+        entries; at fp16 that is 23.3 GB per head per layer, multiplied by heads
+        and layers it is terabytes. Factorising into spatial attention within a
+        frame (3,600 tokens, a 1.3e7-entry score matrix) and temporal attention
+        across 30 frames at pooled spatial resolution turns one impossible matrix
+        into two comfortable ones. The cost is expressiveness: a factorised model
+        cannot attend to a patch in frame 1 and a patch in frame 28 at full
+        spatial resolution simultaneously, which shows up as drift in long
+        occlusions.
+      tradeoffs:
+        - option: "Factorised spatial then temporal attention"
+          pros: "Memory falls from terabytes to megabytes per layer; scales to 1080p without changing the block; well-supported by existing kernels."
+          cons: "Cannot model fine-grained long-range spatio-temporal dependencies; occlusion and reappearance are the visible failure."
+        - option: "Full 3D attention with sequence parallelism"
+          pros: "Best quality on long-range motion; no architectural compromise to explain."
+          cons: "23.3 GB per head per layer at 720p makes it infeasible; even sharded, communication dominates and the clip length is capped by interconnect bandwidth."
+        - option: "Windowed 3D attention with a global token summary"
+          pros: "Recovers some long-range modelling at near-factorised cost; a middle path that keeps memory bounded."
+          cons: "Two mechanisms to tune, and the summary tokens become a quality bottleneck that is hard to attribute when output degrades."
+
+    - topic: "The denoising step budget"
+      explanation: >-
+        Cost is exactly linear in step-equivalents, so the step count is the
+        cheapest lever in the system and the one most often left at its default.
+        A 50-step CFG pipeline is 100 step-equivalents and 108 s; a 30-step
+        distilled sampler at the same guidance is 65 s; a 20-step distilled
+        student without CFG is 21.6 s. The quality question is not "is distillation
+        worse" — it is "which prompt categories get worse", because fast motion
+        and text rendering degrade before static scenes do.
+      tradeoffs:
+        - option: "Fewer steps, same model (50 to 30)"
+          pros: "Zero retraining, immediate 1.67x cost reduction, rollback is a config change."
+          cons: "Quality loss is spread across all prompts; fine detail and small text are the first casualties."
+        - option: "Distilled student, no CFG"
+          pros: "5x fewer GPU-seconds; guidance is baked into the student so the doubled batch disappears."
+          cons: "Needs a training run and a per-category eval; the student's failure mode is over-saturation at high guidance, which users notice."
+        - option: "Keep 50 steps and sell quality"
+          pros: "Maximum quality, simplest story, no eval debt."
+          cons: "208 GPUs for 100k clips/day and no margin for a premium tier; competitors shipping 5x cheaper set the price."
+
+    - topic: "Batching, scheduling, and the tail"
+      explanation: >-
+        Diffusion serving is step-synchronous: every request in a batch advances
+        one denoising step together. That makes batching efficient but couples
+        lifetimes — a batch runs until its longest member finishes, so a 50-step
+        request and a 20-step request in the same batch waste 30 steps of the
+        short one's slot. The fix is continuous batching at step granularity:
+        admit a request when a slot frees, evict finished ones, and keep the batch
+        full rather than keeping it coherent. With 108 s of compute per clip and a
+        90 s interactive SLO, you cannot afford a scheduler that waits.
+      tradeoffs:
+        - option: "Static batches of N clips"
+          pros: "Predictable memory, simple kernels, easy to reason about per-GPU throughput."
+          cons: "Throughput collapses to the longest member; a single 200-step outlier wastes the whole batch."
+        - option: "Continuous batching at step granularity"
+          pros: "Keeps utilisation high under mixed step counts; short requests finish early and free memory."
+          cons: "Requires paged latent buffers and careful KV-free state management; the scheduler becomes the hardest component to test."
+        - option: "Two queues, two fleets (interactive and batch)"
+          pros: "Isolates SLOs: batch tolerates long clips and low priority, interactive stays predictable."
+          cons: "Doubles idle capacity at off-peak; utilisation per fleet is worse than a single shared pool with priority."
+
+    - topic: "Caching and cascades"
+      explanation: >-
+        The cacheable objects in video generation are smaller than people expect:
+        prompt embeddings are a few kilobytes and the VAE encode of a conditioning
+        image is a few megabytes, against 108 GPU-seconds per clip. What actually
+        saves money is changing the computation, not memoising it. A cascade
+        generates a 512x288 draft at 16% of the tokens, then refines at 720p
+        for 15 steps: about 23 s against 108, or 21%. The cost is a quality
+        ceiling set by the draft and a second model in the rollout matrix.
+      tradeoffs:
+        - option: "Cascade (draft then refine)"
+          pros: "5x cheaper per clip; the draft gives an early preview users can cancel, which cuts wasted compute on abandoned requests."
+          cons: "Quality ceiling set by the draft; two models to version, and a mismatch between draft and refine shows as flicker."
+        - option: "Single model, distilled sampler"
+          pros: "One model, one rollout, simpler quality story; 5x saving with no second stage."
+          cons: "Distillation is a training project; the student's weaknesses are category-specific and need a real eval harness."
+        - option: "Cache at the prompt level and re-seed"
+          pros: "Near-zero engineering; helps only repeated prompts, which are a small share of traffic."
+          cons: "Saves prompt encoding, which is well under 1% of cost — a cache that flatters the hit-rate dashboard and moves no money."
+
+  bottlenecks:
+    - failure: "Attention workspace exhausts HBM at high resolution or long duration"
+      symptom: "OOM at 1080p or at 8-second clips; throughput drops sharply as the allocator fragments, and batch size silently collapses to 1."
+      mitigation: "Bound the token count with patch size and duration limits, use factorised or windowed attention, and enable activation checkpointing for the denoise loop. Reject requests that exceed the token budget at admission rather than at step 40."
+    - failure: "Step-synchronous batching couples request lifetimes"
+      symptom: "GPU utilisation sits at 40% while the interactive queue grows; p99 is 3x the median because every batch waits for its longest member."
+      mitigation: "Switch to continuous batching at step granularity with paged latent buffers, cap steps per request at admission, and route long-step requests to the batch fleet."
+    - failure: "The whole fleet is one model version and one quality regression"
+      symptom: "A new distillation checkpoint improves aggregate preference by 2% and breaks text rendering; rollback takes 20 minutes because the weights are baked into the image."
+      mitigation: "Serve weights from object storage with a versioned manifest, keep two versions resident, and gate rollouts on per-category evals rather than an aggregate score."
+
+  what_to_steal:
+    - "Compute the latent token count before anything else: (H/8/p) x (W/8/p) x (F/4) is the number every cost claim multiplies."
+    - "Check the attention matrix against HBM first: 108,000 squared is 23.3 GB per head per layer, which is why factorisation is not optional."
+    - "Treat steps x CFG as one dial: 50 steps with guidance is 100 step-equivalents, and a distilled 20-step student is a 5x fleet reduction."
+    - "Price resolution by the quadratic term, not the linear one: 1080p is 2.25x tokens and 5.06x attention entries."
+
+  markdown: |
+    ## The token count comes first
+
+    A 720p frame is 1280x720. With a VAE that compresses 8x spatially and 4x
+    temporally:
+
+    $$\frac{1280}{8} \times \frac{720}{8} = 160 \times 90 = 14{,}400
+    \ \text{tokens per frame},$$
+
+    and five seconds at 24 fps is 120 frames, or **30 latent frames** after the
+    temporal compression:
+
+    $$14{,}400 \times 30 = 432{,}000\ \text{tokens}.$$
+
+    Patchifying with a DiT patch of 2 merges each 2x2 latent cell into one token:
+
+    $$\frac{160}{2} \times \frac{90}{2} \times 30 = 80 \times 45 \times 30
+    = 108{,}000\ \text{tokens}.$$
+
+    That factor of four is the difference between a service and a research demo.
+
+    ## Per-step cost, and why attention decides the architecture
+
+    A forward pass costs about $2N$ FLOPs per token for $N$ parameters:
+
+    $$2 \times 2\times10^{9} \times 1.08\times10^{5} = 4.32\times10^{14}
+    \ \text{FLOP} = 432\ \text{TFLOP}.$$
+
+    At a realistic 400 TFLOP/s that is **1.08 s per pass**. Fifty denoising steps
+    with classifier-free guidance is 100 passes: **108 s per clip**.
+
+    Now the attention. A full 3D attention over 108,000 tokens allocates a score
+    tensor of
+
+    $$108{,}000^{2} = 1.17\times10^{10}\ \text{entries}
+    \quad\Longrightarrow\quad 23.3\ \text{GB per head per layer in fp16}.$$
+
+    Sixteen heads across 28 layers is terabytes of workspace. This is not a
+    tuning problem; it is the reason every production video DiT factorises
+    attention into spatial (within a frame, 3,600 tokens) and temporal (across 30
+    frames) passes.
+
+    ## The fleet is steps times clips
+
+    | Quantity | Value |
+    |---|---|
+    | Step-equivalents per clip (50 steps, CFG) | 100 |
+    | GPU-seconds per clip | 108 |
+    | Clips per day | 100,000 |
+    | GPU-seconds per day | 1.08e7 |
+    | GPU-days per day | 125 |
+    | GPUs at 60% utilisation | **208** |
+    | Compute cost per clip at 2.50 USD/GPU-hour | **0.075 USD** |
+
+    Read the table backwards. The fleet is not set by the 2B parameters; it is set
+    by 100 step-equivalents. Halve the steps and you halve the fleet. Remove CFG
+    with a distilled student and you halve it again. **Steps are the product
+    decision that looks like an engineering detail.**
+
+    ## Resolution is where margins die
+
+    | | 720p | 1080p | Ratio |
+    |---|---|---|---|
+    | Latent tokens/frame | 14,400 | 32,400 | 2.25x |
+    | Tokens/clip (patch 2) | 108,000 | 243,000 | 2.25x |
+    | TFLOP per step | 432 | 972 | 2.25x |
+    | Attention entries | 1.17e10 | 5.9e10 | **5.06x** |
+    | GPU-seconds per clip | 108 | 243 | 2.25x |
+
+    A premium tier priced at 2.25x the compute is priced correctly for the linear
+    term and incorrectly for the tail: the 5.06x growth in attention entries is
+    what forces smaller batches, more memory pressure, and a worse p99. Charge for
+    the tier, but budget for the tail.
+
+    ## Serving shape
+
+    The daily average is 1.157 clips per second ($10^{5}/86{,}400$), and one GPU
+    delivers $1/108 = 0.00926$ clips/s. That is **125 GPUs at 100%**, or 208 at
+    60%. A 3x peak of 3.47 clips/s needs **375 at 100%** and **625 at 60%**.
+
+    So the peak either buys three times the fleet or it waits. Waiting is the
+    correct answer, and it is a product decision: the interactive tier gets a
+    queue with a 90 s SLO, and the batch tier absorbs everything that can tolerate
+    fifteen minutes. Without that split you provision for a two-hour peak and idle
+    for twenty-two hours, which is how a video product ends up with a compute bill
+    that looks like a mistake.
+
+    ## The bill on a P&L
+
+    At 0.075 USD of compute per clip, 100,000 clips a day is **7,500 USD/day** —
+    around 225,000 USD/month for one product surface. Only one line moves that by a
+    multiple: the step count.
+
+    | Pipeline | GPU-seconds/clip | USD/day at 100k clips |
+    |---|---|---|
+    | 50 steps with CFG | 108 | 7,500 |
+    | 30 steps with CFG | 65 | 4,500 |
+    | 20-step distilled, no CFG | 21.6 | 1,500 |
+    | Cascade, 21% of baseline | 23.1 | 1,600 |
+
+    Nobody argues about GPU generations after seeing that column, and everybody
+    argues about whether the distilled model's text rendering is acceptable — which
+    is the right argument to have, because it is the only one that changes the
+    number by 5x.
+
+    ## What breaks when duration doubles
+
+    A ten-second clip doubles the token count to 216,000 and per-step time to
+    2.16 s, so the clip costs 216 s and the fleet doubles. But the attention
+    entries quadruple to 4.7e10, which is where the memory wall appears: at that
+    size a factorised block's spatial pass is unchanged while the temporal pass
+    grows linearly in frames, so the temporal attention becomes the bottleneck
+    rather than the spatial one. Duration is cheaper than resolution per unit of
+    perceived change, and more expensive per unit of memory.
+
+    ## The stages nobody budgets
+
+    The VAE decode looks free and is not. A five-second 720p clip is
+    $120 \times 1280 \times 720 \times 3 = 3.32\times10^{8}$ pixel values, and a
+    decoder at a few hundred FLOP per pixel is only about 0.1 TFLOP — less than a
+    millisecond at peak. It nonetheless costs two to three seconds, because the
+    operation is memory-bound and runs at a few percent of peak efficiency. On a
+    108 s clip that is 2%; on a 21.6 s distilled clip it is **12%**, and in a
+    cascade it is the stage that decides whether the second pass can be batched
+    with the first.
+
+    Encoding the output is the same story: seconds of CPU per clip, invisible
+    until the GPU fleet is fast enough that the CPU pool becomes the queue.
+
+    ## Where the analogy breaks
+
+    The artist's passes are not independent, and neither are these. An early
+    denoising step commits to a coarse structure that later steps refine rather
+    than replace — which is exactly why distillation (fewer, bigger steps) trades
+    quality in a category-specific way instead of uniformly.
+
+    And the customer is waiting. With 108 s of compute per clip and a 90 s
+    interactive SLO, latency and throughput are not the same number. That gap is
+    the entire reason a distilled or cascaded pipeline exists, and it is why
+    "quality per GPU-second" is the metric to argue about, not "quality".
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Video generation is **a token-count problem with a quadratic penalty**. A five-second 720p clip is 432,000 latent tokens before patching and 108,000 after, and attention over that grid costs 4x the MLP — so the architecture is forced into factorised attention, and the serving cost becomes a product of three numbers you choose: tokens, parameters, and denoising steps. Every product decision about resolution or duration is a multiplication on that product, and none of them are cheap.
+
+    ### The analogy, in full
+
+    An artist who paints by erasing. Each pass starts from static and removes a little noise, and the picture only appears after fifty passes. Every pass costs the same, so the price of a painting is the price of one pass times the number of passes — and the number of passes is a quality decision, not a technical one. For video, the canvas is also moving: thirty latent frames instead of one image, and every frame must agree with its neighbours about what moved. Two ways the analogy breaks. First, the artist's passes are not independent — a bad early pass cannot be fully repaired later, which is why distillation (fewer, larger steps) costs quality in a way that is measurable but not uniform. Second, the customer is waiting: for a five-second clip at 108 seconds of compute, latency and throughput are the same number only if you have exactly one clip in flight, and you never do.
+
+    ### Failure modes, in full
+
+    - You extrapolate from image diffusion: 1,024 tokens at 512px, so video at 100x the tokens should be 100x the work. It is worse — attention is quadratic, so a naive 3D attention over 108,000 tokens needs 23 GB per head per layer just for the score matrix.
+    - You budget one GPU per clip and get 108 seconds per five-second video, then multiply by 100,000 daily clips and discover the fleet is 208 GPUs at 60% utilisation for one product surface.
+    - You add classifier-free guidance because it improves quality, and the bill doubles: CFG runs the model twice per step, which is a 2x cost that never appears in a quality benchmark.
+    - You raise output to 1080p for a premium tier and the per-clip cost goes up 2.25x on tokens but 5.06x on attention — the quadratic term eats the margin the premium tier was supposed to fund.
+    - You batch four clips together to improve utilisation and p99 latency triples, because the batch waits for the longest prompt and every clip in the batch pays the slowest one's step time.
+
+    ### The mechanisms, in full
+
+    - **The latent grid is arithmetic, and it is bigger than you think.** 1280/8 x 720/8 = 160 x 90 = **14,400 tokens per frame**; 5 s at 24 fps is 120 frames, temporally compressed 4x to **30 latent frames**, so 14,400 x 30 = **432,000 tokens** before any patching.
+    - **Patchification is mandatory, not stylistic.** A DiT patch of 2 on the latent grid gives 80 x 45 = 3,600 tokens per frame and **108,000 per clip** — a 4x reduction that keeps the per-step cost inside a GPU. Without it, the score matrix alone is 432,000 squared.
+    - **Per-step cost is 2 x params x tokens.** For a 2B DiT at 108,000 tokens: 2 x 2e9 x 1.08e5 = **4.32e14 FLOP = 432 TFLOP per step**, which is **1.08 s** at a realistic 400 TFLOP/s. Multiply by steps and you have the clip.
+    - **Full 3D attention is arithmetically excluded.** At 108,000 tokens the score tensor is 108,000 squared = **1.17e10 entries**, or **23.3 GB per head per layer** in fp16. Sixteen heads across 28 layers would need terabytes of workspace; factorised spatial-then-temporal attention is the only version that runs.
+    - **Guidance doubles the bill.** Classifier-free guidance evaluates the model on a conditional and an unconditional branch and combines them, so one "step" is two forward passes. A 50-step CFG pipeline is **100 step equivalents**: 108 s per clip on one GPU at 1.08 s per pass.
+    - **Steps are the cheapest quality lever you can also sell.** 50 steps with CFG is 108 s; 30 steps with CFG is 65 s; a distilled 20-step student without CFG is **21.6 s** — a 5x cost reduction for a quality change you must measure per prompt category, not in aggregate.
+    - **Resolution is quadratic in attention and linear in tokens.** 1080p is 240 x 135 = 32,400 tokens per frame, **2.25x** the 720p token count and therefore 2.25x the per-step FLOPs — but 5.06x the attention entries, which is why the premium tier's margin is set by which term dominates at your sequence length.
+    - **Batching improves occupancy, not arithmetic.** Four clips batched with block-diagonal attention cost 4x the FLOPs of one, but keep the GPU busy; joint attention over all four would cost 16x. The win is utilisation, and it is bounded by the longest sequence in the batch.
+    - **Caching is mostly a cascade, not a memo.** Prompt embeddings are negligible, a conditioning image's VAE encode is reusable, but the real lever is draft-then-refine: a 512x288 draft at **16% of the tokens** for 40 step-equivalents (6.9 s), then 15 refine steps at full resolution (16.2 s), which totals about **23 s — 21% of a single 720p run**.
+  derivations:
+    - title: "Latent token count"
+      latex: |
+        For height $H$, width $W$, VAE spatial factor $s$, temporal factor $t$,
+        clip length $F$ frames and DiT patch $p$:
+        $$n = \frac{H}{s\,p} \cdot \frac{W}{s\,p} \cdot \frac{F}{t}.$$
+        At $H=720$, $W=1280$, $s=8$, $p=2$, $F=120$, $t=4$:
+        $$n = 80 \times 45 \times 30 = 108{,}000.$$
+      prose: >-
+        Every factor is a design choice with a quality consequence, and the
+        product is the cost. Doubling duration doubles tokens; halving patch size
+        quadruples them; doubling resolution quadruples them.
+    - title: "Per-step FLOPs and wall time"
+      latex: |
+        Transformer forward FLOPs are approximately $2N$ per token, so
+        $$F_{\text{step}} = 2 N n, \qquad
+        \tau_{\text{step}} = \frac{2Nn}{\text{TFLOPS}_{\text{eff}}}.$$
+        At $N = 2\times10^{9}$, $n = 1.08\times10^{5}$, 400 TFLOP/s:
+        $$F_{\text{step}} = 4.32\times10^{14},\qquad \tau_{\text{step}} = 1.08\ \text{s}.$$
+      prose: >-
+        The $2N$ figure counts a multiply and an add per parameter; attention adds
+        $4n^{2}d$ per layer, which is why the factorised form matters at large
+        $n$ — at 108,000 tokens the quadratic term would otherwise exceed the
+        linear one.
+    - title: "Fleet size from GPU-seconds"
+      latex: |
+        Daily GPU-seconds are $C \cdot \tau_{\text{clip}}$, so the device count at
+        utilisation $u$ is
+        $$G = \frac{C\,\tau_{\text{clip}}}{86{,}400\,u}.$$
+        At $C = 10^{5}$, $\tau = 108$ s, $u = 0.6$:
+        $$G = \frac{1.08\times10^{7}}{86{,}400 \times 0.6} = 208.$$
+      prose: >-
+        Utilisation is in the denominator because a GPU that is 60% busy delivers
+        60% of its capacity to the SLO. Halve the utilisation to buy headroom and
+        you double the fleet; this is the number to argue about when someone asks
+        for a 30 s p99 without changing the model.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Count latent tokens, then multiply by parameters and steps. Attention is
+        quadratic in tokens, which forces factorisation. Cost per clip is
+        steps times passes times per-pass time, and the fleet is that times
+        clips per day.
+      blocks:
+        - kind: checklist
+          body: |
+            - 160 x 90 x 30 = 432,000 tokens; patch 2 gives 108,000
+            - 2 x 2e9 x 1.08e5 = 432 TFLOP per pass, 1.08 s at 400 TFLOP/s
+            - 50 steps x CFG = 100 passes = 108 s per clip
+            - 1e5 clips x 108 s / 86,400 / 0.6 = 208 GPUs
+            - 1080p: 2.25x tokens, 5.06x attention entries
+      checkpoint: >-
+        If you halve the clip duration, what happens to tokens, to per-step time,
+        and to the fleet?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Token count, attention feasibility, step budget, fleet. In that order.
+        The model architecture is downstream of the first two and the product
+        tier is downstream of the third.
+      blocks:
+        - kind: checklist
+          body: |
+            - VAE ratios set tokens; patch size sets them again
+            - Check n-squared attention against HBM before promising a resolution
+            - Steps x CFG is one dial with a 5x range
+            - Fleet = clips x GPU-seconds / 86,400 / utilisation
+            - Price resolution by the quadratic term
+      checkpoint: >-
+        Why is a 90 s interactive SLO impossible at 108 s of compute per clip
+        without changing the pipeline?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The sizing arithmetic and the denoise loop.
+      blocks:
+        - kind: pseudocode
+          body: |
+            tokens = (H/(8*p)) * (W/(8*p)) * (F/4)
+            step_s = 2 * params * tokens / flops_eff
+            clip_s = steps * (2 if cfg else 1) * step_s
+            gpus   = clips_per_day * clip_s / 86400 / utilisation
+
+            denoise(latents):
+              for t in schedule:                 # 50 steps
+                cond   = dit(latents, t, prompt)
+                uncond = dit(latents, t, null)   # doubled batch, not a second loop
+                latents = combine(cond, uncond, guidance)
+              return vae_decode(latents)
+      checkpoint: >-
+        Why is CFG implemented as a doubled batch rather than two sequential
+        passes, and what does that change about memory?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Tokens, per-step cost, fleet.
+      blocks:
+        - kind: math
+          body: |
+            **Tokens.** $n = \frac{H}{sp}\cdot\frac{W}{sp}\cdot\frac{F}{t}$
+            = 80 x 45 x 30 = 108,000.
+
+            **Per step.** $F = 2Nn$ = 432 TFLOP; $\tau = F/\text{TFLOPS}$ =
+            1.08 s.
+
+            **Fleet.** $G = C\tau/(86{,}400u)$ = 208 at 60%.
+
+            **Attention.** $n^2 \times 2$ bytes = 23.3 GB per head per layer.
+      checkpoint: >-
+        At what token count does the attention term exceed the MLP term for a 2B
+        model with 28 layers and head dim 64?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The capacity model plus the two levers that actually move the bill.
+      blocks:
+        - kind: warning
+          body: >-
+            The trap is treating 50 steps and CFG as fixed. They are 100
+            step-equivalents against a 20-step distilled student, a 5x fleet
+            difference that dwarfs any kernel optimisation you will do.
+        - kind: code
+          language: python
+          body: |
+            def video_capacity(h=720, w=1280, frames=120, patch=2, params=2e9,
+                               steps=50, cfg=True, clips=1e5,
+                               tflops=400.0, util=0.6, usd_per_gpu_h=2.5):
+                tokens = (h / (8 * patch)) * (w / (8 * patch)) * (frames / 4)
+                step_s = 2 * params * tokens / (tflops * 1e12)
+                clip_s = steps * (2 if cfg else 1) * step_s
+                gpus = clips * clip_s / 86400 / util
+                return {
+                    "tokens": int(tokens),
+                    "step_s": round(step_s, 3),
+                    "clip_s": round(clip_s, 1),
+                    "gpus": round(gpus, 1),
+                    "usd_per_clip": round(clip_s / 3600 * usd_per_gpu_h, 4),
+                }
+      checkpoint: >-
+        The premium 1080p tier triples the price. What utilisation would you
+        provision for, and what does that do to the per-clip margin?
+  try_it: >-
+    Derive the token count: (1280/8) x (720/8) = 14,400 per frame, 120 frames
+    compressed 4x to 30, so 432,000 tokens; patch 2 gives 108,000. Then compute
+    2 x 2e9 x 108,000 = 432 TFLOP per pass and multiply by 100 step-equivalents
+    to get 108 s of GPU time for a five-second clip.
+  interview_questions:
+    - question: "Estimate the GPU cost of a five-second 720p clip."
+      level: staff
+      key_points:
+        - "Latent tokens: (1280/8) x (720/8) = 14,400 per frame, 30 latent frames, 432,000 tokens; patch 2 gives 108,000."
+        - "Per-step FLOPs are 2 x params x tokens: 2 x 2e9 x 1.08e5 = 432 TFLOP, about 1.08 s at 400 TFLOP/s effective."
+        - "Fifty steps with classifier-free guidance is 100 passes, so 108 GPU-seconds, or 0.075 USD at 2.50 USD per GPU-hour."
+        - "The 2x from CFG is a product decision with a quality justification and a doubled bill."
+      follow_up: "What would you change first to halve that, and what quality evidence would you need?"
+    - question: "Why can you not use full 3D attention over the latent grid?"
+      level: senior
+      key_points:
+        - "At 108,000 tokens the score tensor is 1.17e10 entries, 23.3 GB per head per layer in fp16."
+        - "Across 16 heads and 28 layers the workspace is terabytes, far beyond 80 GB of HBM per device."
+        - "Factorising into spatial attention within frames (3,600 tokens) and temporal attention across 30 frames turns one impossible matrix into two small ones."
+        - "The cost is expressiveness: long-range fine-grained spatio-temporal dependencies, which appear as drift in occlusion and reappearance."
+      follow_up: "What quality failure would make you pay for windowed 3D attention instead?"
+    - question: "You add a 1080p premium tier. What actually gets more expensive?"
+      level: staff
+      key_points:
+        - "Tokens go 108,000 to 243,000, a 2.25x rise, so per-step FLOPs rise 2.25x and per-clip time goes 108 s to 243 s."
+        - "Attention entries rise 5.06x, which shows up as memory pressure, smaller batches, and a worse p99 rather than as a clean linear cost."
+        - "Pricing at 2.25x covers the arithmetic and not the tail; you need headroom for the quadratic term and a token cap at admission."
+        - "A 720p generation plus learned upscaling is a cheaper premium tier at roughly 1.1x cost, with a quality ceiling you have to measure."
+      follow_up: "Where would you set the duration cap, and what does it cost per second of video?"
+    - question: "Utilisation is 40% and the interactive queue is growing. What is wrong?"
+      level: senior
+      key_points:
+        - "Step-synchronous batching couples lifetimes, so a batch runs until its longest member finishes and short requests waste their slots."
+        - "A 50-step request and a 20-step request in the same batch waste 30 steps of the short one's capacity."
+        - "Continuous batching at step granularity keeps the batch full instead of coherent, which recovers utilisation under mixed step counts."
+        - "It needs paged latent buffers and careful state management, and admission control should cap steps per request rather than let the scheduler absorb them."
+      follow_up: "What does paged state cost in memory, and how does that interact with 1080p?"
+  common_mistakes:
+    - "Extrapolating from image diffusion by token count alone, ignoring that attention is quadratic in tokens and 108,000 squared is 23.3 GB per head per layer."
+    - "Treating classifier-free guidance as free quality: it doubles the forward passes, so 50 steps is 100 step-equivalents and 108 s per clip."
+    - "Pricing a 1080p tier at the 2.25x token ratio when attention entries grow 5.06x and the tail latency grows with them."
+    - "Batching statically and losing 60% of utilisation to the longest request in the batch."
+  further_reading:
+    - label: "Peebles, Xie, Saining, Scalable Diffusion Models with Transformers (DiT), ICCV 2023"
+    - label: "Ho, Jain, Abbeel, Denoising Diffusion Probabilistic Models, NeurIPS 2020"
+    - label: "Ho, Salimans, Classifier-Free Diffusion Guidance, 2022"
+  implementations:
+    - language: python
+      title: "Video token count, step FLOPs, and the attention bill"
+      note: >-
+        Patchification turns 432,000 latent tokens into 108,000, and 2ND gives 432 TFLOP per denoising pass. Full 3D attention at that length is 23.3 GB of scores per head per layer, the arithmetic reason attention is factorised. Fifty steps with classifier-free guidance cost 108 s; a 20-step distilled student costs 21.6 s, the 5x the case study sells.
+      code: |
+        W, H, FPS, SECONDS = 1280, 720, 24, 5
+        VAE_STRIDE, TEMPORAL, PATCH = 8, 4, 2
+        PARAMS, STEPS, CFG, TFLOPS = 2e9, 50, 2, 400e12
+
+
+        def latent_tokens(w=W, h=H, fps=FPS, seconds=SECONDS, patch=PATCH):
+            per_frame = (w // VAE_STRIDE // patch) * (h // VAE_STRIDE // patch)
+            frames = seconds * fps // TEMPORAL
+            return per_frame, frames, per_frame * frames
+
+
+        def step_flops(tokens, params=PARAMS):
+            return 2 * params * tokens
+
+
+        def attention_bytes(tokens, heads=16, layers=28, dtype=2):
+            per_head = tokens * tokens * dtype
+            return per_head, per_head * heads * layers
+
+
+        def main():
+            per_frame, frames, tokens = latent_tokens()
+            print(f"latent grid: {per_frame:,} tokens/frame x {frames} frames = {tokens:,}")
+            fl = step_flops(tokens)
+            print(f"per denoising pass: {fl/1e12:.0f} TFLOP; {fl/TFLOPS:.2f} s at 400 TFLOP/s")
+
+            one_head, all_heads = attention_bytes(tokens)
+            print(f"attention scores: {one_head/1e9:.1f} GB per head; "
+                  f"{all_heads/1e12:.1f} TB for 16 heads x 28 layers")
+
+            cfg = fl * STEPS * CFG / TFLOPS
+            distilled = fl * 20 / TFLOPS
+            print(f"50-step CFG clip: {cfg:.1f} s; 20-step distilled: {distilled:.1f} s "
+                  f"({cfg/distilled:.1f}x cheaper)")
+
+            assert (per_frame, frames, tokens) == (3_600, 30, 108_000)
+            assert abs(fl / 1e12 - 432) < 1
+            assert abs(one_head / 1e9 - 23.3) < 0.1
+            assert 100 < cfg < 115
+            assert abs(cfg / distilled - 5) < 0.01
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-video-latent-tokens
+      title: "Latent tokens after patching"
+      difficulty: easy
+      prompt: >-
+        Return the number of latent tokens in a clip: the VAE downsamples by `vae`, the DiT
+        patch by `patch`, and time by `temporal`. Frames are `seconds * fps` before temporal
+        compression.
+      language: python
+      entry: latent_tokens
+      testCases:
+        - input: '{}'
+          expected: "108000"
+          tolerance: 1e-6
+        - input: '{"seconds": 2}'
+          expected: "43200"
+          tolerance: 1e-6
+      solution: |
+        def latent_tokens(w=1280, h=720, seconds=5, fps=24, patch=2, vae=8, temporal=4):
+            per_frame = (w // vae // patch) * (h // vae // patch)
+            return per_frame * (seconds * fps // temporal)
+      solutionExplanation: >-
+        80 x 45 patches over 30 latent frames is 108,000 tokens. The 4x patch reduction is what
+        keeps a per-step pass inside one GPU.
+      tags: [video, diffusion]

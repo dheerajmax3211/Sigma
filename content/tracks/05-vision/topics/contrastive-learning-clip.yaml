@@ -1,0 +1,1441 @@
+id: contrastive-learning-clip
+slug: contrastive-learning-clip
+title: "Contrastive Learning: CLIP and InfoNCE"
+summary: >-
+  Train two encoders on nothing but which image goes with which caption, and
+  the batch itself becomes the label. You derive InfoNCE, show it is a lower
+  bound on mutual information that tightens as log N, and measure what the
+  batch size, the temperature and the prompt ensemble each buy.
+kind: lesson
+difficulty: hard
+position: 2
+estMinutes: 28
+prerequisites: [vision-transformers, information-theory]
+phase: vision-foundations
+tags:
+  - contrastive-learning
+  - clip
+  - infonce
+  - mutual-information
+  - temperature
+  - zero-shot
+  - prompt-ensembling
+  - in-batch-negatives
+  - symmetric-loss
+  - siglip
+
+body:
+  big_idea: >-
+    Two encoders trained only on which image goes with which caption learn a
+    shared space where the batch is the label — so batch size and temperature
+    are part of the objective.
+
+  problem:
+    - >-
+      You have four hundred million image-caption pairs and no labels; the
+      only supervision is "these two belong together", one bit per pair.
+    - >-
+      Your loss sits at 5.5 and nobody can say what a perfect model would
+      report at this batch size; it is 5.5452.
+    - >-
+      You raise the batch from 256 to 2,048, the loss jumps two nats, and both
+      the objective and the metric changed at once.
+
+  analogy: |
+    A cloakroom with two clerks who share no language: one tags your coat in
+    her own script, the other writes the claim in a different one. Nobody says
+    what a coat is; the only supervision is that these two slips refer to the
+    same coat. With N coats and N claims, the correct match for a claim is one
+    of N, and every other coat is a decoy.
+
+  concept_points:
+    - >-
+      **The loss is an N-way cross-entropy, so its floor is $\log N$ and its chance accuracy is $1/N$.**
+      Flatten the batch into "which of these $N$ captions belongs to this
+      image" and InfoNCE is exactly that cross-entropy. At $N = 256$ the floor
+      is $\ln 256 = 5.5452$; at $N = 32{,}768$ it is **10.3972**. Measured at
+      random init: **5.7435** at $N=256$, about 0.20 nats above its floor.
+    - >-
+      **InfoNCE is a lower bound on mutual information, and the bound is $\log N - L$.**
+      On a Gaussian copula whose true mutual information is **0.8304** nats
+      ($\rho = 0.9$), using the exact density ratio as the critic, the bound
+      reads 0.6780 at $N=8$, 0.8178 at 128 and **0.8296** at 2048 — monotone,
+      approaching from below. At $N=2$ it reports 0.3385, 41% of the truth.
+    - >-
+      **The batch *is* the negative pool, so the batch size is part of the objective. 
+      ** Each of the $N$ pairs contributes $N-1$ negatives, and the loss is $\log N$ plus a constant fixed by the geometry: measured $L - \ln N$ was -1.995 at $N=8$, -4.362 at 256 and **
+      -4.911** at 4096. Doubling the batch adds exactly $\ln 2 = 0.6931$ nats
+      to the floor.
+    - >-
+      **At fixed embedding quality a bigger candidate pool is a harder task, not a noisier estimate.**
+      In one fixed synthetic world with identical per-pair signal-to-noise,
+      changing only the batch size dropped top-1 retrieval from **0.9725** to
+      0.9513, 0.8847, 0.7515, 0.5727 and **0.4012** at
+      $N = 8, 16, 64, 256, 1024, 4096$. The embeddings never changed; the
+      question did. Quoting recall@1 without the candidate count is quoting
+      nothing.
+    - >-
+      **Temperature decides how many of those negatives actually carry gradient.**
+      The effective negative count is $\exp(H(p_i))$, the perplexity of the
+      row's softmax, and it collapses as $\tau$ falls: measured **255.96** at
+      $\tau = 10$, **45.95** at 0.1, **14.64** at 0.07, 5.40 at 0.05, 1.23 at
+      0.01 and 1.02 at 0.001. A batch of 256 at CLIP's 0.07 therefore gives
+      about fifteen working negatives, 5.7% of what the batch size advertises.
+    - >-
+      **Zero-shot is a nearest-prototype classifier, and prompt ensembling is variance reduction on the prototype.**
+      With one prompt per class the mean angular error of the class direction
+      is **52.25°** at $K=1$, falling to 24.55° at 8, 12.83° at 32 and
+      **8.20°** at 80. Top-1 accuracy over 1,000 classes went 0.1150 → 0.5830
+      with the same image embeddings.
+
+  definitions:
+    - term: "Positive pair"
+      meaning: >-
+        Two views of the same thing — an image and its caption, or two
+        augmentations of one photograph. It is the entire label: the objective
+        never sees a class, only which rows and columns of the similarity
+        matrix are supposed to align.
+    - term: "In-batch negatives"
+      meaning: >-
+        Every other example in the batch, used as a decoy. With $N$ pairs there
+        are $N-1$ negatives per row, so the negative pool grows with the batch
+        and the loss floor grows as $\log N$ — which is why batch size is a
+        modelling decision, not a throughput setting.
+    - term: "InfoNCE"
+      meaning: >-
+        The cross-entropy of "which of these $N$ candidates is my match",
+        $-\frac{1}{N}\sum_i \log \frac{\exp(s_{ii})}{\sum_j \exp(s_{ij})}$. It
+        is a lower bound on the mutual information between the two modalities,
+        tight up to $\log N - L$ as the batch grows.
+    - term: "Temperature ($\tau$)"
+      meaning: >-
+        The divisor applied to cosine similarities before the softmax. It sets
+        the sharpness of the N-way distribution, and therefore both the
+        effective number of negatives and the scale of the gradient. CLIP's
+        learnable form is `logit_scale` $= 1/\tau$, clamped to $[1, 100]$.
+    - term: "logit_scale"
+      meaning: >-
+        CLIP's name for $1/\tau$, stored in log space and exponentiated at use.
+        Initialised at $\log(1/0.07) = 2.659$ and clamped to $[0, \log 100]$,
+        it is the one scalar the contrastive objective tunes for itself.
+    - term: "Effective negatives"
+      meaning: >-
+        $\exp(H(p_i))$, the perplexity of the row's softmax — how many
+        candidates the gradient is actually spread over. It equals $N$ when the
+        similarities are uniform and 1 when the softmax is one-hot, and at
+        $\tau = 0.07$ on a 256-batch it measured 14.6.
+    - term: "False negative"
+      meaning: >-
+        A pair the loss treats as a decoy that is in fact a match — two
+        different images of the same class, or two captions of the same image.
+        The loss pushes them apart, and no amount of training fixes a label
+        that is wrong.
+    - term: "Symmetric loss"
+      meaning: >-
+        $\frac12 (L_{i\to t} + L_{t\to i})$: the same matrix, softmaxed along
+        rows and along columns. The two are different objectives because the
+        matrix is not symmetric, and averaging them costs one extra softmax
+        pass over a matrix you already have in memory.
+    - term: "Sigmoid (pairwise) contrastive loss"
+      meaning: >-
+        The SigLIP alternative: every one of the $N^2$ cells is an independent
+        binary decision, positive on the diagonal and negative elsewhere. There
+        is no softmax normaliser, so the loss floor does not grow with the
+        batch and the per-pair chance level stays 0.5 at any $N$.
+    - term: "Shared embedding space"
+      meaning: >-
+        One vector space both encoders write into, with a common dimension and
+        a common norm. Nothing forces the two modalities into the same region —
+        the well-known *modality gap* is that they occupy separate cones — but
+        the metric is common, which is all zero-shot classification needs.
+    - term: "Zero-shot classifier"
+      meaning: >-
+        A classifier whose weights are text: embed the class names, embed the
+        image, take the nearest class embedding. No training examples of the
+        target classes are involved, only their names, so the accuracy depends
+        entirely on how good the text-side estimate is.
+    - term: "Prompt ensembling"
+      meaning: >-
+        Averaging the text embeddings of $K$ templates ("a photo of a {}",
+        "a blurry photo of a {}") into one class vector, normalising each
+        before the average and the mean after. It reduces the variance of the
+        class-direction estimate by roughly $\sqrt{K}$.
+
+  diagrams:
+    - type: architecture
+      title: "One CLIP step: two encoders, one matrix, two softmaxes"
+      caption: >-
+        The only learnable parameters outside the encoders are the two
+        projection matrices and one scalar, logit_scale. Everything the loss
+        sees is the N x N block in the middle, which is why the batch size
+        appears in the objective and not just in the memory profile.
+      nodes:
+        - id: img
+          x: 0
+          y: 0
+          label: "image, 224 x 224"
+          kind: client
+          detail: "Cut into patches and encoded by the ViT from the previous topic: one image in, one unit vector out."
+        - id: txt
+          x: 0
+          y: 1
+          label: "caption, tokenised"
+          kind: client
+          detail: "Up to 77 tokens with a start and end marker. The text encoder is a small transformer with causal attention."
+        - id: ienc
+          x: 1
+          y: 0
+          label: "image encoder + projection"
+          kind: model
+          detail: "ViT-B/32 in the original CLIP; 768 features projected to 512 and L2 normalised. The projection matters: the contrastive loss is applied to it, not to the pooled features."
+        - id: tenc
+          x: 1
+          y: 1
+          label: "text encoder + projection"
+          kind: model
+          detail: "Reads the end-of-text token's state, projects to 512 and L2 normalises. Both sides must end on the unit sphere or the cosine is not a cosine."
+        - id: sim
+          x: 2
+          y: 0
+          label: "N x N cosine matrix"
+          kind: storage
+          detail: "N squared numbers, the only place the two modalities meet. At batch 32,768 this is 1.07 billion entries, which is why the batch is the memory-bound object."
+        - id: scale
+          x: 2
+          y: 1
+          label: "logit_scale, learned, clamped to 100"
+          kind: server
+          detail: "One scalar, initialised at log(1/0.07) and clamped to log(100). It sets the temperature, and therefore how many negatives carry gradient."
+        - id: softmax
+          x: 3
+          y: 0
+          label: "softmax along rows, then along columns"
+          kind: worker
+          detail: "Two different normalisers over the same matrix: one asks which caption, the other asks which image. Their average is the loss."
+        - id: loss
+          x: 3
+          y: 1
+          label: "symmetric cross-entropy"
+          kind: worker
+          detail: "Half the row loss plus half the column loss, in nats. Floor is log N; measured 5.5452 at batch 256."
+      edges:
+        - { from: img, to: ienc, label: "patches" }
+        - { from: txt, to: tenc, label: "tokens" }
+        - { from: ienc, to: sim, label: "N x 512, unit norm" }
+        - { from: tenc, to: sim, label: "N x 512, unit norm" }
+        - { from: sim, to: scale, label: "divide by tau" }
+        - { from: scale, to: softmax, label: "scaled logits" }
+        - { from: softmax, to: loss, label: "N-way CE" }
+
+    - type: compare
+      title: "In-batch softmax (InfoNCE) against pairwise sigmoid (SigLIP)"
+      left_label: "InfoNCE: one softmax over N candidates"
+      left_points:
+        - "Every row competes with all N - 1 others, so the loss floor is log N and moves with the batch"
+        - "Measured initial loss: 5.7435 at N = 256, 7.1314 at N = 1024 - the same chance model, different numbers"
+        - "Temperature is a global normaliser: one tau sharpens every row at once, and at 0.07 only 14.6 of 255 negatives carry gradient"
+        - "Needs all-gather of every embedding, so the batch is bounded by the network, not the GPU"
+        - "Chance top-1 is 1/N, which is 0.5 at N = 2 and 0.000031 at N = 32768"
+      right_label: "Sigmoid: N squared independent binary decisions"
+      right_points:
+        - "Each cell is a yes/no question, so the floor is a per-pair ln 2 and does not grow with the batch"
+        - "Measured initial loss: 1.0109 at N = 256 and 1.0060 at N = 1024 - flat in N"
+        - "Per-pair chance level stays 0.5 at every batch size; measured accuracy at initialisation 0.4953 and 0.4994"
+        - "Pairwise bias correction removes the need for a global normaliser, so batches can be sharded across devices"
+        - "No temperature in the softmax sense, but a learned bias and scale still set the decision boundary"
+
+    - type: plot
+      title: "The loss is U-shaped in temperature: 5.49 at 1/tau = 0.1, 0.98 near 25, 24.4 at 1000"
+      chart: line
+      xLabel: "log10(1/temperature) = log10(logit_scale)"
+      yLabel: "symmetric InfoNCE loss (nats), batch 256"
+      series:
+        - name: "measured loss"
+          points:
+            - { x: -1.0, y: 5.4906 }
+            - { x: 0.0, y: 5.0144 }
+            - { x: 0.5229, y: 3.9047 }
+            - { x: 1.0, y: 1.8119 }
+            - { x: 1.1549, y: 1.2584 }
+            - { x: 1.301, y: 1.0132 }
+            - { x: 1.5229, y: 1.0622 }
+            - { x: 2.0, y: 2.5138 }
+            - { x: 2.5229, y: 8.1608 }
+            - { x: 3.0, y: 24.4233 }
+
+    - type: plot
+      title: "Same embeddings, bigger candidate pool: 0.97 at N = 8, 0.40 at N = 4096"
+      chart: line
+      xLabel: "log2(batch size), candidate pool"
+      yLabel: "top-1 retrieval accuracy"
+      series:
+        - name: "retrieval accuracy, fixed per-pair signal-to-noise"
+          points:
+            - { x: 3, y: 0.9725 }
+            - { x: 4, y: 0.9513 }
+            - { x: 6, y: 0.8847 }
+            - { x: 8, y: 0.7515 }
+            - { x: 10, y: 0.5727 }
+            - { x: 12, y: 0.4012 }
+        - name: "chance, 1/N"
+          points:
+            - { x: 3, y: 0.125 }
+            - { x: 4, y: 0.0625 }
+            - { x: 6, y: 0.0156 }
+            - { x: 8, y: 0.0039 }
+            - { x: 10, y: 0.00098 }
+            - { x: 12, y: 0.00024 }
+
+    - type: pipeline
+      title: "Zero-shot classification, in the order the shapes flow"
+      nodes:
+        - label: "image -> encoder -> 512-d"
+          note: "L2 normalise"
+          detail: "One forward pass of the image tower. The output is a unit vector, and every class is scored by its cosine with this vector."
+        - label: "class name -> 80 templates -> encoder"
+          note: "80 forwards per class"
+          detail: "The templates are things like 'a photo of a {}', 'a blurry photo of a {}', 'a photo of the small {}'. Each is a full sentence around the class name, so the text encoder sees grammar, not a word."
+        - label: "normalise, average, renormalise"
+          note: "one vector per class"
+          detail: "Each of the 80 embeddings is a unit vector; their mean has norm below 1; dividing by that norm puts the prototype back on the sphere. Skipping either normalisation is the standard bug."
+        - label: "cosine against every class, times logit_scale"
+          note: "1000 x 1 logits"
+          detail: "A single matrix-vector product. logit_scale only sets the sharpness of the softmax that follows; it cannot change which class wins."
+        - label: "softmax over classes, argmax"
+          note: "prediction"
+          detail: "The softmax is over classes, not over the batch - the opposite of training. That is the whole difference between the loss and the classifier."
+
+  markdown: |
+    ## The supervision is the pairing
+
+    CLIP is two encoders and one constraint. An image goes through a ViT, a caption
+    through a text transformer, both land in the same 512-dimensional space, and
+    the only thing anyone ever tells the model is that *these two belong together*.
+    No class labels, no bounding boxes — 400 million pairs, each one a positive,
+    every other example in the batch a negative.
+
+    Write the batch as $N$ pairs $(u_i, v_i)$ of unit vectors and let
+
+    $$s_{ij} = \frac{1}{\tau}\langle u_i, v_j\rangle$$
+
+    be the scaled cosine similarity. Everything here follows from two facts about
+    that matrix: it is $N \times N$, and it is not symmetric.
+
+    ## InfoNCE is an N-way cross-entropy
+
+    For image $i$ the batch defines a classifier over $N$ candidates:
+
+    $$p(j \mid i) = \frac{\exp(s_{ij})}{\sum_{k=1}^{N}\exp(s_{ik})},
+      \qquad
+      L_{i\to t} = -\frac{1}{N}\sum_{i=1}^{N}\log p(i \mid i).$$
+
+    This is the cross-entropy from *Information Theory*: a one-hot target, a model
+    of entropy $H(p_i)$. **The floor is $\log N$** — if every similarity were equal
+    the softmax would be uniform and $L = \log N$ exactly. Measured at random
+    initialisation the loss lands about 0.20 nats above that floor, because random
+    similarities are not quite uniform:
+
+    | $N$ | 2 | 8 | 256 | 1024 | 32768 |
+    |---|---|---|---|---|---|
+    | $\log N$ | 0.6931 | 2.0794 | 5.5452 | 6.9315 | 10.3972 |
+    | measured at init | 0.7688 | 2.2244 | 5.7435 | 7.1314 | — |
+    | chance accuracy $1/N$ | 0.5 | 0.125 | 0.00391 | 0.00098 | 0.000031 |
+
+    The $N = 2$ column is the 0.5-level baseline: a coin flip and a floor of
+    $\ln 2 = 0.6931$. Every doubling of the batch raises the floor by another
+    $\ln 2$, which is why the loss has no absolute scale: 5.5 at batch 256 is a
+    finished model, and the same number at 32,768 is a model that has learned
+    nothing.
+
+    ## It is a lower bound on mutual information
+
+    The objective is not "make positives similar". It is an estimate of how many
+    bits one modality tells you about the other. Let $f(x,y)$ be any positive
+    critic and take $x_0 \sim p(x \mid y)$ against $N-1$ negatives drawn from
+    $p(x)$. Then
+
+    $$L = \mathbb{E}\left[-\log
+      \frac{f(x_0, y)}{\sum_{j=0}^{N-1} f(x_j, y)}\right].$$
+
+    Jensen's inequality on the concave logarithm gives
+
+    $$\mathbb{E}\left[\log \frac{1}{N}\sum_{j} f(x_j,y)\right]
+      \;\ge\; \frac{1}{N}\sum_j \mathbb{E}\left[\log f(x_j,y)\right],$$
+
+    and substituting back, with $\mathbb{E}_{\text{pos}}$ over matched pairs and
+    $\mathbb{E}_{\text{neg}}$ over shuffled ones,
+
+    $$L \;\ge\; \log N - \frac{N-1}{N}
+      \left(\mathbb{E}_{\text{pos}}[\log f]
+      - \mathbb{E}_{\text{neg}}[\log f]\right).$$
+
+    For the optimal critic $f = p(x\mid y)/p(x)$ the bracket is exactly the KL
+    divergence between the joint and the product of marginals — the mutual
+    information, the same quantity you computed in *Information Theory*. Hence
+
+    $$I(X;Y) \;\ge\; \log N - L_{\text{InfoNCE}}.$$
+
+    Measured on a Gaussian copula with $\rho = 0.9$, whose true mutual information
+    is $0.8304$ nats, using the exact density ratio as the critic:
+
+    | $N$ | 2 | 8 | 32 | 128 | 512 | 2048 |
+    |---|---|---|---|---|---|---|
+    | $\log N - L$ | 0.3385 | 0.6780 | 0.7886 | 0.8178 | 0.8272 | 0.8296 |
+    | gap to truth | 0.492 | 0.152 | 0.042 | 0.013 | 0.0031 | 0.0007 |
+
+    The bound is *loose at small batches* — at $N = 2$ it reports 41% of the
+    truth, and no critic can fix that, because the slack is Jensen's. It also
+    bounds a quantity invariant to any invertible reparametrisation, so high MI
+    does not imply a geometry that is useful for retrieval.
+
+    ## The batch is the negative pool
+
+    Because the negatives *are* the batch, $N$ enters twice: in the floor
+    $\log N$, and in the number of decoys the model must reject. The first is
+    exactly additive. Measured $L - \ln N$ was $-1.995$ at $N = 8$, $-4.362$ at
+    $N = 256$ and $-4.911$ at $N = 4096$: the log-batch term is a constant once the
+    pool is large, and the constant is a property of the geometry, not the batch.
+
+    The second is not additive at all. Holding the per-pair signal-to-noise fixed
+    and changing only the pool:
+
+    | $N$ | 8 | 16 | 64 | 256 | 1024 | 4096 |
+    |---|---|---|---|---|---|---|
+    | top-1 accuracy | 0.9725 | 0.9513 | 0.8847 | 0.7515 | 0.5727 | 0.4012 |
+
+    Same embeddings, same similarities, half the accuracy: the task got harder, and
+    0.40 over 4,096 candidates is not comparable to 0.97 over 8.
+
+    Two corrections keep this honest. The *effective* number of negatives is not
+    $N-1$: temperature sets how peaked the row is, and $\exp(H(p_i))$ collapses
+    from 256 at $\tau = 10$ to 14.6 at $\tau = 0.07$. And some negatives are not
+    negative — with $C$ classes an anchor expects $(N-1)/C$ same-class others in
+    its row, which at 32,768 over 1,000 classes is 32.7 pairs the loss pushes
+    apart with no way to know better.
+
+    ## Temperature, and why CLIP learns it
+
+    $\tau$ is the only scalar in the objective that is not a weight. It sets the
+    sharpness of every row at once, and the loss is U-shaped in it: 5.4906 at
+    $\tau = 10$, 1.2584 at the initial 0.07, a minimum of 0.9814 near
+    $\tau = 0.042$, then 2.5138 at 0.01 and 24.4233 at 0.001. Too flat and the
+    positive is diluted among 255 decoys; too sharp and a single hard negative
+    dominates.
+
+    CLIP sidesteps the choice by learning it. `logit_scale` is initialised at
+    $\log(1/0.07) = 2.659$ and clamped to $[0, \log 100]$, so the learned
+    temperature can only move inside $[0.01, 1]$. The clamp is not cosmetic: at its
+    lower end the measured loss is already 2.5 nats with 1.2 effective negatives,
+    so an unclamped scale would run to a one-hot softmax and stop learning.
+
+    What $\tau$ cannot do is change a prediction. Argmax is invariant to a positive
+    rescaling, so accuracy measured 0.7285 at every temperature from 10 to 0.001
+    while the loss moved by 19 nats. At inference $\tau$ is a calibration
+    parameter: across a 100× range of `logit_scale` it moves the mean maximum class
+    probability from 0.0055 to 0.9810 and moves accuracy not at all.
+
+    ## Both directions, and the transpose that eats the second one
+
+    $S$ is not symmetric: row $i$ is normalised over captions, column $j$ over
+    images. The per-sample losses therefore disagree — correlation 0.9954 at
+    $\tau = 10$, 0.9475 at 0.07 — and at $\tau = 0.07$, 69.5% of pairs differ by
+    more than 10%. Averaging is what CLIP does:
+
+    $$L = \frac{1}{2}\left(L_{i\to t} + L_{t\to i}\right).$$
+
+    The implementation trap is that `softmax(S).T` and `softmax(S.T)` are different
+    matrices. Transpose after the log-softmax and the diagonal is untouched, so the
+    second term equals the first: on a 3×3 case with a correct answer of 0.8816
+    that version returns 0.9154. The loss curve is smooth, the model trains, and
+    you are optimising half the objective you think you are.
+
+    ## Zero-shot classification and prompt ensembling
+
+    Training asks "which caption among these $N$"; inference asks "which class
+    among these $C$". Each class becomes one vector — the mean of its prompt
+    embeddings, put back on the unit sphere:
+
+    $$\bar{v}_c = \frac{\bar{m}_c}{\|\bar{m}_c\|}, \qquad
+      \bar{m}_c = \frac{1}{K}\sum_{k=1}^{K}\frac{v_{c,k}}{\|v_{c,k}\|},
+      \qquad
+      \hat{c}(u) = \arg\max_c \; \alpha\,\langle u, \bar{v}_c\rangle,$$
+
+    with $\alpha$ the learned `logit_scale`. Since $\alpha > 0$ it cannot change
+    the argmax; it only sets how confident the softmax looks.
+
+    The gain from $K$ prompts is variance reduction on $\bar{v}_c$: measured mean
+    angular error fell from 52.25 to 8.20 degrees between $K = 1$ and $K = 80$,
+    and top-1 accuracy over 1,000 classes rose from 0.1150 to 0.5830 on identical
+    image embeddings. That is 6.37×, not the $\sqrt{80} = 8.94$ independent
+    averaging predicts, because 52 degrees is outside the linear regime.
+
+    ## What to take away
+
+    Four numbers decide whether a contrastive run is healthy. The floor, $\log N$:
+    a loss below it is a bug, and a loss 0.2 above it is chance. The effective
+    negatives, $\exp(H(p))$: at $\tau = 0.07$ you are using about 6% of the batch.
+    The collision rate, $(N-1)/C$: at 32k over 1,000 classes, 32 pairs per row are
+    labelled wrong. And the angular error of the text prototype, the only thing
+    prompt ensembling improves.
+
+    ## The longer version
+
+    Two encoders trained on nothing but which image goes with which caption
+    learn a shared space in which the batch itself is the label — and because
+    the batch supplies the negatives, its size and the softmax temperature are
+    part of the objective rather than knobs on top of it.
+
+    A cloakroom with two clerks who share no language. One takes your coat and
+    writes a tag in her own script; the other keeps your ticket and writes the
+    claim in a different script. Nobody ever tells either clerk what a coat is.
+    The only supervision is that these two slips refer to the same coat — and
+    the room does the rest: with N coats on the racks and N claims in hand, the
+    correct match for a claim is one of N, and every other coat is a decoy
+    saying "not this one".
+
+    The analogy breaks exactly where the interesting failure lives. In a real
+    cloakroom every coat is unique, so every decoy is genuinely wrong. In a
+    training batch, two photographs of the same dog are two different coats
+    with the same tag: the loss nominates one as the positive and treats the
+    other as a decoy, pushing apart two things that should be together. At a
+    batch of 32,768 drawn over 1,000 classes, every row contains 32 such
+    impostors — 32 pairs the loss is actively pulling apart.
+
+    ### What goes wrong
+
+    - You have four hundred million image-caption pairs and no labels at all.
+      Cross-entropy wants class indices, MSE wants a target vector, and a
+      margin loss wants a distance that is already meaningful. The only
+      supervision available is "these two things belong together", and you
+      need an objective that turns that single bit per pair into a usable
+      representation.
+    - Your loss sits at 5.5 and stops moving. Half the team says it has
+      converged, the other half says it is broken, and nobody can say what
+      number a *perfect* model would report at this batch size. It is 5.5452,
+      and knowing that ends the argument in one line.
+    - You raise the batch from 256 to 2,048 because the GPU was under-used.
+      The loss jumps by two nats, the learning-rate sweep no longer transfers,
+      and the retrieval numbers improve — or maybe the task got easier. You
+      have changed the objective and the metric at the same time, and you
+      cannot tell which effect you are looking at.
+    - Zero-shot accuracy moves three points when you change "a photo of a {}."
+      to "a photo of the {}." and another two when you average eighty
+      templates instead of one. You cannot tell whether that is ensembling,
+      noise, or a bug in how you combined the text embeddings.
+    - The similarity matrix is square, so you implement the loss in one
+      direction and call it symmetric. It runs, it converges, and it is not
+      the loss CLIP minimises — the two directions disagree about which pairs
+      are hard on 70% of a batch.
+
+    ### The full treatment
+
+    **The loss is an N-way cross-entropy, so its floor is $\log N$ and its
+    chance accuracy is $1/N$.** Flatten the batch into a classification
+    problem — which of these $N$ captions belongs to this image — and InfoNCE
+    is precisely the cross-entropy of that classifier. At $N = 256$ the floor
+    is $\ln 256 = 5.5452$ nats; at $N = 32{,}768$ it is $10.3972$. Measured
+    at random initialisation over 200 trials of 512-dimensional unit vectors
+    with $\tau = 0.07$: loss $5.7435$ at $N = 256$ and $7.1314$ at
+    $N = 1024$, each about $0.20$ nats above its floor because random
+    similarities are not exactly uniform. Chance accuracy was $0.4988$ at
+    $N = 2$ — the 0.5-level coin flip, with a floor of $\ln 2 = 0.6931$ and a
+    measured initial loss of $0.7688$ — then $0.0154$ at $N = 64$ and
+    $0.00384$ at $N = 256$ against $1/256 = 0.003906$. The trap is reading
+    the loss as an absolute number: 5.7 is a *finished* model at batch 256
+    and a *broken* one at batch 32,768, where the floor alone is 10.40.
+
+    **InfoNCE is a lower bound on mutual information, and the bound is
+    $\log N - L$.** Measured on a Gaussian copula whose true mutual
+    information is $0.8304$ nats ($\rho = 0.9$), using the exact density
+    ratio as the critic: the bound reads $0.6780$ at $N = 8$, $0.7886$ at
+    $32$, $0.8178$ at $128$, $0.8272$ at $512$ and $0.8296$ at $2048$ —
+    monotone, approaching the truth from below, with the gap falling from
+    $0.152$ to $0.0007$. At $N = 2$ the same bound reports $0.3385$, which is
+    41% of the truth. The trap is twofold: the residual slack is Jensen's,
+    not the critic's — even the exact density ratio leaves 0.15 nats on the
+    table at $N = 8$ — and mutual information is invariant to any invertible
+    reparametrisation, so a tight bound does not mean the geometry is good
+    for retrieval.
+
+    **The batch *is* the negative pool, so the batch size is part of the
+    objective.** Each of the $N$ pairs contributes $N-1$ negatives, and the
+    loss is $\log N$ plus a constant fixed by the similarity geometry:
+    measured $L - \ln N$ was $-1.995$ at $N = 8$, $-4.362$ at $256$ and
+    $-4.911$ at $4096$, converging to that constant. Doubling the batch adds
+    exactly $\ln 2 = 0.6931$ nats to the floor — 2,048 to 4,096 moves it from
+    $7.6246$ to $8.3178$ with no change to a single weight. The trap is
+    treating a bigger batch as variance reduction: it is a different
+    objective, so losses, learning rates and convergence curves are not
+    comparable across it.
+
+    **At fixed embedding quality a bigger candidate pool is a harder task,
+    not a noisier estimate.** In one fixed synthetic world — 32 dimensions,
+    8,192 classes, identical per-pair cosine signal-to-noise — changing only
+    the batch size dropped top-1 retrieval accuracy from $0.9725$ to
+    $0.9513$, $0.8847$, $0.7515$, $0.5727$ and $0.4012$ at $N = 8, 16, 64,
+    256, 1024, 4096$. The embeddings never changed; the question did. The
+    trap is quoting recall@1 without the candidate count: 0.40 over 4,096
+    candidates and 0.97 over 8 are the same encoder, and every published
+    retrieval number is only comparable at the same pool size.
+
+    **Temperature decides how many of those negatives actually carry
+    gradient.** The effective negative count is $\exp(H(p_i))$, the
+    perplexity of the row's softmax, and it collapses as $\tau$ falls:
+    measured $255.96$ at $\tau = 10$, $45.95$ at $0.1$, $14.64$ at $0.07$,
+    $5.40$ at $0.05$, $1.23$ at $0.01$ and $1.02$ at $0.001$. A batch of 256
+    at CLIP's initial temperature of 0.07 therefore gives you about fifteen
+    negatives, not 255 — 5.7% of what the batch size advertises. The trap is
+    quoting "in-batch negatives = batch size − 1" as if they were all doing
+    work, and then paying for a larger batch to get negatives you never use.
+
+    **Some of the negatives are labelled wrong, and the rate is computable.**
+    Drawing 256 examples over 100 classes puts $2.55$ other samples of the
+    anchor's own class in every row — 1.0% of the 255 negatives — and caps
+    top-1 accuracy at roughly $1/(1 + 2.55) = 0.28$; measured $0.3232$
+    against a Poisson-corrected ceiling of $0.3605$. Scale up to CLIP's
+    setting and the same arithmetic gives 32.7 same-class others per anchor
+    out of 32,767 negatives: 99.90% of the row is genuinely negative, the
+    remaining 0.10% is 32 pairs the loss actively pushes apart, and the
+    ceiling is $1/33.7 = 3.0\%$. The trap is assuming in-batch negatives are
+    negatives; the fix costs a mask, and the mask costs you the negatives you
+    just paid for.
+
+    **Temperature has a measurable optimum, and CLIP learns it under a
+    clamp.** On a trained-quality batch of 256 (accuracy 0.7285) the
+    symmetric loss measured $5.4906$ at $\tau = 10$, $5.0144$ at $1$,
+    $1.8119$ at $0.1$, $1.2584$ at $0.07$, $1.0132$ at $0.05$, bottomed at
+    $0.9814$ for $\tau = 0.0418$, then rose to $2.5138$ at $0.01$, $8.1608$
+    at $0.003$ and $24.4233$ at $0.001$. CLIP does not tune this by hand: it
+    makes `logit_scale` $= \log(1/\tau)$ a learned parameter, initialises it
+    at $\log(1/0.07) = 2.659$ and clamps it to $[0, \log 100]$, so $\tau$ can
+    only travel inside $[0.01, 1]$. The trap is picking $\tau = 1$ "to be
+    safe": at 5.0144 the loss is 90% of the log-256 floor, and the gradient
+    is 14 times smaller than at 0.07, so the run looks healthy and learns
+    almost nothing.
+
+    **Temperature changes the gradient, never a single prediction.** Argmax
+    is invariant to a positive rescaling, so measured accuracy was $0.7285$
+    at every temperature from 10 down to 0.001 while the loss moved from
+    $5.4906$ to $24.4233$. In zero-shot the same invariance shows up as
+    calibration: multiplying the cosine logits by 1, 10 or 100 moved the mean
+    maximum class probability from $0.0055$ to $0.2292$ to $0.9810$ and left
+    top-1 accuracy at $0.9433$. What does change is scale: the gradient with
+    respect to the similarity matrix is $(p_{ij} - \delta_{ij})/\tau$, so a
+    10× smaller $\tau$ is a 10× larger step, and the measured mean gradient
+    norm ran $4.63 \times 10^{-3}$ at $\tau = 3$ against $2.37$ at
+    $\tau = 0.003$ — a factor of 512. The trap is tuning temperature against
+    accuracy, which cannot move, instead of against calibration; and changing
+    $\tau$ mid-training without changing the learning rate, which is a silent
+    LR change of the same factor.
+
+    **The two directions are different losses, which is why CLIP averages
+    them.** The similarity matrix is not symmetric, so row-softmax and
+    column-softmax normalise over different neighbours. Measured correlation
+    between the per-sample image-to-text and text-to-image losses: $0.9954$
+    at $\tau = 10$, $0.9475$ at $0.07$, $0.7645$ at $0.01$. At $\tau = 0.07$,
+    69.5% of pairs have the two losses differing by more than 10%; at
+    $\tau = 0.01$, 97.3% do, and the batch means differ by 8.9% ($2.6219$
+    against $2.4057$). The trap is the transpose itself: compute it *after*
+    the log-softmax has already normalised the rows and the second term
+    silently equals the first. That bug returns $0.9154$ for a case whose
+    correct answer is $0.8816$, and it looks entirely reasonable.
+
+    **Zero-shot is a nearest-prototype classifier, and prompt ensembling is
+    variance reduction on the prototype.** With one prompt per class,
+    measured mean angular error of the class-direction estimate was 52.25
+    degrees at $K = 1$, falling to 42.42, 32.78, 24.55, 17.87, 12.83, 9.16
+    and 8.20 degrees at $K = 2, 4, 8, 16, 32, 64, 80$ — a 6.37×
+    reduction for 80× the prompts, sub-linear against the $\sqrt{80} = 8.94$
+    that independent averaging predicts, because 52° is outside the linear
+    regime. Top-1 accuracy over 1,000 classes went $0.1150 \to 0.5830$ with
+    the same image embeddings. The trap is averaging unnormalised prompt
+    embeddings, or averaging unit vectors and forgetting to renormalise the
+    mean: on the ablation printed at the end of this topic, cosine features
+    scored $0.6800$ with 76 of 100 classes ever predicted, dot-product
+    features $0.3100$ with 40 of 100, because the longest vector wins every
+    argument it is allowed to enter.
+
+
+  derivations:
+    - title: "InfoNCE is the cross-entropy of an N-way identification task"
+      latex: |
+        Let $u_i, v_j \in \mathbb{R}^d$ be unit vectors and
+
+        $$s_{ij} = \frac{1}{\tau}\langle u_i, v_j \rangle .$$
+
+        For image $i$, the batch defines a categorical distribution over $N$
+        candidates,
+
+        $$p(j \mid i) = \frac{\exp(s_{ij})}{\sum_{k=1}^{N}\exp(s_{ik})},$$
+
+        and the loss is the negative log-likelihood of the one correct answer,
+
+        $$L_{i \to t} = -\frac{1}{N}\sum_{i=1}^{N}\log p(i \mid i)
+          = \frac{1}{N}\sum_{i=1}^{N}\left[-s_{ii}
+          + \log\sum_{k=1}^{N}\exp(s_{ik})\right].$$
+
+        The symmetric objective averages the two normalisers:
+
+        $$L = \frac{1}{2}\left(L_{i \to t} + L_{t \to i}\right),
+          \qquad
+          L_{t \to i} = -\frac{1}{N}\sum_{j=1}^{N}\log
+          \frac{\exp(s_{jj})}{\sum_{k=1}^{N}\exp(s_{kj})}.$$
+
+        If all similarities are equal, every $p(j \mid i) = 1/N$ and
+        $L = \log N$. At $N = 256$ that is $5.5452$ nats; a random-initialised
+        model measured $5.7435$.
+      prose: >-
+        The identity is worth stating plainly because it kills a whole class of
+        confusion: this is not a margin loss, a triplet loss or a similarity
+        objective with a threshold. It is ordinary cross-entropy over an
+        $N$-way classification problem whose classes are the other examples in
+        the batch, which is why its floor, its chance level and its behaviour
+        under class imbalance are all the ones you already know from
+        *Information Theory*.
+
+    - title: "Why log N minus the loss lower-bounds the mutual information"
+      latex: |
+        Take $N$ samples: one positive $x_0 \sim p(x \mid y)$ and $N-1$
+        negatives $x_{1..N-1} \sim p(x)$, with a positive critic $f$. The
+        InfoNCE loss is
+
+        $$L = \mathbb{E}\left[-\log
+          \frac{f(x_0,y)}{\sum_{j=0}^{N-1} f(x_j,y)}\right]
+          = -\mathbb{E}\left[\log f(x_0,y)\right]
+          + \mathbb{E}\left[\log \sum_{j=0}^{N-1} f(x_j,y)\right].$$
+
+        Since $\log$ is concave, $\log \frac{1}{N}\sum_j a_j \ge
+        \frac{1}{N}\sum_j \log a_j$, so
+
+        $$\mathbb{E}\left[\log \sum_j f(x_j,y)\right] \;\ge\;
+          \log N + \frac{1}{N}\left(\mathbb{E}_{\text{pos}}[\log f]
+          + (N-1)\,\mathbb{E}_{\text{neg}}[\log f]\right).$$
+
+        Substituting and writing $\Delta = \mathbb{E}_{\text{pos}}[\log f] -
+        \mathbb{E}_{\text{neg}}[\log f]$,
+
+        $$L \;\ge\; \log N - \frac{N-1}{N}\,\Delta .$$
+
+        When $f$ is the density ratio $p(x \mid y)/p(x)$,
+
+        $$\Delta = \mathbb{E}_{p(x,y)}\left[\log
+          \frac{p(x \mid y)}{p(x)}\right]
+          = D_{KL}\!\left(p(x,y)\,\|\,p(x)p(y)\right) = I(X;Y),$$
+
+        hence $I(X;Y) \ge \frac{N}{N-1}\left(\log N - L\right) \ge \log N - L$.
+      prose: >-
+        The bracket is the whole proof: the difference between the average log
+        critic under matched pairs and under shuffled pairs *is* the KL between
+        the joint and the product of marginals, which is the mutual information
+        and nothing else. Everything left over is Jensen's gap, and it is why
+        the bound reads 0.678 against a true 0.830 at $N = 8$ but 0.8296 at
+        $N = 2048$ — even with the exact density ratio as the critic.
+
+    - title: "Temperature sets both the gradient scale and the number of live negatives"
+      latex: |
+        With $p_{ij} = \operatorname{softmax}_j(s_{ij})$ and $s_{ij} =
+        \tau^{-1}\langle u_i, v_j\rangle$,
+
+        $$\frac{\partial L_i}{\partial s_{ij}}
+          = \frac{1}{\tau}\left(p_{ij} - \delta_{ij}\right),
+          \qquad
+          \frac{\partial L_i}{\partial \langle u_i, v_j\rangle}
+          = \frac{p_{ij} - \delta_{ij}}{\tau}.$$
+
+        The gradient is a zero-sum redistribution of probability mass: it moves
+        mass from the positive to the negatives in proportion to $p$, and the
+        whole vector is scaled by $1/\tau$. The number of negatives that
+        receive a non-negligible share is the perplexity of the row,
+
+        $$N_{\text{eff}} = \exp\left(H(p_i)\right)
+          = \exp\left(-\sum_j p_{ij}\log p_{ij}\right),$$
+
+        which satisfies $1 \le N_{\text{eff}} \le N$ with equality at the two
+        limits: $\tau \to \infty$ gives $p$ uniform and $N_{\text{eff}} = N$,
+        while $\tau \to 0$ gives $p$ one-hot and $N_{\text{eff}} = 1$.
+      prose: >-
+        Measured on a 256-batch: $N_{\text{eff}}$ runs 255.96, 45.95, 14.64,
+        5.40 and 1.02 at $\tau = 10, 0.1, 0.07, 0.05, 0.001$, and the mean
+        gradient norm moves by a factor of 512 between $\tau = 3$ and
+        $\tau = 0.003$. That is why changing temperature without changing the
+        learning rate is a silent learning-rate change, and why a batch of 256
+        at $\tau = 0.07$ is really a batch of about fifteen.
+
+  implementations:
+    - language: python
+      title: "Symmetric InfoNCE, and the transpose that silently halves it"
+      note: >-
+        `info_nce` is numerically correct and matches an independent
+        brute-force implementation to 0.0 on all six of its test inputs.
+        `info_nce_rowwise` is **numerically WRONG**: it transposes the matrix
+        *after* the log-softmax has already normalised the rows, so
+        `log_softmax(logits).T[i, i]` is the same number as
+        `log_softmax(logits)[i, i]` and the second term is a copy of the first.
+        On the 3×3 case below the correct answer is 0.8816 and it returns
+        0.9154 — 3.8% high, smooth, monotone, and completely invisible in a
+        loss curve. The fix is one character (`logits.T` before the
+        normalisation, not after), and the way to catch it is to assert that
+        the two directional losses differ on an asymmetric matrix.
+      code: |
+        import numpy as np
+
+
+        def _log_softmax_rows(z):
+            m = z.max(axis=1, keepdims=True)
+            return z - (m + np.log(np.exp(z - m).sum(axis=1, keepdims=True)))
+
+
+        def info_nce(image_emb, text_emb, temperature):
+            """Symmetric InfoNCE in nats. Rows are images, columns are texts."""
+            x = np.asarray(image_emb, dtype=np.float64)
+            y = np.asarray(text_emb, dtype=np.float64)
+            x = x / np.linalg.norm(x, axis=1, keepdims=True)
+            y = y / np.linalg.norm(y, axis=1, keepdims=True)
+            logits = (x @ y.T) / float(temperature)
+            idx = np.arange(logits.shape[0])
+            l_i2t = -_log_softmax_rows(logits)[idx, idx].mean()
+            l_t2i = -_log_softmax_rows(logits.T)[idx, idx].mean()
+            return float(0.5 * (l_i2t + l_t2i))
+
+
+        def info_nce_rowwise(image_emb, text_emb, temperature):
+            """WRONG: the transpose happens after the normalisation."""
+            x = np.asarray(image_emb, dtype=np.float64)
+            y = np.asarray(text_emb, dtype=np.float64)
+            x = x / np.linalg.norm(x, axis=1, keepdims=True)
+            y = y / np.linalg.norm(y, axis=1, keepdims=True)
+            logits = (x @ y.T) / float(temperature)
+            logp = _log_softmax_rows(logits)
+            idx = np.arange(logits.shape[0])
+            return float(0.5 * (-logp[idx, idx].mean() - logp.T[idx, idx].mean()))
+
+
+        if __name__ == "__main__":
+            img = [[1.0, 1.0, 0.0], [0.0, 1.0, 1.0], [1.0, 0.0, 1.0]]
+            txt = [[1.0, 1.0, 1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]
+            print(round(info_nce(img, txt, 0.25), 4))          # 0.8816
+            print(round(info_nce_rowwise(img, txt, 0.25), 4))  # 0.9154 WRONG
+            eye = np.eye(3).tolist()
+            print(round(info_nce(eye, eye, 0.5), 4))           # 0.2395
+            print(round(np.log(3), 4))                         # 1.0986 floor
+
+    - language: python
+      title: "Prompt ensembling and zero-shot logits, three ways"
+      note: >-
+        `prompt_ensemble` and `clip_logits` are numerically correct.
+        `prompt_ensemble_raw` is **numerically WRONG** and `clip_logits_raw`
+        is **numerically WRONG**, in the two ways this is always done wrong.
+        Averaging unnormalised prompt embeddings weights each template by its
+        norm, so a wordy template outvotes the other seventy-nine; and taking a
+        raw dot product instead of a cosine lets the longest class vector win
+        every argument — on the 100-class ablation printed below, accuracy
+        falls from 0.6800 to 0.3100 and the number of distinct classes ever
+        predicted falls from 76 to 40. Neither version raises: the shapes are
+        identical, the logits are finite, and the accuracy is simply wrong.
+        `logit_scale` multiplies both variants identically, so it cannot repair
+        either bug — it never changes an argmax.
+      code: |
+        import numpy as np
+
+
+        def prompt_ensemble(prompts):
+            """Mean of unit prompt vectors, renormalised. (K, d) -> (d,)."""
+            p = np.asarray(prompts, dtype=np.float64)
+            n = np.linalg.norm(p, axis=1, keepdims=True)
+            unit = np.divide(p, n, out=np.zeros_like(p), where=n > 0)
+            v = unit.mean(axis=0)
+            nv = np.linalg.norm(v)
+            return v / nv if nv > 0 else v
+
+
+        def prompt_ensemble_raw(prompts):
+            """WRONG: averages unnormalised embeddings, never renormalises."""
+            return np.asarray(prompts, dtype=np.float64).mean(axis=0)
+
+
+        def clip_logits(image_emb, class_emb, logit_scale=100.0):
+            """Cosine logits. (n, d) x (C, d) -> (n, C)."""
+            x = np.asarray(image_emb, dtype=np.float64)
+            c = np.asarray(class_emb, dtype=np.float64)
+            x = x / np.linalg.norm(x, axis=1, keepdims=True)
+            c = c / np.linalg.norm(c, axis=1, keepdims=True)
+            return logit_scale * (x @ c.T)
+
+
+        def clip_logits_raw(image_emb, class_emb, logit_scale=100.0):
+            """WRONG: dot product, so the norm of each class vector is a weight."""
+            return logit_scale * (np.asarray(image_emb, dtype=np.float64)
+                                  @ np.asarray(class_emb, dtype=np.float64).T)
+
+
+        def _world(seed=40, n_class=100, d=64, sigma=1.3):
+            r = np.random.default_rng(seed)
+            proto = r.normal(size=(n_class, d))
+            proto /= np.linalg.norm(proto, axis=1, keepdims=True)
+            noise = sigma * r.normal(size=(n_class, d)) / np.sqrt(d)
+            txt = proto + noise
+            img = proto + sigma * r.normal(size=(n_class, d)) / np.sqrt(d)
+            txt /= np.linalg.norm(txt, axis=1, keepdims=True)
+            img /= np.linalg.norm(img, axis=1, keepdims=True)
+            txt = txt * np.exp(r.normal(0.0, 0.5, size=(n_class, 1)))
+            img = img * np.exp(r.normal(0.0, 0.5, size=(n_class, 1)))
+            return img, txt
+
+
+        if __name__ == "__main__":
+            img, txt = _world()
+            truth = np.arange(len(img))
+            for name, fn in (("cosine", clip_logits), ("dot   ", clip_logits_raw)):
+                pred = fn(img, txt).argmax(axis=1)
+                print(name, "acc=%.4f" % (pred == truth).mean(),
+                      "distinct=%d" % len(set(pred.tolist())))
+            # cosine  acc=0.6800 distinct=76
+            # dot     acc=0.3100 distinct=40
+            print(prompt_ensemble([[1.0, 1.0], [1.0, -1.0]]))   # [1.0, 0.0]
+            print(prompt_ensemble([[1.0, 0.0], [-1.0, 0.0]]))   # [0.0, 0.0]
+
+  checkpoints:
+    - id: cp-1
+      question: "Your loss is 5.6 at batch 256 and 7.4 at batch 1,024. Did the model get worse, and what is the single number that settles it?"
+      answerKind: short_text
+      hint: "What is the loss of a model that knows nothing, at each of those batch sizes?"
+      solution: >-
+        No. The floors are $\ln 256 = 5.5452$ and $\ln 1024 = 6.9315$, so a loss
+        of 5.6 at batch 256 is 0.05 above chance and 7.4 at batch 1,024 is 0.47
+        above chance — the second model is *worse*, but only by that
+        difference, not by 1.8 nats. Subtracting $\log N$ is the whole
+        comparison. Measured at random initialisation the excess is about 0.20
+        nats at both sizes, which is what "knows nothing" looks like when the
+        similarities are not perfectly uniform.
+    - id: cp-2
+      question: "You train with batch 8 and your InfoNCE-implied lower bound on mutual information is 0.68 nats, against a true 0.83 for the data. Is your critic 18% short, or is something else going on?"
+      answerKind: short_text
+      hint: "The bound holds for any positive critic. What did Jensen's inequality cost you?"
+      solution: >-
+        Something else: the gap is Jensen's, not the critic's. Measured with
+        the *exact* density ratio as the critic, the bound still reads 0.6780
+        at $N = 8$ against a true $0.8304$ — a 0.152-nat gap that closes to
+        0.0007 by $N = 2048$. The proof's only inequality is
+        $\log \frac{1}{N}\sum_j a_j \ge \frac{1}{N}\sum_j \log a_j$, and its
+        slack shrinks as the sum concentrates. Small batches give a valid but
+        loose bound; that is one more reason batch size is a modelling choice.
+    - id: cp-3
+      question: "You halve the temperature from 0.07 to 0.035. Which measured quantity changes, which cannot, and what else must change in the training script?"
+      answerKind: short_text
+      hint: "Argmax of a positively scaled vector. Then look at the derivative with respect to the similarities."
+      solution: >-
+        The loss moves: measured 1.2584 at 0.07, 1.0132 at 0.05 and 1.0622 at
+        0.03, so 0.035 sits on the flat part of the floor, just past the minimum
+        at 0.042. The effective negatives fall from 14.6 to about 3, and the
+        gradient with respect to the similarities doubles, because
+        $\partial L/\partial s = (p - \delta)/\tau$. Accuracy cannot change:
+        argmax is invariant to a positive rescaling, and measured accuracy was
+        0.7285 at every temperature from 10 to 0.001. The script change is the
+        learning rate — halving $\tau$ doubles every step, so an unchanged LR
+        is a silent 2× increase.
+    - id: cp-4
+      question: "Zero-shot accuracy rises from 0.115 to 0.583 when you go from one prompt to eighty. Where does the gain actually come from, and why is it not the 9× that averaging predicts?"
+      answerKind: short_text
+      hint: "The image embeddings never changed. What is noisy, and how does averaging K noisy unit vectors behave when the noise is large?"
+      solution: >-
+        It comes entirely from the text side: the class-direction estimate.
+        Measured mean angular error fell 52.25° → 8.20°, a 6.37× reduction
+        against the $\sqrt{80} = 8.94$ that independent averaging gives in the
+        small-error regime. At 52° the errors are far from linear — averaging
+        vectors 52° apart shrinks the mean's norm and the angular error does not
+        fall as $1/\sqrt{K}$ — so the gain is real but sub-linear. The image
+        embeddings are byte-identical in both runs.
+    - id: cp-5
+      question: "The same encoder scores 0.97 top-1 over 8 candidates and 0.40 over 4,096. Is that a bug in the evaluation?"
+      answerKind: short_text
+      hint: "What changed between the two evaluations — the model, or the question?"
+      solution: >-
+        Neither a bug nor a fair comparison: the question changed. Measured on
+        one fixed synthetic world with only the batch size varied, top-1
+        accuracy fell 0.9725 → 0.9513 → 0.8847 → 0.7515 → 0.5727 → 0.4012 over
+        $N = 8, 16, 64, 256, 1024, 4096$. Any recall@1 number is meaningless
+        without its candidate count, and this is why CLIP's retrieval tables
+        always report the pool.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        The model never sees a label. It sees a batch of matched pairs and is
+        asked, for each image, which of the N captions in this batch is its
+        own. That is a classification problem with N classes, constructed on
+        the fly, and every other example in the batch is a class it must
+        reject. So the objective's floor, its difficulty and its gradient all
+        depend on N — and a single scalar, the temperature, decides how sharply
+        the model commits to an answer and therefore how many of those N-1
+        decoys actually influence the update.
+      blocks:
+        - kind: checklist
+          body: |
+            - The batch is the label: N pairs give N-1 negatives per row
+            - The loss is an N-way cross-entropy, so its floor is log N
+            - Its chance accuracy is 1/N; at N = 2 that is the 0.5 coin flip
+            - The matrix is N x N and not symmetric, so there are two losses
+            - Temperature sets the sharpness, hence the gradient scale and the effective negatives
+            - Zero-shot puts class names in the same space as images
+      checkpoint: >-
+        Before reading on: if the loss floor is log N, what does a training
+        curve at batch 32,768 look like when the model is learning nothing, and
+        what does it look like at batch 64?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in three quantities and the rest follows. First $\log N$, the
+        floor: subtract it before comparing any two runs. Second
+        $\exp(H(p_i))$, the effective negatives: compute the row softmax and its
+        entropy, and see how much of the batch is actually doing work. Third
+        the collision rate $(N-1)/C$: count how many negatives share the
+        anchor's class and remember they are mislabelled. For the mutual
+        information bound, do not reach for a variational estimator — write
+        down the cross-entropy, apply Jensen once, and recognise the KL term as
+        the mutual information.
+      blocks:
+        - kind: checklist
+          body: |
+            - Loss minus log N is the only comparable loss number
+            - Effective negatives = exp(entropy of the row softmax)
+            - Gradient scale = 1/tau, so a temperature change is a learning-rate change
+            - Symmetric loss = average the two normalisers, not the two matrices
+            - Zero-shot = nearest class prototype in the shared space, times logit_scale
+            - Prompt ensembling = normalise, average, renormalise
+      checkpoint: >-
+        Which of those six is a property of the data rather than of the
+        training setup, and which one can you change without retraining?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Four procedures cover the topic: the loss, the effective-negative
+        count, the prompt ensemble, and the zero-shot classifier. In the loss,
+        the only line that can be wrong without raising is the order of the
+        transpose and the log-softmax.
+      blocks:
+        - kind: pseudocode
+          body: |
+            def info_nce(U, V, tau):
+                U = U / norm(U, axis=1)          # unit sphere
+                V = V / norm(V, axis=1)
+                S = (U @ V.T) / tau              # N x N, not symmetric
+                i2t = -mean(diag(log_softmax_rows(S)))
+                t2i = -mean(diag(log_softmax_rows(S.T)))   # transpose FIRST
+                return (i2t + t2i) / 2
+
+            def effective_negatives(S, tau):
+                P = softmax(S / tau, axis=1)
+                return mean(exp(-sum(P * log(P), axis=1)))
+
+            def prompt_ensemble(prompts):        # (K, d)
+                unit = prompts / norm(prompts, axis=1, keepdims=True)
+                m = mean(unit, axis=0)
+                return m / norm(m)               # renormalise the mean
+
+            def zero_shot(u, class_vecs, logit_scale):
+                u = u / norm(u)
+                return argmax(logit_scale * (class_vecs @ u))
+      checkpoint: >-
+        In `info_nce`, which single character moves the transpose, and what
+        number would you print to prove you had moved it?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The bound, the floor and the gradient are three applications of
+        definitions you already have: cross-entropy, KL divergence, and the
+        chain rule through a softmax.
+      blocks:
+        - kind: math
+          body: |
+            Loss and floor:
+
+            $$L = -\frac{1}{N}\sum_i \log
+              \frac{\exp(s_{ii})}{\sum_j \exp(s_{ij})}, \qquad
+              s_{ij} = \frac{\langle u_i, v_j\rangle}{\tau},$$
+
+            so equal similarities give $p = 1/N$ and $L = \log N$.
+
+            Lower bound, with $f$ any positive critic:
+
+            $$L = -\mathbb{E}[\log f(x_0,y)] +
+              \mathbb{E}\left[\log \sum_{j=0}^{N-1} f(x_j,y)\right],$$
+
+            $$\mathbb{E}\left[\log \sum_j f(x_j,y)\right] \ge \log N +
+              \frac{1}{N}\left(\mathbb{E}_{\text{pos}}[\log f] +
+              (N-1)\mathbb{E}_{\text{neg}}[\log f]\right),$$
+
+            $$L \ge \log N - \frac{N-1}{N}
+              \left(\mathbb{E}_{\text{pos}}[\log f] -
+              \mathbb{E}_{\text{neg}}[\log f]\right)
+              = \log N - \frac{N-1}{N} I(X;Y),$$
+
+            because that bracket is
+            $D_{KL}(p(x,y)\,\|\,p(x)p(y))$.
+
+            Gradient and effective negatives:
+
+            $$\frac{\partial L_i}{\partial s_{ij}} =
+              \frac{p_{ij} - \delta_{ij}}{\tau}, \qquad
+              N_{\text{eff}} = \exp\left(-\sum_j p_{ij}\log p_{ij}\right).$$
+      checkpoint: >-
+        Where exactly does the assumption "the negatives are drawn from the
+        marginal" enter the proof, and what happens to the bound if half of
+        them are secretly positives?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A correct symmetric loss, a correct prompt ensemble, a correct
+        zero-shot path, and the measured numbers each one should reproduce.
+        Compare numbers, not code.
+      blocks:
+        - kind: warning
+          body: >-
+            Three failures that never raise. Transposing after the log-softmax
+            makes the second directional loss a copy of the first — 0.9154
+            instead of 0.8816 on a 3×3 case. Averaging unnormalised prompt
+            embeddings lets the wordiest template dominate, and forgetting to
+            renormalise the mean shrinks the class vector so it stops competing
+            with the others. Taking a dot product instead of a cosine lets the
+            longest class vector win everywhere: measured 0.3100 accuracy with
+            40 of 100 classes ever predicted, against 0.6800 with 76.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def _lsm(z):
+                m = z.max(axis=1, keepdims=True)
+                return z - (m + np.log(np.exp(z - m).sum(axis=1, keepdims=True)))
+
+
+            def info_nce(U, V, tau):
+                U = np.asarray(U, float); V = np.asarray(V, float)
+                U = U / np.linalg.norm(U, axis=1, keepdims=True)
+                V = V / np.linalg.norm(V, axis=1, keepdims=True)
+                S = (U @ V.T) / tau
+                i = np.arange(len(S))
+                return float(0.5 * (-_lsm(S)[i, i].mean() - _lsm(S.T)[i, i].mean()))
+
+
+            def effective_negatives(S, tau):
+                Z = np.asarray(S, float) / tau
+                P = np.exp(Z - Z.max(axis=1, keepdims=True))
+                P = P / P.sum(axis=1, keepdims=True)
+                return np.exp(-(P * np.log(P + 1e-300)).sum(axis=1))
+
+
+            def prompt_ensemble(prompts):
+                p = np.asarray(prompts, float)
+                n = np.linalg.norm(p, axis=1, keepdims=True)
+                v = np.divide(p, n, out=np.zeros_like(p), where=n > 0).mean(axis=0)
+                nv = np.linalg.norm(v)
+                return v / nv if nv > 0 else v
+
+
+            def clip_logits(x, c, logit_scale=100.0):
+                x = np.asarray(x, float); c = np.asarray(c, float)
+                x = x / np.linalg.norm(x, axis=1, keepdims=True)
+                c = c / np.linalg.norm(c, axis=1, keepdims=True)
+                return logit_scale * (x @ c.T)
+
+
+            if __name__ == "__main__":
+                print(round(info_nce(np.eye(2), np.eye(2), 1.0), 4))      # 0.3133
+                print(round(info_nce([[1., 0.], [0., 1.]],
+                                     [[0., 1.], [1., 0.]], 1.0), 4))    # 1.3133
+                print(round(np.log(256), 4))                             # 5.5452
+      checkpoint: >-
+        You have a correct implementation and a batch of 32,768. Name the four
+        numbers you would print before believing any training curve, and say
+        which one you cannot compute without class labels.
+
+  problems:
+    - id: p-infonce-symmetric
+      title: "Symmetric InfoNCE, in nats"
+      difficulty: medium
+      prompt: >-
+        Implement `info_nce(image_emb, text_emb, temperature)`. `image_emb` and
+        `text_emb` are lists of `N` vectors of equal length, row `i` of each
+        describing the same pair. L2-normalise each row, form the `N x N`
+        matrix of cosine similarities divided by `temperature`, and return the
+        symmetric loss as a float in nats: half the mean negative log-probability
+        of the correct match when the softmax runs along the rows, plus half the
+        same quantity when it runs along the columns. Use a numerically stable
+        log-softmax (subtract the row maximum before exponentiating). For
+        `N = 1` the answer is 0.0.
+      starter: |
+        import numpy as np
+
+        def info_nce(image_emb, text_emb, temperature):
+            # your implementation here
+            pass
+      language: python
+      entry: info_nce
+      testCases:
+        - input: '[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], 1.0]'
+          expected: "0.3132616875182228"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], 0.5]'
+          expected: "0.2395447662218846"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0]], [[3.0, 4.0]], 0.07]'
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 0.0], [0.0, 1.0]], [[0.0, 1.0], [1.0, 0.0]], 1.0]'
+          expected: "1.3132616875182228"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[3.0, 0.0], [0.0, 2.0]], [[1.0, 0.0], [0.0, 5.0]], 0.5]'
+          expected: "0.1269280110429727"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 1.0, 0.0], [0.0, 1.0, 1.0], [1.0, 0.0, 1.0]], [[1.0, 1.0, 1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]], 0.25]'
+          expected: "0.8815715185125763"
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+
+        def _log_softmax_rows(z):
+            m = z.max(axis=1, keepdims=True)
+            return z - (m + np.log(np.exp(z - m).sum(axis=1, keepdims=True)))
+
+
+        def info_nce(image_emb, text_emb, temperature):
+            x = np.asarray(image_emb, dtype=float)
+            y = np.asarray(text_emb, dtype=float)
+            if x.ndim != 2 or y.ndim != 2:
+                raise ValueError("both embeddings must be (N, d)")
+            if x.shape != y.shape:
+                raise ValueError("image_emb %r and text_emb %r differ in shape"
+                                 % (x.shape, y.shape))
+            if temperature <= 0:
+                raise ValueError("temperature must be positive")
+
+            x = x / np.linalg.norm(x, axis=1, keepdims=True)
+            y = y / np.linalg.norm(y, axis=1, keepdims=True)
+            logits = (x @ y.T) / float(temperature)
+            idx = np.arange(logits.shape[0])
+            l_i2t = -_log_softmax_rows(logits)[idx, idx].mean()
+            l_t2i = -_log_softmax_rows(logits.T)[idx, idx].mean()
+            return float(0.5 * (l_i2t + l_t2i))
+      solutionExplanation: >-
+        The only line that decides correctness is `_log_softmax_rows(logits.T)`
+        rather than `_log_softmax_rows(logits).T`. Log-softmax normalises along
+        the last axis, so transposing before the call normalises over images
+        (the text-to-image classification) while transposing after it gives a
+        matrix whose diagonal is identical to the first one — the second term
+        then equals the first and the reported "symmetric" loss is just the
+        row loss. Test 4 makes that visible: with the diagonal permuted the
+        correct answer is 1.3133, and the transposed-after version returns
+        0.3133 because the diagonal never moves. Test 5 checks that the rows
+        are normalised before the similarity, since the raw dot products would
+        give 4.0 and 50.0 rather than 1.0 and 1.0; test 3 checks the `N = 1`
+        edge case, where the single candidate has probability 1 and the loss is
+        exactly 0; test 2 checks the three-way floor, where the correct class
+        probability is `e^2 / (e^2 + 2) = 0.78699`.
+      complexity: "O(N² d) time for the similarity matrix, O(N²) space; the two log-softmaxes are each one pass over it"
+      tags: [contrastive-learning, infonce, cross-entropy, numerical-stability]
+
+    - id: p-prompt-ensemble
+      title: "Prompt ensembling: normalise, average, renormalise"
+      difficulty: easy
+      prompt: >-
+        Implement `prompt_ensemble(prompts)`. `prompts` is a list of `K` vectors
+        of equal length `d` — the text embeddings of `K` prompt templates for
+        one class. Return the single class vector: L2-normalise each prompt,
+        take the arithmetic mean of the unit vectors, and L2-normalise that
+        mean. Return it as a list of `d` floats. If a prompt has zero norm,
+        treat it as the zero vector rather than dividing by zero; if the mean
+        itself has zero norm (prompts that cancel exactly), return the zero
+        vector.
+      starter: |
+        import numpy as np
+
+        def prompt_ensemble(prompts):
+            # your implementation here
+            pass
+      language: python
+      entry: prompt_ensemble
+      testCases:
+        - input: '[[[1.0, 0.0], [0.0, 1.0]]]'
+          expected: "[0.7071067811865475, 0.7071067811865475]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[2.0, 0.0], [0.0, 3.0]]]'
+          expected: "[0.7071067811865475, 0.7071067811865475]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 1.0], [1.0, -1.0]]]'
+          expected: "[1.0, 0.0]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 2.0]]]'
+          expected: "[0.3333333333333333, 0.6666666666666666, 0.6666666666666666]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 0.0], [-1.0, 0.0]]]'
+          expected: "[0.0, 0.0]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[0.0, 3.0], [4.0, 0.0], [3.0, 4.0]]]'
+          expected: "[0.6643638388299198, 0.7474093186836597]"
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+
+        def prompt_ensemble(prompts):
+            p = np.asarray(prompts, dtype=float)
+            if p.ndim == 1:
+                p = p[None, :]
+            if p.ndim != 2:
+                raise ValueError("prompts must be (K, d)")
+
+            norms = np.linalg.norm(p, axis=1, keepdims=True)
+            unit = np.divide(p, norms, out=np.zeros_like(p), where=norms > 0)
+            v = unit.mean(axis=0)
+            nv = np.linalg.norm(v)
+            if nv == 0:
+                return v.tolist()
+            return (v / nv).tolist()
+      solutionExplanation: >-
+        Three normalisations, two of which are easy to drop. Normalising each
+        prompt stops a template's magnitude — which is a by-product of its
+        length and token frequencies, not of its meaning — from weighting the
+        average; test 2 is exactly that, since `[2, 0]` and `[0, 3]` must give
+        the same answer as `[1, 0]` and `[0, 1]`. Renormalising the mean puts
+        the result back on the unit sphere, where the cosine similarity with an
+        image is a cosine: the mean of two orthogonal unit vectors has norm
+        0.7071, and without the final division every class vector would shrink
+        by roughly `1/sqrt(K)`, which changes the logit scale but — worth
+        noticing — not the argmax. Test 3 checks the rotation case, where the
+        two prompts are orthogonal and their mean must land exactly on `[1, 0]`
+        after renormalisation; test 6 checks a three-prompt mean of
+        `[0, 1]`, `[1, 0]` and `[0.6, 0.8]`, whose average `[0.5333, 0.6]` has
+        norm 0.8028; test 5 is the degenerate case that a `1/norm` implemented
+        without a guard turns into `nan`.
+      complexity: "O(K d) time, O(d) space beyond the input"
+      tags: [clip, zero-shot, prompt-ensembling, normalisation]
+
+    - id: p-zero-shot-accuracy
+      title: "Zero-shot accuracy: cosine, not dot product"
+      difficulty: medium
+      prompt: >-
+        Implement `zero_shot_accuracy(image_emb, class_emb, labels,
+        logit_scale)`. `image_emb` is a list of `n` image vectors,
+        `class_emb` a list of `C` class vectors, `labels` a list of `n`
+        integers giving each image's true class. L2-normalise both sides, form
+        the `n x C` matrix of cosine similarities multiplied by `logit_scale`,
+        take the argmax over classes for each image, and return the fraction
+        that matches `labels`, as a float.
+      starter: |
+        import numpy as np
+
+        def zero_shot_accuracy(image_emb, class_emb, labels, logit_scale):
+            # your implementation here
+            pass
+      language: python
+      entry: zero_shot_accuracy
+      testCases:
+        - input: '[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], [0, 1], 100.0]'
+          expected: "1.0"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], [1, 0], 100.0]'
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 0.9]], [[1.0, 0.0], [0.0, 5.0]], [0], 100.0]'
+          expected: "1.0"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], [[1.0, 0.0], [0.0, 1.0], [1.0, -1.0]], [0, 1, 2], 50.0]'
+          expected: "0.6666666666666666"
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+
+        def zero_shot_accuracy(image_emb, class_emb, labels, logit_scale):
+            x = np.asarray(image_emb, dtype=float)
+            c = np.asarray(class_emb, dtype=float)
+            y = np.asarray(labels)
+            if x.ndim != 2 or c.ndim != 2:
+                raise ValueError("embeddings must be 2-D")
+            if x.shape[1] != c.shape[1]:
+                raise ValueError("dimension mismatch: %d against %d"
+                                 % (x.shape[1], c.shape[1]))
+            if y.shape != (x.shape[0],):
+                raise ValueError("labels must have one entry per image")
+
+            x = x / np.linalg.norm(x, axis=1, keepdims=True)
+            c = c / np.linalg.norm(c, axis=1, keepdims=True)
+            logits = float(logit_scale) * (x @ c.T)
+            pred = logits.argmax(axis=1)
+            return float(np.mean(pred == y))
+      solutionExplanation: >-
+        The class-side normalisation is the one that changes answers. Test 3 is
+        built to catch it: the image `[1, 0.9]` has cosine 0.743 with class 0
+        and 0.669 with class 1, so the correct prediction is class 0, but the
+        raw dot products are 1.0 against `[1, 0]` and 4.5 against `[0, 5]`, so
+        an unnormalised implementation answers class 1 and scores 0.0 instead
+        of 1.0. Image-side normalisation cannot change an argmax over classes —
+        it scales the whole row — which is exactly why it is easy to omit and
+        hard to notice until the class vectors have unequal norms. Test 4 is
+        the ordinary mixed case: two of three correct, 0.6667. Note that
+        `logit_scale` never changes the answer either, so a bug there is
+        invisible in accuracy and only shows up in the probabilities.
+      complexity: "O(n C d) time, O(n C) space for the logits"
+      tags: [clip, zero-shot, cosine-similarity, normalisation]
+
+  try_it: >-
+    Compute ln 256 by hand, then build a 256×512 matrix of random unit vectors and run the
+    symmetric InfoNCE loss on it at τ = 0.07. Report the loss and its gap to the floor: a
+    random-init model should land near 5.74, about 0.20 nats above the 5.5452 a perfect model
+    reports at that batch size.
+  interview_questions:
+    - question: "Your InfoNCE loss has sat at 5.5 for a week at batch 256. Is the model converged or broken?"
+      level: mid
+      key_points:
+        - "The floor is log N, which is ln 256 = 5.5452, so a loss of 5.5 is at or below what a perfect model can reach at that batch size — it cannot be convergence."
+        - "A random-initialisation model measures about 5.7435 at N = 256 and τ = 0.07, roughly 0.20 nats above the floor, because random similarities are not exactly uniform."
+        - "The loss is not comparable across batch sizes: doubling N adds exactly ln 2 = 0.6931 nats to the floor with no weight changing."
+        - "The check is to compare against log N and to look at retrieval accuracy, never the absolute loss alone."
+      follow_up: "What would a loss of 5.5 mean at batch 32,768, where the floor is 10.3972?"
+    - question: "Why can't you compare two runs at batch 256 and batch 2,048 even when the architecture and data are identical?"
+      level: senior
+      key_points:
+        - "The batch is the negative pool: each pair contributes N−1 negatives, so batch size is part of the objective rather than a variance-reduction knob."
+        - "Measured L − ln N was −1.995 at N = 8, −4.362 at 256 and −4.911 at 4096, converging to a constant fixed by the similarity geometry."
+        - "At fixed embedding quality a bigger pool is a harder task: top-1 retrieval fell 0.9725, 0.9513, 0.8847, 0.7515, 0.5727, 0.4012 across N = 8 to 4096 with the embeddings unchanged."
+        - "So losses, learning-rate sweeps and convergence curves do not transfer across batch sizes; only metrics reported with their pool size do."
+      follow_up: "You keep N = 2,048 for throughput. What do you report alongside accuracy so the numbers stay comparable?"
+    - question: "What does the temperature actually control in InfoNCE, and why is τ = 1 a bad default?"
+      level: mid
+      key_points:
+        - "τ sets the sharpness of the row softmax; the effective number of negatives carrying gradient is exp(H(p_i)), measured 14.64 at τ = 0.07 against 45.95 at 0.1 and 255.96 at 10 for batch 256."
+        - "The symmetric loss has a measured optimum of 0.9814 at τ = 0.0418; at τ = 1 it is 5.0144, about 90% of the log-256 floor, with a gradient 14× smaller."
+        - "Temperature never changes a prediction — accuracy was 0.7285 at every τ from 10 to 0.001 — because argmax is invariant to a positive rescaling."
+        - "CLIP makes log(1/τ) a learned parameter initialised at log(1/0.07) = 2.659 and clamps it to [0, log 100], so τ stays in [0.01, 1]."
+      follow_up: "You halve τ mid-run. What else must change, and by what factor?"
+  common_mistakes:
+    - "Reading the absolute loss without log N: 5.5 is a finished model at batch 256 and a badly broken one at batch 32,768, where the floor alone is 10.40."
+    - "Quoting recall@1 without the candidate pool — 0.97 over 8 candidates and 0.40 over 4,096 are the same encoder on the same embeddings."
+    - "Assuming every in-batch negative is a true negative: 256 samples over 100 classes puts 2.55 same-class items in every row and caps top-1 near 0.28."
+  further_reading:
+    - label: "Radford et al., Learning Transferable Visual Models From Natural Language Supervision (CLIP), ICML 2021"
+    - label: "van den Oord, Li, Vinyals, Representation Learning with Contrastive Predictive Coding"

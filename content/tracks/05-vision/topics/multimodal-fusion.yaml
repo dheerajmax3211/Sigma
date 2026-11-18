@@ -1,0 +1,1441 @@
+id: multimodal-fusion
+slug: multimodal-fusion
+title: "Multimodal Architectures: Fusion Strategies"
+summary: >-
+  Separate encoders have to hand their outputs to one model, and where that
+  hand-off happens decides the parameter count, the token bill and the failure
+  mode. You compare early and late fusion on a task only the interaction can
+  solve, price cross-attention against self-attention over a concatenated
+  sequence, show why a linear projector has a rank ceiling, and measure what
+  happens to text when 576 visual tokens take their share of a 4,096-token
+  context.
+kind: lesson
+difficulty: hard
+position: 7
+estMinutes: 26
+prerequisites: [contrastive-learning-clip, vision-transformers]
+phase: vision-foundations
+tags:
+  - multimodal
+  - fusion
+  - early-fusion
+  - late-fusion
+  - cross-attention
+  - projector
+  - connector
+  - token-budget
+  - context-dilution
+  - kv-cache
+  - vision-language
+
+body:
+  big_idea: >-
+    Fusion is a decision about which layer first sees both modalities, and
+    every choice buys a different bill: late fusion cannot represent an
+    interaction, early fusion makes attention quadratic, cross-attention sits
+    between.
+
+  problem:
+    - >-
+      You have a working image encoder and language model and no principled
+      reason to concatenate features, average scores, or wire attention
+      between them.
+    - >-
+      It answers "what colour is the car" and fails"is the red cube left of
+      the blue sphere", because a late-fusion head averages unimodal scores.
+    - >-
+      You budget 4,096 tokens for document QA and four page images consume
+      2,304 before the question is tokenised.
+
+  analogy: |
+    A courtroom with two kinds of expert. The image analyst has written her
+    report before the trial; the lawyer questions her during it. Late fusion
+    reads both reports aloud and lets the judge average the conclusions —
+    cheap, and unable to answer a question needing both together. Early fusion
+    lets everyone interrupt everyone. Cross-attention is the middle: the
+    lawyer asks, the analyst answers, and the analysts never cross-examine
+    each other.
+
+  concept_points:
+    - >-
+      **Late fusion has exactly zero parameters that see both modalities, and a relational label is invisible to it.**
+      On $y = \operatorname{sign}(v_0 t_0)$ each unimodal model measured
+      **0.5232** and 0.5208, and averaging their logits **0.5100**. A linear
+      map over concatenated features did no better — **0.5198**. One bilinear
+      form reached **0.9868**; a 64-unit hidden layer, **1.0000**.
+    - >-
+      **Cross-attention is not self-attention with a mask, and the difference is a shape.**
+      Queries come from the text, keys and values from the vision, so the
+      score matrix is $T \times V$ rather than $(T+V)^2$. At $T = 32$,
+      $V = 576$ that is **18,432** entries against 369,664 — a ratio of 0.0499
+      — and 301.99 MFLOP against 6,056.58 per layer at $d = 4096$.
+    - >-
+      **A cross-attention layer costs $V/T$ times the text's own self-attention, so fusion's price is a ratio, not a size.**
+      Measured at $d = 4096$: with 32 text tokens, cross-attention is 301.99
+      MFLOP against 16.78 for text self-attention — a factor of **18.0**,
+      exactly $576/32$. At 512 text tokens the same image costs 4,831.84
+      against 4,294.97, a factor of **1.125**, exactly $576/512$. The vision
+      tax is largest for short prompts.
+    - >-
+      **The $1/\sqrt{d_k}$ in the score is what decides whether the layer averages or argmaxes.**
+      With learned-scale queries and keys at $d = 64$, raw logits have
+      standard deviation $\sqrt{64} = 8$: measured **7.8705** unscaled against
+      **0.9838** scaled. Softmaxing 576 tokens at that spread gives a mean
+      effective token count of **2.43** (maximum weight 0.999998) unscaled,
+      against **354.72** scaled (maximum weight 0.0866). The layer reads
+      either 355 patches or one patch.
+    - >-
+      **A linear projector has a rank ceiling, and the ceiling is visible as an $R^2$ gap.**
+      Mapping 128 vision dimensions into 256, the best linear map has rank at
+      most 128. On a linear target it scored $R^2 = 0.9939$ against a
+      128–512–256 MLP's 0.9887; on a nonlinear target the order reversed —
+      linear **0.1679**, MLP **0.6274** — for 6x the parameters (196,608
+      against 32,768).
+    - >-
+      **576 tokens is not a round number, it is $24 \times 24$, and it is a resolution decision.**
+      336 pixels at patch 14 and 384 at patch 16 both give a 24×24 grid. In a
+      4,096-token context that is **14.06%** for one image, 28.12% for two,
+      **56.25%** for four and 98.44% for seven. The fraction is quadratic in
+      resolution.
+
+  definitions:
+    - term: "Early fusion"
+      meaning: >-
+        Combining modalities at the input: patch embeddings and text embeddings
+        go into one sequence and one transformer, so every layer sees both. It
+        is the most expressive arrangement and the most expensive, because
+        self-attention runs over $T + V$ tokens and therefore over
+        $(T+V)^2$ pairs.
+    - term: "Late fusion"
+      meaning: >-
+        Combining modalities at the output: each encoder produces a prediction
+        or a score and the scores are averaged, concatenated or voted. Zero
+        parameters see both modalities, so it cannot represent an interaction —
+        measured 0.5100 on a label that is a product of two unimodal signals.
+    - term: "Cross-attention"
+      meaning: >-
+        Attention with queries from one modality and keys and values from
+        another. The score matrix is $T \times V$ rather than $(T+V)^2$, so the
+        cost is bilinear in the two lengths instead of quadratic in their sum,
+        and the vision tokens never attend to each other.
+    - term: "Self-attention (contrast)"
+      meaning: >-
+        Attention where queries, keys and values all come from the same
+        sequence. Over a concatenated multimodal sequence it produces the
+        cross-modal paths *and* all the within-vision paths: at $T = 32$,
+        $V = 576$, 89.75% of the matrix is vision attending to vision.
+    - term: "Projector (connector, adapter)"
+      meaning: >-
+        The module that maps vision features into the language model's embedding
+        space and dimension. Linear (one matrix), MLP (two layers, LLaVA), or
+        query-based (a small set of learned queries, Q-Former). Its rank is
+        capped by the vision dimension when it is linear.
+    - term: "Visual token"
+      meaning: >-
+        One patch embedding after the vision tower, placed in the language
+        model's sequence as if it were a word. Its count is
+        $(\text{resolution}/\text{patch})^2$: 576 at 336/14, 196 at 224/16,
+        1,024 at 512/16.
+    - term: "Token budget"
+      meaning: >-
+        How the fixed context window is divided between modalities. An image is
+        not free context: 576 tokens is 14.06% of 4,096, and the fraction is
+        quadratic in resolution, so a 2× resolution change costs 4× the budget.
+    - term: "Attention dilution"
+      meaning: >-
+        The loss of a text token's share of the softmax mass as more tokens
+        compete for it. Adding $V$ visual tokens multiplies the normaliser by
+        roughly $V \cdot \mathbb{E}[e^{\beta s}]$, so the needle's mass falls
+        from 1.0000 at $V = 0$ to 0.1123 at $V = 576$ with no change to its own
+        score.
+    - term: "KV cache"
+      meaning: >-
+        The stored keys and values for every token already processed, per layer,
+        per request: $n_{\text{tok}} \cdot L \cdot 2 \cdot d \cdot$ bytes per
+        value. It is why images are expensive at serving time — 288.00 MiB for
+        one 576-token image at 32 layers and $d = 4096$ in fp16.
+    - term: "Rank ceiling"
+      meaning: >-
+        The hard limit $\operatorname{rank}(AB) \le \min(\operatorname{rank} A,
+        \operatorname{rank} B)$. A linear map from $d_v$ to $d_t$ with
+        $d_v < d_t$ can only write into a $d_v$-dimensional subspace, so 1,024
+        vision dimensions reach 25% of a 4,096-dimensional embedding space.
+    - term: "Pooling connector"
+      meaning: >-
+        Reducing the patch grid before it enters the language model — average or
+        attention pooling over a $k \times k$ block. It is the only token-count
+        lever that leaves the vision tower and the language model untouched, and
+        it trades resolution for context directly.
+
+  diagrams:
+    - type: architecture
+      title: "Early fusion: one sequence, one transformer, every token sees every token"
+      caption: >-
+        Text and vision meet at the input. The 576 visual tokens are real tokens
+        in the language model's sequence, so they occupy context, they occupy KV
+        cache, and every layer's attention matrix is quadratic in 608 rather than
+        32.
+      nodes:
+        - id: txt
+          x: 0
+          y: 0
+          label: "text, 32 tokens"
+          kind: client
+          detail: "The prompt as the tokenizer produced it. In an early-fusion model it is placed either before or after the image block, and the choice changes what a causal mask lets each token see."
+        - id: img
+          x: 0
+          y: 1
+          label: "image, 336 px"
+          kind: client
+          detail: "336 pixels square at patch 14 gives a 24 x 24 grid, which is the 576 that every token budget in this topic is about."
+        - id: patch
+          x: 1
+          y: 1
+          label: "patch embed, 24 x 24 = 576"
+          kind: model
+          detail: "A strided convolution with stride equal to kernel, from the vision transformer topic. Output is 576 vectors of the language model's width."
+        - id: cat
+          x: 2
+          y: 0
+          label: "one sequence, 608 tokens"
+          kind: storage
+          detail: "Concatenation is free. The bill arrives at the next node, where attention is quadratic in 608 instead of 32."
+        - id: tr
+          x: 3
+          y: 0
+          label: "transformer, full self-attention"
+          kind: model
+          detail: "Every text token attends to every visual token and every visual token attends to every other one: 369,664 entries per layer against 1,024 for text alone."
+        - id: out
+          x: 3
+          y: 1
+          label: "next token"
+          kind: worker
+          detail: "The output head is unchanged. That is the appeal of early fusion: no new modules, only a longer sequence."
+      edges:
+        - { from: txt, to: cat, label: "tokens" }
+        - { from: img, to: patch, label: "pixels" }
+        - { from: patch, to: cat, label: "576 vectors" }
+        - { from: cat, to: tr, label: "608 tokens" }
+        - { from: tr, to: out, label: "hidden states" }
+
+    - type: architecture
+      title: "Cross-attention fusion: the text queries, the image answers, the image tokens never meet"
+      caption: >-
+        The vision tower runs once and its output is projected into the language
+        model's width. Every language-model block then has one extra sublayer
+        whose queries come from the text stream and whose keys and values come
+        from the frozen vision features.
+      nodes:
+        - id: img
+          x: 0
+          y: 0
+          label: "image, 336 px"
+          kind: client
+          detail: "Same input as the early-fusion model. What changes is where it is allowed to influence anything."
+        - id: vit
+          x: 1
+          y: 0
+          label: "vision tower, 576 patches"
+          kind: model
+          detail: "Runs once per image. Its output is a 576 x 1024 matrix that does not change during decoding, which is what makes the KV cache for vision a one-off cost."
+        - id: proj
+          x: 2
+          y: 0
+          label: "projector, 2-layer MLP"
+          kind: model
+          detail: "1024 -> 4096 -> 4096, 20.97M parameters, 0.30% of a 7B model. A linear map here would cap the rank at 1024 of 4096 dimensions."
+        - id: xa
+          x: 3
+          y: 0
+          label: "cross-attention, Q text, K/V vision"
+          kind: model
+          detail: "The score matrix is 32 x 576, not 608 x 608. Cost is V/T times the text's own attention: 18x at 32 text tokens, 1.13x at 512."
+        - id: txt
+          x: 0
+          y: 1
+          label: "text, 32 tokens"
+          kind: client
+          detail: "The only side that produces queries. Swapping the roles so vision queries text is a different model with a different shape."
+        - id: tenc
+          x: 1
+          y: 1
+          label: "text embedding"
+          kind: model
+          detail: "Ordinary token embeddings. The text tokens stay in the causal stream and never enter the vision stack."
+        - id: lm
+          x: 2
+          y: 1
+          label: "language model block"
+          kind: model
+          detail: "Self-attention over text, then cross-attention into vision, then the feed-forward. The visual features are read, never rewritten."
+        - id: out
+          x: 3
+          y: 1
+          label: "next token"
+          kind: worker
+          detail: "Decoding proceeds one text token at a time. Vision keys and values are computed once and reused for every generated token."
+      edges:
+        - { from: img, to: vit, label: "patches" }
+        - { from: vit, to: proj, label: "576 x 1024" }
+        - { from: proj, to: xa, label: "K, V" }
+        - { from: txt, to: tenc, label: "tokens" }
+        - { from: tenc, to: xa, label: "Q" }
+        - { from: tenc, to: lm, label: "residual stream" }
+        - { from: xa, to: lm, label: "fused features" }
+        - { from: lm, to: out, label: "logits" }
+
+    - type: compare
+      title: "Early fusion against late fusion: the same two encoders, two different ceilings"
+      left_label: "Early fusion (concatenate, then attend)"
+      left_points:
+        - "Every layer sees both modalities, so any interaction is representable: measured 1.0000 on a product label, against 0.5100 for late fusion"
+        - "Cost is quadratic in the sum: 369,664 attention entries per layer at 32 text and 576 visual tokens, 0.0499 of it cross-modal"
+        - "The image occupies context, so resolution competes with prompt length: 576 tokens is 14.06% of a 4,096-token window"
+        - "Visual tokens attend to each other, 331,776 of the 369,664 entries, which is 89.75% of the matrix spent on work nobody requested"
+        - "No new parameters: the language model's own layers do the fusion, which is why it is the default for small models"
+      right_label: "Late fusion (encode separately, combine scores)"
+      right_points:
+        - "Zero parameters see both modalities, so a relational label is at chance: measured 0.5100 where the interaction is the whole signal"
+        - "Cost is additive: two encoder passes and one scalar combination, no cross-modal attention matrix at all"
+        - "The image never enters the context, so text length is unaffected and 4,096 tokens of context stay 4,096 tokens of text"
+        - "Each modality keeps its own inductive bias and its own pretrained weights, which is why it survives when one encoder is frozen"
+        - "It fails silently: the model is fluent about each modality and wrong about the relation between them"
+
+    - type: plot
+      title: "Retrieval of one text fact against 0 to 4,608 visual tokens: accuracy 1.00 to 0.32"
+      chart: line
+      xLabel: "visual tokens competing for the softmax (V)"
+      yLabel: "top-1 retrieval accuracy"
+      series:
+        - name: "top-1 retrieval accuracy, 2,000 trials, needle cosine 0.53"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 64, y: 0.834 }
+            - { x: 192, y: 0.736 }
+            - { x: 576, y: 0.593 }
+            - { x: 1152, y: 0.4725 }
+            - { x: 2304, y: 0.3975 }
+            - { x: 4608, y: 0.317 }
+        - name: "chance, 1/(1+V)"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 64, y: 0.01538 }
+            - { x: 192, y: 0.00518 }
+            - { x: 576, y: 0.00173 }
+            - { x: 1152, y: 0.00087 }
+            - { x: 2304, y: 0.00043 }
+            - { x: 4608, y: 0.00022 }
+
+    - type: plot
+      title: "Projector quality: the MLP wins only once the alignment stops being linear"
+      chart: line
+      xLabel: "target type (1 linear, 2 mild nonlinear, 3 strong nonlinear)"
+      yLabel: "held-out R squared"
+      series:
+        - name: "linear projector, rank capped at 128"
+          points:
+            - { x: 1, y: 0.9939 }
+            - { x: 2, y: 0.5206 }
+            - { x: 3, y: 0.1679 }
+        - name: "2-layer MLP, 128-512-256, 6x parameters"
+          points:
+            - { x: 1, y: 0.9887 }
+            - { x: 2, y: 0.7765 }
+            - { x: 3, y: 0.6274 }
+
+  markdown: |
+    ## Three places for the hand-off
+
+    Two encoders produce two matrices and nothing about either one is
+    multimodal. The architecture question is where they first meet, and there are
+    exactly three answers: at the input (early), at the output (late), or
+    somewhere in the middle through attention (cross-attention). Everything else
+    in this topic follows from pricing those three.
+
+    The one thing late fusion cannot do is represent an interaction. If the label
+    is $y = \operatorname{sign}(v_0 t_0)$ — true when the two unimodal signals
+    agree in sign — then $p(y \mid v) = p(y \mid t) = 0.5$ and no function of the
+    two margins recovers it. Measured: 0.5232 and 0.5208 unimodally, 0.5100 for
+    the averaged logits, 0.5198 for a *linear* map over the concatenation. The
+    first model to beat chance needs a product term, which is why 64 bilinear
+    parameters reached 0.9868 while 1,024 hidden-layer parameters reached 1.0000
+    — the interaction, not the width, is what was missing.
+
+    ## Cross-attention is a shape, not a slogan
+
+    With $T$ text tokens and $V$ visual tokens, the two designs write down
+    different matrices:
+
+    $$\underbrace{T \times V}_{\text{cross-attention}} \qquad \text{against}
+      \qquad \underbrace{(T+V)^2}_{\text{self-attention over the concatenation}}$$
+
+    and every cost difference follows from that one line. At $T = 32$,
+    $V = 576$, $d = 4096$:
+
+    | quantity | cross-attention | concatenated self-attention |
+    |---|---|---|
+    | attention entries per layer | 18,432 | 369,664 |
+    | of which vision-to-vision | 0 | 331,776 (89.75%) |
+    | MFLOP per layer | 301.99 | 6,056.58 |
+    | ratio to text-only attention | 18.0× | 361.0× |
+
+    The same $4TVd$ count gives the rule of thumb: cross-attention costs
+    $V/T$ times the text's own self-attention. At 32 text tokens that is 18; at
+    512 it is 1.125. A short prompt with one image is the worst case, which is
+    the reverse of the usual intuition about long prompts.
+
+    The $\sqrt{d_k}$ in the denominator is doing more work than it looks. For
+    queries and keys with entries of order one, $q \cdot k$ has variance $d$, so
+    the logits have standard deviation $\sqrt{d}$ — measured 7.8705 at
+    $d = 64$. Softmax over that spread is a near-argmax: 2.43 effective tokens
+    out of 576, maximum weight 0.999998. Divided by $\sqrt{d}$ the logits have
+    unit variance (measured 0.9838) and the layer integrates 354.72 tokens. Same
+    weights, same inputs, a factor of 146 in how much of the image is read.
+
+    ## The projector, and why it is not one matrix
+
+    The connector maps $d_v$ vision dimensions into $d_t$ language-model
+    dimensions, and if it is linear its rank is at most $\min(d_v, d_t)$. With
+    $d_v = 1024$ and $d_t = 4096$ that is 25% of the embedding space — the other
+    75% is unreachable no matter how long you train. The measured consequence,
+    at a size small enough to train in a second (128 → 256):
+
+    | target | linear $R^2$ | MLP $R^2$ | linear cosine | MLP cosine |
+    |---|---|---|---|---|
+    | exactly linear | 0.9939 | 0.9887 | 0.9999 | 0.9967 |
+    | mildly nonlinear | 0.5206 | 0.7765 | 0.7972 | 0.9128 |
+    | strongly nonlinear | 0.1679 | 0.6274 | 0.6771 | 0.8745 |
+
+    The ordering flips with the target, so "MLP is better" is not a law — it is a
+    bet that the alignment between visual and linguistic structure is not
+    linear, which it is not, and the price of the bet is 6× the parameters here
+    and 5× at LLaVA scale (20,971,520 against 4,194,304, still 0.30% of a 7B
+    model).
+
+    ## The token budget is the real design constraint
+
+    An image is a sequence of patches, and a sequence occupies context.
+
+    | config | grid | tokens | share of 4,096 |
+    |---|---|---|---|
+    | 224 px, patch 16 | 14×14 | 196 | 4.79% |
+    | 336 px, patch 14 | 24×24 | 576 | 14.06% |
+    | 384 px, patch 16 | 24×24 | 576 | 14.06% |
+    | 512 px, patch 16 | 32×32 | 1,024 | 25.00% |
+
+    Four images at 336 px take 2,304 tokens and leave 1,792 for the question,
+    the system prompt and the answer. Seven leave 64. At serving time the bill
+    is worse than the context: 576 tokens × 32 layers × 2 tensors × 4,096 × 2
+    bytes is 288.00 MiB of KV cache per image, and four images are 1.15 GiB
+    before any text is cached.
+
+    ## What crowding does to the text
+
+    The mechanism is the normaliser, not the encoder. A text token's query scores
+    the needle at $s_t$ and each visual token at $s_j$, and its share of the mass
+    is
+
+    $$p_{\text{needle}} = \frac{e^{\beta s_t}}{e^{\beta s_t} + \sum_{j=1}^{V} e^{\beta s_j}}.$$
+
+    Every added visual token adds a positive term to the denominator. Measured
+    with a needle at cosine 0.53 against random visual keys at $\beta = 10$:
+
+    | $V$ | 0 | 64 | 192 | 576 | 1,152 | 2,304 | 4,608 |
+    |---|---|---|---|---|---|---|---|
+    | retrieval accuracy | 1.0000 | 0.8340 | 0.7360 | 0.5930 | 0.4725 | 0.3975 | 0.3170 |
+    | needle's mass | 1.0000 | 0.4489 | 0.2558 | 0.1123 | 0.0617 | 0.0333 | 0.0167 |
+
+    At $V = 576$ the needle holds 64.8× its uniform share and still loses the
+    argmax about 41% of the time. That is the number that matters operationally:
+    attention mass tells you the model has noticed, and retrieval accuracy tells
+    you whether it can use what it noticed.
+
+    The lever that changes $V$ without touching a weight is pooling. A 2×2
+    average pool takes 24×24 to 12×12, so four images cost 576 tokens instead of
+    2,304 and the text budget goes from 1,792 to 3,520. On the measured curve
+    that same move is 0.3975 → 0.5930 accuracy. Whether 19.6 points of reading
+    comprehension is worth 4× the spatial resolution is a product decision; the
+    arithmetic is not.
+
+    ## What to take away
+
+    Four numbers price any fusion design. The cross-modal parameter count: zero
+    means the interaction is invisible, 64 means it is representable. The
+    attention-entry ratio $TV/(T+V)^2$: 0.05 at 32 text tokens, 0.25 at 512.
+    The token share $V/(\text{context})$: 0.14 for one image, 0.56 for four. And
+    the needle's attention mass at the $V$ you actually ship, because that is the
+    quantity that moves before the accuracy does.
+
+    ## The longer version
+
+    Fusion is a decision about which layer first sees both modalities, and every
+    choice buys a different bill: late fusion costs nothing cross-modal and
+    cannot represent an interaction, early fusion represents everything and
+    makes attention quadratic, and cross-attention sits between them by letting
+    the text query the image without letting the image tokens talk to each other.
+
+    A courtroom with two kinds of expert. The image analyst has already written
+    her report before the trial starts; the lawyer asks her questions during the
+    trial. Late fusion is reading both reports aloud and letting the judge
+    average the two conclusions — cheap, and unable to answer a question that
+    needs the report and the testimony to be true together. Early fusion is
+    seating the analyst and the lawyer at one table and letting everyone
+    interrupt everyone, which is expressive and costs a full cross-examination
+    of every witness by every other witness. Cross-attention is the middle
+    arrangement: the lawyer asks, the analyst answers, and the analysts do not
+    cross-examine each other.
+
+    The analogy breaks at the thing that actually matters in practice. A
+    courtroom has no fixed number of seats — you can always add a witness. A
+    context window is exactly 4,096 seats, and the analyst's report occupies 576
+    of them per image whether or not the lawyer asks anything. The analogy also
+    implies the lawyer's questions are free. They are not: every question
+    re-reads all 576 pages, so the cost of the arrangement is the product of the
+    two lengths, not their sum.
+
+    ### What goes wrong
+
+    - You have a working image encoder and a working language model, and no
+      principled reason to prefer concatenating their features, averaging
+      their scores, or wiring attention between them. The three run, all three
+      produce fluent output, and they differ by a factor of twenty in compute
+      and by thirty points in accuracy on the subset of questions that
+      actually need both modalities.
+    - Your model answers "what colour is the car" perfectly and "is the red
+      cube left of the blue sphere" at chance. Nothing in the loss curve says
+      why. The answer is structural: a late-fusion head averages two unimodal
+      scores, and a relational question is not a sum of two unimodal opinions.
+    - You budget a 4,096-token context for a document question-answering
+      feature, ship it, and discover that four page images consume 2,304 of
+      those tokens before the user's question is tokenised. The model is not
+      worse at reading; it is worse at being asked, because the question no
+      longer fits.
+    - You replace the two-layer MLP connector with a single linear map because
+      it is five times smaller and trains faster. It converges, the loss is
+      smooth, and caption quality drops in a way that looks like a data
+      problem. A linear map from 1,024 to 4,096 dimensions can only ever write
+      into a 1,024-dimensional slice of the language model's embedding space.
+    - Someone on the team calls the concatenated-sequence design
+      "cross-attention" because text attends to image tokens somewhere inside
+      it. It is not the same object: at 32 text tokens and 576 visual tokens
+      the concatenated self-attention matrix is 20 times larger, and 89.75% of
+      it is vision tokens attending to other vision tokens.
+
+    ### The full treatment
+
+    **Late fusion has exactly zero parameters that see both modalities, and a
+    relational label is invisible to it.** Train on a label that is the sign of
+    a product, $y = \operatorname{sign}(v_0 t_0)$, with eight noise dimensions
+    on each side: each unimodal logistic model measured 0.5232 and 0.5208
+    accuracy over 4,000 samples, and averaging their logits measured 0.5100.
+    Early fusion that merely concatenates features and fits a linear map did
+    no better — 0.5198 — because a weight matrix over a concatenation still
+    has no cross terms. One bilinear form with 64 parameters reached 0.9868,
+    and a 64-unit hidden layer over the concatenation (1,024 cross-modal
+    parameters) reached 1.0000. The trap is calling concatenation fusion: two
+    feature blocks sharing a matrix is not an interaction, it is two unimodal
+    models with a shared budget.
+
+    **Cross-attention is not self-attention with a mask, and the difference is
+    a shape.** Queries come from the text, keys and values from the vision, so
+    the score matrix is $T \times V$ rather than $(T+V)^2$. At $T = 32$ and
+    $V = 576$ that is 18,432 entries against 369,664 — a ratio of 0.0499 — and
+    301.99 MFLOP against 6,056.58 MFLOP per layer at $d = 4096$. Of the
+    concatenated matrix, $576^2 = 331{,}776$ entries, 89.75%, are vision
+    tokens attending to vision tokens, which is work the language model never
+    asked for. The trap is the word "equivalent": the two designs have the
+    same parameters per layer, the same cross-modal paths, and a twentyfold
+    difference in what the kernel spends its time on.
+
+    **A cross-attention layer costs $V/T$ times the text's own
+    self-attention, so the price of fusion is a ratio, not a size.** Measured
+    at $d = 4096$: with 32 text tokens, cross-attention is 301.99 MFLOP against
+    16.78 MFLOP of text self-attention, a factor of 18.0 — exactly $576/32$.
+    At 512 text tokens the same image costs 4,831.84 MFLOP against 4,294.97,
+    a factor of 1.125, exactly $576/512$. The vision tax is therefore largest
+    for short prompts, which is the opposite of the intuition that a long
+    prompt is the expensive one. The trap is quoting a single overhead number
+    from a paper without its $T$: the same layer is 18× or 1.13× depending on
+    how much text you brought.
+
+    **The $1/\sqrt{d_k}$ in the attention score is what decides whether the
+    layer averages or argmaxes.** With learned-scale queries and keys (entries
+    of order 1) at $d = 64$, the raw logits have standard deviation
+    $\sqrt{64} = 8$: measured 7.8705 unscaled against 0.9838 scaled. Softmaxing
+    576 vision tokens at that spread gives a mean effective token count of
+    2.43 (minimum 1.00, maximum weight 0.999998) unscaled, against 354.72
+    (minimum 296.32, maximum weight 0.0866) scaled. The layer is either
+    reading 355 patches or reading one patch and calling the rest noise. The
+    trap is treating the scale as cosmetic: it is a temperature, and it is the
+    same object as $\tau$ in the contrastive loss, applied to a different
+    softmax.
+
+    **A linear projector has a rank ceiling, and the ceiling is visible as an
+    R-squared gap.** Mapping 128 vision dimensions into a 256-dimensional
+    embedding space, the best linear map has rank at most 128, so it can only
+    reach half of the target space. On an exactly linear target it scored
+    $R^2 = 0.9939$ and cosine 0.9999, beating a 128–512–256 MLP at 0.9887 and
+    0.9967 — the MLP is not free accuracy. On a strongly nonlinear target the
+    ordering reversed: linear $R^2 = 0.1679$, cosine 0.6771; MLP $R^2 = 0.6274$,
+    cosine 0.8745, and rank 256 against 128. The trap is concluding either
+    model is better in general: the MLP wins exactly when the alignment is
+    nonlinear, and pays 6× the parameters (196,608 against 32,768) to be ready
+    for that case.
+
+    **At production scale the projector is 5× a linear map and still under a
+    third of one percent of the model.** The LLaVA-style connector is
+    1024→4096→4096: 20,971,520 parameters against 4,194,304 for the linear
+    projection, a factor of 5.00, and 0.30% of a 7B model. What is not small
+    is the token bill: 576 visual tokens cost $2 \cdot 7 \times 10^9 \cdot 576
+    = 8.06$ TFLOP of prefill, against 7.17 TFLOP for a 512-token text prompt —
+    one image is 1.13 text prompts. The trap is optimising the adapter because
+    it is the part you can see; the adapter is 0.3% of the weights and the
+    image is 113% of the prompt.
+
+    **576 tokens is not a round number, it is $24 \times 24$, and it is a
+    resolution decision.** 336 pixels at patch 14 and 384 pixels at patch 16
+    both give a 24×24 grid. In a 4,096-token context that is 14.06% for one
+    image, 28.12% for two, 56.25% for four (2,304 visual tokens, 1,792 left
+    for everything else) and 98.44% for seven (4,032 visual, 64 left). The trap
+    is budgeting context for the text and discovering afterwards that the
+    images were already more than half of it — and that the fraction is
+    quadratic in resolution, because doubling the side of the image
+    quadruples the token count.
+
+    **Visual tokens crowd text out through the softmax normaliser, and the
+    crowding is measurable.** With one needle fact at cosine 0.53 against $V$
+    random visual tokens, top-1 retrieval measured 1.0000, 0.8340, 0.7360,
+    0.5930, 0.4725, 0.3975 and 0.3170 at $V = 0, 64, 192, 576, 1152, 2304,
+    4608$, and the needle's share of the attention mass fell 1.0000, 0.4489,
+    0.2558, 0.1123, 0.0617, 0.0333, 0.0167 over the same sweep. At $V = 576$
+    the needle still holds 0.1123 of the mass, 64.8× its uniform share of
+    $1/577 = 0.001733$ — it is winning on mass and losing on argmax, because a
+    single distractor above its score takes the retrieval. The trap is
+    monitoring the mean attention weight: it decays smoothly and tells you
+    nothing about the accuracy that has already halved.
+
+    **The KV cache, not the FLOPs, is what stops you putting four images in a
+    request.** One 576-token image at 32 layers, $d = 4096$, fp16 is
+    $576 \cdot 32 \cdot 2 \cdot 4096 \cdot 2 = 301{,}989{,}888$ bytes, or
+    288.00 MiB; four images are 1,152.00 MiB before a single text token is
+    cached. A 512-token prompt plus four images is a 2,816-token sequence whose
+    attention matrix holds 7,929,856 entries against 262,144 for the text
+    alone — 30.25×. The trap is sizing the GPU for weights: the cache is
+    per-request, grows linearly in images, and is the reason multimodal
+    serving throughput is quoted in images per second rather than tokens.
+
+    **Pooling is the only lever that changes the token count without changing
+    the weights, and it has an exchange rate.** A 2×2 average pool takes the
+    24×24 grid to 12×12: 144 tokens per image instead of 576, so four images
+    cost 576 tokens instead of 2,304 and the text budget rises from 1,792 to
+    3,520 — a 96.4% increase for one pooling layer. In the dilution model the
+    same move (from $V = 2304$ to $V = 576$) raised retrieval accuracy from
+    0.3975 to 0.5930, a gain of 0.1955, and the needle's attention mass from
+    0.0333 to 0.1123. The trap is treating token count as a property of the
+    encoder: it is a property of the grid you chose to keep, and 1,728 tokens
+    bought 19.6 accuracy points in this model.
+
+
+  derivations:
+    - title: "Cross-attention costs V/T times the text's own self-attention"
+      latex: |
+        A single attention head projects each token to $d$ dimensions and scores
+        every pair with a dot product. For queries of length $T$ and keys of
+        length $V$ the score matrix costs $T V d$ multiply-adds and the weighted
+        sum costs another $T V d$, so
+
+        $$C_{\text{cross}} = 4 T V d .$$
+
+        Self-attention over the concatenated sequence of length $T + V$ costs
+
+        $$C_{\text{self}} = 4 (T+V)^2 d,
+          \qquad
+          \frac{C_{\text{cross}}}{C_{\text{self}}}
+          = \frac{T V}{(T+V)^2}.$$
+
+        The same argument against text-only self-attention gives the number that
+        actually matters for a language model block:
+
+        $$\frac{C_{\text{cross}}}{C_{\text{text}}}
+          = \frac{4TVd}{4T^2 d} = \frac{V}{T}.$$
+
+        At $T = 32$, $V = 576$, $d = 4096$: $C_{\text{cross}} = 301.99$ MFLOP,
+        $C_{\text{text}} = 16.78$ MFLOP, ratio $18.0$. At $T = 512$ the same
+        layer costs 4,831.84 MFLOP against 4,294.97, ratio $1.125$.
+      prose: >-
+        The identity $V/T$ is the whole cost model, and it says something
+        counter-intuitive: adding an image to a short prompt is expensive and
+        adding one to a long prompt is nearly free, because a long prompt has
+        already paid for a quadratic attention matrix of its own. It also says
+        that the concatenated design is not merely a constant factor worse —
+        its ratio to text-only attention is $(T+V)^2/T^2$, which grows with the
+        image, so every additional image costs more than the last.
+
+    - title: "Why the score is divided by the square root of the key dimension"
+      latex: |
+        Let $q, k \in \mathbb{R}^{d}$ have independent entries with mean zero and
+        variance one, so that $q \cdot k = \sum_{i=1}^{d} q_i k_i$. Each term has
+        variance one and the terms are independent, hence
+
+        $$\operatorname{Var}(q \cdot k) = d,
+          \qquad
+          \operatorname{sd}(q \cdot k) = \sqrt{d}.$$
+
+        Dividing by $\sqrt{d}$ gives unit variance:
+
+        $$\operatorname{Var}\!\left(\frac{q \cdot k}{\sqrt{d}}\right) = 1 .$$
+
+        The softmax over $V$ such scores is a Gibbs distribution at inverse
+        temperature $\beta$, and its entropy falls as the score spread grows:
+
+        $$p_j = \frac{e^{\beta s_j}}{\sum_{i} e^{\beta s_i}},
+          \qquad
+          N_{\text{eff}} = e^{H(p)} .$$
+
+        For small spread, $N_{\text{eff}} \to V$; for spread much larger than one,
+        $N_{\text{eff}} \to 1$.
+      prose: >-
+        Measured at $d = 64$, $V = 576$: the raw logits have sd 7.8705 and give
+        $N_{\text{eff}} = 2.43$ with a maximum weight of 0.999998; dividing by
+        $\sqrt{64}$ gives sd 0.9838 and $N_{\text{eff}} = 354.72$ with a maximum
+        weight of 0.0866. The layer has not changed its weights, only its
+        temperature, and it went from reading one patch to reading most of the
+        image — which is the same trade the contrastive loss makes with $\tau$,
+        applied to a different softmax.
+
+    - title: "A linear projector cannot exceed the rank of the vision space"
+      latex: |
+        Let $X \in \mathbb{R}^{n \times d_v}$ be vision features and
+        $W \in \mathbb{R}^{d_v \times d_t}$ a linear projector. Then
+
+        $$\operatorname{rank}(XW) \le \min\big(\operatorname{rank} X,
+          \operatorname{rank} W\big) \le \min(d_v, d_t),$$
+
+        because the image of $W$ is a subspace of $\mathbb{R}^{d_t}$ spanned by
+        $d_v$ columns. With $d_v = 1024$ and $d_t = 4096$ the reachable subspace
+        has dimension 1,024 out of 4,096 — 25% of the space — and any target
+        direction outside it has zero projection, so no amount of training
+        reduces that part of the loss.
+
+        Inserting a hidden layer of width $h$ with a pointwise nonlinearity
+        $\sigma$ raises the bound:
+
+        $$\operatorname{rank}\big(W_2\,\sigma(W_1 X)\big)
+          \le \min(h, d_t),$$
+
+        and with $h \ge d_v$ the rank is limited only by $d_t$.
+      prose: >-
+        Measured on a 128 → 256 problem: the linear map's output had rank 128
+        exactly, against 256 for the MLP, and the gap showed up as
+        $R^2 = 0.1679$ against 0.6274 on a nonlinear target. The same two models
+        on a linear target scored 0.9939 and 0.9887 — the ceiling is only a
+        ceiling when the target needs the extra dimensions, which is why the
+        MLP is a bet on the data rather than a free improvement.
+
+  implementations:
+    - language: python
+      title: "Cross-attention, and the missing scale that turns it into an argmax"
+      note: >-
+        `cross_attention` is numerically correct: it takes queries from the text,
+        keys and values from the vision, divides by $\sqrt{d_k}$, subtracts the
+        row maximum before exponentiating, and returns weighted sums of shape
+        `(T, d)`. `cross_attention_unscaled` is **numerically WRONG**: it omits
+        the $1/\sqrt{d_k}$ factor. Nothing raises, the output has the right shape
+        and finite values, and the layer silently stops integrating. With
+        learned-scale queries and keys at $d = 64$ the logits have sd 7.8705
+        instead of 0.9838, the maximum attention weight is 0.999998 instead of
+        0.0866, and the mean effective number of attended vision tokens collapses
+        from 354.72 to 2.43 — the layer reads one patch and treats the other 575
+        as noise. The second silent bug in this family is swapping the roles so
+        that vision produces the queries: the output shape becomes `(V, d)`, so
+        an assertion on the returned shape is the cheapest possible test, and a
+        shape assertion is exactly what nobody writes.
+      code: |
+        import numpy as np
+
+
+        def cross_attention(text, vision):
+            """Q from text, K and V from vision. Returns (weights, output)."""
+            q = np.asarray(text, dtype=np.float64)
+            kv = np.asarray(vision, dtype=np.float64)
+            if q.ndim != 2 or kv.ndim != 2:
+                raise ValueError("text and vision must both be (n, d)")
+            if q.shape[1] != kv.shape[1]:
+                raise ValueError("dimension mismatch: %d against %d"
+                                 % (q.shape[1], kv.shape[1]))
+
+            scores = (q @ kv.T) / np.sqrt(q.shape[1])
+            scores = scores - scores.max(axis=1, keepdims=True)
+            w = np.exp(scores)
+            w = w / w.sum(axis=1, keepdims=True)
+            return w, w @ kv
+
+
+        def cross_attention_unscaled(text, vision):
+            """WRONG: no 1/sqrt(d_k). The softmax saturates to one token."""
+            q = np.asarray(text, dtype=np.float64)
+            kv = np.asarray(vision, dtype=np.float64)
+            scores = q @ kv.T
+            scores = scores - scores.max(axis=1, keepdims=True)
+            w = np.exp(scores)
+            w = w / w.sum(axis=1, keepdims=True)
+            return w, w @ kv
+
+
+        def _effective_tokens(w):
+            """exp(entropy) of each row: how many keys the layer actually reads."""
+            return np.exp(-(w * np.log(w + 1e-300)).sum(axis=1))
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(3)
+            T, V, d = 32, 576, 64
+            Q = rng.normal(size=(T, d))       # learned projections: O(1) entries
+            K = rng.normal(size=(V, d))
+            print("logit sd  scaled=%.4f  unscaled=%.4f"
+                  % (np.std((Q @ K.T) / np.sqrt(d)), np.std(Q @ K.T)))
+            for name, fn in (("scaled  ", cross_attention),
+                             ("unscaled", cross_attention_unscaled)):
+                w, _ = fn(Q, K)
+                eff = _effective_tokens(w)
+                print("%s max_w=%.6f  mean_eff=%.4f  min_eff=%.4f"
+                      % (name, w.max(), eff.mean(), eff.min()))
+            # logit sd  scaled=0.9838  unscaled=7.8705
+            # scaled   max_w=0.086614  mean_eff=354.7230  min_eff=296.3207
+            # unscaled max_w=0.999998  mean_eff=2.4306    min_eff=1.0000
+
+    - language: python
+      title: "Token budget, KV cache, and the attention mass a text fact keeps"
+      note: >-
+        `visual_tokens`, `kv_bytes` and `attention_mass` are numerically correct.
+        `attention_mass_text_only` is **numerically WRONG** and is the mistake
+        that makes multimodal serving look free: it normalises the softmax over
+        the text scores only, so the visual tokens never enter the denominator
+        and the function reports 1.0000 for every image count. The correct value
+        at $V = 576$ is 0.1109 and at $V = 2{,}304$ it is 0.0329, so the bug
+        overstates the text fact's share by 9× at four images and by 30× at
+        sixteen. Nothing raises, the number is a valid probability, and a
+        monitoring dashboard built on it will report that adding images changes
+        nothing — right up to the point where accuracy halves. The KV figure is
+        the other thing people get wrong by a factor of two: it is keys *and*
+        values, so the `2` in `n_tok * L * 2 * d` is not optional.
+      code: |
+        import numpy as np
+
+
+        def visual_tokens(resolution, patch):
+            """Patch grid is resolution // patch on each side."""
+            if resolution % patch:
+                raise ValueError("patch %d does not divide resolution %d"
+                                 % (patch, resolution))
+            grid = resolution // patch
+            return grid * grid
+
+
+        def kv_bytes(n_images, tokens_per_image, n_layers, d_model,
+                     bytes_per_value=2):
+            """Keys and values, per layer, per token: the factor of 2 is K and V."""
+            return int(n_images * tokens_per_image * n_layers * 2 * d_model
+                       * bytes_per_value)
+
+
+        def attention_mass(text_scores, vision_scores, beta=10.0):
+            """Share of the softmax mass on text_scores[0], over all tokens."""
+            z = np.concatenate([np.asarray(text_scores, dtype=np.float64),
+                                np.asarray(vision_scores, dtype=np.float64)]) * beta
+            z = z - z.max()
+            p = np.exp(z)
+            p = p / p.sum()
+            return float(p[0])
+
+
+        def attention_mass_text_only(text_scores, vision_scores, beta=10.0):
+            """WRONG: normalises over text only, so the images cost nothing."""
+            z = np.asarray(text_scores, dtype=np.float64) * beta
+            z = z - z.max()
+            p = np.exp(z)
+            p = p / p.sum()
+            return float(p[0])
+
+
+        if __name__ == "__main__":
+            print(visual_tokens(336, 14), visual_tokens(224, 16))   # 576 196
+            b = kv_bytes(1, 576, 32, 4096)
+            print(b, "%.2f MiB" % (b / 2 ** 20))                    # 288.00 MiB
+
+            for V in (0, 576, 2304):
+                rng = np.random.default_rng(21)
+                d, trials, mass, wrong = 32, 800, [], []
+                for _ in range(trials):
+                    k = rng.normal(size=d); k /= np.linalg.norm(k)
+                    q = k + 1.6 * rng.normal(size=d) / np.sqrt(d)
+                    q /= np.linalg.norm(q)
+                    s_t = float(q @ k)
+                    if V:
+                        K = rng.normal(size=(V, d))
+                        K /= np.linalg.norm(K, axis=1, keepdims=True)
+                        s_v = (K @ q).tolist()
+                    else:
+                        s_v = []
+                    mass.append(attention_mass([s_t], s_v))
+                    wrong.append(attention_mass_text_only([s_t], s_v))
+                print("V=%4d correct=%.4f wrong=%.4f uniform=%.6f"
+                      % (V, np.mean(mass), np.mean(wrong), 1.0 / (1 + V)))
+            # V=   0 correct=1.0000 wrong=1.0000 uniform=1.000000
+            # V= 576 correct=0.1109 wrong=1.0000 uniform=0.001733
+            # V=2304 correct=0.0329 wrong=1.0000 uniform=0.000434
+
+  checkpoints:
+    - id: cp-1
+      question: "Your late-fusion model gets 0.51 on a benchmark where each unimodal model gets 0.52. Is that a training bug?"
+      answerKind: short_text
+      hint: "What would the label have to look like for two averaged unimodal scores to be the right answer?"
+      solution: >-
+        Not necessarily — check whether the benchmark's label is a relation.
+        Late fusion has zero parameters that see both modalities, so it can only
+        express $f(v) + g(t)$. On a label that is the sign of a product,
+        measured accuracy was 0.5100, against 0.5232 and 0.5208 for the two
+        unimodal models. Concatenating features and fitting a *linear* map also
+        failed (0.5198), because a weight matrix over a concatenation still has
+        no cross terms. The fix is structural: one bilinear term (64 parameters)
+        reached 0.9868.
+    - id: cp-2
+      question: "Someone proposes replacing cross-attention with self-attention over the concatenated sequence, arguing the two are equivalent because both are attention. What is the smallest number that settles the argument?"
+      answerKind: short_text
+      hint: "Count the entries in each score matrix at T = 32, V = 576."
+      solution: >-
+        18,432 against 369,664 — a factor of 20.1, or exactly
+        $TV/(T+V)^2 = 0.0499$. Both have the same parameters per layer
+        ($4d^2$) and the same cross-modal paths, so a parameter count will not
+        distinguish them; the entry count will. The extra 331,776 entries are
+        vision tokens attending to vision tokens, 89.75% of the concatenated
+        matrix, which is computation the language model did not ask for.
+    - id: cp-3
+      question: "You drop the 1/sqrt(d_k) from your cross-attention layer. Loss still goes down and samples look fine. What did you actually change?"
+      answerKind: short_text
+      hint: "Compute the standard deviation of a dot product of two unit-variance vectors of length 64."
+      solution: >-
+        You changed the temperature. For independent entries with variance one,
+        $q \cdot k$ has variance $d$, so at $d = 64$ the logits have sd
+        $\sqrt{64} = 8$: measured 7.8705 unscaled against 0.9838 scaled. Softmax
+        at that spread is a near-argmax — mean effective tokens 2.43 out of 576,
+        maximum weight 0.999998. The layer still trains, because a one-hot
+        attention over the single best-matching patch is a usable feature; it
+        just never integrates the other 575.
+    - id: cp-4
+      question: "Your linear projector trains to a plateau that no learning-rate change fixes, and the loss is 0.17 R-squared. Where is the floor?"
+      answerKind: short_text
+      hint: "What is the rank of a 1024 x 4096 matrix, and what does that say about the subspace its output can occupy?"
+      solution: >-
+        The floor is the rank. A linear map from 1,024 to 4,096 dimensions has
+        image dimension at most 1,024, which is 25% of the target space, so any
+        target direction outside that subspace is unreachable and its loss
+        cannot fall. Measured at 128 → 256: linear output rank 128 against 256
+        for the MLP, and $R^2$ 0.1679 against 0.6274 on a strongly nonlinear
+        target. The repair is a hidden layer with a nonlinearity: with width $h
+        \ge d_v$ the rank is limited only by $d_t$.
+    - id: cp-5
+      question: "Four 336-pixel images leave your 4,096-token context with 1,792 tokens for the question. A colleague pools 2x2 and says nothing was lost because the model still sees the whole image. What did you gain, what did you lose, and how would you check?"
+      answerKind: short_text
+      hint: "Compute both token counts, then look at what a 2x2 pool does to the smallest representable detail."
+      solution: >-
+        Gained: the text budget goes from 1,792 to 3,520 tokens, a 96.4%
+        increase, because 2,304 visual tokens become 576. The dilution curve
+        says that move (from $V = 2304$ to $V = 576$) is worth 0.3975 → 0.5930
+        retrieval accuracy, 19.6 points, and raises the needle's attention mass
+        from 0.0333 to 0.1123. Lost: spatial resolution — a 12×12 grid cannot
+        localise anything smaller than one twelfth of the image, so OCR, small
+        UI elements and counting tasks degrade first. Check by evaluating on a
+        split where the answer depends on fine detail rather than on the
+        question fitting; the two failure modes are indistinguishable on a
+        benchmark whose questions are short.
+    - id: cp-6
+      question: "You halve the image resolution and the token count drops 4x. You double the number of images and the token count doubles. Which of these two is the dangerous one at serving time?"
+      answerKind: short_text
+      hint: "Which quantity is linear in tokens and which one is quadratic, and which one is per-request?"
+      solution: >-
+        The image count, at serving time. Tokens are linear in images (576 each)
+        but the attention matrix is quadratic in the total sequence: 512 text
+        plus one image is 1,183,744 entries (4.52× text alone) and plus four
+        images is 7,929,856 (30.25×). The KV cache is linear per image but
+        large: 288.00 MiB per 576-token image at 32 layers and $d = 4096$ in
+        fp16, so four images are 1,152.00 MiB per request. Resolution is the
+        lever you pull to buy context; image count is the lever that decides
+        your batch size.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Two encoders produce two matrices, and the architecture question is
+        where they first meet. Meet at the input and every layer can see both
+        modalities, at the cost of putting the image in the context window and
+        making attention quadratic in the total length. Meet at the output and
+        the cost is nearly zero, but nothing in the model can represent a
+        relation between the two. Meet in the middle through attention and you
+        get cross-modal paths without vision tokens rewriting each other — but
+        only if the query comes from one side and the keys and values from the
+        other, which is a shape, not a slogan. Whatever you choose, the image
+        arrives as a fixed number of tokens and those tokens compete with text
+        for a fixed budget.
+      blocks:
+        - kind: checklist
+          body: |
+            - Fusion point: input (early), output (late), or an attention sublayer (cross)
+            - Late fusion has zero parameters that see both modalities
+            - Cross-attention is T x V; self-attention over the concatenation is (T+V) squared
+            - The projector maps vision width to language-model width, and its rank is capped when linear
+            - 576 tokens is 24 x 24, which is a resolution decision
+            - Visual tokens enter the same softmax denominator as text tokens
+      checkpoint: >-
+        Before reading on: if a label depends on a relation between the image and
+        the text, which of the three fusion points can represent it, and which
+        one can represent it without paying for vision-to-vision attention?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in four quantities and everything else is arithmetic. The
+        cross-modal parameter count: zero means the interaction is unrepresentable,
+        a bilinear form means it is representable with $d_v d_t$ numbers. The
+        entry ratio $TV/(T+V)^2$: it compares cross-attention against
+        concatenation and needs only two integers. The token share
+        $V/\text{context}$: it says whether the image is a guest or the
+        tenant. The effective attended-token count $\exp(H(p))$: it says whether
+        the layer is integrating the image or argmaxing one patch. For the
+        projector, reason about rank first and parameters second — a linear map
+        with ten million weights still has rank $d_v$.
+      blocks:
+        - kind: checklist
+          body: |
+            - Count cross-modal parameters before comparing accuracy
+            - Cross vs concat: TV / (T+V)^2, computed from two integers
+            - Cross vs text-only: V / T, so short prompts pay the most
+            - Token share: (resolution / patch)^2 / context
+            - Effective tokens = exp(entropy of the attention row)
+            - Linear projector rank <= min(d_v, d_t); MLP rank <= min(hidden, d_t)
+            - KV cache = tokens x layers x 2 x d x bytes
+      checkpoint: >-
+        Which of those seven is a property of the data, which is a property of
+        the architecture, and which one changes when you swap the GPU's dtype
+        from fp16 to fp32?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Five procedures cover the topic: cross-attention, the entry count that
+        prices it, the token budget, the dilution mass, and the projector fit.
+        The one that is easy to write wrongly without noticing is
+        cross-attention — the scale is optional as far as the shapes are
+        concerned, and the fusion direction is optional as far as the shapes are
+        concerned too, unless you assert on them.
+      blocks:
+        - kind: pseudocode
+          body: |
+            def cross_attention(text, vision):        # (T,d), (V,d)
+                S = text @ vision.T / sqrt(d)          # T x V, NOT (T+V)^2
+                S = S - rowmax(S)
+                W = softmax_rows(S)                    # rows sum to 1 over V
+                return W, W @ vision                   # (T, d)
+
+            def entry_ratio(T, V):
+                return T*V / (T+V)**2                  # 0.0499 at 32, 576
+
+            def budget(resolution, patch, context, n_images):
+                per = (resolution // patch) ** 2
+                return per*n_images, context - per*n_images
+
+            def mass(s_target, s_visual, beta):
+                z = beta * concat([s_target], s_visual)
+                return exp(z[0] - logsumexp(z))        # includes the visual terms
+
+            def fit_linear(X, Y):                      # rank <= min(d_v, d_t)
+                return solve(X.T @ X + lam*I, X.T @ Y)
+      checkpoint: >-
+        In `mass`, which term disappears if you normalise over the text scores
+        only, and what does the function return for any number of images once
+        that term is gone?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three results carry the topic: the $V/T$ cost identity, the unit-variance
+        argument behind $\sqrt{d_k}$, and the rank bound on a linear projector.
+        All three are one line each once the objects are named.
+      blocks:
+        - kind: math
+          body: |
+            Attention cost, $T$ queries against $V$ keys of width $d$:
+
+            $$C_{\text{cross}} = 4TVd, \qquad
+              C_{\text{self}} = 4(T+V)^2 d, \qquad
+              \frac{C_{\text{cross}}}{C_{\text{self}}} = \frac{TV}{(T+V)^2},$$
+
+            and against text-only self-attention,
+
+            $$\frac{C_{\text{cross}}}{C_{\text{text}}} = \frac{V}{T}.$$
+
+            Score variance, for $q,k$ with i.i.d. unit-variance entries:
+
+            $$\operatorname{Var}(q \cdot k) = \sum_{i=1}^{d}
+              \operatorname{Var}(q_i k_i) = d
+              \quad\Longrightarrow\quad
+              \operatorname{sd}\!\left(\frac{q \cdot k}{\sqrt{d}}\right) = 1 .$$
+
+            Rank of a linear projector:
+
+            $$\operatorname{rank}(XW) \le \min(\operatorname{rank} X,
+              \operatorname{rank} W) \le \min(d_v, d_t),$$
+
+            and with one hidden layer of width $h$,
+
+            $$\operatorname{rank}\big(W_2\,\sigma(W_1 X)\big) \le \min(h, d_t).$$
+
+            Attention mass with $V$ visual competitors:
+
+            $$p_{\text{needle}} = \left(1 + \sum_{j=1}^{V}
+              e^{\beta(s_j - s_t)}\right)^{-1},$$
+
+            which is decreasing in $V$ for every fixed $s_t$.
+      checkpoint: >-
+        The mass formula has no dependence on the *values* of the vision
+        vectors, only their scores. What does that imply about how much a better
+        image encoder can recover once the token count is fixed?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A correct cross-attention, a correct budget and mass calculation, and
+        the measured numbers each one should reproduce. Compare numbers, not
+        code.
+      blocks:
+        - kind: warning
+          body: >-
+            Three failures that never raise. Dropping $1/\sqrt{d_k}$ turns the
+            softmax into an argmax: at $d = 64$ the logits have sd 7.8705
+            instead of 0.9838 and the layer reads 2.43 of 576 tokens instead of
+            354.72. Swapping the query and key sides gives an output of shape
+            `(V, d)` instead of `(T, d)` — a shape assertion is the only test
+            that catches it. Normalising the attention mass over the text tokens
+            only makes the visual tokens free: the function returns 1.0000 at
+            every image count while the true value falls to 0.1109 at $V = 576$
+            and 0.0329 at $V = 2{,}304$.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def cross_attention(text, vision):
+                q = np.asarray(text, dtype=np.float64)
+                kv = np.asarray(vision, dtype=np.float64)
+                s = (q @ kv.T) / np.sqrt(q.shape[1])
+                s = s - s.max(axis=1, keepdims=True)
+                w = np.exp(s)
+                return w / w.sum(axis=1, keepdims=True), \
+                    (w / w.sum(axis=1, keepdims=True)) @ kv
+
+
+            def entry_ratio(T, V):
+                return T * V / (T + V) ** 2
+
+
+            def budget(resolution, patch, context, n_images):
+                per = (resolution // patch) ** 2
+                return per * n_images, context - per * n_images
+
+
+            def mass(s_target, s_visual, beta=10.0):
+                z = beta * np.concatenate([[s_target],
+                                           np.asarray(s_visual, float)])
+                z = z - z.max()
+                p = np.exp(z)
+                return float(p[0] / p.sum())
+
+
+            def linear_projector_rank(d_v, d_t):
+                return min(d_v, d_t)
+
+
+            if __name__ == "__main__":
+                print(entry_ratio(32, 576))          # 0.04986149584487535
+                print(budget(336, 14, 4096, 4))      # (2304, 1792)
+                print(linear_projector_rank(1024, 4096))   # 1024
+                print(mass(0.53, [0.0] * 576))       # 0.258053988166936
+      checkpoint: >-
+        You have a correct implementation and a request with four images. Name
+        the four numbers you would print before believing any latency or
+        quality number, and say which one you cannot compute without the
+        tokenizer.
+
+  problems:
+    - id: p-cross-attention
+      title: "Cross-attention: query from text, keys and values from vision"
+      difficulty: medium
+      prompt: >-
+        Implement `cross_attention(text, vision)`. `text` is a list of `T` query
+        vectors of length `d`; `vision` is a list of `V` key-and-value vectors
+        of the same length `d`. Use a single head. Score every text query
+        against every vision key with a dot product divided by `sqrt(d)`,
+        softmax each row along the vision axis (subtract the row maximum before
+        exponentiating so it is numerically stable), and return the weighted sum
+        of the vision vectors, as a list of `T` lists of `d` floats. Do not
+        normalise the input vectors and do not transpose the result: row `i` is
+        the fused vector for text token `i`.
+      starter: |
+        import numpy as np
+
+        def cross_attention(text, vision):
+            # your implementation here
+            pass
+      language: python
+      entry: cross_attention
+      testCases:
+        - input: '[[[1.0, 0.0]], [[1.0, 0.0], [0.0, 1.0]]]'
+          expected: "[[0.6697615493266569, 0.3302384506733431]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]]]'
+          expected: "[[0.5, 0.5]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]]]'
+          expected: "[[0.6697615493266569, 0.3302384506733431], [0.3302384506733431, 0.6697615493266569]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[2.0, 0.0, 0.0, 0.0]], [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]]]'
+          expected: "[[0.8446375965030364, 0.5776812017484818, 0.0, 0.0]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[0.5, 0.5]], [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]]'
+          expected: "[[0.7079540768557814, 0.7079540768557814]]"
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+
+        def cross_attention(text, vision):
+            q = np.asarray(text, dtype=np.float64)
+            kv = np.asarray(vision, dtype=np.float64)
+            if q.ndim != 2 or kv.ndim != 2:
+                raise ValueError("text and vision must both be 2-D")
+            if q.shape[1] != kv.shape[1]:
+                raise ValueError("dimension mismatch: %d against %d"
+                                 % (q.shape[1], kv.shape[1]))
+
+            scores = (q @ kv.T) / np.sqrt(q.shape[1])
+            scores = scores - scores.max(axis=1, keepdims=True)
+            w = np.exp(scores)
+            w = w / w.sum(axis=1, keepdims=True)
+            return (w @ kv).tolist()
+      solutionExplanation: >-
+        The shape is the contract: `scores` is `T x V` because the queries come
+        from the text and the keys from the vision, and the output is `T x d`
+        because each text token leaves with its own weighted average of the
+        vision vectors. Test 1 fixes the scaling — with `d = 2` the score for
+        the matching key is `1/sqrt(2) = 0.7071` and the softmax over `[0.7071,
+        0]` is `[0.6698, 0.3302]`; omitting the `sqrt(d)` gives `[0.7311,
+        0.2689]` instead, which is the single most common silent bug in this
+        layer. Test 4 and test 5 fix the *absence* of query normalisation: with
+        `text = [2, 0, 0, 0]` the scores are `[1, 0, 1]` and the answer is
+        `[0.8446, 0.5777, 0, 0]`, while normalising the query first would give
+        `[0.5, 0, 0.5]` and `[0.7864, 0.3692, 0, 0]`. Test 2 is the
+        uninformative case that still has to be right: identical keys mean a
+        uniform softmax and the mean of the values. Test 3 checks that rows are
+        normalised independently — the matrix is symmetric only because the
+        inputs are, which is exactly the trap this topic warns about in the
+        other direction.
+      complexity: "O(T V d) time and O(T V) space for the score matrix; that product is the whole cost argument"
+      tags: [cross-attention, fusion, softmax, scaled-dot-product]
+
+    - id: p-visual-token-budget
+      title: "Visual token budget: how much context four images cost"
+      difficulty: easy
+      prompt: >-
+        Implement `visual_token_budget(resolution, patch, context, n_images)`.
+        An image of `resolution` pixels square is cut into non-overlapping
+        `patch`-pixel squares, so the grid is `resolution // patch` on each side
+        and each image contributes that many squared visual tokens. Assume
+        `patch` divides `resolution`. Return a dict with four keys:
+        `tokens_per_image` (int), `total_visual` (int, over all images),
+        `text_budget` (int, `context` minus `total_visual`) and
+        `visual_fraction` (float, `total_visual / context`).
+      starter: |
+        import numpy as np
+
+        def visual_token_budget(resolution, patch, context, n_images):
+            # your implementation here
+            pass
+      language: python
+      entry: visual_token_budget
+      testCases:
+        - input: '{"resolution": 336, "patch": 14, "context": 4096, "n_images": 1}'
+          expected: '{"tokens_per_image": 576, "total_visual": 576, "text_budget": 3520, "visual_fraction": 0.140625}'
+          mode: json
+          tolerance: 1e-09
+        - input: '{"resolution": 336, "patch": 14, "context": 4096, "n_images": 4}'
+          expected: '{"tokens_per_image": 576, "total_visual": 2304, "text_budget": 1792, "visual_fraction": 0.5625}'
+          mode: json
+          tolerance: 1e-09
+        - input: '{"resolution": 224, "patch": 16, "context": 2048, "n_images": 2}'
+          expected: '{"tokens_per_image": 196, "total_visual": 392, "text_budget": 1656, "visual_fraction": 0.19140625}'
+          mode: json
+          tolerance: 1e-09
+        - input: '{"resolution": 384, "patch": 16, "context": 8192, "n_images": 7}'
+          expected: '{"tokens_per_image": 576, "total_visual": 4032, "text_budget": 4160, "visual_fraction": 0.4921875}'
+          mode: json
+          tolerance: 1e-09
+        - input: '{"resolution": 336, "patch": 24, "context": 4096, "n_images": 3}'
+          expected: '{"tokens_per_image": 196, "total_visual": 588, "text_budget": 3508, "visual_fraction": 0.1435546875}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+
+        def visual_token_budget(resolution, patch, context, n_images):
+            if patch <= 0:
+                raise ValueError("patch must be positive")
+            if resolution % patch:
+                raise ValueError("patch %d does not divide resolution %d"
+                                 % (patch, resolution))
+            grid = resolution // patch
+            per_image = grid * grid
+            total = per_image * n_images
+            return {
+                "tokens_per_image": int(per_image),
+                "total_visual": int(total),
+                "text_budget": int(context - total),
+                "visual_fraction": float(total / context),
+            }
+      solutionExplanation: >-
+        The only real content is `(resolution // patch) ** 2`; everything else
+        is bookkeeping, which is why the numbers are worth memorising. Test 1
+        is the canonical configuration — 336 pixels at patch 14 is a 24x24 grid,
+        the 576 that LLaVA-1.5 uses, and 576/4096 = 0.140625. Test 4 is the one
+        that catches the resolution error: 384 at patch 16 is also 24x24, so it
+        costs exactly the same 576 tokens as 336 at patch 14, and the answer for
+        seven images in an 8,192 context is 4,032 visual with 4,160 left. Test 3
+        is the case where a smaller patch *and* a larger grid cancel: 224 at
+        patch 16 is 14x14 = 196, less than a third of 576, and the fraction is
+        0.1914 not 0.5625. Test 5 fixes the arithmetic order: 336 at patch 24 is
+        14x14 = 196, not `336/24 = 14` used as a token count. Note the token
+        count is quadratic in resolution and inverse-quadratic in patch size,
+        so the two knobs are not interchangeable.
+      complexity: "O(1) time and space; the lesson is that the exponent is 2, not 1"
+      tags: [token-budget, vision-language, patch-grid, context]
+
+    - id: p-fusion-cost
+      title: "Cross-attention against concatenation, in entries"
+      difficulty: medium
+      prompt: >-
+        Implement `fusion_cost(text_tokens, vision_tokens)`. For `T` text tokens
+        and `V` visual tokens, return a dict with four keys: `cross_entries`
+        (int, the size of the `T x V` cross-attention score matrix),
+        `concat_entries` (int, the size of the `(T+V) x (T+V)` self-attention
+        matrix over the concatenated sequence), `ratio` (float,
+        `cross_entries / concat_entries`) and `vision_block_fraction` (float, the
+        share of the concatenated matrix that is vision attending to vision,
+        `V*V / concat_entries`).
+      starter: |
+        import numpy as np
+
+        def fusion_cost(text_tokens, vision_tokens):
+            # your implementation here
+            pass
+      language: python
+      entry: fusion_cost
+      testCases:
+        - input: '[32, 576]'
+          expected: '{"cross_entries": 18432, "concat_entries": 369664, "ratio": 0.04986149584487535, "vision_block_fraction": 0.8975069252077562}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[512, 576]'
+          expected: '{"cross_entries": 294912, "concat_entries": 1183744, "ratio": 0.2491349480968858, "vision_block_fraction": 0.28027681660899656}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[16, 2304]'
+          expected: '{"cross_entries": 36864, "concat_entries": 5382400, "ratio": 0.006848989298454221, "vision_block_fraction": 0.9862544589774078}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[128, 1024]'
+          expected: '{"cross_entries": 131072, "concat_entries": 1327104, "ratio": 0.09876543209876543, "vision_block_fraction": 0.7901234567901234}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[1, 1]'
+          expected: '{"cross_entries": 1, "concat_entries": 4, "ratio": 0.25, "vision_block_fraction": 0.25}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+
+        def fusion_cost(text_tokens, vision_tokens):
+            T = int(text_tokens)
+            V = int(vision_tokens)
+            if T <= 0 or V <= 0:
+                raise ValueError("token counts must be positive")
+            cross = T * V
+            concat = (T + V) ** 2
+            return {
+                "cross_entries": int(cross),
+                "concat_entries": int(concat),
+                "ratio": float(cross / concat),
+                "vision_block_fraction": float(V * V / concat),
+            }
+      solutionExplanation: >-
+        Two formulas, and both are worth having in your head. `ratio` is
+        `TV/(T+V)^2`, which is at most 0.25 and is attained exactly when `T = V`
+        — test 5 is that maximum, and test 1 is the operating point this topic
+        uses (0.0499 at 32 text and 576 visual tokens). Test 4 shows the ratio
+        rising to 0.0988 as the text grows to 128, which is the point the
+        derivation makes: the cost of cross-attention relative to concatenation
+        depends on the *ratio* of the two lengths, not on the image. Test 3 is
+        the extreme: 16 text tokens against 2,304 (four 576-token images) gives
+        0.00685, so concatenation is 146 times the matrix — and 98.6% of that
+        matrix is vision attending to vision, which is work no language model
+        asked for. Test 2 is the realistic long-prompt case where the gap closes
+        to 4×.
+      complexity: "O(1) time and space"
+      tags: [cross-attention, cost-model, quadratic-attention, fusion]
+
+  try_it: >-
+    At 32 text tokens and 576 visual tokens, compute both attention matrices by hand:
+    cross-attention is T×V = 18,432 entries and concatenated self-attention is (T+V)² =
+    369,664. Report the ratio, then work out what fraction of the big matrix is vision tokens
+    attending to other vision tokens (576² divided by (T+V)²), which should be 89.75%.
+  interview_questions:
+    - question: "Cross-attention and concatenated self-attention can have the same parameter count and 20 times different compute. Explain why."
+      level: mid
+      key_points:
+        - "In cross-attention the queries come from the text and the keys and values from the vision, so the score matrix is T×V; in a concatenated sequence it is (T+V)×(T+V)."
+        - "At T = 32 and V = 576 that is 18,432 entries against 369,664, a ratio of 0.0499, and 301.99 MFLOP against 6,056.58 MFLOP per layer at d = 4096."
+        - "Of the concatenated matrix, 331,776 entries — 89.75% — are vision attending to vision, which is work the language model never asked for."
+        - "Parameter counts can match exactly while the kernel time differs by a factor of twenty, so the two designs are not interchangeable at fixed budget."
+      follow_up: "When would you actually want the image tokens to attend to each other?"
+    - question: "You replace a two-layer MLP connector with a single linear map because it is five times smaller. When does that cost you quality, and by how much?"
+      level: senior
+      key_points:
+        - "A linear map from 128 to 256 dimensions has rank at most 128, so it can only ever write into half of the target space — the ceiling is structural, not a training problem."
+        - "On an exactly linear alignment the linear map wins: R² = 0.9939 and cosine 0.9999 against the MLP's 0.9887 and 0.9967."
+        - "On a nonlinear alignment the ordering reverses: linear R² = 0.1679 and cosine 0.6771, MLP R² = 0.6274 and cosine 0.8745, with rank 256 against 128."
+        - "The MLP pays 6× the parameters (196,608 against 32,768); LLaVA's 1024→4096→4096 connector is 20.97M, 5× a linear map, and still 0.30% of a 7B model."
+      follow_up: "If the connector is 0.3% of the weights, what is actually expensive about putting an image in the prompt?"
+    - question: "You budget 4,096 tokens for document QA and find four page images already consume 2,304. What breaks first as you add images?"
+      level: senior
+      key_points:
+        - "576 tokens is a 24×24 grid (336 px at patch 14 or 384 px at patch 16), so four images are 2,304 visual tokens — 56.25% of the context, leaving 1,792 for text, prompt and answer."
+        - "The KV cache is the binding constraint, not the FLOPs: one 576-token image at 32 layers, d = 4096 in fp16 is 288.00 MiB, so four are 1,152.00 MiB before a single text token."
+        - "Attention dilution degrades retrieval before anything runs out: with one needle at cosine 0.53, top-1 retrieval fell 1.0000, 0.8340, 0.7360, 0.5930, 0.4725, 0.3975, 0.3170 at V = 0 to 4608."
+        - "A 2×2 average pool takes 24×24 to 12×12 — 144 tokens per image — which raises the text budget from 1,792 to 3,520, a 96.4% increase for one pooling layer."
+      follow_up: "Pooling costs resolution. Which questions in your eval set would you expect to get worse, and how would you check?"
+  common_mistakes:
+    - "Calling a concatenated sequence cross-attention because text attends to image tokens somewhere inside it, then budgeting compute as if the matrix were T×V."
+    - "Swapping the MLP connector for a linear map to save parameters and attributing the caption-quality drop to the data, when the cause is the rank ceiling."
+    - "Budgeting the context window for text and only afterwards discovering the images already took more than half of it — a fraction that scales with the square of resolution."
+  further_reading:
+    - label: "Alayrac et al., Flamingo: a Visual Language Model for Few-Shot Learning, NeurIPS 2022"
+    - label: "Liu et al., Visual Instruction Tuning (LLaVA), NeurIPS 2023"

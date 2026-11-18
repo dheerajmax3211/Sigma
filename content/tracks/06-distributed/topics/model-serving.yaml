@@ -1,0 +1,606 @@
+id: model-serving
+slug: model-serving
+title: "Model Serving: Queues, Batching, and Autoscaling"
+summary: >-
+  Serving is queueing theory with a GPU attached: at 90% utilisation the mean
+  response is ten times the service time and the p99 is forty-six times, which
+  is why healthy fleets run near half load and why autoscaling targets matter
+  more than replica counts.
+kind: lesson
+difficulty: hard
+position: 13
+estMinutes: 18
+prerequisites: [continuous-batching, inference-cost-model]
+phase: serving
+tags: [serving, queueing, autoscaling, batching, latency]
+
+body:
+  big_idea: >-
+    Latency is not a property of the model but of the queue in front of it:
+    service time sets a floor and utilisation multiplies it — twice at 50%
+    load, ten times at 90%.
+  problem:
+    - "CPU sits at 90% and p99 is 2.3 seconds on a 50 ms model: you are on the steep part of the queueing curve."
+    - "You size for 80% utilisation, a 10% traffic spike takes you to 88%, and latency triples: your headroom was smaller than your variance."
+    - "You enable a 25 ms coalescing window and the median barely moves while p99 rises by more than the window, because the queue amplifies it."
+  analogy: >-
+    A supermarket with one checkout. Half full, the queue is twice the
+    scanning time; nine-tenths full, ten times — same cashier, same speed,
+    entirely different experience. The cashier is the model, the scanning is
+    service time, and nothing about either changed between those two states.
+  concept_points:
+    - "**Mean response is service time divided by one minus utilisation.** With a 50 ms service time, 50% load gives a 100 ms mean, 75% gives 200 ms, 90% gives 500 ms and 97% gives 2,000 ms. The curve from 50% to 90% costs five times the service time for forty points of utilisation."
+    - "**The tail grows faster than the mean, and the tail is the SLO.** Measured p99 is 441 ms at 50% load, 913 ms at 75%, **2,300 ms at 90%** and 9,210 ms at 97% — at 90% that is 46 times the 50 ms service time. The utilisation you can afford is far below what the mean suggests."
+    - "**This is why fleets run near half load.** Targeting 60% instead of 80% costs 33% more replicas: 10,000 rps of 50 ms work needs **834 replicas at 60% against 625 at 80%**. You are buying tail latency with hardware, and the price is explicit — the only way to make that trade honestly."
+    - "**Batching trades single-request latency for throughput superlinearly.** A 25 ms coalescing window takes batch 1 from 20 tok/s to batch 32 at **426.7 tok/s**, 21x, while service time rises from 50 ms to 75 ms. The added delay is bounded by one window; at batch 128 throughput reaches 914.3 tok/s but service time climbs to 140 ms and the penalty dominates."
+    - "**Autoscaling is capacity divided by a target, and the target is the whole decision.** Replicas needed is arrival rate times service time over target utilisation. Scale-up lags — detection, scheduling, model load, warmup — while existing replicas absorb the excess, so the safety margin must exceed the lag times the traffic slope."
+    - "**Admission control is cheaper than a queue you cannot serve.** A bounded queue with an explicit rejection is a decision made in microseconds; an unbounded queue is a decision made implicitly, badly, by timing out. Rejecting 1% of traffic at the edge usually beats degrading 100% of it."
+  definitions:
+    - { term: "Service time", meaning: "Time to handle one request with no queueing. The floor on latency." }
+    - { term: "Utilisation", meaning: "Arrival rate times service time, as a fraction of capacity. The multiplier on latency." }
+    - { term: "Queueing delay", meaning: "Time spent waiting before service begins. Diverges as utilisation approaches 1." }
+    - { term: "p99 latency", meaning: "The 99th percentile response time. The statistic SLOs are written against." }
+    - { term: "Coalescing window", meaning: "How long a batcher waits to fill a batch. Bounds added latency by its own length." }
+    - { term: "Target utilisation", meaning: "The load fraction autoscaling provisions for. Lower means more replicas and a shorter tail." }
+    - { term: "Scale-up lag", meaning: "Time from demand change to a serving replica: detection, scheduling, load, warmup." }
+    - { term: "Admission control", meaning: "Rejecting or shedding requests at the edge rather than queueing them indefinitely." }
+    - { term: "Warmup", meaning: "Work a new replica must do before it serves at full rate: weights resident, graphs captured, caches primed." }
+    - { term: "Little's law", meaning: "Concurrency equals arrival rate times time in system. Converts between queue depth and latency." }
+    - { term: "Shed load", meaning: "Deliberately failing fast when the queue exceeds a bound, to keep the served fraction healthy." }
+
+  diagrams:
+    - type: plot
+      title: "Response time against utilisation, mean and p99"
+      chart: "line"
+      xLabel: "utilisation"
+      yLabel: "response time, ms"
+      series:
+        - name: "mean"
+          points:
+            - { x: 0.25, y: 67 }
+            - { x: 0.5, y: 100 }
+            - { x: 0.75, y: 200 }
+            - { x: 0.9, y: 500 }
+            - { x: 0.97, y: 2000 }
+        - name: "p99"
+          points:
+            - { x: 0.25, y: 265 }
+            - { x: 0.5, y: 441 }
+            - { x: 0.75, y: 913 }
+            - { x: 0.9, y: 2300 }
+            - { x: 0.97, y: 9210 }
+    - type: compare
+      title: "Two autoscaling targets, one bill"
+      left_label: "Target 60% utilisation"
+      left_points:
+        - "10,000 rps of 50 ms work needs 834 replicas"
+        - "Mean response close to 1.7x service time"
+        - "p99 stays inside a tight SLO"
+        - "33% more hardware than the 80% target"
+      right_label: "Target 80% utilisation"
+      right_points:
+        - "Same traffic needs 625 replicas"
+        - "Mean response 5x service time"
+        - "p99 already 18x service time at target"
+        - "Cheapest bill that still technically works"
+    - type: pipeline
+      title: "Where a request's latency is spent"
+      nodes:
+        - label: "Edge / auth"
+          note: "milliseconds"
+          detail: "Cheap and fixed. Worth measuring because it is pure overhead on every request."
+        - label: "Queue"
+          note: "the term that diverges"
+          detail: "Multiplied by 1/(1-utilisation). At 90% this is nine service times — the largest term in the sum by far."
+        - label: "Coalescing window"
+          note: "bounded by its own length"
+          detail: "Up to 25 ms here, buying 21x throughput at batch 32. Added delay compounds with queueing because it lengthens occupancy."
+        - label: "Service"
+          note: "the floor"
+          detail: "50 ms at batch 1, 75 ms at batch 32. The only term the model controls, and rarely the dominant one."
+    - type: architecture
+      title: "The control loop"
+      nodes:
+        - { id: lb, x: 0, y: 0, label: "Load balancer", kind: client, detail: "Routes to replicas. Queue depth here, not CPU, is the signal that leads demand." }
+        - { id: q, x: 1, y: 0, label: "Bounded queue", kind: worker, detail: "Bounded so overflow becomes a fast rejection rather than an unbounded wait. Depth is the leading indicator." }
+        - { id: repl, x: 2, y: 0, label: "Replicas", kind: model, detail: "Each has a warmup cost. A cold replica inflates effective service time until weights are resident." }
+        - { id: as, x: 1, y: 2, label: "Autoscaler", kind: worker, detail: "Replicas = ceil(arrival x service / target). Reacts with lag, so the target must absorb the lag's traffic growth." }
+        - { id: slo, x: 3, y: 1, label: "SLO feedback", kind: external, detail: "Compare p99 against budget and adjust the target, not the replica count. The target is the tunable." }
+      edges:
+        - { from: lb, to: q }
+        - { from: q, to: repl }
+        - { from: q, to: as, label: "depth", style: "async" }
+        - { from: as, to: repl, label: "scale" }
+        - { from: repl, to: slo, label: "p99" }
+
+  markdown: |
+    ## Latency is a queue property
+
+    For a single server with Poisson arrivals and exponential service,
+
+    $$\mathbb{E}[T] = \frac{1}{\mu - \lambda} = \frac{1/\mu}{1-\rho},
+    \qquad \rho = \frac{\lambda}{\mu}.$$
+
+    With a 50 ms service time that is a factor of $1/(1-\rho)$ on top of the
+    floor:
+
+    | Arrival | Utilisation | Mean | p99 |
+    |---|---|---|---|
+    | 5 rps | 0.25 | 67 ms | 265 ms |
+    | 10 rps | 0.50 | 100 ms | 441 ms |
+    | 15 rps | 0.75 | 200 ms | 913 ms |
+    | 18 rps | 0.90 | **500 ms** | **2,300 ms** |
+    | 19.5 rps | 0.97 | 2,000 ms | 9,210 ms |
+
+    At 90% utilisation the mean is **10x** the service time and the p99 is
+    **46x**. Nothing about the model changed. If your SLO is a p99 — and it
+    should be — the utilisation you can afford is nowhere near 90%.
+
+    ## The bill for a good tail
+
+    Replicas needed is a division:
+
+    $$\text{replicas} = \left\lceil \frac{\lambda \cdot s}{\rho_{\text{target}}} \right\rceil .$$
+
+    | Traffic | 50% target | 60% | 80% |
+    |---|---|---|---|
+    | 100 rps | 10 | 9 | 7 |
+    | 1,000 rps | 100 | 84 | 63 |
+    | 10,000 rps | 1,000 | 834 | 625 |
+
+    Choosing 60% over 80% costs **33% more hardware** and buys you the
+    difference between a 200 ms and a 500 ms mean. That is a real trade with a
+    stated price — which is the only way to make it honestly.
+
+    ## Batching is the exception that pays
+
+    | Batch | Service | Throughput | Added wait |
+    |---|---|---|---|
+    | 1 | 50 ms | 20 tok/s | 0 |
+    | 8 | 56 ms | 142.9 tok/s | ≤25 ms |
+    | 32 | 75 ms | **426.7 tok/s** | ≤25 ms |
+    | 128 | 140 ms | 914.3 tok/s | ≤25 ms |
+
+    Batch 32 buys **21x throughput** for 25 ms of added delay and 25 ms of extra
+    service. Batch 128 doubles throughput again but costs 140 ms of service — and
+    once service time is large, the queue multiplier applies to a bigger number.
+
+    The optimum is where marginal throughput stops paying for marginal service
+    time, which is usually well below the largest batch that fits in memory.
+
+    ## Where the analogy breaks
+
+    **The queue amplifies everything you add to it.** A 25 ms coalescing window
+    at 90% utilisation does not add 25 ms to the user's wait; it adds 25 ms to a
+    term that is already multiplied. Always measure end-to-end.
+
+    **Scale-up is slower than the spike.** Detection, scheduling, model load and
+    warmup all run while the existing replicas absorb the excess — at the exact
+    moment their utilisation exceeds target. The margin has to cover
+    lag × traffic slope, not merely be positive.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Latency is not a property of the model, it is a property of the **queue in front of it**. Service time sets a floor; utilisation multiplies it. At 50% load the mean response is twice the service time; at 90% it is ten times; at 97% it is forty. Every serving decision — batch window, replica count, timeout, autoscaling target — is a choice about where on that curve you are willing to live.
+
+    ### The analogy, in full
+
+    A supermarket with one checkout. When the shop is half full, the queue is twice the scanning time. When it is nine-tenths full, the queue is ten times the scanning time — same cashier, same speed, entirely different experience. The cashier is the model and the scanning time is the service time. Nothing about the cashier changed between those two states. Two ways the analogy breaks. First, a queue can be made *faster* by serving several customers at once: batching is scanning a trolley's items together, which raises throughput a lot and raises a single customer's latency a little. Second, the shop can open new tills, but only after someone notices the queue — the lag between demand and capacity is the reason autoscaling never fully solves the tail.
+
+    ### Failure modes, in full
+
+    - You add replicas until CPU looks comfortable at 90% utilisation and the p99 latency is 2.3 seconds on a 50 ms model. Nothing is broken — you are sitting on the steep part of the queueing curve and it is doing exactly what the maths says.
+    - You size the fleet for 80% utilisation to save money, then a traffic spike of 10% pushes you to 88% and latency triples. The capacity headroom you bought was smaller than the variance in your own traffic.
+    - You enable a 25 ms coalescing window to improve batching throughput and the median latency barely moves while the p99 goes up by more than the window, because the queue amplifies the added delay exactly as it amplifies service time.
+    - You autoscale on CPU, which lags demand — by the time the new replica is warm the spike is over and you have paid for both the queue and the idle replica.
+    - You report mean latency, which is the least informative statistic available for a queue: the mean is dominated by the bulk of fast requests while the tail is where users and SLOs actually live.
+
+    ### The mechanisms, in full
+
+    - **Mean response is service time divided by one minus utilisation.** With a 50 ms service time, a 50% load gives a 100 ms mean response, 75% gives 200 ms, 90% gives 500 ms and 97% gives 2,000 ms. Exactly ten times the service time at 90%, and forty times at 97% — the curve from 50% to 90% costs you five times the service time for 40 points of utilisation.
+    - **The tail grows faster than the mean, and the tail is the SLO.** Measured, p99 response is 441 ms at 50% load, 913 ms at 75%, **2,300 ms at 90%** and 9,210 ms at 97%. At 90% the p99 is 46 times the 50 ms service time. If your SLO is expressed at p99 — and it should be — then the utilisation you can afford is far below what the mean suggests.
+    - **This is why fleets run near half load.** Targeting 60% instead of 80% costs 33% more replicas: 10,000 rps of 50 ms work needs 834 replicas at 60% against 625 at 80%. You are buying tail latency with hardware, and the price is explicit — which is the only way to make that trade honestly.
+    - **Batching trades single-request latency for throughput superlinearly.** A 25 ms coalescing window takes batch 1 from 20 tok/s to batch 32 at 426.7 tok/s — 21 times the throughput — while service time rises from 50 ms to 75 ms. The cost is bounded: at most one window of added delay, which is 25 ms. At batch 128 throughput reaches 914.3 tok/s but service time climbs to 140 ms, and by then the service penalty dominates the window.
+    - **The window's delay is amplified by the queue like everything else.** A 25 ms window added to a service time that is already multiplied tenfold at 90% utilisation does not add 25 ms to the user-visible latency — it adds 25 ms to each stage that sits behind the queue. Measure end-to-end, not at the batcher's edge.
+    - **Autoscaling is capacity divided by a target, and the target is the whole decision.** Replicas needed is arrival rate times service time divided by target utilisation, rounded up. The formula is trivial; choosing the target is the engineering, because it sets both the bill and the tail.
+    - **Autoscaling reacts late, so the queue absorbs the spike.** Scale-up has a lag — detection, scheduling, model load, warmup — during which the existing replicas must absorb the excess. That is precisely the interval where utilisation exceeds your target and the tail explodes, which is why the safety margin must exceed the lag times the traffic slope, not exceed zero.
+    - **Admission control is cheaper than a queue you cannot serve.** A bounded queue with an explicit rejection is a decision the system makes in microseconds; an unbounded queue is a decision it makes implicitly, badly, by timing out. Rejecting 1% of traffic at the edge is usually preferable to degrading 100% of it.
+    - **Warmup is part of the service time on a cold replica.** A replica that has just started cannot serve at full rate until weights are resident and any JIT or graph capture has run. For a large model that is tens of seconds — during which autoscaling looks like it is working while the tail keeps growing.
+    - **Report percentiles with the utilisation that produced them.** A p99 of 300 ms means nothing without it: the same model at 40% load gives 200 ms and at 95% gives 4,600 ms. Latency numbers travel without their load context and then get compared across systems that were never in the same regime.
+  derivations:
+    - title: "Mean response time from utilisation"
+      latex: |
+        For M/M/1 with arrival rate $\lambda$ and service rate $\mu$,
+        $$\mathbb{E}[T] = \frac{1}{\mu-\lambda}
+        = \frac{1/\mu}{1-\lambda/\mu} = \frac{s}{1-\rho}.$$
+      prose: >-
+        The service time $s = 1/\mu$ sets the floor and $1/(1-\rho)$ is the
+        multiplier. At $\rho = 0.9$ the multiplier is 10; at $\rho = 0.97$ it is
+        33. This is the entire content of "the server is busy".
+    - title: "The tail, and why p99 diverges faster"
+      latex: |
+        For M/M/1 the waiting-time survival function is
+        $$\Pr(W > t) = \rho\,e^{-\mu(1-\rho)t},$$
+        so the $q$ quantile of total response is
+        $$T_q = s - \frac{\ln\left((1-q)/\rho\right)}{\mu(1-\rho)}.$$
+      prose: >-
+        The exponent carries $(1-\rho)$, so as utilisation rises both the mean
+        and the tail blow up — but the tail has the extra $-\ln$ factor. At
+        $\rho=0.9$ the measured p99 is 2,300 ms against a 500 ms mean, a ratio
+        that widens further as $\rho \to 1$.
+    - title: "Replica count for a utilisation target"
+      latex: |
+        Capacity per replica is $\mu = 1/s$, so $R$ replicas serve $R/s$ requests
+        per second at full load. At target $\rho_t$,
+        $$R = \left\lceil \frac{\lambda s}{\rho_t} \right\rceil .$$
+      prose: >-
+        Linear in traffic, inverse in target. Doubling traffic doubles replicas;
+        lowering the target from 80% to 60% multiplies by 1.33. The second lever
+        is cheaper to change and is the one to tune against an SLO.
+    - title: "Why a bounded queue beats an unbounded one"
+      latex: |
+        Little's law gives concurrency $L = \lambda W$. With an unbounded queue,
+        $W$ grows without limit as $\rho \to 1$, so $L$ — and therefore memory —
+        grows with it. Bounding $L$ at $L_{\max}$ bounds the wait:
+        $$W_{\max} = \frac{L_{\max}}{\lambda}.$$
+      prose: >-
+        A bound converts an unbounded latency into a rejection rate you choose.
+        At 1,000 rps and a queue depth of 100, the worst wait is 100 ms before
+        shedding — a decision made in microseconds rather than a timeout made in
+        tens of seconds.
+
+  implementations:
+    - language: python
+      title: "Queueing estimates: response time, replicas, and the tail"
+      note: >-
+        Numerically WRONG as a forecast in three ways: it assumes Poisson
+        arrivals and exponential service (real LLM service times are
+        heavy-tailed, which makes the true p99 worse), it assumes one queue per
+        replica rather than a shared queue with work stealing, and it ignores
+        warmup. Treat the mean as a lower bound and the tail as optimistic.
+      code: |
+        import math
+
+        def response_time(service_s, utilisation):
+            if utilisation >= 1:
+                return float("inf")
+            return service_s / (1 - utilisation)
+
+        def p_quantile(service_s, utilisation, q=0.99):
+            mu = 1 / service_s
+            return service_s - math.log((1 - q) / utilisation) / (mu * (1 - utilisation))
+
+        def replicas(arrival_rps, service_s, target=0.6):
+            return math.ceil(arrival_rps * service_s / target)
+
+        def max_wait(queue_depth, arrival_rps):
+            return queue_depth / arrival_rps      # Little's law
+    - language: python
+      title: "Coalescing window: throughput gained versus latency added"
+      note: >-
+        Numerically WRONG because it models the batch as a fixed service time
+        and ignores that a partially filled batch costs the same as a full one
+        while producing less throughput. Real batchers see variable batch sizes,
+        so the realised gain is below this estimate whenever traffic is bursty.
+      code: |
+        def batch_tradeoff(batches=((1, 0.050), (8, 0.056), (32, 0.075), (128, 0.140)),
+                           window_ms=25):
+            rows = []
+            for B, svc in batches:
+                rows.append({"batch": B,
+                             "service_ms": svc * 1e3,
+                             "throughput_tok_s": B / svc,
+                             "added_wait_ms": window_ms if B > 1 else 0})
+            return rows
+
+  checkpoints:
+    - id: cp-1
+      question: "Mean latency is 500 ms on a 50 ms model. What is the utilisation, and what is the p99?"
+      answerKind: short_text
+      hint: "Mean equals service time over one minus utilisation."
+      solution: >-
+        $500 = 50/(1-\rho)$ gives $\rho = 0.9$ — 90%. The measured p99 at that
+        load is **2,300 ms**, 46x the service time. The mean is already alarming
+        and the tail is where the SLO breaks.
+    - id: cp-2
+      question: "Why do healthy fleets run near 50% utilisation when the hardware is expensive?"
+      answerKind: short_text
+      hint: "What does the extra 40 points of utilisation cost in latency?"
+      solution: >-
+        Because 50% to 90% costs **five times the service time** in mean latency
+        (100 ms to 500 ms) and more than five times in the tail (441 to
+        2,300 ms). Targeting 60% instead of 80% costs 33% more replicas — 834
+        against 625 at 10,000 rps — which is a priced trade rather than waste.
+    - id: cp-3
+      question: "A 25 ms coalescing window gives 21x throughput. What did you pay?"
+      answerKind: short_text
+      hint: "Two terms changed, and one of them is multiplied."
+      solution: >-
+        25 ms of added queueing plus service growth from 50 ms to 75 ms at batch
+        32 — but the added 25 ms sits in a term that the queue multiplies, so
+        end-to-end p99 rises by more than 25 ms. You also pay in tail variance,
+        because a partially filled batch costs full service time for less
+        throughput.
+    - id: cp-4
+      question: "Autoscaling targets 80% and the p99 SLO is being missed. What do you change?"
+      answerKind: short_text
+      hint: "Replica count or target — which one moves the tail?"
+      solution: >-
+        The target. Replica count follows from traffic and target, so adding
+        replicas while keeping the target just restores the same utilisation.
+        Lowering the target to 60% drops utilisation and the p99 with it, at a
+        stated 33% hardware cost. Tune the target against the SLO.
+    - id: cp-5
+      question: "Why is an unbounded queue worse than a rejection?"
+      answerKind: short_text
+      hint: "What does Little's law say about wait time as the queue grows?"
+      solution: >-
+        Little's law gives $W = L/\lambda$, so an unbounded $L$ means unbounded
+        wait — the system accumulates requests it will serve too late to be
+        useful. A bound at depth $L_{\max}$ caps the wait at $L_{\max}/\lambda$
+        and converts the overflow into a fast rejection, which is a decision made
+        in microseconds rather than a timeout made in tens of seconds.
+    - id: cp-6
+      question: "Why must a p99 figure be reported with its utilisation?"
+      answerKind: short_text
+      hint: "How far does the same model's p99 move with load?"
+      solution: >-
+        Because load moves it by more than an order of magnitude: the same 50 ms
+        model gives 441 ms at 50% and 9,210 ms at 97%. Latency numbers are
+        compared across systems without their load context, and two figures from
+        different points on the curve look like a performance difference when
+        they are a capacity difference.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Service time is the floor; utilisation is the multiplier. The tail
+        diverges faster than the mean, so SLOs at p99 buy a much lower
+        utilisation target than means suggest. Batching is the one lever that
+        raises throughput faster than it raises latency.
+      blocks:
+        - kind: checklist
+          body: |
+            - Mean = service / (1 - utilisation)
+            - At 90%: mean 10x, p99 46x the service time
+            - Replicas = ceil(arrival x service / target)
+            - A coalescing window is bounded but queue-amplified
+            - Bound the queue; shed load rather than time out
+      checkpoint: >-
+        At what utilisation does the mean double the service time? At what
+        utilisation does it quintuple?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Measure service time first, then decide the target from the SLO, then
+        size the fleet. Batching is a separate decision about throughput and
+        should be evaluated with the queue in place.
+      blocks:
+        - kind: checklist
+          body: |
+            - Measure service time at the batch size you will run
+            - Derive the target from the p99 SLO
+            - Size replicas from traffic, service time and target
+            - Add a bounded queue and an explicit shed policy
+            - Report percentiles with the utilisation that produced them
+      checkpoint: >-
+        Why is measuring service time at batch 1 misleading for a system that
+        will run batch 32?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The arithmetic, then the control loop.
+      blocks:
+        - kind: pseudocode
+          body: |
+            mean(s, rho) = s / (1 - rho)
+            replicas(lam, s, target) = ceil(lam * s / target)
+            max_wait(depth, lam) = depth / lam        # Little's law
+
+            # control loop
+            if p99 > slo:      lower target      # more replicas, less load each
+            if queue_depth > L: shed at the edge # bounded wait, explicit failure
+      checkpoint: >-
+        Why does lowering the target add replicas rather than reducing traffic?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Mean, tail, replicas, and the bound.
+      blocks:
+        - kind: math
+          body: |
+            **Mean.** $\mathbb{E}[T] = \dfrac{s}{1-\rho}$
+
+            **Tail.** $T_q = s - \dfrac{\ln((1-q)/\rho)}{\mu(1-\rho)}$
+
+            **Replicas.** $R = \left\lceil \dfrac{\lambda s}{\rho_t} \right\rceil$
+
+            **Bound.** $W_{\max} = L_{\max}/\lambda$
+      checkpoint: >-
+        Using the tail formula at rho = 0.9 and q = 0.99, do you get 2,300 ms?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A capacity plan with the SLO-driven target, plus the batching evaluation
+        that belongs beside it.
+      blocks:
+        - kind: warning
+          body: >-
+            Real LLM service times are heavy-tailed, so this p99 is optimistic.
+            If your distribution is lognormal rather than exponential, the tail
+            is worse at the same utilisation — use the model for ratios, not
+            absolutes.
+        - kind: code
+          language: python
+          body: |
+            s = 0.050
+            for rho in (0.5, 0.75, 0.9, 0.97):
+                print(f"rho={rho:.2f} mean={response_time(s,rho)*1e3:6.0f} ms "
+                      f"p99={p_quantile(s,rho)*1e3:7.0f} ms")
+            for lam in (100, 1_000, 10_000):
+                print(lam, "rps ->",
+                      [replicas(lam, s, t) for t in (0.5, 0.6, 0.8)], "replicas")
+      checkpoint: >-
+        The plan says 834 replicas at 60%. Traffic grows 10% per quarter. When
+        does the plan break, and what do you monitor to know first?
+  problems:
+    - id: p-response-time
+      title: "Mean response time from utilisation"
+      difficulty: easy
+      prompt: >-
+        Implement `response_time(service_s, utilisation)` returning
+        service_s / (1 - utilisation). If utilisation is at least 1, return
+        float("inf").
+      starter: |
+        def response_time(service_s, utilisation):
+            # your implementation here
+            pass
+      language: python
+      entry: response_time
+      testCases:
+        - input: '[0.05, 0.9]'
+          expected: '0.5000000000000001'
+          mode: json
+          tolerance: 1e-9
+        - input: '[0.05, 0.5]'
+          expected: '0.1'
+          mode: json
+          tolerance: 1e-9
+        - input: '[0.05, 1.0]'
+          expected: 'Infinity'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def response_time(service_s, utilisation):
+            if utilisation >= 1:
+                return float("inf")
+            return service_s / (1 - utilisation)
+      solutionExplanation: >-
+        At 90% utilisation a 50 ms service becomes 500 ms — the tenfold
+        multiplier from the lesson. At 50% it is exactly 100 ms. At 100% the
+        queue never drains and the answer is infinity, which is the honest
+        answer rather than a large number.
+      complexity: "O(1)"
+      tags: [queueing, latency]
+
+    - id: p-replicas
+      title: "Replica count for a utilisation target"
+      difficulty: easy
+      prompt: >-
+        Implement `replicas(arrival_rps, service_s, target)` returning
+        ceil(arrival_rps * service_s / target) as an int.
+      starter: |
+        import math
+
+        def replicas(arrival_rps, service_s, target):
+            # your implementation here
+            pass
+      language: python
+      entry: replicas
+      testCases:
+        - input: '[10000, 0.05, 0.6]'
+          expected: '834'
+          mode: json
+          tolerance: 1e-9
+        - input: '[10000, 0.05, 0.8]'
+          expected: '625'
+          mode: json
+          tolerance: 1e-9
+        - input: '[100, 0.05, 0.5]'
+          expected: '10'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+
+        def replicas(arrival_rps, service_s, target):
+            return int(math.ceil(arrival_rps * service_s / target))
+      solutionExplanation: >-
+        At 10,000 rps of 50 ms work the raw capacity need is 500 replicas; a 60%
+        target turns that into 834 and an 80% target into 625. The 33% difference
+        is the price of the tail, and it is the whole argument for a lower
+        target.
+      complexity: "O(1)"
+      tags: [autoscaling, capacity]
+
+    - id: p-max-wait
+      title: "Worst wait from a bounded queue"
+      difficulty: easy
+      prompt: >-
+        Implement `max_wait(queue_depth, arrival_rps)` returning
+        queue_depth / arrival_rps — the Little's-law bound on time in the queue.
+      starter: |
+        def max_wait(queue_depth, arrival_rps):
+            # your implementation here
+            pass
+      language: python
+      entry: max_wait
+      testCases:
+        - input: '[100, 1000]'
+          expected: '0.1'
+          mode: json
+          tolerance: 1e-9
+        - input: '[1000, 100]'
+          expected: '10.0'
+          mode: json
+          tolerance: 1e-9
+        - input: '[0, 500]'
+          expected: '0.0'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def max_wait(queue_depth, arrival_rps):
+            return queue_depth / arrival_rps
+      solutionExplanation: >-
+        A depth of 100 at 1,000 rps caps the wait at 100 ms — a bound you chose.
+        The same depth at 100 rps is 10 seconds, which is why queue depth must be
+        set from the arrival rate and the latency budget, not picked as a round
+        number.
+      complexity: "O(1)"
+      tags: [admission-control, littles-law]
+
+  try_it: >-
+    With a 50 ms service time, compute mean response at 50%, 75%, 90% and 97% utilisation from
+    S/(1 − ρ). You should get 100, 200, 500 and 2,000 ms. Then compute how many replicas 10,000
+    requests per second needs at a 60% target against an 80% target, and decide what the 209
+    extra replicas buy.
+  interview_questions:
+    - question: "p99 latency is 2.3 seconds on a 50 ms model and CPU is at 90%. What is the model doing wrong?"
+      level: mid
+      key_points:
+        - "Nothing: mean response is S/(1 − ρ) = 500 ms at 90% utilisation, and the measured p99 is 2,300 ms — 46× the service time."
+        - "The queue sets latency, not the model: 100, 200, 500 and 2,000 ms mean response at 50, 75, 90 and 97%."
+        - "Fleets run near half load for exactly this reason — targeting 60% instead of 80% costs 33% more replicas, 834 against 625 for 10,000 rps."
+        - "The fix is capacity or admission control, not a faster kernel, because the kernel is already fast."
+      follow_up: "Your SLO is p99 at 300 ms. What utilisation can you afford, and what does it cost?"
+    - question: "You enable a 25 ms batching window. Median latency barely moves, p99 rises by more than 25 ms. Why?"
+      level: senior
+      key_points:
+        - "Batching does buy throughput superlinearly: a 25 ms window takes batch 1 at 20 tok/s to batch 32 at 426.7 tok/s, with service time rising from 50 to 75 ms."
+        - "But the added delay enters the queue and is amplified like service time, so at 90% utilisation a 25 ms stage contributes far more than 25 ms of expected wait."
+        - "The median is dominated by requests that arrive to an empty slot, so it barely moves while the tail absorbs the amplification."
+        - "Measure end to end at the user, not at the batcher's edge, because that is where the amplification happens."
+      follow_up: "How would you get the batching throughput without paying the tail?"
+    - question: "You autoscale on CPU and the fleet lags every spike. What happens during the lag, and what is cheaper than fixing it?"
+      level: senior
+      key_points:
+        - "Scale-up has a lag — detection, scheduling, model load, warmup — that is tens of seconds for a large model."
+        - "During that interval the existing replicas absorb the excess, utilisation exceeds the target and the tail grows superlinearly rather than linearly."
+        - "The safety margin therefore has to exceed the lag time, which means running permanently at a lower target and paying for it in replicas."
+        - "A bounded queue with explicit rejection is cheaper: rejecting 1% at the edge beats degrading 100% of requests by timing out."
+      follow_up: "What would you autoscale on instead of CPU, and why does it lead demand rather than follow it?"
+  common_mistakes:
+    - "Sizing the fleet for 80% utilisation to save money, then a 10% traffic spike pushes it to 88% and latency triples."
+    - "Reporting mean latency, the least informative statistic for a queue — the mean is dominated by fast requests while the SLO lives in the tail."
+    - "Comparing p99 numbers without the utilisation that produced them: the same model gives 200 ms at 40% load and 4,600 ms at 95%."
+  further_reading:
+    - label: "Dean, Barroso, The Tail at Scale, Communications of the ACM 2013"
+    - label: "Little, A Proof for the Queuing Formula L = λW, Operations Research 1961"

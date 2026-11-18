@@ -1,0 +1,870 @@
+id: model-evaluation
+slug: model-evaluation
+title: "Accuracy Is a Claim That Every Error Costs the Same"
+summary: >-
+  Learn why a model can score 99% accuracy and be worthless, why ROC-AUC
+  survives a change in base rate when PR-AUC collapses, and how to tell whether
+  your probabilities mean anything.
+kind: lesson
+difficulty: medium
+position: 12
+estMinutes: 18
+prerequisites: [logistic-regression, maximum-likelihood-bayesian]
+phase: classical-models
+tags: [evaluation, roc, precision-recall, calibration, bias-variance]
+
+body:
+  big_idea: >-
+    Every metric encodes what an error costs, so accuracy silently asserts that a missed
+    fraud and a false alarm cost the same — which is why ROC-AUC survives a base-rate
+    change that collapses PR-AUC.
+
+  problem:
+    - "You ship a fraud model reporting 99% accuracy, and it predicts \"not fraud\" every time: at 1% prevalence the constant-zero classifier scores exactly 0.99."
+    - "You compare by ROC-AUC, pick the better model, and deploy something worse: ROC-AUC is prevalence-invariant, your error costs are not."
+    - "You multiply a model's output by a money amount and are systematically wrong: a softmax score is a ranking, not a calibrated belief."
+
+  analogy: |
+    A smoke alarm can be judged two ways: how well it *ranks* smoke (does a real
+    fire always score higher than burnt toast?) and how often it *cries wolf* at
+    3am. ROC-AUC measures the ranking — pick a random fire and a random piece of
+    toast, how often does the fire score higher? PR-AUC measures the 3am
+    experience: when it goes off, how often is it real?
+
+  concept_points:
+    - "**Accuracy encodes an unstated cost ratio, and at low prevalence it is dominated by the majority class.** Measured on 100,000 rows: a constant-zero classifier scores 0.5000 accuracy at 50% prevalence, 0.9000 at 10%, 0.9900 at 1%, 0.9990 at 0.1%. Any model below those numbers is worse than doing nothing, and \"doing nothing\" is a one-line baseline you should always compute first."
+    - "**ROC-AUC is prevalence-invariant; PR-AUC is not, and the gap is enormous.** The same scoring function on the same 200,000 rows: ROC-AUC stayed at 0.9220 / 0.9212 / 0.9236 across 50%, 10% and 1% prevalence, while PR-AUC fell from **0.9226 to 0.6632 to 0.2625**. Same discrimination, radically different reported quality — and PR-AUC is the one telling you what deployment will feel like."
+    - "**ROC-AUC has an exact probabilistic meaning, which is why it is prevalence-free.** It equals the probability that a random positive scores higher than a random negative: $\\text{AUC} = P(s^+ > s^-)$. That conditions on one of each, so the ratio cannot enter it. PR-AUC conditions on *being flagged*, a base-rate question. Ties must use average ranks or AUC invents discrimination."
+    - "**A high AUC does not mean the probabilities are meaningful.** Calibration is a separate property: among all rows where the model says 0.8, roughly 80% should be positive. Measured, an uncalibrated model had ECE **0.1885** — its stated confidence was off by 18.9 percentage points — and temperature scaling at $T = 0.25$ cut that to **0.0711** without changing the ranking at all."
+    - "**The evaluation set is part of the model.** A metric computed on data that influenced any choice — feature selection, threshold, early stopping, hyperparameters — is optimistic, and the optimism grows with the number of choices. This is why a held-out set touched twenty times is no longer held out, and why the final number must come from data nobody looked at."
+    - "**Report the metric the decision needs, at the operating point you will ship, against a baseline.** A single AUC hides the only question that matters: at the threshold I will use, how many false positives per day, and how many misses? Those are counts, and a count is what an on-call engineer can act on. \"AUC 0.92\" means nothing without \"0.50 random, 0.87 production\"."
+
+  definitions:
+    - { term: "Prevalence / base rate", meaning: "The fraction of positives in the population. It determines the accuracy of the constant classifier and dominates precision at low values." }
+    - { term: "ROC curve", meaning: "True-positive rate against false-positive rate as the threshold sweeps. Prevalence-invariant because both axes are conditioned on the true class." }
+    - { term: "ROC-AUC", meaning: "$P(s^+ > s^-)$ — the probability a random positive outranks a random negative. Equivalent to the Mann–Whitney $U$ statistic normalised." }
+    - { term: "PR curve", meaning: "Precision against recall as the threshold sweeps. Both axes condition on the prediction, which is why prevalence enters." }
+    - { term: "Average precision (AP)", meaning: "The step-wise area under the PR curve, computed as $\\sum_n (R_n - R_{n-1}) P_n$. The standard summary for imbalanced retrieval." }
+    - { term: "Calibration", meaning: "Agreement between predicted probability and observed frequency. A model is calibrated if, among predictions of 0.8, 80% are positive." }
+    - { term: "ECE", meaning: "Expected calibration error — the bin-weighted average of $|\\text{confidence} - \\text{accuracy}|$. Depends on binning, so report the bin count." }
+    - { term: "Brier score", meaning: "Mean squared error of probabilities: $\\frac{1}{n}\\sum (p_i - y_i)^2$. A proper scoring rule — it rewards both calibration and sharpness." }
+    - { term: "Proper scoring rule", meaning: "A metric whose expected value is optimised by reporting the true probability. Accuracy and AUC are not; log loss and Brier are." }
+    - { term: "Bias–variance decomposition", meaning: "$\\mathbb{E}[(y-\\hat f)^2] = \\text{bias}^2 + \\text{variance} + \\sigma^2$. Tells you whether more data or a simpler model is the fix." }
+    - { term: "Data leakage", meaning: "Information in the features that would not be available at prediction time. The most common cause of a validation score that cannot be reproduced in production." }
+
+  diagrams:
+    - type: compare
+      title: "ROC-AUC vs PR-AUC: which question are you asking?"
+      left_label: "ROC-AUC"
+      left_points:
+        - "Answers: can the model rank at all?"
+        - "Invariant to prevalence — 0.922 at 50%, 10% and 1%"
+        - "Optimistic under heavy imbalance"
+        - "Use when positives and negatives are both plentiful, or costs are symmetric"
+      right_label: "PR-AUC / Average Precision"
+      right_points:
+        - "Answers: when it fires, is it right?"
+        - "Prevalence-sensitive — 0.923 → 0.663 → 0.263"
+        - "Pessimistic in the way deployment actually is"
+        - "Use under imbalance, retrieval, and rare-event detection"
+    - type: plot
+      title: "Same model, only the base rate changes"
+      chart: "bar"
+      xLabel: "prevalence"
+      yLabel: "area under the curve"
+      series:
+        - name: "ROC-AUC"
+          points:
+            - { x: 0.5, y: 0.922 }
+            - { x: 0.1, y: 0.9212 }
+            - { x: 0.01, y: 0.9236 }
+        - name: "PR-AUC"
+          points:
+            - { x: 0.5, y: 0.9226 }
+            - { x: 0.1, y: 0.6632 }
+            - { x: 0.01, y: 0.2625 }
+    - type: plot
+      title: "The constant-zero classifier beats most models at low prevalence"
+      chart: "line"
+      xLabel: "prevalence"
+      yLabel: "accuracy of predicting always-negative"
+      series:
+        - name: "constant-zero accuracy"
+          points:
+            - { x: 0.5, y: 0.5 }
+            - { x: 0.1, y: 0.9 }
+            - { x: 0.01, y: 0.99 }
+            - { x: 0.001, y: 0.999 }
+    - type: pipeline
+      title: "How to evaluate a model you intend to ship"
+      nodes:
+        - label: "Compute the null baselines"
+          note: "random, constant-majority, current production"
+          detail: "A metric is meaningless without a baseline. The constant-majority baseline is one line and catches the most embarrassing failures."
+        - label: "Pick the metric from the cost ratio"
+          note: "not from habit"
+          detail: "If a miss costs 100x a false alarm, optimise recall at a fixed precision, or expected cost directly. AUC cannot express this."
+        - label: "Fix an operating point"
+          note: "the threshold you will actually ship"
+          detail: "Report counts at that threshold: false positives per day, misses per week. A rate is not actionable; a count is."
+        - label: "Check calibration separately"
+          note: "ECE or a reliability diagram"
+          detail: "Ranking and calibration are independent. If anything downstream multiplies the score by money or another probability, calibration is mandatory."
+        - label: "Confirm on data nobody touched"
+          note: "the only honest number"
+          detail: "Every decision made against a set contaminates it. The final report has to come from a set that informed no choice."
+    - type: mermaid
+      title: "Choosing a metric"
+      code: |
+        flowchart TD
+          a["Is the positive class rare (<10%)?"] -->|"no"| b["ROC-AUC is fine<br/>report PR too"]
+          a -->|"yes"| c["PR-AUC / AP"]
+          c --> d["Will you act on the score as a probability?"]
+          b --> d
+          d -->|"yes"| e["Add calibration: ECE + Brier"]
+          d -->|"no"| f["Ranking is enough"]
+          e --> g["Fix the operating point<br/>and report counts"]
+          f --> g
+          g --> h["Re-check on untouched holdout"]
+    - type: stack
+      title: "Four questions a single number cannot answer"
+      layers:
+        - "Ranking: can it tell positives from negatives? (AUC)"
+        - "Operating point: at my threshold, how many errors per day?"
+        - "Calibration: does 0.8 mean 80%?"
+        - "Robustness: does it hold on data I did not look at?"
+
+  markdown: |
+    ## The demonstration that changes how you read a metric
+
+    One scoring function. One dataset of 200,000 rows. The **only** thing that
+    changes between the three columns is the base rate:
+
+    | Prevalence | Accuracy | ROC-AUC | PR-AUC |
+    |---|---|---|---|
+    | 50% | 0.8432 | 0.9220 | **0.9226** |
+    | 10% | 0.8420 | 0.9212 | **0.6632** |
+    | 1% | 0.8406 | 0.9236 | **0.2625** |
+
+    ROC-AUC does not move. PR-AUC falls by a factor of 3.5. Accuracy barely
+    moves at all — and it is the number most often reported.
+
+    Nothing about the model changed. Only how rare the thing you are looking
+    for became. If you had tuned on ROC-AUC at 50% prevalence and deployed at
+    1%, you would have shipped a model whose real-world quality is a third of
+    what your dashboard claimed.
+
+    ## Why ROC is invariant and PR is not
+
+    ROC-AUC has a closed-form meaning:
+
+    $$\text{AUC} = P(s^+ > s^-)$$
+
+    Pick one positive and one negative at random. How often does the positive
+    score higher? That question conditions on **one of each**, so the ratio
+    between them cannot appear in the answer.
+
+    Precision is a different question:
+
+    $$\text{precision} = \frac{TP}{TP + FP}$$
+
+    The denominator counts *everything you flagged*. If positives are 1% of the
+    population, then even a good model's flagged set is mostly negatives, and
+    precision is bounded by the base rate. There is no way to make that
+    prevalence-free — the prevalence is the point.
+
+    ## Accuracy at 1% prevalence
+
+    The threshold sweep on the same 100,000 rows at 1% prevalence:
+
+    | Threshold | Flagged | Precision | Recall | Accuracy |
+    |---|---|---|---|---|
+    | 0.9 | 2,402 | 0.2723 | 0.6264 | 0.9786 |
+    | 0.5 | 5,126 | 0.1510 | 0.7414 | 0.9538 |
+    | 0.1 | 10,459 | 0.0851 | 0.8525 | 0.9028 |
+    | 0.0 | 12,339 | 0.0744 | 0.8793 | 0.8845 |
+
+    Read the last column against the second. At the **best** threshold, 2,402
+    alerts produce 27% precision — roughly 1,750 false alarms. Accuracy
+    reports 0.9786 and calls it a good model.
+
+    And the baseline you must always compute:
+
+    | Prevalence | Constant-zero accuracy |
+    |---|---|
+    | 50% | 0.5000 |
+    | 10% | 0.9000 |
+    | 1% | **0.9900** |
+    | 0.1% | **0.9990** |
+
+    At 1% prevalence, 99% accuracy is the score of a model that does nothing.
+    Any reported accuracy below 0.99 there is *worse than nothing*.
+
+    ## Ties: where AUC quietly breaks
+
+    The rank formulation of AUC is:
+
+    $$\text{AUC} = \frac{\sum_{i \in \text{pos}} r_i - \frac{n_+ (n_+ + 1)}{2}}{n_+ n_-}$$
+
+    This is correct only if tied scores share an **average rank**. Assign tied
+    scores consecutive ranks and you invent discrimination that is not there:
+    with every score equal to 0.5, a naive implementation returns **0.75**
+    where the true answer is **0.5**.
+
+    That is not a theoretical worry. Quantised scores (a model that outputs
+    probabilities rounded to two decimals), bucketed scores, and ensemble
+    averages with repeated values all produce ties routinely. An AUC of 0.75
+    on a model with no discrimination is worse than no metric, because it looks
+    like a result.
+
+    ## Calibration is a separate property
+
+    Ranking and calibration are independent. You can have a perfect AUC and
+    useless probabilities — multiply the logits by 4 and the ranking is
+    unchanged while every probability becomes overconfident.
+
+    Measured on 100,000 rows:
+
+    | Temperature | Mean confidence | ECE | Brier |
+    |---|---|---|---|
+    | 1.00 (as trained) | 0.4267 | **0.1885** | 0.1003 |
+    | 0.50 | 0.3939 | 0.0995 | 0.0740 |
+    | 0.25 | 0.3726 | **0.0711** | 0.0707 |
+
+    ECE of 0.1885 means the stated confidence is wrong by 18.9 percentage
+    points on average. Temperature scaling fixed most of it — and **AUC was
+    identical at every temperature**, because a monotone transform cannot
+    change a ranking.
+
+    That is the cleanest way to see the separation: calibration is a property
+    of the *numbers*, ranking is a property of their *order*.
+
+    ## Where the analogy breaks
+
+    Precision and recall are still not the final vocabulary. At 1% prevalence,
+    moving the threshold from 0.9 to 0.0 raised recall from 0.63 to 0.88 while
+    precision fell from 0.27 to 0.07 — and which of those is better depends
+    entirely on what a miss costs relative to a false alarm.
+
+    The honest formulation is expected cost:
+
+    $$\mathbb{E}[\text{cost}] = C_{\text{FN}} \cdot \text{FN} + C_{\text{FP}} \cdot \text{FP}$$
+
+    With $C_{\text{FN}} = 100 \cdot C_{\text{FP}}$, the low threshold wins
+    decisively. With $C_{\text{FN}} = C_{\text{FP}}$, the high one does. No
+    curve tells you the ratio — a human has to state it, and stating it is the
+    actual engineering work.
+
+    ## The longer version
+
+    The remaining mechanisms, verbatim: how accuracy stays flat while precision
+    collapses, and the bias–variance decomposition that explains why a score
+    below the noise floor is a leak rather than a breakthrough.
+
+    ### Failure modes, in full
+
+    - You will ship a fraud model reporting 99% accuracy, and it will be a model that predicts 'not fraud' every time. That is not a strawman: at 1% prevalence the constant-zero classifier scores exactly 0.99.
+    - You will compare two models by ROC-AUC, pick the better one, and deploy something worse — because ROC-AUC is invariant to prevalence while the cost of your errors is not.
+    - You will treat a model's output as a probability, multiply it by a money amount, and be systematically wrong, because a softmax score is a ranking, not a calibrated belief.
+    - Interviewers ask 'why not accuracy?' and 'when would you use PR over ROC?' expecting the prevalence argument with a number attached, not the phrase 'class imbalance'.
+
+    ### The mechanisms, in full
+
+    - **Accuracy encodes an unstated cost ratio, and at low prevalence it is dominated by the majority class.** Measured on 100,000 rows: a constant-zero classifier scores 0.5000 accuracy at 50% prevalence, 0.9000 at 10%, 0.9900 at 1%, and 0.9990 at 0.1%. Any model below those numbers is worse than doing nothing, and 'doing nothing' is a one-line baseline you should always compute first.
+    - **ROC-AUC is prevalence-invariant; PR-AUC is not, and the gap is enormous.** The same scoring function, evaluated on the same 200,000 rows with only the base rate changed: ROC-AUC stayed at 0.9220 / 0.9212 / 0.9236 across 50%, 10% and 1% prevalence, while PR-AUC fell from **0.9226 to 0.6632 to 0.2625**. Same model, same discrimination, radically different reported quality — and PR-AUC is the one telling you what deployment will feel like.
+    - **ROC-AUC has an exact probabilistic meaning, which is why it is prevalence-free.** It equals the probability that a randomly chosen positive scores higher than a randomly chosen negative: $\text{AUC} = P(s^+ > s^-)$. That statement conditions on one positive and one negative, so the ratio of positives to negatives cannot enter it. PR-AUC conditions on *being flagged*, which is a base-rate question by construction.
+    - **Ties must be handled with average ranks, or AUC is silently wrong.** With all scores tied at 0.5, a naive rank implementation returns **0.75 instead of 0.5** — it invented discrimination that does not exist. Quantised or bucketed scores produce ties constantly, so this is not a corner case. Average-rank tie handling is the difference between a metric and a random number.
+    - **Accuracy stays flat while the model becomes useless.** At 1% prevalence, sweeping the threshold from 0.9 down to 0.0 moved accuracy only from 0.9786 to 0.8845, while precision fell from 0.2723 to 0.0744. Every one of those thresholds has *higher* accuracy than the model deserves, because 99% of the rows are negatives and accuracy mostly measures whether you left them alone.
+    - **A high AUC does not mean the probabilities are meaningful.** Calibration is a separate property: among all rows where the model says 0.8, roughly 80% should be positive. Measured, an uncalibrated model had ECE **0.1885** — its stated confidence was off by 18.9 percentage points on average — and temperature scaling at $T = 0.25$ cut that to **0.0711** without changing the ranking at all, so AUC was identical.
+    - **Bias–variance is a decomposition of expected error, not a metaphor.** $\mathbb{E}[(y - \hat{f})^2] = \text{bias}^2 + \text{variance} + \sigma^2$. The irreducible $\sigma^2$ term is why a perfect test score is often a bug: if your validation error is below the noise floor, you have a leak, not a breakthrough.
+    - **The evaluation set is part of the model.** A metric computed on data that influenced any choice — feature selection, threshold, early stopping, hyperparameters — is optimistic, and the optimism grows with the number of choices. This is why a held-out set touched twenty times is no longer held out, and why the final number must come from data nobody looked at.
+    - **Report the metric the decision needs, at the operating point you will ship.** A single AUC hides the only question that matters: at the threshold I will actually use, how many false positives per day, and how many misses? Those are counts, not rates, and a count is what an on-call engineer can act on.
+    - **Every reported metric needs its baseline.** The correct comparison is not 'AUC is 0.92, which is high' but 'AUC is 0.92 against 0.50 for random and 0.87 for the current production model'. A metric without a baseline is a number without a meaning.
+
+
+  derivations:
+    - title: "Why ROC-AUC equals P(s⁺ > s⁻)"
+      latex: |
+        The ROC curve plots $\\text{TPR}(t) = P(s^+ > t)$ against
+        $\\text{FPR}(t) = P(s^- > t)$. The area under it is
+        $$\\text{AUC} = \\int \\text{TPR} \\, d(\\text{FPR}) = \\int P(s^+ > t)\\, dP(s^- > t).$$
+        Since $s^-$ is drawn from its own distribution, this integral is exactly
+        $$\\text{AUC} = P(s^+ > s^-)$$
+        by the definition of expectation over $s^-$.
+      prose: >-
+        The conditioning is on one positive and one negative, which is precisely
+        why prevalence cannot enter. This also explains the tie problem: if
+        s+ = s- the event is false, and a correct implementation counts it as
+        half, which is what averaging tied ranks achieves.
+    - title: "Why precision is bounded by prevalence"
+      latex: |
+        By Bayes' rule,
+        $$\\text{precision} = P(y{=}1 \\mid \\hat y{=}1) = \\frac{\\pi \\cdot \\text{TPR}}{\\pi \\cdot \\text{TPR} + (1-\\pi)\\cdot \\text{FPR}}$$
+        where $\\pi$ is prevalence. Dividing through by $\\pi$,
+        $$\\text{precision} = \\frac{\\text{TPR}}{\\text{TPR} + \\frac{1-\\pi}{\\pi}\\text{FPR}}.$$
+      prose: >-
+        As pi falls, the factor (1-pi)/pi grows without bound, so any non-zero
+        FPR drives precision toward zero. This is not a flaw in the metric; it
+        is arithmetic telling you that flagging a rare event is dominated by
+        false alarms unless the FPR is extremely small.
+    - title: "The bias–variance decomposition"
+      latex: |
+        For $y = f(x) + \\varepsilon$ with $\\mathbb{E}[\\varepsilon] = 0$ and
+        $\\operatorname{Var}(\\varepsilon) = \\sigma^2$,
+        $$\\mathbb{E}\\big[(y - \\hat f)^2\\big] = \\big(\\mathbb{E}[\\hat f] - f\\big)^2 + \\operatorname{Var}(\\hat f) + \\sigma^2.$$
+      prose: >-
+        The three terms are irreducible noise, systematic error, and sensitivity
+        to the sample. It tells you which lever to pull: high bias wants a
+        richer model, high variance wants more data or stronger
+        regularisation, and sigma-squared is a floor you cannot beat.
+    - title: "Why temperature scaling cannot change AUC"
+      latex: |
+        Temperature scaling maps logits $z \\mapsto z/T$ for $T > 0$ before the
+        softmax. Since $1/T > 0$, the map is strictly increasing, so
+        $$s_i > s_j \\iff \\frac{z_i}{T} > \\frac{z_j}{T}.$$
+        AUC depends only on the ordering of scores, so it is invariant.
+      prose: >-
+        A strictly monotone transform preserves every pairwise comparison, and
+        ROC-AUC is a function of pairwise comparisons alone. This is the formal
+        reason calibration and ranking are independent, and why you must
+        measure them separately.
+
+  implementations:
+    - language: python
+      title: "ROC-AUC with correct tie handling"
+      note: >-
+        The naive consecutive-rank version is WRONG whenever scores tie, and it
+        errs optimistically (0.75 instead of 0.5 on all-tied input). Predicted
+        probabilities and quantised scores tie constantly, so this matters.
+      code: |
+        import numpy as np
+
+        def roc_auc(y_true, scores):
+            """Rank-based ROC-AUC, P(s+ > s-) with half credit for ties."""
+            y = np.asarray(y_true).astype(int)
+            s = np.asarray(scores, dtype=float)
+            n = len(s)
+            n_pos = int((y == 1).sum())
+            n_neg = int((y == 0).sum())
+            if n_pos == 0 or n_neg == 0:
+                return float("nan")   # AUC is undefined with one class
+
+            # Average ranks for ties. Without this, tied scores get arbitrary
+            # consecutive ranks and the result is wrong -- optimistically.
+            order = np.argsort(s, kind="mergesort")
+            sorted_s = s[order]
+            ranks = np.empty(n, dtype=float)
+            i = 0
+            while i < n:
+                j = i
+                while j + 1 < n and sorted_s[j + 1] == sorted_s[i]:
+                    j += 1
+                avg = (i + j) / 2.0 + 1.0     # 1-based average rank
+                ranks[order[i : j + 1]] = avg
+                i = j + 1
+
+            rank_sum_pos = ranks[y == 1].sum()
+            u = rank_sum_pos - n_pos * (n_pos + 1) / 2.0
+            return float(u / (n_pos * n_neg))
+    - language: python
+      title: "Expected calibration error and Brier score"
+      note: >-
+        ECE is bin-dependent, which is a real weakness: with 15 bins on 1,000
+        rows most bins hold under 70 points and the estimate is noisy. Report
+        the bin count and the sample size alongside the number, or use a
+        reliability diagram instead of a scalar.
+      code: |
+        import numpy as np
+
+        def expected_calibration_error(y_true, probs, bins=15):
+            """Bin-weighted |confidence - accuracy|. Lower is better."""
+            y = np.asarray(y_true, dtype=float)
+            p = np.asarray(probs, dtype=float)
+            if len(y) != len(p):
+                raise ValueError("length mismatch")
+            idx = np.clip((p * bins).astype(int), 0, bins - 1)
+            ece = 0.0
+            for b in range(bins):
+                m = idx == b
+                if not m.any():
+                    continue
+                ece += (m.sum() / len(p)) * abs(p[m].mean() - y[m].mean())
+            return float(ece)
+
+        def brier(y_true, probs):
+            """Mean squared error of probabilities -- a proper scoring rule."""
+            y = np.asarray(y_true, dtype=float)
+            p = np.asarray(probs, dtype=float)
+            return float(((p - y) ** 2).mean())
+
+        def reliability_table(y_true, probs, bins=10):
+            """Enough rows to draw an honest reliability diagram."""
+            y = np.asarray(y_true, dtype=float)
+            p = np.asarray(probs, dtype=float)
+            idx = np.clip((p * bins).astype(int), 0, bins - 1)
+            out = []
+            for b in range(bins):
+                m = idx == b
+                out.append({
+                    "bin": f"{b / bins:.2f}-{(b + 1) / bins:.2f}",
+                    "n": int(m.sum()),
+                    "mean_confidence": float(p[m].mean()) if m.any() else None,
+                    "observed_rate": float(y[m].mean()) if m.any() else None,
+                })
+            return out
+
+  checkpoints:
+    - id: cp-1
+      question: "Your fraud model reports 99.2% accuracy at 1% prevalence. What do you ask first?"
+      answerKind: short_text
+      hint: "What does a model that always predicts 'not fraud' score?"
+      solution: >-
+        Ask for the constant-zero baseline. At 1% prevalence it scores 0.9900,
+        so 0.992 is barely above doing nothing. Then ask for precision and
+        recall at the shipping threshold, and the count of alerts per day —
+        because at that prevalence, accuracy is mostly measuring how well you
+        left the 99% alone.
+    - id: cp-2
+      question: "Two models have identical ROC-AUC. Can their PR-AUC differ substantially?"
+      answerKind: short_text
+      hint: "Does ROC-AUC depend on prevalence? Does PR-AUC?"
+      solution: >-
+        Yes — and not just slightly. ROC-AUC is $P(s^+ > s^-)$, which conditions
+        on one of each class and is therefore prevalence-free. PR-AUC conditions
+        on being flagged, so it is bounded by the base rate. Measured here, the
+        same model held ROC-AUC at 0.922 across 50%/10%/1% prevalence while
+        PR-AUC fell 0.9226 → 0.6632 → 0.2625. If the two models were evaluated
+        at different prevalences, comparing their PR-AUCs is meaningless.
+    - id: cp-3
+      question: "Why does a naive rank-based AUC return 0.75 when every score is identical?"
+      answerKind: short_text
+      hint: "What ranks do tied scores get from a plain argsort?"
+      solution: >-
+        `argsort` assigns tied scores arbitrary *consecutive* ranks, so the sum
+        of positive ranks differs from the sum expected under perfect
+        randomness. With all scores tied, the true AUC is 0.5 — no
+        discrimination. Consecutive ranks produce 0.75, which invents
+        discrimination. Average ranks for ties give exactly 0.5. This matters
+        because quantised and bucketed scores tie constantly.
+    - id: cp-4
+      question: "You apply temperature scaling and AUC is unchanged, but ECE drops from 0.19 to 0.07. Explain both."
+      answerKind: short_text
+      hint: "What does a monotone transform preserve?"
+      solution: >-
+        Temperature scaling divides logits by a positive constant, which is a
+        strictly increasing map — so every pairwise ordering is preserved, and
+        AUC depends only on orderings. ECE compares the probability *value*
+        against the observed frequency, and the value changes even though the
+        order does not. Ranking and calibration are independent properties.
+    - id: cp-5
+      question: "At 1% prevalence the best threshold gives 27% precision. Is that a bad model?"
+      answerKind: short_text
+      hint: "Use the precision formula with pi = 0.01."
+      solution: >-
+        Not necessarily — precision is bounded by prevalence. With pi = 0.01,
+        even a TPR of 0.63 requires an FPR below about 1.7% to reach 27%
+        precision. So 27% precision at 63% recall corresponds to a genuinely
+        strong ranker; it just cannot look good in precision terms because the
+        base rate caps it. The right question is whether the expected cost at
+        that operating point beats the alternatives, including doing nothing.
+    - id: cp-6
+      question: "When is a validation score below the noise floor not good news?"
+      answerKind: short_text
+      hint: "What is the sigma-squared term in the bias-variance decomposition?"
+      solution: >-
+        It means you have a leak. $\mathbb{E}[(y-\hat f)^2] = \text{bias}^2 +
+        \text{variance} + \sigma^2$, and $\sigma^2$ is irreducible. A validation
+        error below the estimated noise floor implies the model had access to
+        information it will not have at prediction time — target leakage, a
+        feature computed after the label, or preprocessing fitted on the full
+        dataset including the validation rows.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A metric is a claim about what an error costs. Accuracy claims both
+        kinds of error cost the same, which is almost never true, and at low
+        prevalence it is dominated entirely by the majority class. The
+        replacement question is: at the threshold I will actually ship, how many
+        false alarms and how many misses per day?
+      blocks:
+        - kind: checklist
+          body: |
+            - Accuracy at 1% prevalence: constant-zero scores 0.99
+            - ROC-AUC answers "can it rank?" — prevalence-free
+            - PR-AUC answers "when it fires, is it right?" — prevalence-bound
+            - Calibration answers "does 0.8 mean 80%?"
+            - Always compute the null baselines first
+      checkpoint: >-
+        If a model reports 99.2% accuracy on a 1%-prevalence problem, what is
+        the first number you would ask for, and why is it not another metric?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Two levers: which metric, and which operating point. The metric follows
+        from the cost ratio and the prevalence; the operating point follows from
+        the count of errors you can afford to have a human handle. Pick the
+        metric before you look at results, not after.
+      blocks:
+        - kind: checklist
+          body: |
+            - Rare positive → PR-AUC / average precision
+            - Balanced or symmetric cost → ROC-AUC is fine
+            - Score used as a probability → add ECE and Brier
+            - Always → the operating point, reported in counts
+            - Always → the null baseline (random and constant-majority)
+      checkpoint: >-
+        Why should the metric be chosen before seeing results? What does it mean
+        about a paper that reports whichever metric its model did best on?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The two implementations worth being able to write from memory are AUC
+        with average-rank ties, and ECE.
+      blocks:
+        - kind: pseudocode
+          body: |
+            auc(y, s):
+                assign average ranks to tied scores     # WITHOUT THIS IT IS WRONG
+                u = sum(ranks where y == 1) - n_pos*(n_pos+1)/2
+                return u / (n_pos * n_neg)
+
+            ece(y, p, bins=15):
+                for each bin b:
+                    conf = mean(p in b); freq = mean(y in b)
+                    ece += (|b| / n) * |conf - freq|
+                return ece
+
+            operating_point(y, s, thr):
+                pred = s > thr
+                return count_FP, count_FN, precision, recall
+
+            # and the baselines, always:
+            constant_zero_accuracy = 1 - prevalence
+      checkpoint: >-
+        In the AUC pseudocode, why is the average-rank step not an optimisation
+        but a correctness requirement?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three results worth deriving: AUC as a probability, the prevalence bound
+        on precision, and the bias-variance split.
+      blocks:
+        - kind: math
+          body: |
+            **AUC as a probability.**
+            $$\text{AUC} = \int \text{TPR}\,d(\text{FPR}) = \int P(s^+ > t)\,dP(s^- > t) = P(s^+ > s^-)$$
+
+            **Precision under prevalence $\pi$.** By Bayes,
+            $$\text{precision} = \frac{\pi\,\text{TPR}}{\pi\,\text{TPR} + (1-\pi)\,\text{FPR}} = \frac{\text{TPR}}{\text{TPR} + \frac{1-\pi}{\pi}\text{FPR}}$$
+            As $\pi \to 0$, the multiplier $(1-\pi)/\pi \to \infty$.
+
+            **Bias–variance.**
+            $$\mathbb{E}[(y-\hat f)^2] = (\mathbb{E}[\hat f] - f)^2 + \operatorname{Var}(\hat f) + \sigma^2$$
+      checkpoint: >-
+        In the precision derivation, what happens to the bound as FPR → 0? Does
+        that mean a perfect classifier is required, or something weaker?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete evaluation harness that reports the metric, the operating
+        point, the calibration, and the baselines together.
+      blocks:
+        - kind: warning
+          body: >-
+            The point of this harness is that no single number is reported
+            alone. Read the operating-point section first: that is the one an
+            on-call engineer can act on.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def roc_auc(y_true, scores):
+                y = np.asarray(y_true).astype(int)
+                s = np.asarray(scores, float)
+                n_pos = int((y == 1).sum()); n_neg = int((y == 0).sum())
+                if n_pos == 0 or n_neg == 0:
+                    return float("nan")
+                order = np.argsort(s, kind="mergesort")
+                ss = s[order]
+                ranks = np.empty(len(s)); i = 0
+                while i < len(s):
+                    j = i
+                    while j + 1 < len(s) and ss[j + 1] == ss[i]:
+                        j += 1
+                    ranks[order[i:j + 1]] = (i + j) / 2.0 + 1.0
+                    i = j + 1
+                u = ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2.0
+                return float(u / (n_pos * n_neg))
+
+            def average_precision(y_true, scores):
+                y = np.asarray(y_true).astype(int)
+                s = np.asarray(scores, float)
+                order = np.argsort(-s)
+                y = y[order]
+                tp = np.cumsum(y); fp = np.cumsum(1 - y)
+                prec = tp / np.maximum(tp + fp, 1)
+                rec = tp / max(int(y.sum()), 1)
+                ap = 0.0; prev = 0.0
+                for i in range(len(y)):
+                    if y[i] == 1:
+                        ap += prec[i] * (rec[i] - prev); prev = rec[i]
+                return float(ap)
+
+            def evaluate(y_true, scores, threshold):
+                y = np.asarray(y_true).astype(int)
+                pred = (np.asarray(scores, float) > threshold).astype(int)
+                tp = int(((pred == 1) & (y == 1)).sum())
+                fp = int(((pred == 1) & (y == 0)).sum())
+                fn = int(((pred == 0) & (y == 1)).sum())
+                prec = tp / max(tp + fp, 1)
+                rec = tp / max(tp + fn, 1)
+                return {
+                    "roc_auc": roc_auc(y, scores),
+                    "pr_auc": average_precision(y, scores),
+                    "threshold": threshold,
+                    # Counts, not just rates -- this is what an operator acts on.
+                    "flagged": int(pred.sum()),
+                    "false_positives": fp,
+                    "false_negatives": fn,
+                    "precision": prec,
+                    "recall": rec,
+                    "accuracy": float((pred == y).mean()),
+                    "constant_zero_accuracy": float((y == 0).mean()),
+                }
+      checkpoint: >-
+        The harness reports `constant_zero_accuracy` alongside `accuracy`.
+        Argue for always including that baseline, and say when it would be
+        misleading rather than clarifying.
+
+  problems:
+    - id: p-roc-auc
+      title: "ROC-AUC with correct tie handling"
+      difficulty: medium
+      prompt: >-
+        Implement `roc_auc(y_true, scores)` returning $P(s^+ > s^-)$ computed by
+        the rank (Mann–Whitney) formulation. **Tied scores must receive their
+        average rank**, so that an input where every score is identical returns
+        exactly 0.5. Return `float('nan')` if either class is absent.
+      starter: |
+        import numpy as np
+
+        def roc_auc(y_true, scores):
+            # your implementation here
+            pass
+      language: python
+      entry: roc_auc
+      testCases:
+        - input: '[[0,0,1,1],[0.1,0.4,0.35,0.8]]'
+          expected: "0.75"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0,0,1,1],[0.1,0.2,0.8,0.9]]'
+          expected: "1.0"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0,1,0,1],[0.5,0.5,0.5,0.5]]'
+          expected: "0.5"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0,0,1,1],[0.9,0.8,0.2,0.1]]'
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def roc_auc(y_true, scores):
+            y = np.asarray(y_true).astype(int)
+            s = np.asarray(scores, dtype=float)
+            n_pos = int((y == 1).sum())
+            n_neg = int((y == 0).sum())
+            if n_pos == 0 or n_neg == 0:
+                return float("nan")
+
+            # Average ranks for ties. Consecutive ranks would return 0.75 on the
+            # all-tied case instead of the correct 0.5.
+            order = np.argsort(s, kind="mergesort")
+            ss = s[order]
+            ranks = np.empty(len(s), dtype=float)
+            i = 0
+            while i < len(s):
+                j = i
+                while j + 1 < len(s) and ss[j + 1] == ss[i]:
+                    j += 1
+                ranks[order[i : j + 1]] = (i + j) / 2.0 + 1.0
+                i = j + 1
+
+            u = ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2.0
+            return float(u / (n_pos * n_neg))
+      solutionExplanation: >-
+        The rank formulation of AUC is the Mann–Whitney U statistic normalised
+        by n_pos * n_neg. The third test case is the whole point: with every
+        score tied there is no discrimination, so AUC must be exactly 0.5. A
+        naive argsort gives tied values consecutive ranks, which makes the
+        positive rank sum higher than chance and returns 0.75 — inventing
+        discrimination that is not there. Average ranks make a tied pair count
+        as half a win, which is exactly the P(s+ > s-) convention.
+      complexity: "O(n log n) time, O(n) space"
+      tags: [auc, roc, ties, evaluation]
+
+    - id: p-ece
+      title: "Expected calibration error"
+      difficulty: medium
+      prompt: >-
+        Implement `expected_calibration_error(y_true, probs, bins=15)` returning
+        the bin-weighted mean of $|\text{mean confidence} - \text{observed rate}|$.
+        Assign each prediction to bin `min(int(p * bins), bins - 1)`. Empty bins
+        contribute nothing. Return 0.0 for empty input.
+      starter: |
+        import numpy as np
+
+        def expected_calibration_error(y_true, probs, bins=15):
+            # your implementation here
+            pass
+      language: python
+      entry: expected_calibration_error
+      testCases:
+        - input: '[[0,1,0,1],[0.1,0.9,0.2,0.8],2]'
+          expected: "0.14999999999999997"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0,1],[0.0,1.0],10]'
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0,0],[0.9,0.9],10]'
+          expected: "0.9"
+          mode: json
+          tolerance: 1e-12
+        - input: "[[],[],15]"
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def expected_calibration_error(y_true, probs, bins=15):
+            y = np.asarray(y_true, dtype=float)
+            p = np.asarray(probs, dtype=float)
+            if y.size == 0:
+                return 0.0
+            if y.shape != p.shape:
+                raise ValueError("length mismatch")
+            idx = np.clip((p * bins).astype(int), 0, bins - 1)
+            ece = 0.0
+            for b in range(int(bins)):
+                m = idx == b
+                if not m.any():
+                    continue
+                ece += (m.sum() / len(p)) * abs(p[m].mean() - y[m].mean())
+            return float(ece)
+      solutionExplanation: >-
+        ECE is the weighted average gap between what the model claims and what
+        happens. In the first case both bins are off by exactly 0.15, so ECE is
+        0.15. A perfectly calibrated two-point input gives 0, and a model that
+        says 0.9 twice while being wrong both times gives 0.9 — the maximum
+        possible miscalibration for those predictions. Empty bins are skipped
+        rather than counted as zero error, because including them would
+        understate ECE and the behaviour would depend on an arbitrary bin count.
+      complexity: "O(n + bins) time, O(n) space"
+      tags: [calibration, ece, evaluation]
+
+    - id: p-operating-point
+      title: "Errors in counts at the shipping threshold"
+      difficulty: easy
+      prompt: >-
+        Implement `operating_point(y_true, scores, threshold)` returning a dict
+        with integer keys `false_positives`, `false_negatives`, and float keys
+        `precision`, `recall`. A row is flagged when `score > threshold`
+        (strictly). Use 0.0 for precision or recall when the denominator is 0.
+      starter: |
+        def operating_point(y_true, scores, threshold):
+            # your implementation here
+            pass
+      language: python
+      entry: operating_point
+      testCases:
+        - input: '[[0,1,1,0,1],[0.2,0.8,0.6,0.9,0.4],0.5]'
+          expected: '{"false_positives": 1, "false_negatives": 1, "precision": 0.6666666666666666, "recall": 0.6666666666666666}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0,0,1,1],[0.1,0.2,0.3,0.4],0.5]'
+          expected: '{"false_positives": 0, "false_negatives": 2, "precision": 0.0, "recall": 0.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0,0,1,1],[0.6,0.7,0.8,0.9],0.5]'
+          expected: '{"false_positives": 2, "false_negatives": 0, "precision": 0.5, "recall": 1.0}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def operating_point(y_true, scores, threshold):
+            tp = fp = fn = 0
+            for y, s in zip(y_true, scores):
+                flagged = float(s) > float(threshold)
+                if flagged and int(y) == 1:
+                    tp += 1
+                elif flagged and int(y) == 0:
+                    fp += 1
+                elif not flagged and int(y) == 1:
+                    fn += 1
+            precision = tp / (tp + fp) if (tp + fp) else 0.0
+            recall = tp / (tp + fn) if (tp + fn) else 0.0
+            return {
+                "false_positives": fp,
+                "false_negatives": fn,
+                "precision": float(precision),
+                "recall": float(recall),
+            }
+      solutionExplanation: >-
+        The point of this problem is that it returns counts, not just rates. A
+        precision of 0.67 means nothing to an on-call engineer; "1,750 false
+        alarms today" does. The strict comparison matters too — using >= instead
+        of > silently changes every threshold sitting exactly on a score, which
+        is precisely where quantised models put their most common value.
+      complexity: "O(n) time, O(1) space"
+      tags: [precision, recall, operating-point]
+
+  try_it: >-
+    Score a constant-zero classifier on 100,000 rows at 1% prevalence and confirm
+    it reports 0.9900 accuracy, then write down the precision and recall it
+    actually achieves. Now compute AUC on all-tied scores with a naive rank
+    implementation: it returns 0.75 where the correct answer is 0.5.
+  interview_questions:
+    - question: "Why does accuracy mislead at 1% prevalence, and what replaces it?"
+      level: mid
+      key_points:
+        - "Accuracy encodes an unstated cost ratio — it charges a miss and a false alarm the same, which is almost never true."
+        - "The constant-zero classifier scores 0.9900 at 1% prevalence, 0.9990 at 0.1%, and every one of those numbers is worse than useless."
+        - "Precision is bounded by the base rate, so at the operating point a TPR of 0.8197 with precision 0.0380 implies an FPR of 0.2565 — arithmetic, not model weakness."
+        - "The replacement is the metric the decision needs, at the threshold you will ship: PR-AUC for ranking, plus false positives and misses per day as counts."
+      follow_up: "Give a case where accuracy is the right metric despite heavy imbalance."
+    - question: "ROC-AUC is 0.92 and PR-AUC is 0.66. Which do you ship on?"
+      level: senior
+      key_points:
+        - "ROC-AUC is prevalence-invariant because it equals $P(s^+ > s^-)$, a probability conditioned on one positive and one negative."
+        - "PR-AUC is not: the same scoring function fell from 0.9226 to 0.6632 to 0.2624 as prevalence went 50% → 10% → 1%."
+        - "Precision is the operator's cost, so at low prevalence PR-AUC is the number that tracks what deployment feels like."
+        - "Report both plus the operating point, and never compare models on ROC-AUC when the deployment prevalence differs from the evaluation set."
+      follow_up: "Your evaluation set is enriched to 10% positives. What exactly is invalid about the PR-AUC you computed on it?"
+    - question: "Why must AUC handle ties with average ranks?"
+      level: mid
+      key_points:
+        - "With all scores tied at 0.5 a naive rank implementation returns 0.75 instead of 0.5 — it invents discrimination that does not exist."
+        - "Average ranks give every tied pair credit of one half, which is exactly the $P(s^+ > s^-) + \\tfrac12 P(s^+ = s^-)$ definition."
+        - "Quantised or bucketed scores produce ties constantly, so this is a real-data problem rather than a corner case."
+        - "The same care is needed for AP, where tied scores change which thresholds exist."
+  common_mistakes:
+    - "Reporting accuracy on imbalanced data, where 0.99 is exactly what ignoring the minority class scores."
+    - "Choosing between models on ROC-AUC when deployment prevalence is 1%, where the same scorer's PR-AUC ranges from 0.6632 to 0.2624."
+    - "Reading a high AUC as calibrated probabilities — an ECE of 0.1885 means a stated 0.8 is off by nearly 19 percentage points."
+  further_reading:
+    - label: "Fawcett, An introduction to ROC analysis (Pattern Recognition Letters, 2006)"
+    - label: "Saito & Rehmsmeier, The Precision-Recall Plot Is More Informative than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets (PLoS ONE, 2015)"

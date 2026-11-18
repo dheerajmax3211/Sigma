@@ -1,0 +1,663 @@
+id: speech-synthesis-tts
+slug: speech-synthesis-tts
+title: "Speech Synthesis: Phonemes, Vocoders, and the Cost of a Frame"
+summary: >-
+  Text-to-speech is three rate conversions in a row — a few tokens of text, 80
+  mel frames a second, 24,000 samples a second — and every architecture choice in
+  the last decade is a decision about which of those conversions gets a neural
+  network, which gets a duration model, and how many sequential passes you are
+  willing to pay for before the first syllable is audible.
+kind: lesson
+difficulty: medium
+position: 2
+estMinutes: 24
+prerequisites: [neural-audio-codecs]
+
+body:
+  big_idea: >-
+    A TTS system is a rate ladder: an acoustic model emits 80 mel frames per
+    second and a vocoder 24,000 samples, so the design question is sequential
+    steps per second of audio.
+  problem:
+    - "You train Tacotron, it sounds good on 8-second clips, and in production it repeats a word or babbles: attention took a different path."
+    - "You switch to a non-autoregressive model for speed and the output is flat, because the duration predictor was trained on unreliable teacher alignments."
+    - "You quote RTF 0.05 and it still feels slow: RTF measures the whole utterance, while the user experiences the silence before the first syllable."
+  analogy: >-
+    A film crew dubbing a documentary. The script supervisor converts the
+    script into a phonetic shooting script, one line per sound. The director
+    decides how long each line is held — the duration model, the only place
+    timing exists. The camera shoots 80 frames per second of "mel", and a
+    second unit turns each frame into 300 samples of actual light.
+  concept_points:
+    - "**The rate ladder is the whole design space.** A second of speech is about 2.5 words, roughly 10 phonemes, 80 mel frames at a 12.5 ms hop, and 24,000 samples at 24 kHz — each conversion multiplying the sequence length by 8 and 300 and 300 again. Every architecture decides where to stop predicting explicitly: frame-level models stop at the mel, vocoders at the waveform, codec systems at 50-75 tokens/s."
+    - "**Phonemes are shorter, not smaller.** English has around 39 phonemes in ARPAbet against 26 letters plus punctuation — comparable vocabularies. The win is sequence length: \\\"through\\\" is 7 characters and 3 phonemes, a 2.3x reduction, and because attention is quadratic that is a **5.4x** saving in the text encoder. The cost is a G2P model that must handle names, loanwords and heteronyms."
+    - "**Splitting acoustic model from vocoder splits what from how.** The acoustic model predicts 80 mel bins at 80 frames/s — 6,400 values per second — and the vocoder turns that into 24,000 samples. Each half trains on its own data and can be swapped: HiFi-GAN replaced WaveNet without retraining an acoustic model. The vocoder still solves an inverse problem with missing phase."
+    - "**Tacotron's attention is the first thing that breaks.** A seq2seq acoustic model decodes one frame at a time — **80 sequential steps per second of audio** — attending over the phoneme sequence. Location-sensitive attention, feeding back the previous alignment, is what keeps it monotonic. The failures are repetition, skipping and babbling, and all three are alignment failures rather than acoustic ones."
+    - "**FastSpeech removes the recurrence and pays for it with a duration model.** A duration predictor emits one integer per phoneme, a length regulator repeats each phoneme its predicted number of times, and a feed-forward decoder sees the whole utterance at once: sequential depth drops from 80 per second to **1 per utterance**. The durations must come from somewhere — distilled from a Tacotron teacher, or an external aligner."
+    - "**Diffusion and flow matching invert the cost curve.** Instead of 80 sequential steps per second, a diffusion model denoises the whole utterance in parallel and pays $S$ steps in total: a 10-second utterance at 32 steps is **3.2 sequential passes per second**, 25x fewer than an autoregressive mel model and 187x fewer than a 600-token/s codec language model. It gives up streaming."
+  definitions:
+    - term: "Phoneme"
+      meaning: >-
+        The smallest contrastive sound unit of a language. ARPAbet has about 39
+        for English plus stress digits; the IPA covers the world's languages with
+        a much larger inventory. A phoneme sequence is shorter and more regular
+        than a character sequence, at the cost of needing a lexicon or a
+        grapheme-to-phoneme model.
+    - term: "Grapheme-to-phoneme (G2P)"
+      meaning: >-
+        The mapping from written text to phonemes. Rule-based for regular
+        orthographies, lexicon-plus-model for English, and always wrong somewhere:
+        heteronyms like "read", "lead" and "bass" need part-of-speech context, and
+        proper nouns need a fallback.
+    - term: "Acoustic model"
+      meaning: >-
+        The network that maps a phoneme (or character) sequence to an acoustic
+        representation, usually 80-bin mel frames at 80 frames/s. It owns timing
+        and prosody, either through attention or through an explicit duration
+        predictor.
+    - term: "Vocoder"
+      meaning: >-
+        The network that turns mel frames into a waveform. It must supply phase,
+        which the mel transform discarded, so it is solving an ill-posed inverse
+        problem; HiFi-GAN and WaveNet are the two canonical families, and the
+        difference between them is 24,000 sequential steps per second versus one
+        pass per chunk.
+    - term: "Mel spectrogram"
+      meaning: >-
+        80 (or 128) log-magnitude bins on a perceptual frequency scale, at a hop
+        of 12.5 ms for Tacotron-lineage models — 80 frames per second, 6,400
+        values per second. It discards phase, which is why a vocoder is required.
+    - term: "Duration predictor"
+      meaning: >-
+        A head that predicts how many frames each phoneme occupies. It is the
+        component that replaces attention in non-autoregressive TTS, and its
+        accuracy determines whether the output sounds deliberate or list-like.
+    - term: "Length regulator"
+      meaning: >-
+        The operation that expands a phoneme-level sequence to frame-level by
+        repeating each phoneme its predicted number of frames. It is a gather, not
+        a learned layer, and it is where an off-by-one in duration becomes a
+        clipped phoneme.
+    - term: "Monotonic alignment search (MAS)"
+      meaning: >-
+        The dynamic-programming search inside VITS for the alignment between text
+        and frames that maximises the likelihood under the current model. It
+        enforces monotonicity by construction, which is why VITS does not exhibit
+        Tacotron's skipping and repetition failures.
+    - term: "Normalising flow"
+      meaning: >-
+        An invertible, volume-preserving map between a simple base density and a
+        complex one, with a tractable Jacobian determinant. VITS uses a stack of
+        them to make the posterior flexible while keeping the KL divergence exact.
+    - term: "Flow matching"
+      meaning: >-
+        A generative objective that regresses a velocity field onto the straight
+        path between noise and data, then samples by integrating an ODE. It needs
+        far fewer steps than DDPM because the learned path is closer to straight;
+        10-32 steps is the usual TTS operating range.
+    - term: "Real-time factor (RTF)"
+      meaning: >-
+        Generation time divided by audio duration. RTF 0.1 means ten seconds of
+        audio in one second. It says nothing about first-chunk latency, which is
+        the number a conversational product is judged on.
+    - term: "First-chunk latency"
+      meaning: >-
+        The wall-clock delay from a complete text input to the first audible
+        sample. For a streaming system it is text front end plus one chunk of
+        acoustic model plus one vocoder pass plus the playback buffer — the only
+        latency a user perceives at the start of a turn.
+
+  diagrams:
+    - type: architecture
+      title: "The rate ladder: text, phonemes, mel frames, samples"
+      caption: >-
+        Every arrow multiplies the sequence length. The design question is where to
+        stop predicting sequentially: at the phoneme (one pass), at the mel frame
+        (80 steps per second), or at the sample (24,000 steps per second).
+      nodes:
+        - id: text
+          x: 0
+          y: 1
+          label: "text, ~2.5 words/s"
+          kind: client
+          detail: "A 10-second utterance is about 25 words, or 32 text tokens at 1.3 tokens per word. This is the only stage where the sequence is short."
+        - id: g2p
+          x: 1
+          y: 1
+          label: "normalise + G2P, ~10 phonemes/s"
+          kind: worker
+          detail: "Numbers, dates and abbreviations are expanded first, then phonemes are looked up or predicted. A 10-second utterance is about 100 phonemes; at 39 symbols the inventory is no larger than the alphabet, but the sequence is 2.3x shorter."
+        - id: dur
+          x: 2
+          y: 1
+          label: "duration predictor / attention"
+          kind: model
+          detail: "The only place timing exists. At 80 frames/s a 100 ms phoneme is 8 frames; a model that gets this wrong is intelligible but wrong-sounding."
+        - id: mel
+          x: 3
+          y: 1
+          label: "80 mel bins at 80 frames/s"
+          kind: storage
+          detail: "6,400 values per second, 10 seconds = 800 frames = 64,000 values = 125 kB in fp16. Phase is gone, which is what the vocoder must invent."
+        - id: voc
+          x: 4
+          y: 1
+          label: "vocoder"
+          kind: gpu
+          detail: "HiFi-GAN: one pass per chunk, transposed convolutions up to 24 kHz. WaveNet: 24,000 sequential steps per second of audio, which is why it was replaced."
+        - id: wav
+          x: 5
+          y: 1
+          label: "24 kHz waveform"
+          kind: client
+          detail: "24,000 samples per second; a 10-second clip is 240,000 samples. The vocoder's output is statistically consistent with the mel, not a recovery of the original phase."
+        - id: steps
+          x: 3
+          y: 2
+          label: "sequential depth"
+          kind: server
+          detail: "Per second of audio: 24,000 (sample AR), 600 (codec AR), 80 (mel AR), S per utterance (diffusion), 1 (non-autoregressive). This is the number that sets latency."
+      edges:
+        - { from: text, to: g2p, label: "expand, then map" }
+        - { from: g2p, to: dur, label: "phonemes" }
+        - { from: dur, to: mel, label: "one frame per 12.5 ms" }
+        - { from: mel, to: voc, label: "80 bins" }
+        - { from: voc, to: wav, label: "x300 upsampling" }
+        - { from: mel, to: steps, label: "or S passes for the whole clip", style: async }
+
+    - type: plot
+      title: "Sequential steps needed to produce one second of audio"
+      chart: bar
+      xLabel: "architecture"
+      yLabel: "sequential passes per second of audio"
+      series:
+        - name: "sequential depth"
+          points:
+            - { x: 1, y: 24000 }
+            - { x: 2, y: 600 }
+            - { x: 3, y: 80 }
+            - { x: 4, y: 3.2 }
+            - { x: 5, y: 1 }
+
+    - type: compare
+      title: "Autoregressive versus non-autoregressive acoustic models"
+      left_label: "Autoregressive (Tacotron 2)"
+      left_points:
+        - "80 sequential decoder steps per second of audio, each conditioned on the previous frame"
+        - "Attention learns the alignment, so no external aligner and no duration labels are needed"
+        - "Failure modes are structural: repetition, skipping, and babbling on long or out-of-domain text"
+        - "Streams naturally once attention is monotonic: audio can start before the sentence ends"
+        - "Prosody is learned implicitly and is often more natural than a duration model's"
+      right_label: "Non-autoregressive (FastSpeech 2, VITS)"
+      right_points:
+        - "One pass for the whole utterance; the duration predictor replaces attention"
+        - "Needs durations from somewhere — a teacher's attention, an external aligner, or MAS"
+        - "No alignment failures, because alignment is fixed before decoding"
+        - "Duration, pitch and energy are explicit and therefore controllable (speak slower, raise pitch)"
+        - "Cannot stream without chunking, because the length regulator needs the whole text"
+
+    - type: mermaid
+      title: "Diffusion TTS: S passes over the whole clip, not 80 passes per second"
+      code: |
+        flowchart LR
+          T["text + phonemes"] --> C["duration: 800 frames for 10 s"]
+          C --> N["x_T ~ N(0, I), shape 80 x 800"]
+          N --> S1["step 1: v_theta(x_t, t, text)"]
+          S1 --> S2["step 2"]
+          S2 --> D["... S = 32 steps ..."]
+          D --> M["mel, 80 x 800"]
+          M --> V["vocoder, one pass"]
+          V --> W["10 s of 24 kHz audio"]
+
+  markdown: |
+    ## Three rates in a row
+
+    Text-to-speech looks like one model and is actually three conversions. Take a
+    ten-second sentence spoken at a normal 150 words per minute: it is about 25
+    words, about 100 phonemes, 800 mel frames and 240,000 samples.
+
+    | stage | unit | count for 10 s | rate |
+    |---|---|---|---|
+    | text | tokens | ~32 | 3.2/s |
+    | phonemes | phonemes | ~100 | 10/s |
+    | mel | frames | 800 | 80/s |
+    | waveform | samples | 240,000 | 24,000/s |
+
+    Each row is roughly an order of magnitude longer than the one above it, and
+    that ladder is why the field's architectures look the way they do. A model
+    that predicts every sample sequentially needs 24,000 steps per second of
+    audio. A model that predicts mel frames needs 80. A model that predicts one
+    vector per utterance needs one.
+
+    ## Characters or phonemes
+
+    English has 26 letters and around 39 phonemes, so the vocabulary argument for
+    phonemes is weak. The sequence-length argument is not: "through" is seven
+    characters and three phonemes, and a 2.3× shorter sequence makes attention
+    $2.3^2 = 5.4$ times cheaper. Phonemes also remove the irregularity that makes
+    English orthography hard — "ough" has at least six pronunciations.
+
+    The price is a grapheme-to-phoneme stage. A lexicon covers common words; a
+    model covers the rest; both fail on names, loanwords and heteronyms, where the
+    correct pronunciation depends on meaning ("I read it yesterday" against "I
+    read every day"). Production systems therefore carry three layers: lexicon,
+    G2P model, and a fallback that spells the word out. Character-based models
+    skip all of it and learn pronunciation from data, which works well when the
+    training set is large and the domain is narrow, and badly on the long tail of
+    proper nouns.
+
+    ## The acoustic model and the vocoder
+
+    Tacotron 2 established the split that outlived it: a seq2seq model with
+    location-sensitive attention predicts 80-bin mel frames at a 12.5 ms hop,
+    and a WaveNet vocoder turns those frames into 24 kHz audio. The mel is a
+    compact target — $80 \times 80 = 6{,}400$ values per second — and it is
+    exactly the representation whose phase has been discarded, so the vocoder is
+    an inverse problem rather than a copy.
+
+    That split is why vocoders iterate independently of acoustic models. WaveNet
+    was autoregressive at the sample level: 24,000 sequential steps per second,
+    with a μ-law 256-way softmax at each step, which is 8 bits per sample and
+    192 kbps before any entropy coding. It sounded better than anything before it
+    and was far too slow to serve. HiFi-GAN replaced it with a feed-forward
+    generator and a multi-period discriminator, and the same acoustic models got
+    faster without being retrained.
+
+    ## Attention, and the failures it owns
+
+    A Tacotron decoder is autoregressive over frames. At each step it attends over
+    the phoneme sequence, produces one mel frame, and feeds that frame back.
+    Location-sensitive attention adds the previous alignment as an input, which
+    is what biases the model toward monotonic progress.
+
+    When that bias fails, three symptoms appear. **Repetition**: a phoneme is
+    attended twice, so a word is said twice. **Skipping**: a phoneme is never
+    attended, so a syllable vanishes. **Babbling**: attention collapses onto one
+    position and the model emits plausible-sounding noise. All three are alignment
+    failures, all three are more likely on long or out-of-distribution text, and
+    none of them is fixed by more data alone.
+
+    ## Removing the recurrence
+
+    FastSpeech's answer is to make alignment explicit. A duration predictor emits
+    one integer per phoneme; a length regulator repeats each phoneme that many
+    times; a feed-forward decoder consumes the expanded sequence in one pass.
+    Sequential depth per second of audio falls from 80 to 1.
+
+    The catch is that durations have to be supervised. FastSpeech distilled them
+    from a trained Tacotron's attention, which inherits the teacher's errors on
+    exactly the sentences where the teacher was unreliable. FastSpeech 2 replaced
+    the teacher with an external aligner (Montreal forced aligner) and added
+    explicit pitch and energy predictors, which also made prosody controllable:
+    you can ask for a slower, lower, quieter reading without retraining.
+
+    VITS goes further and makes the whole pipeline one model. A posterior encoder
+    reads the mel, a stack of normalising flows maps a Gaussian to that posterior,
+    monotonic alignment search finds the best text-to-frame alignment, and a
+    HiFi-GAN decoder produces the waveform. Flows are the load-bearing choice: the
+    KL term needs an exact density, and an invertible map with a tractable
+    Jacobian gives one, so training is a likelihood objective plus an adversarial
+    term rather than an adversarial term alone. A stochastic duration predictor
+    samples phoneme lengths, which is why VITS output varies between runs instead
+    of being a deterministic function of the text.
+
+    ## Diffusion and flow matching
+
+    Diffusion TTS denoises the whole utterance at once. For 10 seconds of audio
+    that is 800 mel frames, and a 32-step sampler performs 32 network passes over
+    all 800 frames — 3.2 sequential passes per second of audio, against 80 for an
+    autoregressive mel model and 600 for a 75 Hz codec language model.
+
+    That is a 25× reduction in sequential depth, and it is bought with
+    parallelism, not magic: each pass is over the full 800-frame sequence, so the
+    compute per pass is much larger. The trade is favourable on a GPU because
+    matrix multiplies are wide, and it is catastrophic for streaming because no
+    frame is final until the last step. A flow-matching model is the same shape
+    with a straighter path, which is why it converges in 10-32 steps instead of
+    1,000.
+
+    Matching the step budget to the frame rate is the practical skill. Halving the
+    frame rate halves the cost of each step and leaves the step count unchanged;
+    doubling the steps doubles latency and leaves the frame rate unchanged. A
+    40 fps latent with 16 steps costs 16 passes per utterance; an 80 fps mel with
+    32 steps costs 32. Both are cheap in sequential terms and both are
+    non-streaming, which is the constraint that decides whether the product can
+    use them at all.
+
+    ## Latency is not RTF
+
+    A model with RTF 0.02 can still feel slow. The number a user experiences is
+    the delay to the first audible sample, and it decomposes into the text front
+    end (tens of milliseconds), the first chunk of acoustic model, the first
+    vocoder pass, and the playback buffer. A streaming system adds lookahead: a
+    chunked vocoder needs context on both sides of the boundary or it clicks.
+
+    Three regimes, three latencies. A non-autoregressive model needs the whole
+    text, so it cannot start before the sentence is complete, but then produces
+    everything in one pass. An autoregressive mel model can start after the first
+    phoneme but pays 80 steps per second. A diffusion model cannot start until the
+    text is complete and then pays $S$ passes for the whole clip, which is fine
+    for narration and wrong for a conversation.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A TTS system is a rate ladder: text is O(1) tokens per word, an acoustic model emits 80 mel frames per second, and a vocoder emits 24,000 samples per second, so the design question is never "which model is best" but "how many sequential steps does this architecture need per second of audio, and can the product afford them" — 24,000 for a sample-level autoregressive vocoder, 80 for a frame-level autoregressive acoustic model, one for a non-autoregressive model, and $S$ total for a diffusion model that denoises the whole utterance at once.
+
+    ### The analogy, in full
+
+    A film crew dubbing a documentary. The script supervisor (the text front end) converts the written script into a phonetic shooting script, one line per sound. The director (the acoustic model) decides how long each line is held — this is the duration model, and it is the only place where timing exists. The camera then shoots 80 frames per second of "mel", which is enough to see the performance but not enough to project. A second unit (the vocoder) turns each frame into 300 individual samples of actual light. The analogy breaks in two places. The director's timing decisions are not independent: prosody is a property of the whole utterance, so a duration model that predicts each phoneme from local context produces the flat, list-like reading that gives synthetic speech away. And the second unit is not filling in plausible detail — it is inverting a lossy transform, so a vocoder trained on mel frames from real recordings has to reproduce the phase distribution of real speech, which is where the "buzzy" and "metallic" artefacts come from.
+
+    ### Failure modes, in full
+
+    - You train a Tacotron-style model, it sounds good on 8-second clips, and in production it occasionally repeats a word, skips a clause, or degenerates into babbling on a long sentence. Nothing errors: attention simply chose a different monotonic path, and there is no constraint in the model that says it may not.
+    - You switch to a non-autoregressive model for speed and the output is intelligible but flat, because the duration predictor was trained on attention alignments from a teacher that was itself unreliable on the same long sentences.
+    - You quote a real-time factor of 0.05 and the product still feels slow, because RTF measures the whole utterance and the user hears the first syllable: 2 seconds of audio generated in 100 ms is excellent, and 100 ms of silence before any audio arrives is what the user actually experiences.
+    - You try diffusion for quality, put 1,000 steps in because that is what the image papers use, and discover that the step count is not a quality dial but a latency budget — 1,000 steps over a 10-second utterance is 1,000 sequential network passes for 10 seconds of speech.
+
+    ### The mechanisms, in full
+
+    - **The rate ladder is the whole design space.** A second of speech is about 2.5 words, roughly 10 phonemes, 80 mel frames at a 12.5 ms hop, and 24,000 samples at 24 kHz. Each conversion multiplies the sequence length by 8, 300, and 300 again. Any architecture has to decide where to stop predicting explicitly and start predicting in parallel: frame-level models stop at the mel, sample-level vocoders stop at the waveform, and codec-based systems stop at 50-75 tokens per second.
+    - **Phonemes are shorter, not smaller.** English has around 39 phonemes in the ARPAbet inventory plus stress markers, against 26 letters plus punctuation — comparable vocabularies. The win is sequence length and regularity: "through" is 7 characters and 3 phonemes, a 2.3× reduction, and because attention cost is quadratic in sequence length that is a 5.4× saving in the text encoder. The cost is a grapheme-to-phoneme model that must be right for names, loanwords and heteronyms, and it is wrong often enough that production systems carry a pronunciation lexicon and a fallback.
+    - **Splitting acoustic model from vocoder is a split between what and how.** The acoustic model predicts a compact, perceptually warped target — 80 mel bins at 80 frames/s is 6,400 values per second — and the vocoder turns that into 24,000 samples. The split lets each half be trained on its own data and swapped independently, which is why HiFi-GAN could replace WaveNet without retraining a single acoustic model. It also means the vocoder is always solving an inverse problem with missing phase, so it can only ever produce something statistically consistent with the mel, never the original waveform.
+    - **Tacotron's attention is the first thing that breaks.** A seq2seq acoustic model decodes one frame at a time — 80 sequential steps per second of audio — and attends over the phoneme sequence. Location-sensitive attention, which feeds back the previous alignment, is what keeps it monotonic; without it, the model can attend backwards and loop. The characteristic failures are repetition (a phoneme attended twice), skipping (a phoneme never attended), and babbling (attention collapses to one position), and all three are alignment failures rather than acoustic ones.
+    - **FastSpeech removes the recurrence and pays for it with a duration model.** A duration predictor emits one integer per phoneme, a length regulator expands the phoneme sequence to frame length by repeating each phoneme its predicted number of times, and the decoder is a feed-forward stack that sees the whole utterance at once. Sequential depth drops from 80 per second to 1 per utterance. The price is that durations must come from somewhere: the original distilled them from a Tacotron teacher's attention, and FastSpeech 2 replaced the teacher with an external aligner plus explicit pitch and energy prediction.
+    - **VITS makes the whole thing one model and borrows the likelihood from flows.** A conditional VAE encodes the mel into a latent, a stack of invertible normalising flows maps a simple Gaussian to the complex posterior, and a HiFi-GAN decoder produces the waveform; monotonic alignment search finds the alignment that maximises the likelihood, and a stochastic duration predictor samples phoneme lengths. Flows are there because the KL term needs an exact, tractable density, and a flow gives you one: the change of variables is exact and invertible, so training is a single likelihood objective rather than an adversarial game alone.
+    - **Diffusion and flow matching invert the cost curve.** Instead of 80 sequential steps per second of audio, a diffusion model denoises the entire utterance in parallel and pays $S$ sequential steps in total. For a 10-second utterance at 32 steps that is 3.2 sequential passes per second of audio — 25× fewer than an autoregressive mel model and 187× fewer than a 600-token/s codec language model. What it gives up is streaming: the whole utterance must be denoised before any of it is final, so the latency is $S \times t_{\text{step}}$ plus the vocoder, independent of duration but incompatible with the first-chunk budgets a voice agent needs.
+    - **The step budget and the frame rate must be chosen together.** A flow matcher over mel frames at 80 fps and 32 ODE steps means each step evaluates the network over all 800 frames of a 10-second clip: 32 passes, each 800 frames wide. Halving the frame rate to 40 fps halves the per-step cost and leaves the step count alone; doubling the steps doubles the latency and leaves the frame rate alone. The two knobs are orthogonal, and conflating them is how people end up with a 1,000-step model that is slow and a 4-step model that is buzzy.
+    - **Latency has three separate terms and only one of them is the model.** The text front end (normalisation, G2P, lexicon lookup) is tens of milliseconds; the acoustic model is $S$ passes or 80 sequential steps; the vocoder is one pass per chunk. A streaming system adds a fourth: lookahead, because a chunked vocoder needs context on both sides of the chunk boundary to avoid clicks. Quoting RTF collapses all four into one number that hides the term the user feels.
+  derivations:
+    - title: "The rate ladder, and what it costs to move one rung"
+      latex: |
+        For an utterance of duration $T$ seconds, sample rate $f_s$, mel hop $H$
+        and phoneme rate $r_p$:
+
+        $$N_{\text{samples}} = f_s T, \qquad
+          N_{\text{frames}} = \frac{f_s T}{H} = f_r T, \qquad
+          N_{\text{phonemes}} = r_p T.$$
+
+        At $f_s = 24{,}000$, $H = 300$ (12.5 ms), $T = 10$ s:
+
+        $$N_{\text{frames}} = \frac{240{,}000}{300} = 800, \qquad
+          N_{\text{samples}} = 240{,}000, \qquad
+          \frac{N_{\text{samples}}}{N_{\text{frames}}} = 300.$$
+
+        With 100 phonemes for the same utterance, the compression from samples to
+        phonemes is $240{,}000/100 = 2{,}400\times$.
+      prose: >-
+        The 300× ratio between samples and frames is the mel hop, and it is the
+        only reason a frame-level acoustic model is tractable: 800 predictions for
+        ten seconds rather than 240,000. The 8× ratio between frames and phonemes
+        is the duration model's job — at 100 phonemes in 800 frames the average
+        phoneme is 8 frames, or 100 ms. Every duration-predictor bug is a bug
+        about that 8.
+
+    - title: "Why a diffusion model's step count is a latency budget, not a quality dial"
+      latex: |
+        Let $S$ be the number of sampling steps and $t_s$ the wall-clock cost of
+        one network pass over the whole utterance. Generation time is
+
+        $$T_{\text{gen}} = S\, t_s + t_{\text{voc}},$$
+
+        independent of the utterance length except through $t_s$, which grows with
+        the number of frames. The real-time factor is
+
+        $$\text{RTF} = \frac{S\, t_s + t_{\text{voc}}}{T}.$$
+
+        Requiring $\text{RTF} \le 0.5$ for a 10 s utterance with
+        $t_{\text{voc}} = 20$ ms gives
+
+        $$S\, t_s \le 5{,}000 - 20 = 4{,}980\ \text{ms}
+          \quad\Longrightarrow\quad
+          t_s \le \frac{4{,}980}{S}\ \text{ms}.$$
+
+        At $S = 32$ that is 155.6 ms per pass; at $S = 1{,}000$ it is 4.98 ms.
+      prose: >-
+        The inequality is the entire argument against copying image-diffusion step
+        counts into audio. A 1,000-step sampler needs a 5 ms pass over 800 frames
+        to stay under RTF 0.5, which is roughly a small model on a good GPU; a
+        32-step sampler needs 156 ms, which is a large model. The step count and
+        the model size trade against each other almost linearly, and quality is a
+        function of total compute rather than of either one alone.
+
+  implementations:
+    - language: python
+      title: "The frame budget: durations, length regulator, and the vocoder multiple"
+      note: >-
+        Two things are worth running. The first is the arithmetic: 80 frames per
+        second, 300 samples per frame at 24 kHz, and a duration vector that must
+        sum to the frame count or the length regulator silently truncates. The
+        second is the failure the arithmetic catches — a duration predictor whose
+        output sums to 795 frames for an 800-frame target leaves the last phoneme
+        five frames short, and the listener hears a clipped final consonant. The
+        function is deliberately strict about the sum for that reason.
+      code: |
+        import numpy as np
+
+
+        def length_regulator(phonemes, durations, frames_expected):
+            """Repeat phoneme i durations[i] times; assert the total matches."""
+            durations = np.asarray(durations, dtype=int)
+            total = int(durations.sum())
+            if total != frames_expected:
+                raise ValueError(
+                    f"durations sum to {total}, expected {frames_expected} "
+                    f"({frames_expected - total:+d} frames)"
+                )
+            return np.repeat(np.arange(len(phonemes)), durations)
+
+
+        if __name__ == "__main__":
+            # 10 s at 24 kHz, hop 300 -> 80 frames/s -> 800 frames
+            fs, hop, T = 24_000, 300, 10.0
+            frames = int(fs * T / hop)
+            print(frames, fs * T / frames)          # 800, 300.0 samples per frame
+
+            # 100 phonemes, ~8 frames each on average
+            rng = np.random.default_rng(0)
+            durations = rng.integers(6, 11, size=100)
+            durations[-1] += frames - durations.sum()   # force the sum to match
+            idx = length_regulator(range(100), durations, frames)
+            print(idx.shape)                        # (800,)
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A 10-second utterance at 24 kHz with a 12.5 ms mel hop: how many mel
+        frames, how many samples, and what is the ratio between them?
+      answerKind: short_text
+      hint: "12.5 ms is 80 frames per second. The sample count is sample rate times duration."
+      solution: >-
+        $10 \times 80 = 800$ frames; $24{,}000 \times 10 = 240{,}000$ samples. The
+        ratio is $240{,}000/800 = 300$ samples per frame, which is the hop. That
+        300× gap is why the acoustic model predicts frames and the vocoder predicts
+        samples.
+
+    - id: cp-2
+      question: >-
+        FastSpeech needs a duration predictor and Tacotron does not. What does the
+        predictor replace, and where do its training targets come from?
+      answerKind: short_text
+      hint: "Tacotron's alignment is learned implicitly by attention. What is the explicit version of that?"
+      solution: >-
+        It replaces attention. Tacotron learns a soft alignment between text and
+        frames and decodes one frame at a time; FastSpeech expands the phoneme
+        sequence to frame length with a length regulator and decodes in one pass,
+        so it must know each phoneme's length up front. The original distilled
+        durations from a trained Tacotron's attention; FastSpeech 2 used an external
+        forced aligner and added pitch and energy predictors, removing the teacher
+        and its errors.
+
+    - id: cp-3
+      question: >-
+        Why does a 32-step diffusion TTS model need fewer sequential passes than an
+        80 frames/s autoregressive model for the same 10-second clip?
+      answerKind: short_text
+      hint: "Count passes, not frames. One diffusion step covers every frame at once."
+      solution: >-
+        The autoregressive model needs $80 \times 10 = 800$ sequential passes,
+        because each frame depends on the previous one. The diffusion model needs
+        32, because each step denoises all 800 frames in parallel. Per second of
+        audio that is 80 against 3.2, a 25× reduction in sequential depth — paid
+        for with a much wider pass and with the loss of streaming, since no frame is
+        final until step 32.
+
+  try_it: >-
+    Take a 10-second sentence and compute its four rates by hand: words at 150 wpm,
+    phonemes at roughly 4 per word, mel frames at 80 per second, samples at 24 kHz.
+    Then compute how many sequential network passes each of the four architectures
+    in the table needs for that clip, and which of them could emit audio before the
+    sentence ends.
+
+  interview_questions:
+    - question: "Walk me through what happens between text and audio in a modern TTS system, and tell me where the timing decisions are made."
+      level: mid
+      key_points:
+        - "Text normalisation and G2P produce phonemes; the acoustic model produces 80 mel frames per second; the vocoder produces 24,000 samples per second."
+        - "Timing is decided either by attention (autoregressive) or by a duration predictor plus a length regulator (non-autoregressive); nothing else in the stack owns it."
+        - "The mel discards phase, so the vocoder is solving an inverse problem and its output is statistically consistent with the mel rather than a recovery of the original."
+        - "Latency is not RTF: the user hears the first chunk, so the front end, the first acoustic chunk and the first vocoder pass are the numbers that matter."
+      follow_up: "If you needed to stream this system, which component would you have to change first and why?"
+    - question: "Why did the field move from autoregressive acoustic models to non-autoregressive ones, and what did it cost?"
+      level: senior
+      key_points:
+        - "Autoregressive decoding is 80 sequential steps per second of audio and its attention can repeat, skip, or babble on long text."
+        - "Non-autoregressive models replace attention with a duration predictor and a length regulator, so the whole utterance is one pass and alignment cannot drift."
+        - "The cost is that durations need supervision — a teacher's attention or an external aligner — and the teacher's errors propagate into the student."
+        - "Explicit durations, pitch and energy also make prosody controllable, which is a gain rather than a cost in product terms."
+      follow_up: "What does VITS add on top of FastSpeech 2, and why do normalising flows matter for its training objective?"
+    - question: "You have a diffusion TTS model at 32 steps and a codec language model at 600 tokens/s. Both sound good. How do you choose?"
+      level: senior
+      key_points:
+        - "Sequential depth: the diffusion model needs 32 passes per utterance, the codec LM 600 per second of audio, so the LM is roughly 187× deeper for a 10-second clip."
+        - "Streaming: diffusion needs the whole utterance denoised before any frame is final, while a codec LM can emit tokens incrementally."
+        - "Controllability and editability differ: diffusion conditions on a whole mel and can be guided, a token LM can be sampled and constrained token by token."
+        - "The decision is usually latency-shaped: sub-300 ms conversational turns rule out full-utterance diffusion, and long-form narration rules out the cost of 600 sequential steps per second."
+      follow_up: "What would a chunked diffusion model need to look like to serve a voice agent, and what breaks at the chunk boundary?"
+
+  common_mistakes:
+    - "Reporting RTF as the latency number, when RTF averages over the utterance and the user experiences the first-chunk delay."
+    - "Training a non-autoregressive model without a duration source and hoping the length regulator learns lengths from the mel loss alone."
+    - "Predicting a linear spectrogram and reconstructing with Griffin-Lim, then blaming the model for the metallic phase artefacts."
+    - "Copying image-diffusion step counts into audio: 1,000 steps over an 800-frame utterance needs a 5 ms pass to stay real-time."
+
+  further_reading:
+    - label: "Shen et al., Natural TTS Synthesis by Conditioning WaveNet on Mel Spectrogram Predictions (Tacotron 2, 2017)"
+    - label: "Ren, Rui, Tan, Wang, Zhao & Wang, FastSpeech: Fast, Robust and Controllable Text to Speech (2019)"
+    - label: "Kim, Kong & Son, VITS: Conditional Variational Autoencoder with Adversarial Learning for End-to-End Text-to-Speech (2021)"
+    - label: "Kong, Kim & Bae, HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis (2020)"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Three sequences, each longer than the last: about 100 phonemes, 800 mel
+        frames, 240,000 samples for a ten-second sentence. Ask of any architecture:
+        which of these does it predict, and how many sequential steps does that
+        cost per second of audio?
+      blocks:
+        - kind: checklist
+          body: |
+            - text -> phonemes: a lexicon or a G2P model
+            - phonemes -> mel: an acoustic model, with attention or a duration predictor
+            - mel -> waveform: a vocoder, which must supply phase
+            - latency is the first chunk, not the average
+      checkpoint: >-
+        Which stage owns timing, and what happens to a non-autoregressive model
+        that has no duration supervision at all?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Choose the target before the architecture. If you predict mel at 80 frames
+        per second, an autoregressive decoder is natural but pays 80 steps per
+        second; if you predict at the phoneme level you need durations; if you
+        predict the whole clip at once you are in diffusion or flow-matching
+        territory and you have given up streaming.
+      blocks:
+        - kind: checklist
+          body: |
+            - 24 kHz, hop 300: 80 frames/s, 300 samples per frame
+            - 10 s utterance: 800 frames, 240,000 samples
+            - AR mel: 80 passes per second of audio
+            - diffusion: S passes per utterance, S in 10-32
+            - NAR: 1 pass per utterance
+      checkpoint: >-
+        At what utterance length does a 32-step diffusion model become cheaper in
+        sequential depth than an 80 fps autoregressive one? Express it as an
+        inequality in T.
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The non-autoregressive path in five lines, with the duration sum as the
+        assertion that catches most bugs.
+      blocks:
+        - kind: pseudocode
+          body: |
+            text -> normalise -> phonemes p[1..U]
+            durations d[1..U] = duration_predictor(p)
+            frames = length_regulator(p, d)        # sum(d) frames
+            mel = decoder(frames)                  # 80 x sum(d)
+            wav = vocoder(mel)                     # 300 samples per frame
+
+            assert sum(d) == round(80 * duration_seconds)
+      checkpoint: >-
+        Which line would you change to make the voice speak 20% slower, and which
+        to make it higher-pitched?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The rate ladder and the diffusion step budget are the two derivations that
+        matter.
+      blocks:
+        - kind: math
+          body: |
+            $$N_{\text{frames}} = f_r T = 80 \times 10 = 800, \qquad
+              N_{\text{samples}} = f_s T = 24{,}000 \times 10 = 240{,}000,$$
+
+            $$\frac{N_{\text{samples}}}{N_{\text{frames}}} = \frac{f_s}{f_r}
+              = \frac{24{,}000}{80} = 300.$$
+
+            Diffusion cost: $T_{\text{gen}} = S t_s + t_{\text{voc}}$, so
+            $\text{RTF} \le 0.5$ requires
+
+            $$t_s \le \frac{0.5T - t_{\text{voc}}}{S}.$$
+
+            At $T = 10$ s, $t_{\text{voc}} = 20$ ms, $S = 32$:
+            $t_s \le 155.6$ ms.
+      checkpoint: >-
+        Why does the diffusion latency not grow with utterance length, and what
+        does grow?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The three-rate table and the sequential-depth comparison, with the numbers
+        the topic quotes.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            fs, hop, T = 24_000, 300, 10.0
+            frames = fs * T / hop              # 800
+            samples = fs * T                   # 240,000
+            print(frames, samples, samples / frames)   # 800 240000.0 300.0
+
+            for name, depth in [
+                ("sample AR (WaveNet)", 24_000),
+                ("codec AR, 75 Hz x 8", 600),
+                ("mel AR, 80 fps", 80),
+                ("diffusion, 32 steps / 10 s", 32 / 10),
+                ("non-autoregressive", 1),
+            ]:
+                print(f"{name:28s} {depth:8.1f} passes per second of audio")
+      checkpoint: >-
+        Which row changes if you halve the mel hop, and which rows do not?

@@ -1,0 +1,1438 @@
+id: pooling-and-shape-algebra
+slug: pooling-and-shape-algebra
+title: "Pooling, Stride, Padding, and the Shape Algebra"
+summary: >-
+  Size any convolution or pooling layer from the single inequality that defines
+  it, choose same or valid padding deliberately — including the asymmetric split
+  an even kernel forces — and predict what a stride-2 stack does to the
+  receptive field, then say exactly what a transposed convolution can and cannot
+  undo.
+kind: lesson
+difficulty: medium
+position: 5
+estMinutes: 30
+prerequisites: [convolutions]
+phase: deep-learning-foundations
+tags: [pooling, stride, padding, output-shape, receptive-field, downsampling, transposed-convolution, checkerboard]
+
+body:
+  big_idea: >-
+    Every shape comes from one inequality — the last window has to fit — and
+    every downsampling step spends spatial resolution to buy receptive field,
+    through stride or through pooling.
+
+  problem:
+    - >-
+      Your residual block adds a 112-wide tensor to a 114-wide one: padding 3
+      from a 7×7 stride-2 stem, reused on a 3×3 stride-2 stage.
+    - >-
+      You want "same" padding on a 4×4 kernel and write $p = 1.5$; the
+      framework takes an int, and no symmetric padding returns 32.
+    - >-
+      You assume max versus average pooling is cosmetic, but after ten 2×2
+      pools the average-pool gradient has decayed to 9.5e-7 of its input
+      scale.
+
+  analogy: |
+    Halving a stack of invoices by merging pairs. Average pooling is a fixed
+    rule: staple each pair and record the mean, so repeated merging drifts
+    every invoice toward the global average. Max pooling keeps the larger
+    invoice and bins the other, untouched, so a later audit still finds it at
+    full value. A strided convolution hires a clerk to decide, and pays the
+    clerk 36,928 numbers.
+
+  concept_points:
+    - >-
+      **The output size is one inequality, and the +1 outside the floor is a count.**
+      With pad $p$:
+      $n_{\text{out}} = \lfloor (n + 2p - d(k-1) - 1)/s \rfloor + 1$. So 224,
+      k=7, s=2, p=3 → **112**; the same with p=1 → 112, p=2 → **113**, p=3 →
+      **114**. The trap is Python: `int()` truncates toward zero where `//`
+      floors.
+    - >-
+      **"Same" on an even kernel does not exist symmetrically.** Same padding
+      asks $2p = d(k-1)$, which for $k=4$ is $p=1.5$. Measured on a 32-wide
+      input: p=0 → **29**, p=1 → **31**, p=2 → **33**, p=3 → **35**; no
+      symmetric integer returns 32. Frameworks split the total, so (n=224,
+      k=7, s=2) → **(2, 3)** and (224, k=3, s=2) → **(0, 1)** — a 3×3 stride-2
+      "same" layer is already asymmetric.
+    - >-
+      **Pooling has zero parameters — that is both the point and the cost.**
+      On a 224×224×64 tensor, 2×2 stride-2 max pooling owns **0** numbers; the
+      3×3 stride-2 convolution that replaced it owns **36,928** and does
+      **924,844,032** FLOPs against **2,408,448** comparisons — **384×** the
+      arithmetic. Global average pooling removes **97.96%** of a 25M-weight
+      classifier. Whatever pooling discards, training never learns that it
+      existed.
+    - >-
+      **Max pooling is not a filter; it is a router.** On 4×4 blocks it
+      violates linearity with median relative error **0.353**, so its
+      frequency response does not exist. Exactly one position per window gets
+      the gradient at coefficient **1.0**; average pooling gives all four
+      0.25. After ten 2×2 pools the average-pool gradient is **9.54e-7** on
+      all inputs, the max-pool gradient **1.0** on one — a factor of **1024**.
+    - >-
+      **Receptive field: $r \leftarrow r + (k-1)j$, $j \leftarrow j\,s$, and stride makes it exponential.**
+      At stride 1, $r = 1 + L(k-1)$: **21** at ten 3×3 layers. At stride 2,
+      $r = 2^{L+1}-1$: **63** at five layers, **2047** at ten — 97.5× the
+      stride-1 field for the same parameters. A ResNet-50-shaped stack reaches
+      **R = 427** with a total stride of 32.
+    - >-
+      **Transposed convolution is the adjoint, not the inverse.** With stride
+      2, k=3, p=1 on 16 inputs, the convolution matrix $A$ is
+      **8×16 of rank 8**, so $A^\top A$ has an 8-dimensional null space: half
+      the directions are annihilated, though
+      $\langle Ax, y\rangle = \langle x, A^\top y\rangle$ holds to **2.2e-16**.
+      Hence the checkerboard: a stride-2 transpose ripples `1,1,2,1,2,…`
+
+  definitions:
+    - term: "Output shape (shape algebra)"
+      meaning: >-
+        The integer map from (n, k, s, p, d) to the output extent,
+        $\lfloor (n + 2p - d(k-1) - 1)/s \rfloor + 1$, applied independently per
+        spatial axis. It is a counting argument — how many windows of the given
+        footprint fit inside the padded input at the given step — not a rule
+        anyone should memorise without the derivation.
+    - term: "Same padding"
+      meaning: >-
+        Padding chosen so that $n_{\text{out}} = \lceil n/s \rceil$: enough to
+        cover every input position once, no more. At stride 1 it is
+        $p = (k-1)/2$ and exists only for odd $k$; at stride greater than 1 it is
+        a computed total, $\max((n_{\text{out}}-1)s + d(k-1) + 1 - n, 0)$, that
+        depends on $n \bmod s$ and is usually *smaller* than $k-1$ — 1 pixel
+        total for a 3×3 at stride 2 on 224.
+    - term: "Valid padding"
+      meaning: >-
+        No padding: every output position sees a complete window made only of
+        real inputs. Each layer costs $k-1$ pixels per axis, so four 3×3 valid
+        layers turn 224 into 216 and a deep valid stack eventually produces an
+        empty tensor rather than an error, which is the failure mode to watch.
+    - term: "Asymmetric padding"
+      meaning: >-
+        Different numbers of pixels before and after, $(p_{\text{before}},
+        p_{\text{after}})$. Forced whenever the total padding is odd: every even
+        kernel with "same", and every odd kernel at stride greater than 1. The
+        convention in TensorFlow/Keras is to put the extra pixel on the bottom
+        and right; the consequence of getting the side wrong is a one-pixel
+        translation of every feature, which no shape assertion catches.
+    - term: "Jump (stride product)"
+      meaning: >-
+        The input distance between two adjacent output positions, $j_\ell =
+        \prod_{i \le \ell} s_i$. It is the only quantity that makes the
+        receptive-field recursion work: a layer contributes $(k-1)j$, not
+        $(k-1)$. At stride 1 the jump is 1 forever; one stride-2 layer doubles it
+        for every subsequent layer, which is the entire source of exponential
+        field growth.
+    - term: "Pooling"
+      meaning: >-
+        A fixed, parameter-free aggregation over a window, applied per channel:
+        max, mean, or (rarely) sum. It reduces the spatial extent and provides
+        approximate local invariance. It has no weights, so it cannot adapt to
+        the data, and it is the only layer in the network whose gradient either
+        routes (max) or dilutes (average) rather than multiplies by a learned
+        matrix.
+    - term: "Max pooling"
+      meaning: >-
+        Take the largest value in the window. Non-linear, a selection rather than
+        a filter, and its backward pass is a one-hot scatter: one position per
+        window receives the whole incoming cotangent at coefficient 1.0, so
+        gradient magnitude is preserved and gradient support shrinks by $k^2$
+        per layer. Ties are broken by scan order, silently and per
+        implementation.
+    - term: "Average pooling"
+      meaning: >-
+        Take the mean of the window. A linear, separable, fixed box filter with
+        DC gain 1 and — for even window sizes — exactly zero gain at the Nyquist
+        frequency. Its backward pass is uniform: every position gets $1/k^2$ of
+        the cotangent, so at depth $L$ the gradient scale is $k^{-2L}$, which is
+        $9.5\times10^{-7}$ for ten 2×2 layers.
+    - term: "Global average pooling"
+      meaning: >-
+        Average the entire spatial extent to one number per channel, then apply a
+        dense layer. Replaces the 7×7×512 → 1000 head (25,088,000 weights) with
+        512×1000 + 1000 and removes 97.96% of the classifier. Safe precisely
+        because it is one layer at the end — there is no depth left for the
+        $k^{-2L}$ attenuation to compound.
+    - term: "Transposed convolution"
+      meaning: >-
+        The adjoint of a convolution: the linear map $A^\top$ satisfying
+        $\langle Ax, y\rangle = \langle x, A^\top y\rangle$, implemented by
+        scattering each input value times the kernel into the output. Output
+        length $(n-1)s - 2p + k + \text{output\_padding}$; the extra
+        `output_padding` exists because with $s>1$ several input lengths produce
+        the same output length, so the transpose is not uniquely determined by
+        shape alone. Not an inverse: for $s>1$ the operator has more columns than
+        rows and its transpose cannot recover what the forward pass discarded.
+    - term: "Checkerboard artefact"
+      meaning: >-
+        The periodic amplitude ripple a strided transposed convolution leaves on
+        smooth inputs, because the number of contributing windows alternates
+        between adjacent output positions. Measured: k=3 with s=2 on a constant
+        input returns 1,1,2,1,2,...,1,1 — a factor of 2 — while k=4 with s=2
+        returns a flat 2, since $k$ is a multiple of $s$. Interpolating and then
+        convolving avoids it by making the contribution count constant.
+
+  diagrams:
+    - type: compare
+      title: "Same and valid padding on the same 5x5 input with the same 3x3 kernel"
+      left_label: "Valid (p = 0)"
+      left_points:
+        - "5x5 in, 3x3 kernel, stride 1: (5 - 3)//1 + 1 = 3, so 3x3 out."
+        - "Every window is entirely real data; nothing is invented."
+        - "Each layer costs k-1 pixels per axis, so a 3x3 stack loses 2 per layer: 224, 222, 220."
+        - "Borders are read once and the centre is reused nine times, which biases the layer toward the middle of the image."
+      right_label: "Same (p = 1)"
+      right_points:
+        - "5x5 in, 3x3 kernel, stride 1, p=1: (5 + 2 - 3)//1 + 1 = 5, so 5x5 out."
+        - "24 of the 49 padded positions are invented zeros — 49% of what the kernel sees is fiction."
+        - "Needs 2p = k-1, which is an integer only for odd k. k=4 needs a total of 3, split 1 and 2."
+        - "At stride 2 the same rule gives 0 before and 1 after for a 3x3, so 'same' is already asymmetric."
+
+    - type: plot
+      title: "Receptive field against depth: linear at stride 1, exponential at stride 2 and 4"
+      chart: line
+      xLabel: "depth (3x3 layers)"
+      yLabel: "receptive field (input pixels)"
+      series:
+        - name: "stride 1: 2L + 1"
+          points:
+            - { x: 1, y: 3 }
+            - { x: 2, y: 5 }
+            - { x: 3, y: 7 }
+            - { x: 4, y: 9 }
+            - { x: 5, y: 11 }
+            - { x: 6, y: 13 }
+        - name: "stride 2: 2^(L+1) - 1"
+          points:
+            - { x: 1, y: 3 }
+            - { x: 2, y: 7 }
+            - { x: 3, y: 15 }
+            - { x: 4, y: 31 }
+            - { x: 5, y: 63 }
+            - { x: 6, y: 127 }
+        - name: "stride 4: 1 + 2(4^L - 1)/3"
+          points:
+            - { x: 1, y: 3 }
+            - { x: 2, y: 11 }
+            - { x: 3, y: 43 }
+            - { x: 4, y: 171 }
+            - { x: 5, y: 683 }
+            - { x: 6, y: 2731 }
+
+    - type: plot
+      title: "The box filter's gain: even kernels have an exact zero at the Nyquist frequency"
+      chart: line
+      xLabel: "frequency (fraction of Nyquist)"
+      yLabel: "gain"
+      series:
+        - name: "2x2 box"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 0.25, y: 0.9239 }
+            - { x: 0.5, y: 0.7071 }
+            - { x: 0.75, y: 0.3827 }
+            - { x: 1.0, y: 0.0 }
+        - name: "3x3 box"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 0.25, y: 0.8047 }
+            - { x: 0.5, y: 0.3333 }
+            - { x: 0.75, y: 0.1381 }
+            - { x: 1.0, y: 0.3333 }
+        - name: "4x4 box"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 0.25, y: 0.6533 }
+            - { x: 0.5, y: 0.0 }
+            - { x: 0.75, y: 0.2706 }
+            - { x: 1.0, y: 0.0 }
+
+    - type: pipeline
+      title: "The shape algebra in one pass: 224 to 7 in five halvings"
+      nodes:
+        - label: "224 x 224 x 3"
+          note: "input"
+          detail: "Both spatial axes are sized independently, by the same formula. Channels are never touched by the shape algebra."
+        - label: "conv 7x7 s2 p3 -> 112"
+          note: "(224 + 6 - 7)//2 + 1"
+          detail: "2p = 6 = k-1, so this is exactly 'same' at stride 2 and the answer is ceil(224/2) = 112."
+        - label: "max 3x3 s2 p1 -> 56"
+          note: "(56 + 2 - 3)//2 + 1"
+          detail: "A 2x2/2 pool here would also give 56 on this even input, but 27 on a 55 input. The 3x3/2/p1 form gives ceil(n/2) always, so 55 also maps to 28."
+        - label: "3x3 s2 p1 -> 28"
+          note: "learned downsampling"
+          detail: "36,928 parameters where the pool has 0, and 924,844,032 FLOPs where the pool has 2,408,448 comparisons: 384x the arithmetic for the ability to choose what survives."
+        - label: "3x3 s2 p1 -> 14"
+          note: "stride compounds the field"
+          detail: "Each of these doubles the jump, so the field grows exponentially rather than linearly: 11 after the pool, then 19, 35 and 67."
+        - label: "3x3 s2 p1 -> 7"
+          note: "(7 + 2 - 3)//2 + 1"
+          detail: "Total stride 32. One output at this point sees 67 of the 224 input pixels — 30% of the width."
+        - label: "global average pool -> 1"
+          note: "7 x 7 x 512 -> 512"
+          detail: "Replaces a 25,088,000-weight dense head with 513,000 and removes 97.96% of the classifier. Zero parameters."
+
+    - type: architecture
+      title: "Two ways to halve a feature map, in the same block"
+      caption: >-
+        Both paths take 224 to 112 and are interchangeable in shape. They are not
+        interchangeable in cost or in what the gradient can reach: one owns
+        nothing and routes, the other owns 36,928 numbers and mixes.
+      nodes:
+        - { id: x, x: 0, y: 0, label: "x (64, 224, 224)", kind: client, detail: "Channels-first. The batch axis never participates in the shape algebra." }
+        - { id: conv, x: 1, y: 0, label: "conv 3x3, 64->64, p1", kind: model, detail: "Shape-preserving: 2p = k-1 = 2, so 224 stays 224. 36,928 parameters." }
+        - { id: pool, x: 2, y: 0, label: "max pool 2x2, s2", kind: server, detail: "Zero parameters. Output 111 on a 223 input, 112 on 224. Gradient density 0.25 per layer, coefficient 1.0." }
+        - { id: y, x: 3, y: 0, label: "y (64, 112, 112)", kind: client, detail: "Half the extent per axis, so a quarter of the positions and a quarter of the activation memory." }
+        - { id: convs, x: 2, y: 1, label: "conv 3x3, s2, p1", kind: model, detail: "The modern replacement: 36,928 parameters, 924,844,032 FLOPs, and it learns what to keep. Gives 112 on 223 and on 224 both." }
+      edges:
+        - { from: x, to: conv, label: "224" }
+        - { from: conv, to: pool, label: "224" }
+        - { from: pool, to: y, label: "112, fixed rule" }
+        - { from: conv, to: convs, label: "alternative" }
+        - { from: convs, to: y, label: "112, learned" }
+
+  markdown: |
+    ## The bug is one line of integer arithmetic
+
+    224 in, 7×7 kernel, stride 2, padding 3 → 112. Every ResNet stem does this, so
+    the number starts to feel like a property of the architecture. Keep padding 3,
+    change the kernel to 3×3, and the layer returns **114**; drop to padding 2 and
+    it returns **113**. Neither is wrong; the expectation was. The formula is not
+    a convention to memorise — it is one inequality, read differently for each
+    question you ask of it.
+
+    ## One inequality, one count
+
+    Pad $p$ per side so the input occupies $0$ through $n + 2p - 1$. Window $i$
+    starts at $s\,i$; with dilation $d$ its last tap lands at $s\,i + d(k-1)$, and
+    the window is legal exactly when that position is still on the canvas:
+
+    $$s\,i + d(k-1) \le n + 2p - 1.$$
+
+    Solve for the largest legal index and add one — an index is not a count:
+
+    $$n_{\text{out}} = \left\lfloor \frac{n + 2p - d(k-1) - 1}{s} \right\rfloor + 1.$$
+
+    | configuration | effective k | $n_{\text{out}}$ |
+    |---|---|---|
+    | 224, k=7, s=2, p=3 | 7 | 112 |
+    | 224, k=3, s=2, p=1 | 3 | 112 |
+    | 224, k=3, s=2, p=2 | 3 | 113 |
+    | 224, k=3, s=2, p=3 | 3 | 114 |
+    | 32, k=3, s=2, p=1 | 3 | 16 |
+    | 27, k=2, s=2, p=0 | 2 | 13 |
+    | 55, k=3, s=1, p=0, d=2 | 5 | 51 |
+
+    The last row is the dilation row: a 3×3 with $d=2$ is a 5-wide footprint
+    holding 9 weights, so $d(k-1)+1 = 5$ enters where $k$ would have been: reach
+    without parameters, sampling a comb rather than a block.
+
+    The `//` must floor on integers, because `int()` truncates toward zero and
+    reports a plausible window count for a kernel that does not fit. And the
+    formula applies per axis; using one axis for both is correct only for square
+    kernels on square inputs, which is what every test uses.
+
+    ## What "same" means, and why even kernels cannot be symmetric
+
+    Ask for $n_{\text{out}} = \lceil n/s\rceil$ and the required total padding is
+
+    $$T = \max\left((n_{\text{out}}-1)s + d(k-1) + 1 - n,\ 0\right),$$
+
+    because the last window must be able to start at $(n_{\text{out}}-1)s$ and
+    still hold a full footprint. Put $\lfloor T/2\rfloor$ before and the
+    remainder after.
+
+    At stride 1 that collapses to $T = k-1$, so $p = (k-1)/2$, an integer only
+    for odd $k$. For $k=4$ the requirement is $T=3$ — 1 before, 2 after — and a
+    symmetric sweep on a 32-wide input gives 29, 31, 33, 35 for p = 0..3: no
+    integer returns 32.
+
+    At stride greater than 1 the total is not $k-1$. For 224, k=3, s=2 it is
+    $111 \cdot 2 + 3 - 224 = 1$ — 0 before, 1 after. A 3×3 stride-2 "same" layer
+    is asymmetric in every real framework, and $T$ depends on $n \bmod s$, so
+    `padding='same'` and `padding=1` are different layers, not synonyms.
+
+    ## Pooling is a filter you never fit
+
+    Average pooling is convolution with a fixed box kernel: zero parameters, where
+    the strided convolution that replaces it in a modern backbone carries 36,928
+    and costs 384× the arithmetic on a 224×224×64 map. Being linear and fixed, it
+    has a frequency response, and
+
+    $$|H(\omega)| = \left|\frac{\sin(k\omega/2)}{k\sin(\omega/2)}\right|$$
+
+    is 1 at DC and exactly 0 at $\omega = \pi$ for even $k$. In 2-D that is an
+    exact zero at the checkerboard frequency: 2×2 and 4×4 map any $\pm1$
+    checkerboard to a constant, and 3×3 leaves 1/9 of it.
+
+    On iid standard normal input
+    a 2×2 mean keeps **0.2503** of the variance; a 2×2 max keeps **0.4921** and
+    shifts the mean by **+1.0286**. Ten average pools deep, the activation scale
+    has been multiplied by $0.25^{10} = 9.5\times10^{-7}$ — which is why global
+    average pooling belongs at the end of a network and not in the middle, where
+    the depth would compound it.
+
+    ## Max pooling is a router, not a filter
+
+    Max pooling violates linearity by a median 0.353 relative error, so it has no
+    frequency response at all. What it has is a decision: one position wins, and
+    the entire incoming cotangent goes there at coefficient 1.0, where average
+    pooling spreads $1/k^2$ everywhere.
+
+    Both conserve gradient mass and distribute it oppositely. After ten 2×2 pools
+    on 1024 samples, average pooling has put $9.54\times10^{-7}$ on each of 1024
+    inputs (total $9.77\times10^{-4}$), max pooling 1.0 on exactly one (total
+    1.0): the norms differ by 1024. Max pooling does not attenuate the gradient,
+    it thins the set of positions that receive one — which is why deep max-pooled
+    stacks train, and why a unit behind a max pool can be permanently dead, on
+    the winning path $1/4^L$ of the time and zero the rest.
+
+    ## Receptive field is exponential in the stride
+
+    $$r_{\ell+1} = r_\ell + (k-1)\,j_\ell, \qquad j_{\ell+1} = s\,j_\ell,$$
+
+    from $r = j = 1$. At stride 1 the jump stays 1 and $r = 1 + L(k-1)$, so 3×3
+    gives $2L+1$: 21 at depth 10. At stride 2 the jump doubles every layer and
+    $r = 2^{L+1}-1$: 15, 63, 2047 at depths 3, 5, 10. Same parameter count, 97.5×
+    the field, paid for entirely in resolution.
+
+    | stack | depth 1 | 3 | 5 | 10 |
+    |---|---|---|---|---|
+    | 3×3, stride 1 | 3 | 7 | 11 | 21 |
+    | 3×3, stride 2 | 3 | 15 | 63 | 2047 |
+    | 3×3, stride 4 | 3 | 43 | 683 | 699,051 |
+
+    A ResNet-50-shaped stack — 7×7/2 stem, 3×3/2 pool, then 3+4+6+3 blocks with a
+    stride-2 3×3 at each stage head — reaches **427** at total stride 32, so five
+    halvings take 224 to 7 and each output of the last stage sees the entire
+    image. A five-layer stride-2 stack reaches only 63, or 28% of a 224-wide
+    input: depth buys the field, stride buys it faster.
+
+    ## Transposed convolution is the gradient, not the inverse
+
+    With n=16, k=3, s=2, p=1 the forward operator is **8×16 of rank 8**. Its
+    transpose is the transposed convolution, and
+
+    $$\langle Ax, y\rangle = \langle x, A^\top y\rangle$$
+
+    holds to 2.2e-16. Everything follows from the shape: $A^\top A$ has an
+    8-dimensional null space, so conv-then-transposed-conv keeps 8 of 16
+    directions, scales them by $\sigma^2 \in [1.000, 1.545]$, and annihilates the
+    rest. A projection, not an inverse — which is what a backward pass needs and
+    not what the word "deconvolution" promises.
+
+    The kernel runs the other way, and this is the part that ships broken. The
+    transpose scatters, which in filter terms is an upsample followed by a full
+    convolution with $w$. Re-applying the forward correlation to the upsampled
+    signal is the obvious implementation, and a random 3-tap kernel gives a
+    maximum error of 1.422 against an output of scale 3.045, while a symmetric
+    kernel gives exactly 0.000 — so it passes every smoke test written with a box
+    or Gaussian kernel.
+
+    The ripple is the same arithmetic. At stride 2 with k=3 the number of windows
+    covering each output alternates, so a constant input returns `1,1,2,1,2,…,1,1`
+    — a 2× checkerboard at the stride frequency. With k=4 and s=2 the count is
+    constant and the output is flat.
+
+    ## The longer version
+
+    Every shape in a convolutional network comes from one inequality — the last
+    window has to fit — and every downsampling step spends spatial resolution to
+    buy receptive field, either through a learned projection (stride) or through
+    a fixed rule with no parameters at all (pooling).
+
+    Halving a stack of invoices by merging pairs. Average pooling is a fixed
+    merge rule: staple each pair together and record the mean. No judgement, no
+    parameters, and if you keep merging, every invoice drifts toward the global
+    average. Max pooling is the same merger with a different fixed rule: keep
+    whichever invoice is larger and throw the other one in the bin. Nothing is
+    learned in either case, but the survivor is passed through *untouched*,
+    which is why a later audit can still find it at full value. A strided
+    convolution is the third option: hire a clerk to decide what the merged
+    invoice says, and pay the clerk (36,928 numbers at 64 channels) every time.
+
+    The analogy breaks in two places, and both are the content of this topic.
+    First, a merge is not invertible and a transposed convolution does not
+    un-merge: it produces *a* set of pairs consistent with the merged totals —
+    one of many preimages — so the pairs you get back are not the ones you put
+    in, and no later layer can tell the difference. Second, the merger
+    changes what a later auditor can even reach: after ten max merges only one
+    input in 1024 is on the path the gradient travels, while after ten average
+    merges all 1024 are on it but each carries 1/1024 of the weight. "Lossless"
+    and "reachable" are different claims, and pooling trades one for the other.
+
+    ### What goes wrong
+
+    - Your residual block adds a 112-wide tensor to a 114-wide one and the
+      forward pass dies at layer four. Nothing is wrong with the convolution:
+      you kept padding 3 from a 7×7 stride-2 stem on a 3×3 stride-2 stage, and
+      224 comes back as 114. The bug is one line of integer arithmetic that no
+      test in the repository covers, because every test uses 3×3 stride 1
+      padding 1, which is exactly the configuration where the formula is
+      forgiving.
+    - You want "same" padding on a 4×4 kernel and write p = (k-1)/2 = 1.5. The
+      framework takes an int. With p=1 a 32-wide input returns 31, with p=2 it
+      returns 33, and no symmetric padding ever returns 32 — an even kernel
+      needs an odd number of pad pixels, so it has to be split 1 before and 2
+      after, and the side you choose moves every feature by one pixel.
+    - You inherit a network that max-pools four times and trains, and a paper
+      you are reproducing average-pools at the same four points and does not.
+      You assume the choice is cosmetic. It is not: after ten 2×2 poolings on
+      a 1024-long signal the average-pool gradient has decayed to 9.5e-7 of
+      its input scale, while the max-pool gradient still arrives at full
+      strength.
+    - You quote a 63-pixel receptive field for a five-layer stride-2 stack,
+      having assumed fields grow linearly with depth the way they do at stride
+      1 (21 pixels at ten layers). They grow exponentially — 2^(L+1) − 1 — so
+      five layers already reach 63 and ten reach 2047, at no extra parameter
+      cost and at the price of the entire spatial resolution.
+    - You upsample a segmentation mask with a transposed convolution, call it
+      deconvolution, and then wonder why the output ripples at twice the
+      stride frequency and why re-convolving it does not return the input. It
+      is the gradient of the convolution, not its inverse: with stride 2 the
+      operator is 8×16 of rank 8, so half of the input directions were
+      annihilated before you started.
+
+    ### The full treatment
+
+    **The output size is one inequality, and the +1 outside the floor is a
+    count.** Pad $p$ on each side so the input occupies positions
+    $0,\dots,n+2p-1$. Window $i$ starts at $s\,i$; with dilation $d$ its last
+    tap sits at $s\,i + d(k-1)$, and the window is legal exactly when that
+    position is still inside the padded input:
+    $s\,i + d(k-1) \le n + 2p - 1$. Solve for the largest legal index and add
+    one to turn an index into a count:
+    $n_{\text{out}} = \lfloor (n + 2p - d(k-1) - 1)/s \rfloor + 1$. Check it
+    against the cases you actually type: 224, k=7, s=2, p=3 → **112**; 224,
+    k=3, s=2, p=1 → **112**; 224, k=3, s=2, p=2 → **113**; 224, k=3, s=2,
+    p=3 → **114**; 55, k=3, s=1, p=0, d=2 → **51**. The trap is Python, not
+    the mathematics: `//` floors on ints but `int()` truncates toward zero, so
+    a floating numerator that goes negative silently reports one window too
+    many instead of raising.
+
+    **`ceil(n/s)` is a theorem about same padding, not about stride.** With
+    $p = (k-1)/2$ and odd $k$ the formula collapses to
+    $\lfloor (n-1)/s \rfloor + 1 = \lceil n/s \rceil$. Verified over **6,300**
+    configurations (n from 8 to 259, k in {1,3,5,7,9}, s from 1 to 5): **zero
+    mismatches**. Remove the padding and the identity fails immediately —
+    k=3, s=2, p=0 is exactly one short of $\lceil n/2 \rceil$ for every $n$
+    from 3 to 299. That is the anatomy of the production-only shape bug: the
+    shortcut is exact in every configuration whose padding is "same", which is
+    every configuration in your test suite, and off by one the moment someone
+    sets p=2 on a 7×7 (224 → 111, not 112) or p=0 on anything strided.
+
+    **"Same" on an even kernel does not exist symmetrically.** Same padding
+    asks $2p = d(k-1)$, which for $k=4$ is $p=1.5$. Measured on a 32-wide
+    input with k=4: p=0 → **29**, p=1 → **31**, p=2 → **33**, p=3 → **35**.
+    There is no symmetric integer that returns 32, because the kernel needs a
+    total of 3 pad pixels and 3 is odd. Every framework that offers "same"
+    therefore computes a total $T = \max((n_{\text{out}}-1)s + d(k-1) + 1 - n,
+    0)$, puts $\lfloor T/2 \rfloor$ before and the remainder after. Measured:
+    (n=32, k=4, s=1) → **(1, 2)**; (n=224, k=7, s=2) → **(2, 3)**;
+    (n=224, k=3, s=2) → **(0, 1)** — a 3×3 stride-2 "same" layer is *already*
+    asymmetric, which surprises people who assume only even kernels are. The
+    trap: PyTorch's `padding=` is symmetric by construction, so "same"
+    semantics need an explicit `F.pad` with (left, right, top, bottom), and
+    swapping two of those four numbers shifts every downstream feature.
+
+    **A window count is exact; the coverage is not.** 2×2 stride-2 pooling on
+    223 returns **111** and never looks at the last row and column: **445** of
+    49,729 pixels are discarded (223² − 4·111²). On 224 it returns 112 and
+    discards nothing. That parity dependence is the reason modern networks
+    downsample with 3×3 stride 2 padding 1 rather than 2×2 max pooling: 223 →
+    **112** and 224 → **112** both, because the strided formula gives
+    $\lceil n/2 \rceil$ where the pool gives $\lfloor n/2 \rfloor$. Same
+    output size on the even inputs every benchmark uses; different behaviour
+    on the odd ones your data loader will eventually hand you.
+
+    **Pooling has zero parameters — that is both the point and the cost.**
+    Measured on a 224×224×64 tensor: 2×2 stride-2 max pooling owns **0**
+    numbers; the 3×3 stride-2 convolution that replaced it in every modern
+    backbone owns **36,928** and performs **924,844,032** FLOPs against
+    **2,408,448** comparisons — **384×** the arithmetic. Global average
+    pooling is the same trade at the other end: replacing the 7×7×512 → 1000
+    dense head (25,088,000 weights) with 512×1000 + 1000 removes **97.96%** of
+    the classifier. The trap is reading "zero parameters" as "free". Pooling
+    is the only operation in the network that deletes measurements with no
+    learned criterion, so whatever it discards cannot be recovered by training
+    and the gradient never learns that it existed.
+
+    **Average pooling is a fixed low-pass filter, and even kernels have a zero
+    at Nyquist.** 2×2 average pooling is convolution with the box kernel
+    $\tfrac14[[1,1],[1,1]]$ — separable, parameter-free, fixed. Its 2-D gain
+    at the checkerboard frequency $(\pi,\pi)$ is exactly **0.000000** for k=2
+    and k=4, **0.1111** for k=3 and **0.0400** for k=5: even kernels annihilate
+    the Nyquist mode, odd kernels merely attenuate it. In 1-D on 8 samples the
+    box $[1/2,1/2]$ has smallest singular value **0.1951** (= cos(7π/16)), and
+    the 2-D stride-1 operator is 49×64 of rank **49**: 15 of 64 dimensions
+    annihilated, because the box is separable and $8\times8 \to 7\times7$ loses
+    one row and one column's worth at once. The trap: "average pooling
+    smooths" understates it. It is a rank-deficient linear map, and stacking it
+    stacks a smoother whose rank loss compounds — which is
+    why 2×2 average pooling lives at the very end of a network and almost
+    never in the middle.
+
+    **Max pooling is not a filter at all; it is a router, and that is why it
+    survives gradient sparsity.** Measured on 4×4 blocks, max pooling violates
+    linearity with a median relative error of **0.353** (average pooling by
+    **4.6e-16** — it is exactly linear), so its frequency response does not
+    exist. What it has instead is a selection: exactly one of the four
+    positions in each window receives the gradient, at coefficient **1.0** —
+    measured density 0.25, total 16.0 for sixteen unit cotangents — while
+    average pooling gives all four **0.25** (density 1.0, the same total).
+    Stack ten 2×2 pools on length 1024 and the difference is the whole story:
+    the average-pool gradient is **9.54e-7** on all 1024 inputs (total
+    **9.77e-4**); the max-pool gradient is **1.0** on exactly one input (total
+    **1.0**) — a factor of **1024** in norm. Max pooling does not attenuate the
+    gradient, it thins it: $4^{-L}$ of the paths survive, each at full
+    strength. That is why a max-pooled stack ten deep still trains, why an
+    average-pooled one ten deep barely moves, and why a unit behind a max pool
+    can be dead forever — it receives gradient only $1/4^L$ of the time.
+
+    **Average pooling keeps 25% of iid variance per 2×2 output; max keeps 49%
+    and shifts the mean.** Measured on four million draws of four standard
+    normals: variance of the mean **0.2503** (theory 0.25), variance of the max
+    **0.4921**, mean of the max **+1.0286**. So a 2×2 average pool divides the
+    activation scale by four in variance per layer — $0.25^{10} = 9.54\times
+    10^{-7}$ after ten layers — while max pooling keeps roughly half the
+    variance and adds a +1.03σ offset that the following BatchNorm has to
+    absorb. This is the quantitative version of "avg blurs, max keeps edges",
+    and it is why global average pooling is safe (one layer, no depth to
+    compound) while average pooling in the middle of a deep stack is not.
+
+    **Receptive field: $r \leftarrow r + (k-1)j$, $j \leftarrow j\,s$, and the
+    stride makes it exponential.** Each layer appends $(k-1)$ copies of the
+    current jump, and a stride-$s$ layer multiplies the jump by $s$. At stride
+    1 the jump never moves and $r = 1 + L(k-1)$: with 3×3 kernels that is
+    $2L+1$, so **21** pixels at ten layers. At stride 2 the jump doubles every
+    layer and $r = 2^{L+1}-1$: **15** at three layers, **63** at five, **2047**
+    at ten — **97.5×** the stride-1 field at the same depth and the same
+    parameter count. A ResNet-50-shaped stack (7×7/2 stem, 3×3/2 max pool,
+    then 3+4+6+3 blocks with a stride-2 3×3 at the head of each stage) reaches
+    **R = 427** with a total stride of **32**: five halvings take 224 pixels to
+    7, so every output of the last stage already sees the whole image several
+    times over. The trap: "receptive
+    field grows linearly with depth" is a stride-1 statement. One stride-2
+    layer anywhere doubles the contribution of every layer after it, so depth
+    compounds multiplicatively — and a field number quoted without its stride
+    schedule is unfalsifiable.
+
+    **Transposed convolution is the adjoint, not the inverse — and it is not
+    the forward correlation run backwards, either.** Write one conv layer as a
+    matrix
+    $A \in \mathbb{R}^{n_{\text{out}}\times n_{\text{in}}}$. Its transpose
+    $A^\top$ *is* the transposed convolution: identical weights, indices
+    scattered instead of gathered, and $\langle Ax, y\rangle = \langle x,
+    A^\top y\rangle$ holds to **2.2e-16**. It is not an inverse, for a
+    structural reason: with stride 2, k=3, p=1 on 16 inputs, $A$ is **8×16 of
+    rank 8**, so $A^\top A$ has an **8-dimensional null space** and
+    conv-then-transposed-conv keeps 8 of 16 directions — scaling them by
+    $\sigma^2 \in [1.000, 1.545]$ and annihilating the rest. The second trap is
+    the direction of the kernel: the transpose scatters rather than gathers,
+    which in filter terms is an upsample followed by a full *convolution* with
+    the same weights — not the forward correlation re-applied. Reuse the
+    forward correlation on the upsampled signal (the obvious move, because that
+    code already exists) and a random 3-tap kernel gives a maximum error of
+    **1.422** against an output of scale 3.045 — 47% — while a symmetric kernel
+    gives **0.000**, which is why the bug passes every smoke test built on a
+    box or Gaussian kernel. The third
+    consequence is cosmetic and famous: at stride 2 with k=3 the number of
+    windows covering each output alternates, so a constant input returns
+    `1,1,2,1,2,…,1,1` — a **2×** ripple at the stride frequency, the
+    checkerboard artefact; k=4 with s=2 divides evenly and returns a flat 2.
+
+  derivations:
+    - title: "The output shape, derived from the last legal window"
+      latex: |
+        Pad $p$ on each side, so the padded input has length $n + 2p$ and its
+        last position is index $n + 2p - 1$. Window $i$ starts at $s\,i$; with
+        dilation $d$ its $t$-th tap sits at $s\,i + d\,t$, so the last tap is at
+        $s\,i + d(k-1)$. The window is legal iff that tap is still on the canvas:
+
+        $$s\,i + d(k-1) \le n + 2p - 1.$$
+
+        Divide by $s$ and floor, since $i$ is an integer:
+
+        $$i \le \left\lfloor \frac{n + 2p - 1 - d(k-1)}{s} \right\rfloor = i_{\max}.$$
+
+        The number of windows is the number of indices in $\{0,\dots,i_{\max}\}$:
+
+        $$n_{\text{out}} = i_{\max} + 1 = \left\lfloor \frac{n + 2p - d(k-1) - 1}{s} \right\rfloor + 1.$$
+
+        Checks: $n=224$, $k=7$, $s=2$, $p=3$ gives
+        $\lfloor 223/2\rfloor + 1 = 112$. $n=224$, $k=3$, $s=2$, $p=2$ gives
+        $\lfloor 225/2\rfloor + 1 = 113$. $n=55$, $k=3$, $p=0$, $d=2$ gives
+        $\lfloor 51/1 \rfloor + 1 = 51$.
+      prose: >-
+        The inequality is the whole derivation. Every off-by-one in every
+        framework's shape code is a mistake about one of three things: forgetting
+        the $-1$ that converts "last index" into "length", forgetting the $+1$
+        that converts an index into a count, or using truncation instead of floor
+        when the numerator goes negative because the kernel no longer fits.
+
+    - title: "Same padding, solved for p — and why even kernels force an asymmetric split"
+      latex: |
+        Ask for $n_{\text{out}} = \lceil n/s \rceil$ and substitute into the shape
+        formula. The last output position must be able to start at
+        $(n_{\text{out}}-1)s$ and still contain a full footprint of
+        $d(k-1)+1$ positions, so the total padding must satisfy
+
+        $$(n_{\text{out}}-1)s + d(k-1) + 1 \le n + T,$$
+
+        with equality at the smallest admissible $T$:
+
+        $$T = \max\left((n_{\text{out}}-1)s + d(k-1) + 1 - n,\ 0\right).$$
+
+        Split $T$ as $\lfloor T/2 \rfloor$ before and $T - \lfloor T/2\rfloor$
+        after. A symmetric split exists iff $T$ is even. At stride 1 with
+        $d=1$, $T = k-1$, so
+
+        $$p = \frac{k-1}{2} \in \mathbb{Z} \iff k \text{ is odd},$$
+
+        and for even $k$ the padding is forced to be $(k/2 - 1,\ k/2)$ — for
+        $k=4$, $(1, 2)$. At stride $s>1$, $T$ is generally smaller than $k-1$
+        and depends on $n \bmod s$: for $n=224$, $k=3$, $s=2$,
+        $T = 111\cdot 2 + 3 - 224 = 1$, so $(0, 1)$.
+      prose: >-
+        Two consequences that people miss. First, "same" is not a constant: the
+        same 3×3 kernel at stride 1 pads 2 total and at stride 2 pads 1 total, so
+        a layer labelled "same" is not shape-preserving when it is strided in the
+        sense of preserving anything but the ceil relation. Second, an even
+        kernel cannot be same-padded symmetrically at all, which means the
+        padding is a modelling decision that has to be made per layer, not a
+        default you inherit from the kernel size.
+
+    - title: "Receptive field: the recursion and its closed form"
+      latex: |
+        Let $r_\ell$ be the field and $j_\ell$ the jump after $\ell$ layers, with
+        $r_0 = j_0 = 1$. A layer of kernel $k$ and stride $s$ appends $(k-1)$
+        windows' worth of the incoming jump and multiplies the jump by $s$:
+
+        $$r_{\ell+1} = r_\ell + (k-1)\,j_\ell, \qquad j_{\ell+1} = s\,j_\ell.$$
+
+        Since $j_\ell = s^\ell$, the recursion telescopes into a geometric series:
+
+        $$r_L = 1 + (k-1)\sum_{\ell=0}^{L-1} s^\ell.$$
+
+        For $s = 1$ every term is 1, so $r_L = 1 + L(k-1)$; for $s > 1$ the sum
+        is $(s^L-1)/(s-1)$ and the last term dominates:
+
+        $$r_L = 1 + (k-1)\frac{s^L - 1}{s - 1}.$$
+
+        For $k=3$: stride 1 gives $2L+1$ (21 at $L=10$); stride 2 gives
+        $2^{L+1}-1$ (63 at $L=5$, 2047 at $L=10$); stride 4 gives
+        $1 + 2(4^L-1)/3$ (683 at $L=5$).
+      prose: >-
+        The difference between linear and exponential growth is one term: at
+        stride 1 the geometric series has ratio 1 and counts layers, at stride
+        $s>1$ it has ratio $s$ and the deepest layer contributes $s^{L-1}$ times
+        what the first one does. That is why a stride-2 stem is worth more
+        receptive field than ten extra stride-1 layers, and why the field number
+        is meaningless without the stride schedule that produced it.
+
+  implementations:
+    - language: python
+      title: "Pooling forwards and backwards: a filter for average, a router for max"
+      note: >-
+        Numerically correct: the two backward passes both conserve gradient mass
+        (16.0 in, 16.0 out for sixteen unit cotangents) and differ only in where
+        it lands — density 0.25 at coefficient 1.0 for max, density 1.0 at 0.25
+        for average. Three hazards. First, `np.argmax` on a window breaks ties by
+        the first index in row-major order, and frameworks do not all agree, so a
+        window with two equal maxima sends its whole cotangent to a winner that
+        can differ between implementations while the forward pass is identical.
+        Second, the output size uses floor division, so 2×2/2 on 223 returns 111
+        and the last row and column are never read — 445 pixels of a 49,729-pixel
+        map, silently. Third, the nested loop is written for clarity and is
+        **44× slower** than the alternative (measured 14.07 ms against 0.32 ms
+        for a 224×224 max pool): reshape to `(H//k, k, W//k, k)` and reduce over
+        the two length-`k` axes, which is what you should actually ship.
+      code: |
+        import numpy as np
+
+
+        def pool2d_forward(x, k=2, stride=None, mode="max"):
+            """x: (H, W) or (C, H, W). Returns the pooled map."""
+            x = np.asarray(x, dtype=float)
+            s = stride or k
+            shape = x.shape
+            xf = x.reshape(-1, shape[-2], shape[-1])
+            ho = (shape[-2] - k) // s + 1
+            wo = (shape[-1] - k) // s + 1
+            out = np.empty((xf.shape[0], ho, wo))
+            for a in range(ho):
+                for b in range(wo):
+                    win = xf[:, a * s:a * s + k, b * s:b * s + k]
+                    out[:, a, b] = win.max(axis=(1, 2)) if mode == "max" \
+                        else win.mean(axis=(1, 2))
+            return out.reshape(shape[:-2] + (ho, wo))
+
+
+        def pool2d_backward(x, grad_out, k=2, stride=None, mode="max"):
+            """The adjoint of pool2d_forward: scatter the cotangent back."""
+            x = np.asarray(x, dtype=float)
+            g = np.asarray(grad_out, dtype=float)
+            s = stride or k
+            shape = x.shape
+            xf = x.reshape(-1, shape[-2], shape[-1])
+            gf = g.reshape(-1, g.shape[-2], g.shape[-1])
+            dx = np.zeros_like(xf)
+            for n in range(xf.shape[0]):
+                for a in range(gf.shape[1]):
+                    for b in range(gf.shape[2]):
+                        win = xf[n, a * s:a * s + k, b * s:b * s + k]
+                        if mode == "max":
+                            f = int(np.argmax(win))       # first max, row-major
+                            dx[n, a * s + f // k, b * s + f % k] += gf[n, a, b]
+                        else:
+                            dx[n, a * s:a * s + k, b * s:b * s + k] += gf[n, a, b] / (k * k)
+            return dx.reshape(shape)
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            x = rng.normal(size=(8, 8))
+            gm = pool2d_backward(x, np.ones((4, 4)), 2, 2, "max")
+            ga = pool2d_backward(x, np.ones((4, 4)), 2, 2, "avg")
+            print(np.count_nonzero(gm) / gm.size, gm.sum())   # 0.25 16.0
+            print(np.count_nonzero(ga) / ga.size, ga[0, 0])   # 1.0  0.25
+            print(pool2d_forward(np.zeros((224, 224)), 2, 2).shape)  # (112, 112)
+            print(pool2d_forward(np.zeros((223, 223)), 2, 2).shape)  # (111, 111)
+
+    - language: python
+      title: "Transposed convolution: the adjoint, and the correlation that is not it"
+      note: >-
+        `conv_transpose1d_reuse_forward` is **numerically WRONG**. The transpose
+        scatters instead of gathering, and in filter terms that is an upsample
+        followed by a full *convolution* with the same weights — `np.convolve(z,
+        w)`, which reverses internally — not the forward correlation re-applied.
+        Re-applying the forward correlation to the upsampled signal (written here
+        as `np.convolve(z, w[::-1])`, the natural thing to reach for because the
+        forward code already exists) gives a maximum error of **1.422139** against
+        an adjoint output of scale 3.045 — 47% — on a random 3-tap kernel, and
+        exactly **0.000** for a symmetric kernel such as [1, 2, 1]. That exactness
+        on symmetric kernels is why the bug survives smoke tests and
+        visualisations: box and Gaussian kernels are what people test with.
+        `conv_transpose1d_adjoint` is the definition, and it agrees with an
+        explicit matrix transpose to **2.2e-16**. Note also that with
+        `padding > 0` the output length is $(m-1)s + k - 2p$ only for one of the
+        $s$ admissible input lengths — that ambiguity is why PyTorch has
+        `output_padding`.
+      code: |
+        import numpy as np
+
+
+        def conv_transpose1d_adjoint(y, w, stride=1, padding=0, n_in=None):
+            """The definition: scatter w[t] * y[o] to position o*stride - padding + t."""
+            y = np.asarray(y, dtype=float)
+            w = np.asarray(w, dtype=float)
+            if n_in is None:
+                n_in = (len(y) - 1) * stride + len(w) - 2 * padding
+            out = np.zeros(n_in)
+            for o in range(len(y)):
+                for t in range(len(w)):
+                    idx = o * stride - padding + t
+                    if 0 <= idx < n_in:
+                        out[idx] += w[t] * y[o]
+            return out
+
+
+        def conv_transpose1d(y, w, stride=1, padding=0, n_in=None):
+            """Same map, vectorised: upsample, then a full convolution with w.
+
+            np.convolve reverses its second argument internally, and that
+            reversal is exactly what the transpose of a correlation needs.
+            """
+            y = np.asarray(y, dtype=float)
+            w = np.asarray(w, dtype=float)
+            z = np.zeros((len(y) - 1) * stride + 1)
+            z[::stride] = y
+            full = np.convolve(z, w)
+            out = full[padding:len(full) - padding] if padding else full
+            return out if n_in is None else out[:n_in]
+
+
+        def conv_transpose1d_reuse_forward(y, w, stride=1, padding=0):
+            """WRONG. Correlates with w instead of convolving, so it is exact only
+            for symmetric kernels and off by 1.42 for a random 3-tap one."""
+            y = np.asarray(y, dtype=float)
+            w = np.asarray(w, dtype=float)
+            z = np.zeros((len(y) - 1) * stride + 1)
+            z[::stride] = y
+            return np.convolve(z, w[::-1])
+
+
+        def conv_matrix(n, k, s, p, w):
+            """The forward operator as an explicit matrix, for checking the adjoint."""
+            no = (n + 2 * p - k) // s + 1
+            a = np.zeros((no, n))
+            for o in range(no):
+                for t in range(k):
+                    idx = o * s - p + t
+                    if 0 <= idx < n:
+                        a[o, idx] += w[t]
+            return a
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(11)
+            y = rng.normal(size=8)
+            w = rng.normal(size=3)
+            a = conv_matrix(17, 3, 2, 0, w)
+            print(np.abs(conv_transpose1d(y, w, 2, 0) - a.T @ y).max())            # 0.0
+            print(np.abs(conv_transpose1d_reuse_forward(y, w, 2, 0) - a.T @ y).max())  # 1.422139
+            ws = np.array([1.0, 2.0, 1.0])
+            a_s = conv_matrix(17, 3, 2, 0, ws)
+            print(np.abs(conv_transpose1d_reuse_forward(y, ws, 2, 0) - a_s.T @ y).max())  # 0.0
+            print(np.round(conv_transpose1d(np.ones(8), np.ones(3), 2, 0)[2:-2], 1))
+            # [2. 1. 2. 1. 2. 1. 2. 1. 2. 1. 2. 1. 2.]   <- the 2x ripple
+
+
+  checkpoints:
+    - id: cp-1
+      question: "224 in, 3×3 kernel, stride 2. Your stem used padding 3 on a 7×7 and you keep it here, getting 114. What should p be for 112, and why is the answer not simply (k-1)/2?"
+      answerKind: short_text
+      hint: "Compute 224 + 2p − 3 and floor-divide by 2 before adding anything."
+      solution: >-
+        With p=3: $(224 + 6 - 3)//2 + 1 = 227//2 + 1 = 113 + 1 = 114$. With p=2 it
+        is $225//2 + 1 = 113$. With p=1 it is $223//2 + 1 = 112$. Now the
+        interesting part: $(k-1)/2 = 1$, so at stride 1 the "same" rule would
+        give exactly this p — but at stride 2 the *minimum* total padding that
+        achieves $\lceil n/s\rceil$ is $\max((112-1)\cdot2 + 3 - 224, 0) = 1$,
+        i.e. p=0 before and p=1 after, which is smaller than $k-1 = 2$ and
+        asymmetric. "Same" is a computed quantity that depends on $n \bmod s$,
+        not a constant attached to the kernel size. p=1 happens to land on 112
+        here because the surplus pixel falls inside the floor.
+
+    - id: cp-2
+      question: "You need same padding on a 4×4 kernel over a 32-wide input. Which two numbers does a framework apply, and why does no single p work?"
+      answerKind: short_text
+      hint: "Same padding asks for a total of k−1. For k=4 that total is 3, and 3 is odd."
+      solution: >-
+        $(1, 2)$ — one pixel before, two after. Symmetric choices give
+        $32 + 2p - 4 + 1$: p=0 → 29, p=1 → 31, p=2 → 33, p=3 → 35. Because
+        $2p = k-1 = 3$ has no integer solution, the total padding is odd and the
+        split is forced. The side matters: TensorFlow and Keras put the extra
+        pixel at the bottom and right, so a framework that puts it on the other
+        side shifts every downstream feature by one pixel while every shape
+        assertion still passes.
+
+    - id: cp-3
+      question: "Two positions in a 2×2 window tie for the maximum. Where does the backward pass send the gradient, and how much of it?"
+      answerKind: short_text
+      hint: "Max pooling stores an index during the forward pass, not a mask."
+      solution: >-
+        All of it, to one of them — coefficient 1.0, not 0.5 each. Max pooling
+        saves the argmax index and scatters the whole incoming cotangent there,
+        so the window's gradient mass is conserved (measured total 16.0 for
+        sixteen unit cotangents) while its support shrinks to one position
+        (density 0.25). `np.argmax` and every framework's kernel break the tie by
+        scan order, which means two implementations with identical forward
+        outputs can have different gradients on tied inputs. Average pooling is
+        the alternative that has no tie at all: all four positions get 0.25, so
+        density is 1.0 and the same total is spread rather than routed.
+
+    - id: cp-4
+      question: "Five 3×3 layers at stride 2. What is the receptive field, what is the jump, and what fraction of a 224-pixel input does one output of the fifth layer actually see?"
+      answerKind: short_text
+      hint: "Start at r = 1, j = 1 and apply r ← r + 2j, j ← 2j five times."
+      solution: >-
+        $r = 63$, $j = 32$, so one output of the fifth layer sees $63/224 = 28.1\%$
+        of the input. The recursion is $r \leftarrow r + (k-1)j$ with
+        $j \leftarrow 2j$, which for 3×3 gives $2^{L+1}-1$: 3, 7, 15, 31, 63. Ten
+        such layers reach 2047, against 21 for ten stride-1 layers — a factor of
+        97.5 at identical parameter cost. The resolution is what pays for it:
+        total stride 32 means a 224 input is 7 at this depth, so the field covers
+        the image several times over and the marginal value of the next stride-2
+        layer is zero.
+
+    - id: cp-5
+      question: "You call a stride-2 transposed convolution a deconvolution. How many of the 16 input directions can it recover, and what happens to the other 8?"
+      answerKind: short_text
+      hint: "Write the forward layer as a matrix and count its rank."
+      solution: >-
+        Eight of sixteen. With n=16, k=3, s=2, p=1 the forward operator is
+        8×16 of rank 8, so its transpose maps back into an 8-dimensional
+        subspace: $A^\top A$ has an 8-dimensional null space and the surviving
+        directions are scaled by $\sigma^2 \in [1.000, 1.545]$, not by 1. The
+        other eight directions are annihilated — not approximately, exactly — and
+        no amount of training or extra layers recovers them, because the
+        information was never in the output. The adjoint identity
+        $\langle Ax, y\rangle = \langle x, A^\top y\rangle$ is what makes it the
+        correct backward pass, and it is a different statement from $A^\top A = I$.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Two separate questions that share one piece of arithmetic. The first is a
+        counting question: given a padded canvas and a window that has to fit
+        inside it, how many distinct window positions are there? The second is a
+        question about what survives: every downsampling step — pooling or
+        stride — throws away spatial position, and the only thing that
+        distinguishes the options is *which* information the rule keeps and how
+        the gradient gets back through it. Neither question is about images.
+      blocks:
+        - kind: checklist
+          body: |
+            - Shape: one inequality, solved for the largest window index, plus one
+            - Padding: "same" means the output is the ceiling of n/s, nothing more
+            - Symmetry: a total padding is split in half only if it is even
+            - Pooling: zero parameters, so the rule is fixed before training starts
+            - Gradient: max routes it to one position, average dilutes it to all
+            - Field: each layer adds kernel width measured in the *current* jump
+      checkpoint: >-
+        Before any algebra: a window's last tap has to be inside the padded
+        input. Which three quantities decide whether window number i is legal,
+        and which one of them makes the answer depend on the input size rather
+        than only on the kernel?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Do not reach for a memorised formula; write the inequality and solve it.
+        For any shape question, ask where the last tap of window i lands and
+        require it to be on the canvas — the floor and the +1 then fall out and
+        you cannot get them backwards. For any padding question, ask what total
+        padding would make the output the ceiling of n/s, then ask whether that
+        total is even. For any pooling question, ask whether the operation is
+        linear in its input: if it is, it is a filter and has a frequency
+        response and a uniform gradient; if it is a selection, it has neither.
+      blocks:
+        - kind: checklist
+          body: |
+            - Shape -> last-tap inequality -> floor -> +1
+            - Padding -> required total T -> even? -> split, else asymmetric
+            - Average pool -> linear -> box filter -> uniform 1/k^2 gradient
+            - Max pool -> selection -> argmax index -> one-hot gradient
+            - Receptive field -> track two numbers, r and j, never one
+      checkpoint: >-
+        Which of those five questions has an answer that does not change if you
+        double the input resolution, and which one changes by a factor of two
+        when you double the stride?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three routines, none longer than ten lines. The shape function is
+        arithmetic on integers; the padding function is the shape function solved
+        for p; the pooling backward pass is a scatter keyed by an index saved
+        during the forward pass.
+      blocks:
+        - kind: pseudocode
+          body: |
+            def output_shape(n, k, stride, padding, dilation):
+                effective = dilation * (k - 1) + 1
+                return (n + 2*padding - effective) // stride + 1
+
+            def same_padding(n, k, stride, dilation):
+                effective = dilation * (k - 1) + 1
+                out = ceil(n / stride)                     # integer ceil
+                total = max((out - 1) * stride + effective - n, 0)
+                return [total // 2, total - total // 2]
+
+            def maxpool_backward(x, g, k, stride):
+                dx = zeros_like(x)
+                for each window (a, b):
+                    i = argmax of the window, in row-major order
+                    dx[window_origin + (i // k, i % k)] += g[a, b]
+                return dx
+
+            def receptive_field(layers):        # [(k, s), ...]
+                r, j = 1, 1
+                for k, s in layers:
+                    r = r + (k - 1) * j
+                    j = j * s
+                return r, j
+      checkpoint: >-
+        In `same_padding`, why is `max(..., 0)` there at all — under what
+        circumstances would the expression inside it be negative, and what does
+        returning a negative padding mean physically?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Four lines of algebra and one geometric series. Everything quantitative
+        in this topic is one of these.
+      blocks:
+        - kind: math
+          body: |
+            Shape, from the last legal window:
+
+            $$s\,i + d(k-1) \le n + 2p - 1
+              \;\Longrightarrow\;
+              n_{\text{out}} = \left\lfloor \frac{n + 2p - d(k-1) - 1}{s}\right\rfloor + 1.$$
+
+            Same padding, solved for the total:
+
+            $$T = \max\left((n_{\text{out}}-1)s + d(k-1) + 1 - n,\ 0\right),
+              \qquad n_{\text{out}} = \left\lceil \frac{n}{s}\right\rceil .$$
+
+            Receptive field, with $j_\ell = s^\ell$:
+
+            $$r_L = 1 + (k-1)\sum_{\ell=0}^{L-1} s^\ell
+              = 1 + (k-1)\frac{s^L - 1}{s - 1}\ \ (s > 1),
+              \qquad r_L = 1 + L(k-1)\ \ (s = 1).$$
+
+            Adjoint identity, from the definition of the matrix transpose:
+
+            $$\langle Ax, y\rangle = (Ax)^\top y = x^\top A^\top y
+              = \langle x, A^\top y\rangle .$$
+      checkpoint: >-
+        The geometric series is what turns depth into an exponential. What is the
+        ratio when s = 1, and why does the closed form need a separate case
+        there rather than a limit?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The three functions the problems ask for, plus the two measurements that
+        decide whether pooling is a filter or a router. Compare your output
+        against the printed numbers before looking at the code.
+      blocks:
+        - kind: warning
+          body: >-
+            The three places this goes wrong are not syntax. `int()` on a float
+            numerator truncates toward zero, so a kernel that does not fit
+            reports a positive window count instead of failing — use `//` on
+            ints. `np.argmax` breaks ties by scan order, so a max-pool backward
+            pass is only deterministic relative to a stated convention. And the
+            padding split is `total // 2` before, remainder after: reversing that
+            is a one-pixel translation of every feature that no shape assertion
+            will catch.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def conv_output_shape(n, k, stride=1, padding=0, dilation=1):
+                return (n + 2 * padding - dilation * (k - 1) - 1) // stride + 1
+
+
+            def same_padding(n, k, stride=1, dilation=1):
+                eff = dilation * (k - 1) + 1
+                out = -(-n // stride)                      # integer ceil
+                total = max((out - 1) * stride + eff - n, 0)
+                before = total // 2
+                return [before, total - before]
+
+
+            def max_pool2d_backward(x, grad_out, k=2, stride=2):
+                x = np.asarray(x, dtype=float)
+                g = np.asarray(grad_out, dtype=float)
+                h, w = x.shape
+                ho, wo = (h - k) // stride + 1, (w - k) // stride + 1
+                dx = np.zeros_like(x)
+                for a in range(ho):
+                    for b in range(wo):
+                        win = x[a*stride:a*stride+k, b*stride:b*stride+k]
+                        f = int(np.argmax(win))            # first max, row-major
+                        dx[a*stride + f // k, b*stride + f % k] += g[a, b]
+                return dx
+
+
+            if __name__ == "__main__":
+                print(conv_output_shape(224, 7, 2, 3))     # 112
+                print(conv_output_shape(224, 3, 2, 2))     # 113
+                print(same_padding(32, 4, 1))              # [1, 2]
+                print(same_padding(224, 3, 2))             # [0, 1]
+                x = np.arange(16, dtype=float).reshape(4, 4)
+                print(max_pool2d_backward(x, np.ones((2, 2))).astype(int).tolist())
+                # [[0,0,0,0],[0,1,0,1],[0,0,0,0],[0,1,0,1]]
+      checkpoint: >-
+        `same_padding(224, 3, 1)` returns [1, 1] but `same_padding(224, 3, 2)`
+        returns [0, 1]. Which of those two layers is shape-preserving, and what
+        does the other one preserve instead?
+
+  problems:
+    - id: p-output-shape
+      title: "The output shape of a conv or pooling layer"
+      difficulty: easy
+      prompt: >-
+        Implement `conv_output_shape(n, k, stride=1, padding=0, dilation=1)`
+        returning the output extent along one spatial axis, as an int. `n` is the
+        input size, `k` the kernel size, `padding` the number of pixels added on
+        *each* side, and `dilation` the spacing between kernel taps. Use integer
+        floor division — a floating-point cast truncates toward zero and gives
+        the wrong answer whenever the kernel does not fit. Do not special-case
+        "same" padding; the formula covers it.
+      starter: |
+        def conv_output_shape(n, k, stride=1, padding=0, dilation=1):
+            # your implementation here
+            pass
+      language: python
+      entry: conv_output_shape
+      testCases:
+        - input: "[224, 7, 2, 3, 1]"
+          expected: "112"
+          mode: json
+          tolerance: 0.000001
+        - input: "[55, 3, 1, 0, 2]"
+          expected: "51"
+          mode: json
+          tolerance: 0.000001
+        - input: "[27, 2, 2, 0, 1]"
+          expected: "13"
+          mode: json
+          tolerance: 0.000001
+        - input: "[7, 7, 1, 0, 1]"
+          expected: "1"
+          mode: json
+          tolerance: 0.000001
+        - input: "[100, 5, 3, 0, 1]"
+          expected: "32"
+          mode: json
+          tolerance: 0.000001
+        - input: "[224, 3, 2, 2, 1]"
+          expected: "113"
+          mode: json
+          tolerance: 0.000001
+        - input: "[224, 3, 1, 1, 1]"
+          expected: "224"
+          mode: json
+          tolerance: 0.000001
+        - input: "[224, 4, 2, 1, 1]"
+          expected: "112"
+          mode: json
+          tolerance: 0.000001
+      solution: |
+        def conv_output_shape(n, k, stride=1, padding=0, dilation=1):
+            effective = dilation * (k - 1) + 1
+            return (n + 2 * padding - effective) // stride + 1
+      solutionExplanation: >-
+        The padded input has length n + 2p. A window of k taps spaced d apart
+        occupies d(k-1)+1 positions, so the last legal window start is
+        n + 2p - (d(k-1)+1), and the number of starts is that divided by s,
+        floored, plus one. Keeping the whole expression in integers is not
+        pedantry: `int((n + 2p - eff) / s) + 1` truncates toward zero instead of
+        flooring, so a window that falls 3 pixels short at stride 2 gives
+        `int(-1.5) = -1` where floor gives `-2`. The two differ by exactly one in
+        the case you wanted to raise on. Test 2 is the one that catches a missing
+        dilation term — (55 - 5)//1 + 1 = 51, where ignoring d would give 53 — and
+        test 6 catches a hard-coded `ceil(n/s)`: 113, not 112, because here
+        2p = 4 exceeds k-1 = 2.
+      complexity: "O(1) time and space"
+      tags: [shape-algebra, stride, padding, dilation]
+
+    - id: p-same-padding
+      title: "Same padding, including the asymmetric case"
+      difficulty: medium
+      prompt: >-
+        Implement `same_padding(n, k, stride=1, dilation=1)` returning the
+        padding as a two-element list `[before, after]`, where `before` is
+        applied at the start of the axis and `after` at the end. The output size
+        must be `ceil(n / stride)`. Use the smallest total padding that achieves
+        it, and put the smaller half first — the TensorFlow `SAME` convention, so
+        `same_padding(32, 4)` is `[1, 2]` and not `[2, 1]`.
+      starter: |
+        def same_padding(n, k, stride=1, dilation=1):
+            # your implementation here
+            pass
+      language: python
+      entry: same_padding
+      testCases:
+        - input: "[32, 4, 1, 1]"
+          expected: "[1, 2]"
+          mode: json
+          tolerance: 0.000001
+        - input: "[224, 3, 2, 1]"
+          expected: "[0, 1]"
+          mode: json
+          tolerance: 0.000001
+        - input: "[224, 7, 2, 1]"
+          expected: "[2, 3]"
+          mode: json
+          tolerance: 0.000001
+        - input: "[32, 3, 1, 1]"
+          expected: "[1, 1]"
+          mode: json
+          tolerance: 0.000001
+        - input: "[31, 4, 2, 1]"
+          expected: "[1, 2]"
+          mode: json
+          tolerance: 0.000001
+        - input: "[224, 3, 1, 2]"
+          expected: "[2, 2]"
+          mode: json
+          tolerance: 0.000001
+        - input: "[13, 4, 2, 1]"
+          expected: "[1, 2]"
+          mode: json
+          tolerance: 0.000001
+      solution: |
+        def same_padding(n, k, stride=1, dilation=1):
+            eff = dilation * (k - 1) + 1
+            out = -(-n // stride)
+            total = max((out - 1) * stride + eff - n, 0)
+            before = total // 2
+            return [before, total - before]
+      solutionExplanation: >-
+        The last output position must be able to start at `(out-1)*stride` and
+        still hold a full footprint of `eff = d(k-1)+1` positions, so the padded
+        axis must be at least `(out-1)*stride + eff` long; subtract n to get the
+        total padding, and clamp at zero so that a kernel smaller than the stride
+        does not produce a negative pad. The split is floor-first: the smaller
+        half goes at the beginning, which is what makes `[1, 2]` come out of
+        k=4 rather than `[2, 1]`. Note what test 2 says about parity — a 3×3 at
+        stride 2 needs a total of 1, not 2, so "same" at stride 2 is neither
+        symmetric nor equal to `(k-1)/2`; and test 5 shows a 4×4 at stride 2 on
+        an odd input (31) needing 3 while 32 needs 2, which is the `n mod s`
+        dependence that makes `padding='same'` a computed quantity.
+      complexity: "O(1) time and space"
+      tags: [padding, same-padding, asymmetry, stride]
+
+    - id: p-maxpool-backward
+      title: "Max-pool backward: route the gradient to the argmax"
+      difficulty: medium
+      prompt: >-
+        Implement `max_pool2d_backward(x, grad_out, k=2, stride=2)` for a single
+        channel, returning `dx` with the same shape as `x`. `x` is the input to
+        the forward max pool of window `k` and stride `stride`; `grad_out` is the
+        incoming cotangent shaped `(H_out, W_out)` with
+        `H_out = (H - k)//stride + 1`. Each window sends its *entire* cotangent
+        to the position that was the maximum in the forward pass, with
+        coefficient 1.0 — not split, not averaged. Break ties by the first
+        position in row-major (row then column) order. Input positions not
+        covered by any window must receive zero.
+      starter: |
+        import numpy as np
+
+        def max_pool2d_backward(x, grad_out, k=2, stride=2):
+            # your implementation here
+            pass
+      language: python
+      entry: max_pool2d_backward
+      testCases:
+        - input: '[[[1.0,2.0,3.0,4.0],[5.0,6.0,7.0,8.0],[9.0,10.0,11.0,12.0],[13.0,14.0,15.0,16.0]], [[1.0,1.0],[1.0,1.0]], 2, 2]'
+          expected: "[[0.0,0.0,0.0,0.0],[0.0,1.0,0.0,1.0],[0.0,0.0,0.0,0.0],[0.0,1.0,0.0,1.0]]"
+          mode: json
+          tolerance: 0.000001
+        - input: '[[[1.0,2.0,3.0],[4.0,5.0,6.0],[7.0,8.0,9.0]], [[2.0]], 3, 1]'
+          expected: "[[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,2.0]]"
+          mode: json
+          tolerance: 0.000001
+        - input: '[[[-1.0,-2.0,-3.0,-4.0],[-5.0,-6.0,-7.0,-8.0],[-9.0,-10.0,-11.0,-12.0],[-13.0,-14.0,-15.0,-16.0]], [[1.0,2.0],[3.0,4.0]], 2, 2]'
+          expected: "[[1.0,0.0,2.0,0.0],[0.0,0.0,0.0,0.0],[3.0,0.0,4.0,0.0],[0.0,0.0,0.0,0.0]]"
+          mode: json
+          tolerance: 0.000001
+        - input: '[[[1.0,2.0,3.0],[4.0,5.0,6.0],[7.0,8.0,9.0]], [[1.0]], 2, 2]'
+          expected: "[[0.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,0.0]]"
+          mode: json
+          tolerance: 0.000001
+        - input: '[[[1.0,2.0,3.0],[4.0,5.0,6.0],[7.0,8.0,9.0]], [[1.0,1.0],[1.0,1.0]], 2, 1]'
+          expected: "[[0.0,0.0,0.0],[0.0,1.0,1.0],[0.0,1.0,1.0]]"
+          mode: json
+          tolerance: 0.000001
+      solution: |
+        import numpy as np
+
+        def max_pool2d_backward(x, grad_out, k=2, stride=2):
+            x = np.asarray(x, dtype=float)
+            g = np.asarray(grad_out, dtype=float)
+            h, w = x.shape
+            ho = (h - k) // stride + 1
+            wo = (w - k) // stride + 1
+            if g.shape != (ho, wo):
+                raise ValueError("grad_out must be (%d, %d), got %s" % (ho, wo, g.shape))
+            dx = np.zeros_like(x)
+            for a in range(ho):
+                for b in range(wo):
+                    win = x[a * stride:a * stride + k, b * stride:b * stride + k]
+                    flat = int(np.argmax(win))
+                    dx[a * stride + flat // k, b * stride + flat % k] += g[a, b]
+            return dx
+      solutionExplanation: >-
+        Max pooling has no weights, so its Jacobian is not a matrix of numbers
+        learned from data but a selection: for each window, one position gets 1
+        and the rest get 0. The backward pass is therefore a scatter keyed by
+        `argmax` — the same index the forward pass saved — and the `+=` matters
+        because overlapping windows (stride smaller than k) can select the same
+        input position twice, in which case it accumulates both cotangents.
+        `argmax` on the flattened window returns the first maximum in row-major
+        order, which is the tie rule stated in the prompt; a different rule
+        changes only tied windows, and those are exactly the windows where two
+        correct implementations disagree. Test 1 is the one that catches
+        averaging instead of routing: with unit cotangents an average-pool
+        backward pass would put 0.25 in all sixteen positions, where the expected
+        answer puts 1.0 in four and 0.0 in twelve. Test 3 shows the sign does not
+        matter — argmax of an all-negative window is its least negative value,
+        which here is the top-left corner of every window, and a version that had
+        used `abs` somewhere would put the gradient on the bottom-right instead.
+      complexity: "O(H_out·W_out·k²) time, O(H·W) space"
+      tags: [pooling, max-pool, backward, gradient-routing]
+
+  visualizers:
+    - id: vs-shape-flow
+      kind: shape_flow
+      title: "Shape algebra: hold, halve, or die"
+      description: >-
+        Push a tensor through a stack and watch
+        n ← floor((n + 2p − d(k−1) − 1)/s) + 1 resolve at every step. With
+        k=3, s=1, p=1 nothing changes at any depth, which is why a shape bug can
+        hide for twenty layers. Set s=2, p=1 and it halves — 112, 56, 28, 14, 7 —
+        while s=2, p=0 loses a pixel per layer on odd inputs and s=2, p=3 gains
+        one.
+      params:
+        input: [3, 224, 224]
+        stages:
+          - { k: 7, stride: 2, padding: 3 }
+          - { k: 3, stride: 2, padding: 1 }
+          - { k: 3, stride: 2, padding: 1 }
+          - { k: 3, stride: 2, padding: 1 }
+          - { k: 3, stride: 2, padding: 1 }
+    - id: vs-pool-choice
+      kind: tensor
+      title: "Max or average: what the window keeps and what it passes back"
+      description: >-
+        Send one 4×4 patch through both rules. Average pooling is a fixed box
+        filter — gain 0.7071 at half-Nyquist and exactly 0 at the checkerboard
+        frequency for a 2×2 — and passes 1/4 of the cotangent to all four
+        positions. Max pooling is a selection, violates linearity by a median
+        0.353, and passes all of the cotangent to exactly one position. Ten
+        layers deep the totals differ by a factor of 1024.
+      params:
+        window: [2, 2]
+        stride: 2
+        modes: [max, average]
+
+  try_it: >-
+    Compute the output size for 224 into a 7x7 stride-2 layer with padding 3, then for 224 into
+    a 3x3 stride-2 layer with padding 1, and explain why the second returns 112 and not 111.
+    Then run the same two layers on a 223 input and count how many pixels a 2x2 stride-2 pool
+    never looks at — it is 445 of 49,729.
+  interview_questions:
+    - question: 'State the output-size formula and explain why ceil(n/s) is a theorem about same padding rather than about stride.'
+      level: mid
+      key_points:
+        - 'The formula is n_out = floor((n + 2p - d(k-1) - 1)/s) + 1, derived from the condition that the last window still fits.'
+        - 'With p = (k-1)/2 and odd k it collapses to floor((n-1)/s) + 1, which equals ceil(n/s); verified over 6,300 configurations with zero mismatches.'
+        - 'Break the padding assumption and it fails immediately: 224 with k = 7, s = 2, p = 2 returns 111, not 112.'
+        - 'The +1 outside the floor is a count, not a correction: it is the number of legal window starts.'
+    - question: 'You need to halve spatial resolution. Argue for a stride-2 convolution over 2x2 max pooling using numbers.'
+      level: senior
+      key_points:
+        - 'Pooling owns zero parameters, which is both the appeal and the limit: it is a fixed rule that cannot adapt to the task.'
+        - 'The 3x3 stride-2 convolution that replaced it owns 36,928 numbers and performs 924,844,032 FLOPs against 2,408,448 comparisons on a 224x224x64 tensor.'
+        - 'Max pooling is a router, not a filter: it violates linearity with a median relative error of 0.353, so it has no frequency response to reason about.'
+        - 'Average pooling is exactly linear but keeps only 25% of the iid variance per output, while max keeps 49% and shifts the mean by +1.03.'
+      follow_up: 'Same padding on an even kernel: from a 32-wide input, k = 4 gives 29, 31, 33, 35 for p = 0..3. What do production implementations do instead?'
+    - question: 'Why is a transposed convolution not the inverse of a convolution?'
+      level: mid
+      key_points:
+        - 'It is the adjoint A^T of the forward operator A: the same weights, with a scatter in place of a gather.'
+        - 'With stride 2 the operator is 8x16 and rank-deficient, so no inverse exists and re-convolving does not return the input.'
+        - 'That rank deficiency is what produces the checkerboard ripple at twice the stride frequency when the kernel is not a multiple of the stride.'
+        - 'It is the correct tool for upsampling and for backpropagating through a conv, and the wrong tool for undoing one.'
+  common_mistakes:
+    - 'Using ceil(n/s) with padding that is not (k-1)/2, so a 7x7 stride-2 stem with p = 2 returns 111 and the residual add fails at layer four.'
+    - 'Assuming a symmetric same padding exists for even kernels. k = 4 needs p = 1.5, so the padding has to be split asymmetrically.'
+    - 'Calling a transposed convolution a deconvolution and expecting it to invert the forward pass, then wondering why the mask ripples at the stride frequency.'
+  further_reading:
+    - label: "Dumoulin & Visin, A guide to convolution arithmetic for deep learning (2016)"
+    - label: "Zeiler & Fergus, Visualizing and Understanding Convolutional Networks (ECCV 2014)"

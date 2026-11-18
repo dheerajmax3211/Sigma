@@ -1,0 +1,91 @@
+id: "dist-zero-fsdp"
+title: "ZeRO and FSDP: sharding the memory"
+minutes: 15
+order: 802
+params:
+  - { id: "pb", label: "model size (billions of parameters)", min: 1, max: 70, step: 1, init: 7 }
+  - { id: "n", label: "GPUs", min: 1, max: 64, step: 1, init: 8 }
+derived:
+  - { id: "ddp", expr: "16 * pb" }
+  - { id: "z1", expr: "4 * pb + 12 * pb / n" }
+  - { id: "z2", expr: "2 * pb + 14 * pb / n" }
+  - { id: "z3", expr: "16 * pb / n" }
+cards:
+  - kind: "story"
+    kicker: "Start here"
+    title: "Why a 7B model does not fit"
+    body:
+      - "Training does not only store the weights. With Adam in mixed precision each parameter costs about **16 bytes**: 2 for the weights, 2 for the gradient, and 12 for the optimiser state."
+      - "Plain data parallelism repeats all 16 bytes on every GPU. **ZeRO** and **FSDP** split those pieces across GPUs, so each GPU stores only its share."
+    callout: "Shard the optimiser, then the gradients, then the weights."
+  - kind: "lab"
+    kicker: "See it"
+    title: "Memory per GPU"
+    intro: "Gigabytes needed on each GPU for the model state alone. **Drag the size and the GPU count.**"
+    view:
+      type: "bars"
+      max: 300
+      items:
+        - { label: "plain data parallel (GB)", value: "ddp", color: "#ef4444" }
+        - { label: "shard optimiser, stage 1 (GB)", value: "z1", color: "#f97316" }
+        - { label: "shard gradients too, stage 2 (GB)", value: "z2", color: "#38bdf8" }
+        - { label: "shard everything, stage 3 (GB)", value: "z3", color: "#1cd6ac" }
+    sliders:
+      - "pb"
+      - "n"
+    outro: "A {pb} billion model needs **{ddp} GB** per GPU with plain copies, but only **{z3} GB** at stage 3 on {n} GPUs. Activations come on top."
+  - kind: "code"
+    kicker: "Write it"
+    title: "The memory formula"
+    intro: "Each stage is one line."
+    lang: "python"
+    code: |
+      def per_gpu_gb(params_b, n, stage):
+          if stage == 0: return 16 * params_b
+          if stage == 1: return 4 * params_b + 12 * params_b / n
+          if stage == 2: return 2 * params_b + 14 * params_b / n
+          return 16 * params_b / n
+
+      assert per_gpu_gb(7, 8, 0) == 112
+      assert per_gpu_gb(7, 8, 1) == 38.5
+      assert per_gpu_gb(7, 8, 2) == 26.25
+      assert per_gpu_gb(7, 8, 3) == 14
+      assert per_gpu_gb(7, 1, 3) == per_gpu_gb(7, 1, 0)   # one GPU: nothing to share
+    note: "Stage 3 costs extra communication. Weights must be gathered just in time for each layer, then dropped."
+  - kind: "lab"
+    kicker: "Memorise"
+    title: "What each stage shards"
+    intro: "Pick the least sharding that fits."
+    view:
+      type: "flow"
+      stages:
+        - { label: "Stage 0", note: "Nothing. Every GPU holds everything.", color: "#ef4444" }
+        - { label: "Stage 1", note: "Optimiser state is split. Biggest saving for the cost.", color: "#f97316" }
+        - { label: "Stage 2", note: "Gradients are split too.", color: "#38bdf8" }
+        - { label: "Stage 3 (FSDP)", note: "Weights are split. Gather each layer when needed.", color: "#1cd6ac" }
+  - kind: "check"
+    kicker: "Your turn"
+    title: "Biggest chunk"
+    question: "Which part of the 16 bytes per parameter is largest?"
+    options:
+      - { text: "Optimiser state, 12 bytes", correct: true, why: "Adam keeps master weights and two moments." }
+      - { text: "Weights, 2 bytes", why: "They are small." }
+      - { text: "Gradients, 2 bytes", why: "Also small." }
+      - { text: "Activations", why: "They are extra, not part of the 16." }
+  - kind: "check"
+    kicker: "Practice"
+    title: "Trade"
+    question: "What does stage 3 cost compared with stage 1?"
+    options:
+      - { text: "More communication to gather weights", correct: true, why: "Memory is saved by moving data." }
+      - { text: "More memory", why: "It uses the least." }
+      - { text: "Lower accuracy", why: "The maths is the same." }
+      - { text: "Nothing", why: "There is a cost." }
+  - kind: "mistakes"
+    kicker: "Before you move on"
+    title: "Mistakes to avoid"
+    items:
+      - "**Counting only the weights.** The optimiser dominates."
+      - "**Forgetting activations.** They can exceed the model state."
+      - "**Sharding when the model fits.** You pay communication for nothing."
+    next: { label: "Next: tensor parallelism", href: "/learn/dist-tensor-parallel" }

@@ -1,0 +1,162 @@
+id: nextjs-api-and-streaming-ui
+title: Next.js API routes and a streaming UI
+order: 33
+minutes: 10
+params:
+  - { id: net, label: "network delay one way (ms)", min: 10, max: 200, step: 10, init: 50 }
+  - { id: ttft, label: "model start-up (ms)", min: 300, max: 1500, step: 100, init: 600 }
+derived:
+  - { id: first, expr: "2 * net + ttft" }
+cards:
+  - kind: story
+    kicker: Start here
+    title: Keep the key on the server
+    body:
+      - "If your page calls the model directly, your API key travels to every visitor's browser, and anyone can copy it and run up your bill."
+      - "So the browser talks to **your** server, and your server talks to the model. In Next.js that server code is a **route handler**."
+    callout: "Browser to route to model, and back."
+
+  - kind: lab
+    kicker: See it first
+    title: Follow one chat message
+    intro: "The browser posts the question to your route. The route calls the model with the secret key and **streams** chunks back. **Drag the delays** to see when the first word arrives."
+    view:
+      type: flow
+      stages:
+        - { label: "1. Browser", note: "posts the question to /api/chat, {net} ms away", color: "#38bdf8" }
+        - { label: "2. Route handler", note: "runs on your server and adds the secret key", color: "#a78bfa" }
+        - { label: "3. Model", note: "needs about {ttft} ms before its first token", color: "#f59e0b" }
+        - { label: "4. Stream back", note: "each chunk is forwarded as it arrives", color: "#1cd6ac" }
+        - { label: "5. React state", note: "the page appends text, first word after **{first} ms**", color: "#ef4444" }
+    also:
+      type: bars
+      max: 1900
+      items:
+        - { label: "to the server (ms)", value: net, color: "#38bdf8" }
+        - { label: "model start-up (ms)", value: ttft, color: "#f59e0b" }
+        - { label: "back to the browser (ms)", value: net, color: "#1cd6ac" }
+    sliders: [net, ttft]
+    outro: "Two network trips plus the model start-up put the first word on screen after **{first} ms**."
+
+  - kind: formula
+    kicker: Read the formula
+    title: Time to the first word
+    tex: "t_{\\text{first}} = 2d + t_{0}"
+    say: "The question travels to the server, the answer travels back, and the model needs its own start-up time in between. Add those three together."
+    verify:
+      - { expr: "first", equals: 700, tol: 0.5 }
+      - { expr: "2 * 50 + 600", equals: 700, tol: 0.5 }
+    symbols:
+      - { tex: "t_{\\text{first}}", means: "milliseconds until the first word shows", value: first }
+      - { tex: "d", means: "one-way network delay between browser and server", value: net }
+      - { tex: "2d", means: "the trip there and the trip back" }
+      - { tex: "t_{0}", means: "the model's start-up time before its first token", value: ttft }
+
+  - kind: code
+    kicker: Read it
+    title: The route handler
+    intro: "A file at `app/api/chat/route.ts` that exports **POST** becomes the endpoint. It returns a `Response` built from a stream."
+    lang: typescript
+    code: |
+      // app/api/chat/route.ts
+      export async function POST(request: Request) {
+        const { question } = await request.json();
+        const encoder = new TextEncoder();
+
+        const stream = new ReadableStream({
+          async start(controller) {
+            for await (const text of askModel(question)) {   // your model call
+              controller.enqueue(encoder.encode(text));
+            }
+            controller.close();
+          },
+        });
+
+        return new Response(stream, {
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
+    note: "`askModel` stands for your model call. The key lives in an environment variable and never reaches the browser."
+
+  - kind: code
+    kicker: In code
+    title: The page that reads the stream
+    intro: "A **client component** keeps the text in state. Each chunk adds to it, and React redraws."
+    lang: typescript
+    code: |
+      "use client";
+      import { useState } from "react";
+
+      export default function Chat() {
+        const [text, setText] = useState("");
+
+        async function ask(question: string) {
+          setText("");
+          const res = await fetch("/api/chat", {
+            method: "POST",
+            body: JSON.stringify({ question }),
+          });
+          const reader = res.body!.getReader();
+          const decoder = new TextDecoder();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            setText((t) => t + decoder.decode(value, { stream: true }));
+          }
+        }
+
+        return <button onClick={() => ask("Hi")}>{text || "Ask"}</button>;
+      }
+    note: "`\"use client\"` marks code that runs in the browser and may use state and click handlers."
+
+  - kind: check
+    kicker: Check yourself
+    title: Where does the key live
+    question: "Where should the model API key be used in a Next.js chat app?"
+    options:
+      - { text: "Only in the route handler, on the server", correct: true, why: "Server code is never sent to the browser, so the key stays private." }
+      - { text: "In the client component", why: "Anything in client code is visible to every visitor." }
+      - { text: "In the page's HTML", why: "Anyone can view the page source and copy it." }
+
+  - kind: story
+    kicker: One more idea
+    title: Server components fetch first
+    body:
+      - "A page without \"use client\" is a **server component**. It can read a database directly and send finished HTML to the browser."
+      - "Use it to load data, and use small client components only where you need clicks, state or streaming."
+    callout: "Server for data, client for interaction."
+
+  - kind: check
+    kicker: Check yourself
+    title: Server or client
+    question: "A button that opens a menu when clicked needs which kind of component?"
+    options:
+      - { text: "A client component", correct: true, why: "Click handlers and state run in the browser, which needs a client component." }
+      - { text: "A server component", why: "Server components send finished HTML and cannot respond to clicks on their own." }
+      - { text: "A route handler", why: "A route handler is an endpoint, not a piece of the page." }
+
+  - kind: practice
+    kicker: Your turn
+    title: "Format a stream event"
+    intro: "A streaming route sends server sent events. Write `sse(event, data)` returning the text `event: NAME`, a newline, `data: DATA`, then a blank line (two newlines in all after the data)."
+    entry: sse
+    starter: |
+      def sse(event, data):
+          pass
+    solution: |
+      def sse(event, data):
+          return f'event: {event}\ndata: {data}\n\n'
+    tests:
+      - { input: "[\"token\", \"hello\"]", expected: "\"event: token\\ndata: hello\\n\\n\"" }
+      - { input: "[\"done\", \"\"]", expected: "\"event: done\\ndata: \\n\\n\"" }
+      - { input: "[\"error\", \"boom\"]", expected: "\"event: error\\ndata: boom\\n\\n\"" }
+    hint: "Each field is one line. A blank line ends the event."
+
+  - kind: mistakes
+    kicker: Watch out
+    title: Three easy slips
+    items:
+      - "**Calling the model from the browser.** Your key would be exposed to everyone."
+      - "**No error path.** If the stream breaks mid-way, show a message and a retry button."
+      - "**Marking everything use client.** You lose the benefits of server rendering for no reason."
+    next: { label: "Next: the agent loop", href: /learn/agent-loop }

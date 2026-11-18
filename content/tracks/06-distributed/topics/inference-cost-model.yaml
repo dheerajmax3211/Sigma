@@ -1,0 +1,646 @@
+id: inference-cost-model
+slug: inference-cost-model
+title: "The Inference Cost Model"
+summary: >-
+  Price a served model from first principles: weights read per step, the roofline
+  that caps throughput, and why batch size divides your cost by exactly its own
+  value until the KV cache stops you.
+kind: lesson
+difficulty: hard
+position: 11
+estMinutes: 18
+prerequisites: [continuous-batching, quantisation]
+phase: serving
+tags: [inference, cost, roofline, kv-cache, serving]
+
+body:
+  big_idea: >-
+    Decode reads every weight to produce one token per sequence, so inference
+    cost is bytes moved, not FLOPs computed — batching divides price by the
+    batch size until the KV cache eats the memory.
+  problem:
+    - "You estimate 70B serving cost from FLOPs and predict a throughput you cannot reach: decode is a bandwidth measurement with a matmul attached."
+    - "You size for batch 256: the arithmetic says 6,126 tokens per second, but at 32k context the KV cache alone needs 320 GiB."
+    - "You quote $58 per million tokens at batch 1, a colleague quotes $0.23 at batch 256; both are right and neither is comparable."
+  analogy: >-
+    A forklift must drive past every shelf before it can pick anything: the
+    trip takes as long as driving the aisles whether it takes one box or
+    thirty, so batching thirty pickers into one truck divides the cost per box
+    by thirty. Every extra picker needs a seat, though — that seat is the KV
+    cache.
+  concept_points:
+    - "**Decode reads the weights once per step, so throughput is bandwidth over bytes.** A 70B model in fp16 is **140 GB**. At 3.35 TB/s a step takes **41.79 ms**, which at batch 1 is **23.9 tokens/second** — not because the GPU is slow, but because that is the time to stream the parameters past the multipliers. Intensity is $2P/2P = 1.0$ against a **147.6 FLOP/byte** ridge."
+    - "**Cost per million tokens is price over throughput, and batching divides it by the batch.** At 2.50 USD per GPU-hour on 2 GPUs: batch 1 gives 23.9 tok/s and **58.04 USD/M**; batch 32 gives 765.7 tok/s and **1.814 USD/M**; batch 256 gives 6,125.7 tok/s and **0.227 USD/M**. Each step is exactly the batch multiple, because only the weight read is amortised."
+    - "**The KV cache is what actually caps the batch.** For 80 layers, 8 KV heads, head dim 128, fp16: **320 KiB per token**. At 4k context that is 1.25 GiB per sequence, so batch 32 needs **40.0 GiB**; at 32k it is 10.00 GiB per sequence and batch 32 needs **320.0 GiB**, which does not fit on four 80 GB cards."
+    - "**Prefill is the opposite regime: compute-bound.** A 4,096-token prompt costs $2PT \\approx 5.73\\times10^{14}$ FLOPs — 1,160 ms at peak, about **2,900 ms at 40% MFU**. Its intensity is 4,096 FLOP/byte against decode's 1.0, three orders of magnitude apart, which is why the phases need different optimisation and why MFU applies only to prefill."
+    - "**Quantisation buys exactly the byte ratio, not the precision ratio.** int8 weights are 70 GB, so the step halves to **20.90 ms** and throughput doubles — a measured **2.00x**, not the 4x that comparing int8 to fp32 suggests. In a memory-bound loop you get bytes and nothing more."
+    - "**First-token latency and token cost are separate budgets.** Time to first token is dominated by prefill; time per output token is the 41.79 ms decode step. A 4,000-token prompt generating 10 tokens spends 2,900 ms in prefill against 418 ms in decode — over 85% prefill, so optimising decode there is wasted work."
+  definitions:
+    - { term: "Decode", meaning: "The autoregressive step: one forward pass per generated token, reading all weights each time. Memory-bandwidth-bound." }
+    - { term: "Prefill", meaning: "Processing the prompt in one parallel pass. Compute-bound; cost scales with prompt length and batch together." }
+    - { term: "Arithmetic intensity", meaning: "FLOPs per byte moved. Compared against the ridge point to decide which roofline bound applies." }
+    - { term: "Ridge point", meaning: "Peak FLOP/s divided by memory bandwidth: 147.6 FLOP/byte on an H100 at 3.35 TB/s." }
+    - { term: "MFU", meaning: "Model FLOPs utilisation, the achieved fraction of peak. 30-50% for large prefill matmuls; near-irrelevant for decode." }
+    - { term: "KV cache", meaning: "Stored keys and values per token per layer: 320 KiB per token for the 70B configuration here." }
+    - { term: "Time to first token", meaning: "Latency from request to first generated token. Dominated by prefill and queueing." }
+    - { term: "Time per output token", meaning: "Steady-state decode latency. Dominated by weight bytes and bandwidth." }
+    - { term: "Cost per million tokens", meaning: "GPU price per hour divided by tokens per hour, times 1e6. Meaningless without batch and context." }
+    - { term: "Batch size", meaning: "Sequences decoded together. Divides cost per token exactly, until KV memory or a latency SLO binds." }
+    - { term: "Memory-bound", meaning: "A kernel whose time is set by bytes moved rather than FLOPs issued. Decode always is, at practical batch sizes." }
+
+  diagrams:
+    - type: plot
+      title: "Cost per million tokens falls as one over batch size"
+      chart: "line"
+      xLabel: "batch size (log scale)"
+      yLabel: "dollars per 1M tokens"
+      series:
+        - name: "70B fp16 on 2 GPUs at 2.50 USD/h"
+          points:
+            - { x: 1, y: 58.043 }
+            - { x: 32, y: 1.814 }
+            - { x: 256, y: 0.227 }
+            - { x: 1024, y: 0.057 }
+    - type: compare
+      title: "Prefill versus decode"
+      left_label: "Prefill (compute-bound)"
+      left_points:
+        - "All prompt tokens in one parallel pass"
+        - "Intensity 4,096 FLOP/byte, far above the 147.6 ridge"
+        - "4k tokens costs 5.73e14 FLOPs, 1,160 ms at peak"
+        - "Scales with prompt length times batch; MFU matters here"
+      right_label: "Decode (memory-bound)"
+      right_points:
+        - "One token per sequence per weight read"
+        - "Intensity 1.0 FLOP/byte, 148x below the ridge"
+        - "One step is 41.79 ms regardless of how many tokens it yields"
+        - "Scales with weight bytes over batch; MFU irrelevant"
+    - type: pipeline
+      title: "Where the money goes in one request"
+      nodes:
+        - label: "Queue"
+          note: "unbounded at high utilisation"
+          detail: "The only component with no fixed cost. At 90% utilisation it adds roughly nine times the service time, which is why fleets run near 50%."
+        - label: "Prefill"
+          note: "compute-bound, 1,160+ ms at 4k"
+          detail: "2 x P x T FLOPs. At 40% MFU the 4k estimate becomes about 2,900 ms. This is first-token latency for a long prompt."
+        - label: "Decode x N"
+          note: "41.79 ms per token, amortised by batching"
+          detail: "Weights streamed once per step. The batch divides the cost; the KV cache limits the batch. At 32k the cache, not the weights, binds."
+        - label: "Stream out"
+          note: "perceived latency, not cost"
+          detail: "Streaming reduces perceived time to first token. It changes no cost line."
+    - type: architecture
+      title: "Memory budget: weights versus cache"
+      nodes:
+        - { id: hw, x: 0, y: 0, label: "4x 80 GB HBM", kind: database, detail: "320 GB total. Weights take 140 GB, leaving 189.6 GiB for KV cache and activations." }
+        - { id: w, x: 1, y: 0, label: "Weights 140 GB", kind: model, detail: "70e9 params x 2 bytes. A fixed 41.79 ms of pure streaming per step at 3.35 TB/s." }
+        - { id: kv, x: 1, y: 2, label: "KV 320 KiB/token", kind: database, detail: "4k context needs 1.25 GiB per sequence, so 189.6 GiB buys 151. At 32k it buys 18." }
+        - { id: bw, x: 2, y: 1, label: "Bandwidth 3.35 TB/s", kind: worker, detail: "The actual bottleneck. Doubling it halves decode time; doubling FLOPS changes nothing." }
+        - { id: cost, x: 3, y: 1, label: "dollars per 1M tokens", kind: external, detail: "Price per hour over tokens per hour. Falls as 1/batch until KV or the SLO limits the batch." }
+      edges:
+        - { from: hw, to: w, label: "140 GB" }
+        - { from: hw, to: kv, label: "189.6 GiB" }
+        - { from: w, to: bw, label: "streamed per step" }
+        - { from: bw, to: cost, label: "tok/s" }
+        - { from: kv, to: cost, label: "caps batch", style: "async" }
+
+  markdown: |
+    ## The one equation
+
+    Producing one token per sequence requires streaming every weight past the
+    multipliers, so
+
+    $$t_{\text{step}} = \frac{\text{weight bytes}}{\text{HBM bandwidth}}.$$
+
+    For 70B in fp16 that is 140 GB over 3.35 TB/s = **41.79 ms**. With $B$
+    sequences in flight the step produces $B$ tokens, so
+
+    $$\text{tokens/s} = \frac{B}{t_{\text{step}}}, \qquad
+    \frac{\$}{10^{6}\,\text{tokens}} = \frac{\text{price per hour}}{3600 \cdot \text{tokens/s}} \times 10^{6}.$$
+
+    | Batch | tok/s | USD per 1M tokens |
+    |---|---|---|
+    | 1 | 23.9 | 58.04 |
+    | 32 | 765.7 | 1.814 |
+    | 256 | 6,125.7 | 0.227 |
+    | 1,024 | 24,502.9 | 0.057 |
+
+    The ratios are exactly 32.0x and 256.0x. **Batching divides cost by its own
+    value**, precisely, because the 41.79 ms is unchanged and only the tokens
+    per step changed. Notice what is absent from that equation: FLOPs, precision
+    beyond byte count, and MFU. None of them move a memory-bound kernel.
+
+    ## Why the roofline agrees
+
+    $$\text{ridge} = \frac{494.5\times10^{12}}{3.35\times10^{12}} = 147.6\ \text{FLOP/byte}.$$
+
+    Decode at batch 1 does $2P$ FLOPs per $2P$ bytes: intensity **1.0**, which
+    is 148x below the ridge — memory-bound by a wide margin. Prefill on a 4k
+    prompt does $2PT$ FLOPs on $2P$ bytes: intensity **4,096**, far above the
+    ridge — compute-bound.
+
+    Same model, same hardware, opposite regime. That is why one deployment
+    optimises bandwidth and the other optimises tensor-core occupancy, and why
+    "make it faster" is an incomplete instruction.
+
+    ## What actually stops you batching
+
+    The cache, not the weights.
+
+    $$2 \times 80 \times 8 \times 128 \times 2 = 327{,}680\ \text{bytes} = 320\ \text{KiB per token}$$
+
+    | Context | Per sequence | Batch 32 needs |
+    |---|---|---|
+    | 4,096 | 1.25 GiB | 40.0 GiB |
+    | 32,768 | 10.00 GiB | 320.0 GiB |
+    | 131,072 | 40.00 GiB | 1,280.0 GiB |
+
+    At 4k, batch 32 is comfortable. At 32k it needs 320 GiB, more than the four
+    cards holding the weights. The batch that fits is a function of **context
+    length**, so cost per token rises with context even though the weights never
+    moved.
+
+    ## The 2x that looks like a 4x
+
+    int8 weights are 70 GB instead of 140, so the step halves to 20.90 ms and
+    throughput doubles: **2.00x**, measured. Not 4x, because int8 is half of
+    fp16, not a quarter. In a memory-bound loop you get the byte ratio and
+    nothing more.
+
+    ## Where the analogy breaks
+
+    The forklift story implies the truck's capacity is the only limit. Two
+    things it cannot express.
+
+    **Prefill is a separate phase with a different cost driver.** Loading 4,000
+    tokens costs 5.73e14 FLOPs and over a second of wall time, more than 25
+    decode steps, and none of it is amortised by batching.
+
+    **The price only means something with its batch and context.** 58.04 and
+    0.227 describe the same model on the same hardware. Quoting either without
+    naming batch size and context length is quoting a number that cannot be
+    compared to anything.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    In the decode loop you read every weight to produce one token per sequence, so inference cost is **bytes moved, not FLOPs computed**. That single fact gives the whole cost model: throughput is bandwidth divided by weight bytes, cost per million tokens is GPU price divided by tokens per second, and batching divides cost by exactly the batch size — until the KV cache eats the memory you were using to batch.
+
+    ### The analogy, in full
+
+    A warehouse where the forklift must drive past every shelf before it can pick anything. The engine is irrelevant — the trip takes as long as driving the aisles, whether you take one box or thirty. Batching is sending thirty pickers in the same truck. The drive is identical, so the cost per box falls by thirty. That is why throughput is bandwidth divided by weight bytes, and why cost per token is inversely proportional to batch size, exactly. Two ways the analogy breaks. First, every extra picker needs a seat: the KV cache is per-sequence memory, so the truck has a finite capacity that shrinks as each picker brings more luggage. Second, loading is a separate phase — prefill is compute-heavy and its cost scales with prompt length, not batch, so a long prompt can dominate a request that generates three tokens.
+
+    ### Failure modes, in full
+
+    - You estimate the cost of serving a 70B model from its FLOPs and predict a throughput you cannot reach, because decode is not compute-bound — it is a memory-bandwidth measurement with a matmul attached.
+    - You size a deployment for batch 256 and it fits on paper: the arithmetic says 6,126 tokens per second. Then at 32k context the KV cache alone needs 320 GiB and the batch that fits is 18, not 256.
+    - You report $58 per million tokens from a batch-1 benchmark and a colleague reports $0.23 from a batch-256 benchmark. Both are correct and neither is comparable — batch size is part of the price.
+    - You quantise weights to int8 expecting four times the speed and get exactly 2.00x, because you halved the bytes and the loop was bandwidth-bound the whole time.
+    - You are asked what a feature costs and answer with a model name instead of a dollar figure, which means you cannot tell whether it is affordable.
+
+    ### The mechanisms, in full
+
+    - **Decode reads the weights once per step, so throughput is bandwidth over bytes.** A 70B model in fp16 is 70e9 x 2 = **140 GB** of weights. At HBM bandwidth of 3.35 TB/s one step takes 140/3350 = **41.79 ms**. At batch 1 that is **23.9 tokens/second** — not because the GPU is slow, but because 41.79 ms is the time to stream the parameters past the multipliers.
+    - **The roofline ridge point decides the regime.** $494.5\times10^{12}$ FLOP/s divided by $3.35\times10^{12}$ B/s is **147.6 FLOP/byte**. Decode at batch 1 has intensity $2P/2P = 1.0$ — **148x below the ridge** — so it is unambiguously memory-bound. That ratio, not the FLOP count, is what you optimise.
+    - **Cost per million tokens is price over throughput, and batching divides it by exactly the batch.** At 2.50 USD per GPU-hour on 2 GPUs: batch 1 gives 23.9 tok/s and **58.04 USD/M**; batch 32 gives 765.7 tok/s and **1.814 USD/M**; batch 256 gives 6,125.7 tok/s and **0.227 USD/M**. Each step is exactly the batch multiple because the weight read is amortised and nothing else changed.
+    - **The KV cache is what actually caps the batch.** For 80 layers, 8 KV heads, head dim 128, fp16: $2\times80\times8\times128\times2 = 327{,}680$ bytes = **320 KiB per token**. At 4k context that is 1.25 GiB per sequence, so batch 32 needs **40.0 GiB**. At 32k it is 10.00 GiB per sequence and batch 32 needs **320.0 GiB**, which does not fit on four 80 GB cards. The batch you can run is a function of context, not of model size.
+    - **Prefill is the opposite regime and is compute-bound.** A 4,096-token prompt costs $2PT = 2\times70\times10^{9}\times4096 \approx 5.73\times10^{14}$ FLOPs: 1,160 ms at peak, about **2,900 ms at 40% MFU**. Prefill intensity is 4,096 FLOP/byte against decode's 1.0 — three orders of magnitude apart, which is why the phases need different optimisation.
+    - **Quantisation buys exactly the byte ratio, not the precision ratio.** int8 weights are 70 GB, so the step halves to **20.90 ms** and throughput doubles — a measured **2.00x**, not the 4x that comparing int8 to fp32 suggests. In a memory-bound loop you get bytes and nothing more.
+    - **First-token latency and token cost are separate budgets.** Time to first token is dominated by prefill; time per output token is the 41.79 ms decode step. A 4,000-token prompt generating 10 tokens spends 2,900 ms in prefill against 418 ms in decode — over 85% prefill, so optimising decode there is wasted work.
+    - **MFU converts the roofline into a real number, and only for prefill.** At 40% MFU the effective compute ceiling is 197.8 TFLOP/s and every prefill estimate is about 2.5x worse than the peak figure. Decode is untouched by MFU because it is not using the compute units — which is why decode efficiency is quoted as a fraction of bandwidth instead.
+    - **Total cost is the model plus its memory.** Two 80 GiB cards hold 130.4 GiB of weights with 29.6 GiB left: room for a batch of 23 at 4k context and nothing at 32k. The honest configuration is 4 GPUs, where 189.6 GiB of cache buys 151 sequences at 4k. Quoting an hourly price for "a 70B model" without the KV budget is quoting a number that cannot run.
+    - **The price is only meaningful with batch and context attached.** The same model on the same hardware spans **58.04 USD/M to 0.227 USD/M** across batch 1 to 256, and context changes the maximum batch by an order of magnitude. A figure without batch, context, precision and GPU count is not a comparison, it is a number.
+  derivations:
+    - title: "Throughput and cost per token from the memory bound"
+      latex: |
+        Weights must be read once per decode step:
+        $$t_{\text{step}} = \frac{2P}{B_{\text{HBM}}}.$$
+        With $B$ sequences decoded together,
+        $$\text{tok/s} = \frac{B}{t_{\text{step}}} = \frac{B\,B_{\text{HBM}}}{2P},$$
+        and at price $c$ per GPU-hour over $N$ GPUs,
+        $$\frac{\$}{10^{6}\text{ tok}} = \frac{N c}{3600}\cdot\frac{2P}{B\,B_{\text{HBM}}}\cdot 10^{6}.$$
+      prose: >-
+        Every factor except $B$ is constant, so cost is exactly inversely
+        proportional to batch size. "Batch 32 is 32x cheaper" is not an
+        empirical observation, it is the algebra.
+    - title: "KV memory and the batch that fits"
+      latex: |
+        Per token per sequence, $\text{KV} = 2LH_{kv}db$. For $S$ sequences at
+        context $C$ the cache is $S\cdot C\cdot\text{KV}$, so with $M$ bytes
+        available
+        $$S_{\max} = \frac{M}{C\cdot \text{KV}}.$$
+      prose: >-
+        The inverse dependence on $C$ is the whole story of long-context
+        serving: eight times the context is one eighth the batch at fixed
+        memory, so per-token cost rises even though the model is unchanged.
+    - title: "Prefill cost and where MFU enters"
+      latex: |
+        $$t_{\text{prefill}} = \frac{2PT}{\eta F_{\text{peak}}}.$$
+        For $P=70\times10^{9}$, $T=4096$, $F_{\text{peak}}=494.5$ TFLOP/s and
+        $\eta=0.40$:
+        $$t = \frac{2(70\times10^{9})(4096)}{0.40\times494.5\times10^{12}} \approx 2.9\ \text{s}.$$
+      prose: >-
+        MFU appears here with full force and nowhere in the decode equation.
+        Halving MFU doubles first-token latency; it does not change the token
+        cost, because decode is not using the compute units.
+    - title: "Why int8 gives 2x and not 4x"
+      latex: |
+        Throughput scales as $b^{-1}$ where $b$ is bytes per parameter, so
+        $$\frac{\text{tok/s}(b_1)}{\text{tok/s}(b_2)} = \frac{b_2}{b_1}.$$
+        fp16 is 2 bytes and int8 is 1, so the ratio is exactly 2.
+      prose: >-
+        The speedup equals the byte ratio — never the parameter-count ratio and
+        never the comparison against fp32. A larger measured gain means some
+        other bottleneck moved as well.
+
+  implementations:
+    - language: python
+      title: "The cost model: throughput, price, and the batch that fits"
+      note: >-
+        Numerically WRONG as a capacity plan in three ways: it assumes 100% of
+        peak bandwidth (real decode reaches 60-80%), it ignores queueing and the
+        latency SLO that caps batch, and it counts weights only. Treat the
+        output as a floor; the reliable part is the ratio between rows.
+      code: |
+        def cost_model(params=70e9, bytes_per_param=2.0, bandwidth=3.35e12,
+                       gpu_price_hr=2.50, n_gpus=2, layers=80, kv_heads=8,
+                       head_dim=128, kv_bytes=2, context=4096,
+                       mem_per_gpu_gb=80):
+            weights = params * bytes_per_param
+            t_step = weights / bandwidth
+            kv_tok = 2 * layers * kv_heads * head_dim * kv_bytes
+            kv_seq = kv_tok * context
+            free = n_gpus * mem_per_gpu_gb * 2**30 - weights
+            bmax = int(max(free, 0) // kv_seq) if kv_seq else 0
+            rows = []
+            for B in (1, 8, 32, 128, 256):
+                Be = min(B, bmax) if bmax else B
+                tps = Be / t_step
+                rows.append({"requested": B, "effective": Be,
+                             "tok_s": round(tps, 1),
+                             "cost_per_mtok": round(n_gpus * gpu_price_hr
+                                                    / (tps * 3600) * 1e6, 3)})
+            return {"t_step_ms": round(t_step * 1e3, 2),
+                    "kv_per_token_kib": kv_tok // 1024,
+                    "max_batch_by_memory": bmax, "rows": rows}
+    - language: python
+      title: "Roofline classification"
+      note: >-
+        Numerically WRONG for anything but a single unfused kernel: it assumes
+        one intensity for the whole operation, which fails as soon as you fuse
+        ops (a fused softmax-cross-entropy moves fewer bytes than its parts).
+        Intensity near the ridge is also not a clean boundary, since real decode
+        kernels reach only part of peak bandwidth.
+      code: |
+        def roofline(flops, bytes_moved, peak_flops, bandwidth):
+            intensity = flops / bytes_moved
+            ridge = peak_flops / bandwidth
+            return {"intensity": intensity, "ridge": ridge,
+                    "bound": "compute" if intensity >= ridge else "bandwidth",
+                    "ratio_to_ridge": intensity / ridge}
+
+        P = 70e9
+        roofline(2 * P, 2 * P, 494.5e12, 3.35e12)              # bandwidth, 1.0
+        roofline(2 * P * 4096, 2 * P, 494.5e12, 3.35e12)       # compute, 4096
+
+  checkpoints:
+    - id: cp-1
+      question: "Why is decode throughput set by bandwidth rather than FLOPs?"
+      answerKind: short_text
+      hint: "Compute the arithmetic intensity of one decode step and compare it to the ridge."
+      solution: >-
+        One decode step on 70B does $2P$ FLOPs while reading $2P$ bytes, so its
+        intensity is **1.0 FLOP/byte** against a ridge of **147.6** — 148x
+        below. A kernel that far below the ridge is limited by bytes moved, so
+        time is 140 GB / 3.35 TB/s = **41.79 ms** and FLOPs never enter the
+        calculation.
+    - id: cp-2
+      question: "Batch 1 costs $58.04 per million tokens and batch 32 costs $1.814. Why exactly 32x?"
+      answerKind: short_text
+      hint: "Which term changes and which is fixed?"
+      solution: >-
+        The 41.79 ms step is fixed by weight bytes over bandwidth, so it
+        produces $B$ tokens instead of one. Tokens per second scale linearly in
+        $B$ and cost divides by tokens per second, so cost scales as $1/B$
+        exactly: 58.043/32 = 1.814, a ratio of 32.0 with no diminishing return.
+    - id: cp-3
+      question: "Your plan says batch 256 fits. At 32k context, what breaks?"
+      answerKind: short_text
+      hint: "Compute KV bytes per token, then per sequence, then for the batch."
+      solution: >-
+        The KV cache. At 320 KiB per token a 32k sequence needs **10.00 GiB**,
+        so batch 256 needs 2,560 GiB and even batch 32 needs **320.0 GiB** —
+        more than four 80 GB cards. Weights were never the constraint; context
+        length set the batch.
+    - id: cp-4
+      question: "You quantise fp16 to int8 and measure 2.00x. A colleague expected 4x. Who is right?"
+      answerKind: short_text
+      hint: "What is the byte ratio between fp16 and int8?"
+      solution: >-
+        The measurement. In a memory-bound loop the speedup equals the byte
+        ratio, and fp16 is 2 bytes against int8's 1, so the ceiling is **2.00x**.
+        The 4x figure comes from comparing int8 to fp32, which is a different
+        starting point.
+    - id: cp-5
+      question: "A request is 4,000 prompt tokens and 10 output tokens. Which phase dominates?"
+      answerKind: short_text
+      hint: "Compare prefill time against ten decode steps of 41.79 ms."
+      solution: >-
+        Prefill. Ten decode steps are **418 ms**, while prefill on 4,096 tokens
+        is 5.73e14 FLOPs — 1,160 ms at peak, about **2,900 ms at 40% MFU**.
+        Prefill is over 85% of the latency, so optimising decode there is wasted
+        effort; the levers are prompt length, chunked prefill, or a prefix cache.
+    - id: cp-6
+      question: "Why is a cost-per-token figure without batch size and context meaningless?"
+      answerKind: short_text
+      hint: "How far apart are the extremes measured here?"
+      solution: >-
+        Because they move the number by orders of magnitude: the same model on
+        the same hardware is **58.04 USD/M at batch 1 and 0.227 USD/M at batch 256**,
+        and context changes the maximum batch by an order of magnitude through
+        KV memory. Two figures compare only when batch, context, precision and
+        GPU count all match.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Decode reads every weight to make one token per sequence, so it is a
+        bandwidth measurement. Batching amortises that read, dividing cost by
+        the batch size exactly. The KV cache is what stops the batch growing.
+      blocks:
+        - kind: checklist
+          body: |
+            - Decode: time = weight bytes / bandwidth (41.79 ms for 70B fp16)
+            - Intensity 1.0 vs ridge 147.6 means memory-bound
+            - Cost per token proportional to 1/batch, exactly
+            - KV 320 KiB/token caps batch as context grows
+            - Prefill is compute-bound and is the first-token latency
+      checkpoint: >-
+        If you doubled HBM bandwidth, what happens to cost per million tokens at
+        fixed batch? What if you doubled FLOPs instead?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Classify the phase first: prefill is compute-bound, decode is
+        bandwidth-bound. Write the equation for that phase before touching the
+        config, then choose between quantising bytes and growing the batch.
+      blocks:
+        - kind: checklist
+          body: |
+            - Classify by intensity versus ridge point
+            - Decode: optimise bytes moved and batch within KV budget
+            - Prefill: optimise MFU and prompt length
+            - Report batch, context, precision and GPU count with any price
+            - Check KV memory before believing a batch plan
+      checkpoint: >-
+        Which phase benefits from a larger batch, and which benefits from a
+        shorter prompt?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The model in a dozen lines, including the memory check most plans forget.
+      blocks:
+        - kind: pseudocode
+          body: |
+            t_step    = (2 * params * bytes_per_param) / bandwidth
+            kv_token  = 2 * layers * kv_heads * head_dim * kv_bytes
+            kv_seq    = kv_token * context
+            max_batch = (gpu_mem * n_gpus - weights) / kv_seq
+
+            for B in candidates:
+                B_eff = min(B, max_batch)
+                tok_s = B_eff / t_step
+                cost  = (n_gpus * price_hr) / (tok_s * 3600) * 1e6
+      checkpoint: >-
+        What happens to max_batch if context doubles, and what does that do to
+        cost per token at a fixed request rate?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Four results worth memorising.
+      blocks:
+        - kind: math
+          body: |
+            **Step time.** $t_{\text{step}} = 2P / B_{\text{HBM}}$
+
+            **Cost per million tokens.**
+            $$\frac{\$}{10^6} = \frac{Nc}{3600}\cdot\frac{2P}{B\,B_{\text{HBM}}}\cdot 10^{6}$$
+
+            **Batch that fits.** $S_{\max} = M / (C \cdot 2LH_{kv}db)$
+
+            **Prefill with MFU.** $t_{\text{prefill}} = 2PT / (\eta F_{\text{peak}})$
+      checkpoint: >-
+        Using these, estimate the cost of 32k-context requests at batch 8 on
+        four GPUs. Which term surprises you?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete estimate with the memory cap, plus the roofline check that
+        tells you whether you are optimising the right phase.
+      blocks:
+        - kind: warning
+          body: >-
+            The reliable part of this output is the ratio between rows. Absolute
+            numbers assume full bandwidth and no queueing, so read them as a
+            floor.
+        - kind: code
+          language: python
+          body: |
+            P, bpp, BW = 70e9, 2.0, 3.35e12
+            L, Hkv, d, kbb = 80, 8, 128, 2
+            weights = P * bpp
+            t_step = weights / BW
+            kv_tok = 2 * L * Hkv * d * kbb
+            for ctx in (4096, 32768):
+                kv_seq = kv_tok * ctx
+                free = 4 * 80 * 2**30 - weights
+                bmax = int(free // kv_seq)
+                print(f"ctx {ctx}: kv/seq {kv_seq/2**30:.2f} GiB, max batch {bmax}")
+                for B in (8, 32):
+                    Be = min(B, bmax)
+                    tps = Be / t_step
+                    print(f"   batch {B}: {tps:8.1f} tok/s  "
+                          f"${4*2.50/(tps*3600)*1e6:7.3f}/M")
+      checkpoint: >-
+        At 32k context the max batch collapses. What three levers restore
+        throughput, and what does each cost?
+
+  problems:
+    - id: p-decode-throughput
+      title: "Decode throughput and cost per million tokens"
+      difficulty: easy
+      prompt: >-
+        Implement `decode_cost(params, bytes_per_param, bandwidth, batch,
+        gpu_price_hr, n_gpus)` returning a dict with `t_step_ms` (weight bytes
+        over bandwidth, in ms), `tok_s` (batch over step time) and
+        `cost_per_mtok` (n_gpus * price / (tok_s * 3600) * 1e6). Round to 2, 1
+        and 2 decimals respectively.
+      starter: |
+        def decode_cost(params, bytes_per_param, bandwidth, batch,
+                        gpu_price_hr=2.50, n_gpus=2):
+            # your implementation here
+            pass
+      language: python
+      entry: decode_cost
+      testCases:
+        - input: '[70000000000, 2.0, 3350000000000.0, 1]'
+          expected: '{"t_step_ms": 41.79, "tok_s": 23.9, "cost_per_mtok": 58.04}'
+          mode: json
+          tolerance: 5e-3
+        - input: '[70000000000, 2.0, 3350000000000.0, 32]'
+          expected: '{"t_step_ms": 41.79, "tok_s": 765.7, "cost_per_mtok": 1.81}'
+          mode: json
+          tolerance: 5e-3
+        - input: '[70000000000, 1.0, 3350000000000.0, 1]'
+          expected: '{"t_step_ms": 20.9, "tok_s": 47.8, "cost_per_mtok": 29.02}'
+          mode: json
+          tolerance: 5e-3
+      solution: |
+        def decode_cost(params, bytes_per_param, bandwidth, batch,
+                        gpu_price_hr=2.50, n_gpus=2):
+            weights = params * bytes_per_param
+            t_step = weights / bandwidth
+            tok_s = batch / t_step
+            cost = (n_gpus * gpu_price_hr) / (tok_s * 3600) * 1e6
+            return {"t_step_ms": round(t_step * 1e3, 2),
+                    "tok_s": round(tok_s, 1),
+                    "cost_per_mtok": round(cost, 2)}
+      solutionExplanation: >-
+        Batch 1 gives 41.79 ms per token and 23.9 tok/s. Batch 32 produces 32
+        tokens in the same 41.79 ms, so throughput is exactly 32x and cost
+        exactly 1/32. The int8 case halves the bytes, halves the step time and
+        doubles throughput: the 2.00x law, not 4x.
+      complexity: "O(1)"
+      tags: [inference, cost, roofline]
+
+    - id: p-kv-batch
+      title: "The batch that fits in memory"
+      difficulty: medium
+      prompt: >-
+        Implement `max_batch(params, bytes_per_param, layers, kv_heads,
+        head_dim, kv_bytes, context, mem_per_gpu_gb, n_gpus)` returning the
+        largest batch whose KV cache fits in memory left after the weights, as
+        an int. Use GiB (2**30 bytes).
+      starter: |
+        def max_batch(params, bytes_per_param, layers, kv_heads, head_dim,
+                      kv_bytes, context, mem_per_gpu_gb, n_gpus):
+            # your implementation here
+            pass
+      language: python
+      entry: max_batch
+      testCases:
+        - input: '[70000000000, 2.0, 80, 8, 128, 2, 4096, 80, 4]'
+          expected: '151'
+          mode: json
+          tolerance: 1e-9
+        - input: '[70000000000, 2.0, 80, 8, 128, 2, 32768, 80, 4]'
+          expected: '18'
+          mode: json
+          tolerance: 1e-9
+        - input: '[70000000000, 2.0, 80, 8, 128, 2, 4096, 80, 2]'
+          expected: '23'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def max_batch(params, bytes_per_param, layers, kv_heads, head_dim,
+                      kv_bytes, context, mem_per_gpu_gb, n_gpus):
+            weights = params * bytes_per_param
+            kv_tok = 2 * layers * kv_heads * head_dim * kv_bytes
+            kv_seq = kv_tok * context
+            free = n_gpus * mem_per_gpu_gb * 2**30 - weights
+            if free <= 0 or kv_seq <= 0:
+                return 0
+            return int(free // kv_seq)
+      solutionExplanation: >-
+        Four 80 GiB cards give 320 GiB, of which 130.4 is weights, leaving 189.6 GiB of
+        cache. At 4k each sequence needs 1.25 GiB so 151 fit; at 32k it needs
+        10 GiB and only 18 fit. Two cards leave just 29.6 GiB, enough for 23
+        sequences at 4k — the configuration that "supports 70B" but cannot batch
+        it.
+      complexity: "O(1)"
+      tags: [kv-cache, memory]
+
+    - id: p-roofline-bound
+      title: "Roofline: compute-bound or bandwidth-bound"
+      difficulty: easy
+      prompt: >-
+        Implement `roofline_bound(flops, bytes_moved, peak_flops, bandwidth)`
+        returning "compute" when flops/bytes_moved is at least
+        peak_flops/bandwidth, else "bandwidth".
+      starter: |
+        def roofline_bound(flops, bytes_moved, peak_flops, bandwidth):
+            # your implementation here
+            pass
+      language: python
+      entry: roofline_bound
+      testCases:
+        - input: '[140000000000, 140000000000, 494500000000000.0, 3350000000000.0]'
+          expected: '"bandwidth"'
+          mode: json
+          tolerance: 1e-9
+        - input: '[573440000000000000, 140000000000, 494500000000000.0, 3350000000000.0]'
+          expected: '"compute"'
+          mode: json
+          tolerance: 1e-9
+        - input: '[147600, 1, 494500000000000.0, 3350000000000.0]'
+          expected: '"compute"'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def roofline_bound(flops, bytes_moved, peak_flops, bandwidth):
+            intensity = flops / bytes_moved
+            ridge = peak_flops / bandwidth
+            return "compute" if intensity >= ridge else "bandwidth"
+      solutionExplanation: >-
+        Decode at batch 1 has intensity exactly 1.0 against a ridge of 147.6, so
+        it is bandwidth-bound by a wide margin. A 4k prefill has intensity 4,096
+        and is compute-bound. The third case sits exactly on the ridge and
+        resolves to "compute" under the >= test.
+      complexity: "O(1)"
+      tags: [roofline, performance]
+
+  try_it: >-
+    A 70B model in fp16 is 140 GB of weights on 3.35 TB/s of HBM. Compute one decode step as
+    140/3350 = 41.79 ms and batch-1 throughput as 23.9 tokens per second. Then compute the KV
+    cache for 80 layers, 8 KV heads and head dim 128 in fp16 and check it against 320 KiB per
+    token.
+  interview_questions:
+    - question: "Why is decode memory-bound, and what single number proves it rather than asserts it?"
+      level: mid
+      key_points:
+        - "Each decode step reads every weight to emit one token per sequence: 140 GB for a 70B in fp16, which is 41.79 ms at 3.35 TB/s."
+        - "At batch 1 the arithmetic intensity is 2P/2P = 1.0 FLOP per byte against a ridge point of 147.6, so it sits 148× below the crossover."
+        - "Prefill is the opposite regime at 4,096 FLOP per byte: a 4k prompt costs about 5.73e14 FLOPs, 1,160 ms at peak and roughly 2,900 ms at 40% MFU."
+        - "So decode is improved by moving fewer bytes and prefill by using more FLOPs, which is why the two phases need different optimisation."
+      follow_up: "At batch 32, how far does the intensity move, and does it change which resource you optimise?"
+    - question: "Cost per million tokens spans 58.04 dollars to 0.227 dollars for the same model. What explains a factor of 256?"
+      level: mid
+      key_points:
+        - "Cost per million is GPU price divided by throughput, and batching divides it by exactly the batch size because the step time is set by weight bytes."
+        - "Batch 1 gives 23.9 tokens per second and 58.04 dollars per million; batch 32 gives 765.7 and 1.814; batch 256 gives 6,125.7 and 0.227."
+        - "The arithmetic is exact rather than empirical: the weights are read once per step regardless of how many sequences are in it."
+        - "The improvement stops when the KV cache caps the batch — 320 KiB per token is 10.00 GiB per sequence at 32k context, so batch 256 does not exist."
+      follow_up: "Why does the 256× improvement disappear at 32k context?"
+    - question: "You quantise weights to int8 expecting four times the speed and measure exactly 2.00×. Explain the number."
+      level: senior
+      key_points:
+        - "The loop is bandwidth-bound, so the speedup equals the byte ratio rather than the precision ratio: fp16 weights are 140 GB and int8 weights are 70 GB."
+        - "The step halves from 41.79 to 20.90 ms and throughput doubles, which is 2.00× and not the 4× a comparison against fp32 would suggest."
+        - "The 4× figure is available only if you were serving fp32, which nobody does for a 70B model."
+        - "Quantising the cache on top helps less than the byte ratio suggests, because the cache is then a larger share of the remaining traffic."
+      follow_up: "Where would the 4× actually appear, and under what conditions?"
+  common_mistakes:
+    - "Estimating serving throughput from FLOPs, which predicts nothing for a decode loop whose arithmetic intensity is 1.0."
+    - "Quoting dollars per million tokens without batch, context, precision and GPU count — the same model spans 58.04 to 0.227 dollars per million."
+    - "Sizing a deployment for batch 256 on paper when the KV cache at 32k needs 320 GiB and only 18 sequences fit."
+  further_reading:
+    - label: "Williams, Waterman, Patterson, Roofline: An Insightful Visual Performance Model for Multicore Architectures, Communications of the ACM 2009"
+    - label: "Pope et al., Efficiently Scaling Transformer Inference, MLSys 2023"

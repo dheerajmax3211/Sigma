@@ -1,0 +1,93 @@
+id: "dist-data-parallel"
+title: "Data parallelism and all-reduce"
+minutes: 14
+order: 801
+params:
+  - { id: "g", label: "GPUs", min: 1, max: 64, step: 1, init: 8 }
+derived:
+  - { id: "comm", expr: "40 * (g - 1) / g" }
+  - { id: "eff", expr: "100 * 100 / (100 + comm)" }
+cards:
+  - kind: "story"
+    kicker: "Start here"
+    title: "Same model, different slices of data"
+    body:
+      - "**Data parallelism** puts a full copy of the model on every GPU. Each GPU takes a different slice of the batch and computes its own gradient."
+      - "Before the update, the GPUs must agree. An **all-reduce** averages the gradients across all of them, so every copy takes the same step and stays identical."
+    callout: "More GPUs means a bigger batch per step, not a bigger model."
+  - kind: "lab"
+    kicker: "See it"
+    title: "What the sync costs"
+    intro: "Each step takes 100 ms of compute. Averaging a 2 GB gradient adds a wait that grows with the GPU count, then levels off. **Drag the GPUs.**"
+    view:
+      type: "bars"
+      max: 140
+      items:
+        - { label: "compute per step (ms)", value: "100", color: "#38bdf8" }
+        - { label: "waiting on all-reduce (ms)", value: "comm", color: "#f97316" }
+    sliders:
+      - "g"
+    outro: "With {g} GPUs the wait is **{comm} ms**, so each GPU does useful work **{eff} percent** of the time. Real systems overlap the sync with the backward pass to hide most of it."
+  - kind: "code"
+    kicker: "Write it"
+    title: "Averaging gradients is exact"
+    intro: "Shard the data, average the shard gradients, and you get the full-batch gradient."
+    lang: "python"
+    code: |
+      xs = [1, 2, 3, 4]
+      ys = [2, 4, 6, 8]
+      w = 0.0
+
+      def grad(x, y, w):
+          return 2 * (w * x - y) * x
+
+      full = sum(grad(x, y, w) for x, y in zip(xs, ys)) / len(xs)
+
+      def shard_mean(idx):
+          return sum(grad(xs[i], ys[i], w) for i in idx) / len(idx)
+
+      gpu0 = shard_mean([0, 1])
+      gpu1 = shard_mean([2, 3])
+      allreduce = (gpu0 + gpu1) / 2
+
+      assert full == -30
+      assert (gpu0, gpu1) == (-10, -50)
+      assert allreduce == full
+    note: "This only holds when the shards are the same size. Uneven shards need a weighted average."
+  - kind: "lab"
+    kicker: "Memorise"
+    title: "One training step"
+    intro: "What happens on every step."
+    view:
+      type: "flow"
+      stages:
+        - { label: "Split", note: "Each GPU gets its own mini-batch.", color: "#38bdf8" }
+        - { label: "Backward", note: "Each GPU computes local gradients.", color: "#1cd6ac" }
+        - { label: "All-reduce", note: "Gradients are averaged across GPUs.", color: "#f97316" }
+        - { label: "Update", note: "Every copy applies the same step.", color: "#a78bfa" }
+  - kind: "check"
+    kicker: "Your turn"
+    title: "Why identical"
+    question: "Why must every GPU apply the same averaged gradient?"
+    options:
+      - { text: "So the model copies never drift apart", correct: true, why: "Different steps would make them different models." }
+      - { text: "To use less memory", why: "Each GPU still holds a full copy." }
+      - { text: "To make the batch smaller", why: "The batch grows." }
+      - { text: "Because the loss is zero", why: "No." }
+  - kind: "check"
+    kicker: "Practice"
+    title: "Limit"
+    question: "What does data parallelism NOT solve?"
+    options:
+      - { text: "A model too big to fit on one GPU", correct: true, why: "Every GPU holds the whole model." }
+      - { text: "Slow training on lots of data", why: "That is what it helps." }
+      - { text: "Large batches", why: "It enables them." }
+      - { text: "Averaging gradients", why: "It does that." }
+  - kind: "mistakes"
+    kicker: "Before you move on"
+    title: "Mistakes to avoid"
+    items:
+      - "**Forgetting to scale the learning rate with the batch.** A bigger batch often wants a bigger rate."
+      - "**Uneven last batch.** Pad or weight it."
+      - "**Different random seeds for init.** Copies must start identical."
+    next: { label: "Next: sharding memory with ZeRO and FSDP", href: "/learn/dist-zero-fsdp" }

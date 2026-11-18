@@ -1,0 +1,1167 @@
+id: gradient-stability
+slug: gradient-stability
+title: "Vanishing Gradients: Why a 1% Gain Error Costs 2.3 Decades"
+summary: >-
+  Read a deep network's backward pass as a product of Jacobians, measure the
+  per-layer gain, convert it into a decade budget, and pick the fix that changes
+  a factor in that product instead of the learning rate.
+kind: lesson
+difficulty: hard
+position: 12
+estMinutes: 26
+prerequisites: [backpropagation]
+phase: mathematical-foundations
+tags: [gradients, numerical-stability, jacobian, initialisation, residual-connections, clipping]
+
+body:
+  big_idea: >-
+    A deep gradient is a product of Jacobians, so its size is a sum of per-layer
+    logarithms: a 1% gain error loses 2.3 decades over fifty layers, and no fix changes
+    that rate.
+
+  problem:
+    - "Your 40-layer net trains, the loss falls to 0.31, then NaN — nothing warned you the gradient hit $10^{12}$ two steps earlier."
+    - "Your first three layers are still at their initial values after 10,000 steps: no error, no warning, just a model worse than a 6-layer baseline."
+    - "You add three blocks to a working architecture and it stops training: the only change is the exponent on a $0.92$."
+
+  analogy: |
+    Fifty amplifiers, each with a gain knob. Set every knob to 0.9 and a signal
+    leaves at $0.9^{50} = 0.005$ of its strength — silence. Set them to 1.1 and
+    it leaves 117 times louder. Set them to 1.01 and nothing seems wrong until
+    40% has gone. The knobs are the per-layer Jacobians; only their product
+    matters.
+
+  concept_points:
+    - "**The backward pass is a product of Jacobians, so book-keeping is logarithmic.** Unrolling $g_{l-1} = g_l J_l$ gives $g_0 = g_L \\prod_l J_l$, and $\\log_{10}$ turns the product into a sum. Fifty layers at gain $0.9$ leave $10^{-2.29}$; at $1.1$ they leave $10^{2.07}$, a 117× amplification. The trap: the loss is a function of the product and looks fine until it is a NaN."
+    - "**At critical init the typical gain is 1 and the worst-case gain is 2.** $\\mathbb{E}\\|Wx\\|^2 = \\sigma^2 n_{\\text{out}}\\|x\\|^2$, so a random direction is preserved at $\\sigma = 1/\\sqrt{n}$. Measured: RMS gain $0.998$–$1.002$ and spectral norm $1.94$–$2.01$, the Marchenko–Pastur edge $2\\sigma\\sqrt{n} = 2$. Quoting $\\sigma_{\\max}$ as the per-layer gain predicts $2^{50} = 1.1\\times10^{15}$ of explosion for a net that trains fine."
+    - "**Vanishing gradients are the default for saturating activations.** $\\sigma'(z) \\le 0.25$, so twenty logistic layers cost at least $0.25^{20} = 9.1\\times10^{-13}$. Measured on a 30-layer net: the first layer's gradient is $4.97\\times10^{-19}$ of the last — $0.63$ decades per layer. That is far above fp32's smallest normal, so nothing underflows: this is a loss of *significance*, not of range."
+    - "**Explosion is the same product above 1, and its signature is a delayed NaN.** At gain $1.5$ fifty layers give $1.5^{50} = 6.4\\times10^{8}$; fp16's largest value is $65{,}504$, so the same growth overflows at depth 28. The loss stays healthy because it is a *forward* quantity. Worse, clipping an already-overflowed tensor gives coefficient $0$, and `inf * 0` is `nan`."
+    - "**A healthy norm can hide a dead gradient.** At critical init, $n=64$: after 10 layers $\\sigma_{\\max} = 4.49$ and $\\sigma_{\\min} = 1.8\\times10^{-12}$; after 50 layers $\\sigma_{\\max} = 5.47$ and $\\sigma_{\\min} = 4.0\\times10^{-18}$ — condition number $1.4\\times10^{18}$, past $1/\\epsilon_{f64} = 4.5\\times10^{15}$, so the product is numerically singular. A dashboard showing only $\\|g\\|$ reports this as healthy."
+    - "**A residual changes $\\prod J_l$ into $\\prod (I + J_l)$, and the identity never decays.** The leading $I$ survives at every depth with coefficient exactly 1. Measured with branch $\\sigma_{\\max} = 0.2$: after 50 blocks the residual product has typical gain $2.62$, while the same product without the identity is $1.13\\times10^{-35}$. The exponent goes from $-0.70$ decades per block to $+0.008$."
+
+  definitions:
+    - term: "Backward amplification"
+      meaning: >-
+        The factor by which the loss gradient is multiplied on its way from layer
+        $L$ back to layer 1: $\prod_l \|J_l\|$. Everything in this topic is a
+        statement about that one number.
+    - term: "Spectral norm"
+      meaning: >-
+        $\|A\|_2 = \sigma_{\max}(A)$, the largest singular value — the worst-case
+        amplification of a vector by $A$. Submultiplicative, so it bounds the
+        product, but it is not what a typical gradient experiences.
+    - term: "Per-layer gain"
+      meaning: >-
+        The empirical factor $\|g_{l-1}\|/\|g_l\|$ between consecutive gradient
+        norms. This is the measurable quantity; it mixes the weight matrix, the
+        activation derivative, and the conditioning of the layer.
+    - term: "RMS gain"
+      meaning: >-
+        $\|W\|_F/\sqrt{n_{\text{in}}}$, the root-mean-square singular value. It
+        equals the expected amplification of a random unit vector and is the right
+        predictor of what training does; for a critical-init layer it is 1.0 while
+        $\sigma_{\max}$ is 2.0.
+    - term: "Critical initialisation"
+      meaning: >-
+        The weight scale at which a layer preserves the second moment of its input:
+        $\sigma^2 = 1/n_{\text{in}}$ for a linear layer (the fan-in convention, which
+        preserves the *backward* signal), $2/n_{\text{in}}$ after a ReLU (He), and
+        $2/(n_{\text{in}}+n_{\text{out}})$ for Glorot/Xavier.
+    - term: "Fan-in"
+      meaning: >-
+        The number of inputs a unit sums over, i.e. the number of columns of $W$
+        for a layer computing $xW^\top$. Every variance-preserving init is a
+        function of fan-in, which is why the same network needs a different constant
+        after a width change.
+    - term: "Marchenko–Pastur edge"
+      meaning: >-
+        The limiting largest singular value of a random matrix with i.i.d. entries
+        of variance $\sigma^2$: $\sigma(\sqrt{m}+\sqrt{n})$, which is
+        $2\sigma\sqrt{n}$ for a square matrix. It is why a critical-init layer has
+        $\sigma_{\max} = 2$.
+    - term: "Condition number (of the backward map)"
+      meaning: >-
+        $\kappa = \sigma_{\max}/\sigma_{\min}$ of the Jacobian product. It measures
+        how many directions survive: once $\kappa > 1/\epsilon$, the product is
+        numerically singular and the small directions carry no usable gradient.
+    - term: "Vanishing gradient"
+      meaning: >-
+        A per-layer gain below 1 sustained over depth, so the gradient at early
+        layers is below the precision of the numbers it is added to. The symptom is
+        early layers that never move; the cause is an exponent, not a bad step size.
+    - term: "Exploding gradient"
+      meaning: >-
+        A per-layer gain above 1 sustained over depth. The symptom is a loss that is
+        finite for a while and then NaN, or weights that jump by orders of magnitude
+        in one step. In low precision the overflow happens at a specific depth you
+        can compute in advance.
+    - term: "Residual stream"
+      meaning: >-
+        The identity path in $y = x + f(x)$. It contributes a factor of exactly 1 to
+        the backward product at every depth, so the product becomes
+        $\prod(I+J)$ rather than $\prod J$ and the typical path stops decaying
+        exponentially.
+    - term: "Global-norm clipping"
+      meaning: >-
+        Rescaling every gradient tensor by
+        $\min(1, \text{max\_norm}/\|\mathbf{g}\|_2)$ where the norm is over the
+        concatenation of all tensors. It preserves the update direction exactly,
+        which is why it is preferred to per-tensor or per-element clipping.
+    - term: "Dynamical isometry"
+      meaning: >-
+        The property that a layer's input–output Jacobian has all singular values
+        near 1, so signal and gradient norms are preserved in both directions. It is
+        achievable with orthogonal weights plus an activation-specific gain, and it is
+        the strongest form of the stability this topic is about.
+    - term: "Loss scale"
+      meaning: >-
+        A constant multiplier applied to the loss before the backward pass in fp16
+        training, so small gradients land in the representable range; gradients are
+        divided by it before the optimiser step. bf16 has fp32's exponent range and
+        does not need it, which is why bf16 replaced fp16 on modern accelerators.
+
+  diagrams:
+    - type: plot
+      title: "One gain error per layer is the whole story: log₁₀ gradient magnitude against depth"
+      chart: "line"
+      xLabel: "depth (layers)"
+      yLabel: "log₁₀ |gradient| relative to the seed"
+      series:
+        - name: "gain 0.25 (sigmoid at saturation)"
+          points:
+            - { x: 0, y: 0.0 }
+            - { x: 10, y: -6.0206 }
+            - { x: 20, y: -12.0412 }
+            - { x: 30, y: -18.0618 }
+            - { x: 40, y: -24.0824 }
+            - { x: 50, y: -30.103 }
+        - name: "gain 0.9 (1% shrink per layer)"
+          points:
+            - { x: 0, y: 0.0 }
+            - { x: 10, y: -0.4576 }
+            - { x: 20, y: -0.9151 }
+            - { x: 30, y: -1.3727 }
+            - { x: 40, y: -1.8303 }
+            - { x: 50, y: -2.2879 }
+        - name: "gain 1.0 (critical)"
+          points:
+            - { x: 0, y: 0.0 }
+            - { x: 10, y: 0.0 }
+            - { x: 20, y: 0.0 }
+            - { x: 30, y: 0.0 }
+            - { x: 40, y: 0.0 }
+            - { x: 50, y: 0.0 }
+        - name: "gain 1.1 (1% growth per layer)"
+          points:
+            - { x: 0, y: 0.0 }
+            - { x: 10, y: 0.4139 }
+            - { x: 20, y: 0.8279 }
+            - { x: 30, y: 1.2418 }
+            - { x: 40, y: 1.6557 }
+            - { x: 50, y: 2.0696 }
+        - name: "gain 1.5"
+          points:
+            - { x: 0, y: 0.0 }
+            - { x: 10, y: 1.7609 }
+            - { x: 20, y: 3.5218 }
+            - { x: 30, y: 5.2827 }
+            - { x: 40, y: 7.0437 }
+            - { x: 50, y: 8.8046 }
+    - type: plot
+      title: "The norm stays healthy while the condition number explodes (n = 64, critical init)"
+      chart: "line"
+      xLabel: "depth (number of multiplied random matrices)"
+      yLabel: "log₁₀ singular value of the product"
+      series:
+        - name: "log₁₀ σ_max — the worst direction"
+          points:
+            - { x: 1, y: 0.287 }
+            - { x: 5, y: 0.528 }
+            - { x: 10, y: 0.652 }
+            - { x: 25, y: 0.749 }
+            - { x: 50, y: 0.738 }
+        - name: "log₁₀ σ_min — the direction that dies"
+          points:
+            - { x: 1, y: -2.047 }
+            - { x: 5, y: -6.833 }
+            - { x: 10, y: -11.74 }
+            - { x: 25, y: -16.767 }
+            - { x: 50, y: -17.397 }
+    - type: architecture
+      title: "Where the identity term lives in a residual block's backward pass"
+      nodes:
+        - id: gout
+          x: 0
+          y: 1
+          label: "g at block output"
+          kind: client
+          detail: >-
+            The cotangent arriving from block l+1. Everything below is one
+            application of the chain rule, the same VJP from *Backpropagation*.
+        - id: ident
+          x: 1
+          y: 0
+          label: "identity path"
+          kind: cache
+          detail: >-
+            Contributes g × 1 exactly. No weight, no activation, no decay — the
+            factor is 1.0 at depth 1 and at depth 200. In the product expansion this
+            is the leading I term.
+        - id: branch
+          x: 1
+          y: 2
+          label: "residual branch J"
+          kind: model
+          detail: >-
+            Contributes g × J with σ_max(J) = 0.2 in the measured example. On its own
+            this product is 1.6e-140 after 200 blocks; as one term among many it is
+            a small correction.
+        - id: sum
+          x: 2
+          y: 1
+          label: "g_in = g(I + J)"
+          kind: server
+          detail: >-
+            Fan-out accumulation, exactly as in the tied-weight case: the two paths
+            into this node add. The sum is where the +1 comes from.
+        - id: prev
+          x: 3
+          y: 1
+          label: "block l−1"
+          kind: server
+          detail: >-
+            The next multiplication. Repeat 200 times and the norm grows like
+            sqrt(1 + c²) per block instead of c per block.
+      edges:
+        - { from: gout, to: ident, label: "g" }
+        - { from: gout, to: branch, label: "g" }
+        - { from: ident, to: sum, label: "× 1" }
+        - { from: branch, to: sum, label: "× J" }
+        - { from: sum, to: prev, label: "g(1+J)" }
+      caption: >-
+        The identity edge carries no parameters, which is exactly why it cannot
+        vanish: there is nothing in it to shrink. Every fix that claims to "improve
+        gradient flow" is either adding such an edge or rescaling a factor on the
+        other one.
+    - type: compare
+      title: "Two failure modes that look nothing alike in the logs"
+      left_label: "Vanishing (gain < 1)"
+      left_points:
+        - "Loss decreases, then flattens at a value a shallower model already beat"
+        - "Early layers' weights are unchanged from initialisation after 10k steps"
+        - "Gradient norms decay monotonically as you walk backwards through layers"
+        - "No NaN, no exception, no warning — the run 'succeeds'"
+        - "Fixes that change the exponent: init, activation, norm, residual"
+      right_label: "Exploding (gain > 1)"
+      right_points:
+        - "Loss is fine for 100-500 steps, then NaN — the delay is depth divided by the exponent"
+        - "Gradient norm grows geometrically; in fp16 it hits 65,504 and becomes inf"
+        - "One bad batch is enough once a single outlier direction is amplified"
+        - "Weights jump by orders of magnitude in one step; the checkpoint is unrecoverable"
+        - "Fixes: clipping for spikes, init/norm for structure — not the learning rate"
+    - type: pipeline
+      title: "Diagnose the exponent before choosing a fix"
+      nodes:
+        - label: "Log the per-layer gradient norm"
+          note: "‖∂L/∂h_l‖ for every l, every N steps"
+          detail: >-
+            Without this you have one number at the input and no way to tell a bad
+            init from a bad loss scale. The cost is one reduction per layer.
+        - label: "Compute successive ratios"
+          note: "gain_l = ‖g_{l−1}‖ / ‖g_l‖"
+          detail: >-
+            This is the empirical per-layer gain. It already includes the activation
+            derivative, so it is the number that matters. Guard against zero
+            denominators — a dead ReLU layer gives exactly 0.
+        - label: "Convert to a decade budget"
+          note: "Σ log₁₀ gain_l over the depth"
+          detail: >-
+            Compare the total with the 7.2 usable decades of fp32 precision, not
+            with 76. A total of −2 decades is a fixable drift; −19 is a dead network.
+        - label: "Find the layer where it breaks"
+          note: "the first l with gain far from 1"
+          detail: >-
+            A single layer with gain 0.01 is a bug (wrong fan-in, saturated
+            activation, a missing normalisation), not a depth problem. Uniform decay
+            across all layers is a scaling problem, and the fix is global.
+        - label: "Change a factor, then re-measure"
+          note: "one change, same seed, same step count"
+          detail: >-
+            Re-run the ratio measurement. If the exponent did not move, the change did
+            not touch the product — which rules out most of what people try first.
+
+  markdown: |
+    ## A gradient is a product, so count decades
+
+    Backpropagation gives one factor per layer. Unroll the recursion and the
+    gradient arriving at the first layer is
+
+    $$g_0 = g_L \prod_{l=1}^{L} J_l,$$
+
+    so its magnitude is a product of matrices, and the only tractable way to
+    reason about many factors near 1 is logarithms:
+
+    $$\log_{10}\|g_0\| \le \log_{10}\|g_L\| + \sum_{l=1}^{L} \log_{10}\|J_l\|_2.$$
+
+    That is the whole subject. A per-layer gain of 1.1 over 50 layers is
+    $10^{2.07}$; the same gain, mis-set to 0.9, is $10^{-2.29}$. Neither number is
+    large in the way a NaN or an overflow is large, and that is precisely why this
+    failure mode runs for weeks undiagnosed.
+
+    | gain per layer | depth 10 | depth 50 | depth 100 |
+    |---|---|---|---|
+    | 0.25 (sigmoid) | $9.5\times10^{-7}$ | $7.9\times10^{-31}$ | $7.5\times10^{-61}$ |
+    | 0.90 | 0.349 | 0.00515 | $2.7\times10^{-5}$ |
+    | 0.99 | 0.904 | 0.605 | 0.366 |
+    | 1.00 | 1.0 | 1.0 | 1.0 |
+    | 1.01 | 1.105 | 1.645 | 2.705 |
+    | 1.10 | 2.59 | 117 | $1.38\times10^{4}$ |
+    | 1.50 | 57.7 | $6.4\times10^{8}$ | $4.1\times10^{17}$ |
+
+    Read the 0.99 and 1.01 rows. One percent is inside the noise of any
+    hyperparameter search you have run, and at depth 500 it is a factor of
+    about 150 one way or the other. **Depth converts small relative errors into large
+    absolute ones, and the conversion rate is the log of the gain.**
+
+    ## What the layer actually multiplies by
+
+    For $W \in \mathbb{R}^{n\times n}$ with i.i.d. $\mathcal{N}(0,\sigma^2)$
+    entries, a random unit vector $x$ has
+
+    $$\mathbb{E}\|Wx\|^2 = \sigma^2 n \|x\|^2, \qquad
+      \|W\|_F^2 \approx \sigma^2 n^2, \qquad
+      \sigma_{\max}(W) \to 2\sigma\sqrt{n}.$$
+
+    Setting $\sigma = 1/\sqrt{n}$ makes the first expression 1 and the third 2.
+    Both statements are true and they answer different questions: the RMS gain
+    $\|W\|_F/\sqrt{n}$ is what a typical gradient sees, and $\sigma_{\max}$ is the
+    worst case, which matters once 50 layers have shaped the gradient into that
+    direction.
+
+    | $n$ | RMS gain $\|W\|_F/\sqrt{n}$ | $\sigma_{\max}$ |
+    |---|---|---|
+    | 64 | 0.9977 | 2.005 |
+    | 128 | 0.9949 | 1.939 |
+    | 256 | 1.0017 | 1.992 |
+    | 512 | 1.0009 | 1.979 |
+
+    So a critical-init layer is a gain-1 object with a gain-2 worst case. Networks
+    train because the typical vector is preserved; they occasionally explode
+    because the worst vector is not.
+
+    ## The condition number, which the norm hides
+
+    Multiply 50 such matrices and the picture splits:
+
+    | depth | $\sigma_{\max}$ | $\sigma_{\min}$ | condition |
+    |---|---|---|---|
+    | 1 | 1.94 | $9.0\times10^{-3}$ | $2.2\times10^{2}$ |
+    | 5 | 3.37 | $1.5\times10^{-7}$ | $2.3\times10^{7}$ |
+    | 10 | 4.49 | $1.8\times10^{-12}$ | $2.5\times10^{12}$ |
+    | 25 | 5.61 | $1.7\times10^{-17}$ | $3.3\times10^{17}$ |
+    | 50 | 5.47 | $4.0\times10^{-18}$ | $1.4\times10^{18}$ |
+
+    The largest singular value barely moves — 1.94 to 5.47 across fifty layers, not
+    $2^{50}$ — because each new Jacobian rotates the signal away from the previous
+    one's top singular direction. The smallest collapses by fifteen orders of
+    magnitude. Since $1/\epsilon_{f64} = 4.5\times10^{15}$, the depth-50
+    product is **numerically singular in float64**. That is the precise form of
+    "the gradient vanished": not that its norm is small, but that the map has
+    squeezed most directions below the rounding threshold, so the parameter
+    directions that correspond to those singular values receive nothing usable.
+
+    Monitoring $\|g\|$ alone is therefore not a diagnostic: a network whose
+    gradient norm is 0.3 can still have a backward map that is rank-deficient to
+    machine precision.
+
+    ## Two failure modes, one exponent
+
+    **Sigmoid.** $\sigma' \le 0.25$, so $0.25^{20} = 9.1\times10^{-13}$. Measured
+    on a 30-layer, width-128 net with Xavier init: the first layer's gradient is
+    $4.97\times10^{-19}$ of the last's — $0.63$ decades per layer, matching the
+    $0.25$ bound to two digits. This is not a tuning problem. No learning rate
+    recovers a factor of $10^{19}$.
+
+    **ReLU.** Halves the second moment, so the gain is $1/\sqrt{2} = 0.707$ and
+    thirty layers cost $3.05\times10^{-5}$. He init, $\sigma^2 = 2/n$, is exactly
+    the factor of two that repays it; measured, the 30-layer ratio goes from
+    $1.10\times10^{-4}$ to $2.56$.
+
+    **Explosion.** A gain of 1.5 crosses fp16's maximum of 65,504 at depth 28
+    ($1.5^{28} = 85{,}223$) and fp32's maximum of $3.4\times10^{38}$ at depth 219.
+    The loss curve does not show it until the weights have grown enough to affect
+    the forward pass, which is why the NaN arrives late and without warning.
+
+    ## Five fixes, and the factor each one changes
+
+    | fix | factor it changes | measured effect | what it costs |
+    |---|---|---|---|
+    | critical / orthogonal init | the matrix gain | 2.0 or 0.7 → 1.00 ± 0.03 | needs the right fan-in and the right activation |
+    | activation choice | $\varphi'(z)$ | 0.25 → 1.0 per layer | ReLU dead units; smoothness |
+    | normalisation | the conditioning of each $J_l$ | keeps the gain near 1 independent of depth | batch dependence, an extra reduction |
+    | residual connection | $\prod J \to \prod(I+J)$ | −0.70 → +0.008 decades per block | memory, and $(1+c)^L$ still grows |
+    | global-norm clipping | the final norm only | bounds the step, leaves the direction | cannot fix vanishing; changes the objective |
+
+    Only the first four change an exponent. Clipping changes a constant, which is
+    why it is the right answer for a spike and the wrong answer for a trend.
+
+    ## Measure before you fix
+
+    Log $\|\partial L/\partial h_l\|$ per layer, then take successive ratios. That
+    ratio is the empirical gain, invariant to the loss scale, batch size and
+    learning rate, so it isolates the thing you are fixing. Three patterns:
+
+    - **Uniform decay of about 0.6-0.9 per layer**: an init or activation problem.
+      Change $\sigma$ or the activation, not the optimiser.
+    - **One layer with a ratio near 0**: a bug in that layer — wrong fan-in, a
+      saturated activation, a missing normalisation, or a dead ReLU block.
+    - **Growing ratios that accelerate**: an explosion. Check the dtype range
+      first; the NaN is a symptom and the exponent is upstream of it.
+
+    ## Where this picture is incomplete
+
+    The product bound is a worst case, and the honest statement is about the
+    *distribution* of gains, not one number: a layer can have $\sigma_{\max} = 2$
+    and $\sigma_{\min} = 0.01$, and then "the gain" depends on which direction the
+    gradient occupies. The measurements above are for random Gaussian matrices;
+    trained networks are far from Gaussian, and a trained net often has a handful
+    of large singular values carrying most of the signal. That is not a refutation
+    of the analysis — it is the same phenomenon one level up: the spectrum is the
+    object, and the norm is a summary that loses the part you needed.
+
+    Nothing here explains why *training* sometimes recovers from a bad init. Batch
+    normalisation and residuals keep the forward pass well conditioned, and a net
+    can start at a 0.7 gain and end up training because the forward pass shifts the
+    activation distribution fast enough to move the Jacobian. The exponent gives the
+    direction and the rate, not the whole dynamics.
+
+    ## The longer version
+
+    The remaining mechanisms and failure modes, verbatim: what float32 range
+    actually buys you, why ReLU costs half the second moment and what He init
+    pays for it, orthogonal initialisation, and why Adam and clipping cannot
+    repair a structural exponent.
+
+    ### Failure modes, in full
+
+    - Your 40-layer net trains for 300 steps, the loss falls to 0.31, and then it is NaN. Every fix you try is a learning-rate change, because nothing in the stack told you the gradient had grown to 10^12 two steps before the NaN.
+    - The first three layers of your model are still at their initial values after 10,000 steps. There is no error and no warning — just a model that is slightly worse than a 6-layer baseline, forever.
+    - You switch to fp16 for throughput, the loss goes NaN within a hundred steps, and the conclusion in the ticket is "fp16 is unstable" rather than "the gradient exceeded 65,504".
+    - You add three blocks to a working architecture and it stops training. The design is identical; the only thing that changed is the exponent on a 0.92.
+    - An interviewer asks why residual connections help, and "they let gradients flow" is a phrase, not an answer. The answer is one term in a product expansion, and it has a number attached.
+    - You add LayerNorm, the loss starts moving, and you conclude that normalisation fixes vanishing gradients. It does not; it rescales each layer's input so the *conditioning* improves. Knowing which of the two happened is the difference between a fix you can reason about and one you cargo-cult.
+
+    ### The mechanisms, in full
+
+    - **The backward pass is a product of Jacobians, so the only honest book-keeping is in logarithms.** From *Backpropagation*, one step is $g_{l-1} = g_l J_l$, and unrolling gives $g_0 = g_L \prod_{l=1}^{L} J_l$. Submultiplicativity bounds the norm by $\|g_0\| \le \|g_L\| \prod_l \|J_l\|_2$, and taking $\log_{10}$ turns that product into a sum: $\log_{10}\|g_0\| \approx \log_{10}\|g_L\| + \sum_l \log_{10}\text{gain}_l$. At the two ends: 50 layers at a gain of $0.9$ leave $10^{-2.29}$ — half a percent of the signal — while $1.1$ leaves $10^{2.07}$, a 117× amplification. Same architecture, same data, same optimiser. The trap is that you monitor the loss, which is a function of the product and therefore looks unremarkable right up to the step where it is a straight line or a NaN.
+    - **At the critical init the typical gain is exactly 1 and the worst-case gain is 2, and confusing the two is the most common analytical error.** For $W$ with i.i.d. $\mathcal{N}(0,\sigma^2)$ entries acting on a unit-norm $x$, $\mathbb{E}\|Wx\|^2 = \sigma^2 n_{\text{out}}\|x\|^2$, so a random direction is preserved when $\sigma^2 n_{\text{out}} = 1$; for a square layer that is $\sigma = 1/\sqrt{n}$, and the same algebra gives the RMS gain $\|W\|_F/\sqrt{n_{\text{in}}} = \sigma\sqrt{n_{\text{out}}} = 1$. Measured at $n = 64, 128, 256, 512$: RMS gains $0.9977$, $0.9949$, $1.0017$, $1.0009$ and spectral norms $2.005$, $1.939$, $1.992$, $1.979$ — the Marchenko–Pastur edge $2\sigma\sqrt{n} = 2$. So this layer amplifies its worst direction by 2 and its typical direction by 1. Quote $\sigma_{\max}$ as "the per-layer gain" and you predict $2^{50} = 1.1\times10^{15}$ of explosion for a network that trains fine, because a random gradient does not point along the top singular vector. The measurement that settles it is the ratio of successive gradient norms, $\|g_{l-1}\|/\|g_l\|$: that is the empirical gain, and it is invariant to the loss scale.
+    - **Vanishing gradients are the default for saturating activations, and the rate is a property of the derivative, not of the optimiser.** The logistic derivative is $\sigma'(z) = \sigma(z)(1-\sigma(z)) \le 0.25$, attained at $z=0$, so twenty layers cost at least $0.25^{20} = 9.1\times10^{-13}$. Measured on a 30-layer, width-128 net with Xavier init and logistic activations: the first layer's gradient norm is $4.97\times10^{-19}$ of the last layer's — $0.63$ decades lost per layer, which is $10^{-0.63} = 0.234$, indistinguishable from the $0.25$ bound. Note what that number is *not*: $4.97\times10^{-19}$ is far above fp32's smallest normal ($1.18\times10^{-38}$), so nothing underflows and no exception is raised. It is simply $4.97\times10^{-19}$ in a sum whose other terms are $O(1)$, which means it rounds to zero. Vanishing gradients are a loss of *significance*, not of range.
+    - **Explosion is the same product on the other side of 1, and its signature is a delayed NaN.** At a per-layer gain of $1.5$, fifty layers give $1.5^{50} = 6.4\times10^{8}$ and a hundred give $4.1\times10^{17}$; fp16's largest finite value is $65{,}504$, whose log is $4.816$, so the same growth overflows at depth 28 ($1.5^{28} = 85{,}223$). This is why the loss is healthy for a few hundred steps and then NaN: the gradient grows geometrically, but the loss is a *forward* quantity and only starts moving once the weights are large enough to matter. Worse, clipping is applied to the already-overflowed tensor: a global norm of `inf` gives a coefficient of zero, and `inf * 0` is `nan`, so the clip converts an overflow into a NaN instead of into a bounded step.
+    - **A healthy norm can hide a dead gradient: the condition number of the product decides how many directions survive.** At critical init, $n=64$, averaged over 20 draws: after 10 layers $\sigma_{\max} = 4.49$ and $\sigma_{\min} = 1.8\times10^{-12}$; after 50 layers $\sigma_{\max} = 5.47$ (sd 2.08) and $\sigma_{\min} = 4.0\times10^{-18}$, a condition number of $1.4\times10^{18}$. Since $1/\epsilon_{f64} = 4.5\times10^{15}$, the product is **numerically singular in float64** — the small singular directions are destroyed by rounding *inside* the product, not by its magnitude. The backward map therefore collapses a wide set of input directions into a narrow subspace, and the parameter directions that correspond to its small singular values receive no usable gradient. A dashboard showing only $\|g\|$ reports this as healthy.
+    - **You do not have 76 decades of float32 range; you have 7 decades of relative precision.** fp32 spans $1.18\times10^{-38}$ to $3.40\times10^{38}$ — $76.5$ decades, the number people quote. But the mantissa is 24 bits, so anything smaller than the unit roundoff $2^{-24} \approx 6.0\times10^{-8}$ relative to the value it is added to is rounded away: $\log_{10}(2^{24}) = 7.22$ decades. bf16 keeps 8 mantissa bits, so $\epsilon_{\text{bf16}} = 2^{-8} = 3.9\times10^{-3}$ — 2.4 decimal digits, and accumulating a gradient into a bf16 buffer silently drops any contribution below 0.4% of the running total. This is the entire argument for mixed precision with a loss scale: you are not protecting the range, you are protecting the bottom 7 decades of the mantissa.
+    - **ReLU throws away half the second moment, and He init is exactly the factor that pays for it.** For symmetric pre-activations, $\mathbb{E}[\operatorname{relu}(z)^2] = \tfrac12\mathbb{E}[z^2]$, so a ReLU layer at LeCun init has gain $1/\sqrt{2} = 0.707$; thirty layers give $0.707^{30} = 3.05\times10^{-5}$. Measured on the 30-layer net: the 30-layer ratio is $1.10\times10^{-4}$ at $\sigma = 1/\sqrt{n}$ (worse than the prediction, because dead units compound) and $2.56$ at $\sigma = \sqrt{2/n}$, a per-layer gain of $1.03$. He init restores unit gain to within 3%. The trap is one init rule for every activation: Xavier is calibrated for $\tanh$, and applying it to a ReLU net costs about 0.15 decades per layer for no reason.
+    - **A residual connection changes the product from $\prod J_l$ to $\prod (I + J_l)$, and the identity factor never decays.** Expanding, $\prod_{l=1}^{L}(I+J_l) = I + \sum_l J_l + \sum_{l<l'} J_lJ_{l'} + \dots$, and the leading $I$ is present at every depth with coefficient exactly 1. Measured with every branch Jacobian normalised to $\sigma_{\max} = 0.2$, $n=64$, mean of 20 draws: after 50 blocks the residual product has $\sigma_{\max} = 8.40$ and a typical gain of $2.62$; after 200 blocks $\sigma_{\max} = 254$ and typical gain $46.9$. The same product *without* the identity is $1.13\times10^{-35}$ at 50 blocks and $1.61\times10^{-140}$ at 200. The exponent goes from $-0.70$ decades per block to $+0.008$ decades per block. Residuals do not bound the worst case — $(1+c)^L$ still grows — they remove the exponential decay of the typical path, which is what "gradients flow" means when you write it down.
+    - **Orthogonal initialisation makes the matrix gain exactly 1, and the activation still sends you a bill.** A matrix whose singular values are all 1 has $\sigma_{\max} = \sigma_{\min} = 1$, so any product of them has gain exactly 1 at any depth, with condition number 1 — the idealised deep linear network. But $h = \operatorname{relu}(Wx)$ still multiplies the norm by $1/\sqrt{2}$, so dynamical-isometry init uses $\sqrt{2}\cdot$orthogonal for ReLU. The factor is $1/\varphi'(0)$ for a saturating activation — $1$ for $\tanh$, and $4$ for the logistic, which is the whole reason sigmoid nets do not train at depth. And the correction drifts: with unit-variance pre-activations the measured mean derivative of $\tanh$ is $\mathbb{E}[\operatorname{sech}^2(z)] = 0.606$, so a $\tanh$ net that starts critical decays at $0.22$ decades per layer once it leaves the linear regime. Orthogonalising fixes the matrix and leaves the activation's bill unpaid.
+    - **Adam rescales away a constant factor and clipping bounds the norm; neither fixes a structural exponent.** Adam's step is $\hat m/(\sqrt{\hat v}+\epsilon)$ with $\epsilon = 10^{-8}$, so a gradient of $10^{-12}$ produces a step $10^{-4}$ of the nominal one — per-parameter normalisation buys scale invariance down to $\epsilon$ and then stops. A direction whose singular value is $4\times10^{-18}$ has no gradient left to normalise at all. Clipping by global norm, $\text{coef} = \min(1, \text{max\_norm}/\|\mathbf{g}\|_2)$, preserves the direction and shortens the step: with $\text{max\_norm} = 1$ and $\|\mathbf{g}\| = 100$ the coefficient is $0.01$. That is the right tool for an intermittent spike from one bad batch, and the wrong tool for a 50-layer product whose exponent is 1.1 — it turns every step into the same clipped crawl, which is a different optimisation problem, not a fixed one.
+
+
+  derivations:
+    - title: "The gradient norm is bounded by a product, and the product is a sum in log space"
+      latex: |
+        With $g_{l-1} = g_l J_l$ for $l = L, \dots, 1$,
+        $$g_0 = g_L J_L J_{L-1} \cdots J_1.$$
+        The spectral norm is submultiplicative, $\|AB\|_2 \le \|A\|_2\|B\|_2$, so
+        $$\|g_0\|_2 \le \|g_L\|_2 \prod_{l=1}^{L}\|J_l\|_2.$$
+        Taking $\log_{10}$ of both sides turns the bound into an additive budget:
+        $$\log_{10}\|g_0\|_2 \le \log_{10}\|g_L\|_2 + \sum_{l=1}^{L}\log_{10}\sigma_{\max}(J_l).$$
+        With a constant gain $c$, the sum is $L\log_{10} c$: at $c = 0.9$ and
+        $L = 50$ that is $-2.29$; at $c = 1.1$ it is $+2.07$.
+      prose: >-
+        The inequality is the only thing you need in order to stop treating a deep
+        network's gradient as an opaque number. It also tells you why the failure is
+        invisible at depth 12 (a 1% error is 0.05 decades) and why nobody believes it
+        until depth 1,700, where the same 1% has consumed all 7.2 decades of fp32
+        mantissa. Note that the bound is an inequality: the true norm can be much
+        smaller, because consecutive Jacobians rotate the signal away from each
+        other's top singular directions. That is the difference between a prediction
+        of explosion and an observation of stability.
+    - title: "Why the critical init is 1/√fan-in, and why the worst case is still 2"
+      latex: |
+        Let $W \in \mathbb{R}^{m\times n}$ have i.i.d. entries with variance
+        $\sigma^2$ and let $x$ be independent with $\|x\| = 1$. Each output
+        coordinate is $z_i = \sum_j W_{ij}x_j$ with
+        $$\mathbb{E}[z_i^2] = \sigma^2\sum_j x_j^2 = \sigma^2\|x\|^2,$$
+        so $\mathbb{E}\|z\|^2 = m\sigma^2\|x\|^2$ and the RMS gain is
+        $\sigma\sqrt{m}$. For a square layer $m = n$, and setting the gain to 1 gives
+        $$\sigma = \frac{1}{\sqrt{n}},$$
+        the LeCun/Xavier scale. (A rectangular layer needs $\sigma^2 = 1/n_{\text{out}}$
+        to preserve the forward signal and $1/n_{\text{in}}$ to preserve the backward
+        one; Glorot averages the two.) For the worst case, the largest singular value
+        of a Gaussian matrix converges to the Marchenko–Pastur edge
+        $$\sigma_{\max} \to \sigma(\sqrt{m}+\sqrt{n}) \;\overset{m=n}{=}\; 2\sigma\sqrt{n} = 2.$$
+        Adding an activation multiplies the gain by $\mathbb{E}[\varphi'(z)]$ in the
+        mean-field approximation, so the variance-preserving scale is
+        $\sigma^2 = g^2/n_{\text{out}}$ with $g = 1/\mathbb{E}[\varphi'(z)]$: $g = 1$ for
+        $\tanh$, $g = 2$ for ReLU (because $\mathbb{E}[\operatorname{relu}(z)^2] =
+        \tfrac12\mathbb{E}[z^2]$), $g = 4$ for the logistic.
+      prose: >-
+        Two numbers come out of the same calculation and they are not the same
+        number. The RMS gain of 1 is what makes the typical gradient survive; the
+        spectral norm of 2 is what makes the bound loose by a factor of two per
+        layer, and over 50 layers that looseness is $10^{15}$. Quoting the bound as
+        if it were the behaviour is the single most common way to mis-diagnose a
+        stable network as an exploding one.
+    - title: "Why an identity path changes the exponent"
+      latex: |
+        For a residual chain $h_{l} = h_{l-1} + f_l(h_{l-1})$ the per-block Jacobian
+        is $I + J_l$, so the backward product is
+        $$\prod_{l=1}^{L}(I+J_l) = I + \sum_{l=1}^{L}J_l + \sum_{l<l'} J_lJ_{l'} + \cdots + \prod_{l=1}^{L}J_l.$$
+        There are $2^L$ terms, and the first one is $I$ with coefficient exactly 1 at
+        every depth. Bounding the rest,
+        $$\left\|\prod_{l=1}^{L}(I+J_l) - I\right\| \le (1+c)^L - 1, \qquad c = \max_l\|J_l\|,$$
+        while for the plain product $\|\prod_l J_l\| \le c^L$. In the measured
+        example $c = 0.2$: at $L = 200$ the plain product has $\sigma_{\max} =
+        1.61\times10^{-140}$ and the residual product has $\sigma_{\max} = 254$.
+      prose: >-
+        The identity term is not a small correction — it is the term that survives.
+        For a random unit vector the residual product grows like $\sqrt{1+c^2}$ per
+        block rather than $c$ per block, which at $c = 0.2$ is 1.9% per block: a
+        gain, not a decay. The worst case still grows like $(1+c)^L$, so residuals
+        are not a bound on explosion; they are the removal of an exponential decay,
+        and that is the property the phrase "gradients flow" is trying to name.
+
+  implementations:
+    - language: python
+      title: "Depth diagnostic: per-layer gain and the decade budget"
+      note: >-
+        Numerically WRONG in three ways, each instructive. (1) It uses
+        $\sigma_{\max}$ of each weight matrix as the gain, which overestimates a
+        critical-init layer by 2x and will report "explosion" for a network that
+        trains — use the ratio of measured gradient norms instead, or
+        $\|W\|_F/\sqrt{n_{\text{in}}}$ if you have no gradients. (2) It divides
+        successive norms with no guard, so a dead ReLU layer whose gradient is
+        exactly 0 produces `nan` and poisons the whole sum. (3) It ignores the
+        activation derivative entirely, which is the dominant factor in the sigmoid
+        case: it will predict a stable 50-layer sigmoid net that in fact loses 31
+        decades.
+      code: |
+        import numpy as np
+
+        def layer_gains(weights):
+            """Worst-case per-layer gain of a stack of linear layers.
+
+            This is the bound, not the behaviour. See the note above: for a
+            random-init layer the typical gain is half this number.
+            """
+            out = []
+            for W in weights:
+                W = np.asarray(W, dtype=float)
+                s = np.linalg.svd(W, compute_uv=False)
+                out.append(float(s.max()))
+            return out
+
+        def decade_budget(gains):
+            """Total log10 amplification, and the depth at which it crosses fp32."""
+            gains = np.asarray(gains, dtype=float)
+            # Guard: a zero gain is -inf decades, which is a dead layer, not a
+            # number you can average.
+            safe = np.maximum(gains, 1e-300)
+            per_layer = np.log10(safe)
+            cumulative = np.cumsum(per_layer)
+            below = np.nonzero(cumulative < np.log10(1.2e-7))[0]
+            return {
+                "log10_total": float(per_layer.sum()),
+                "decades_per_layer": float(per_layer.mean()),
+                "first_below_fp32_eps": int(below[0] + 1) if below.size else -1,
+            }
+
+        def measured_gain(norms):
+            """Empirical per-layer gain from logged gradient norms.
+
+            `norms` runs from the loss backwards (norms[0] is the last layer), so
+            the ratio norms[i+1]/norms[i] is what one more layer multiplies by.
+            """
+            norms = np.asarray(norms, dtype=float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratios = norms[1:] / norms[:-1]
+            return ratios
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            Ws = [rng.normal(0, 1 / 8.0, (64, 64)) for _ in range(50)]
+            print(decade_budget(layer_gains(Ws)))
+    - language: python
+      title: "Orthogonal init that survives a ReLU, and what it cannot fix"
+      note: >-
+        Numerically WRONG in two ways. (1) For a rectangular layer with
+        $n_{\text{out}} < n_{\text{in}}$, the first $n_{\text{out}}$ columns of `Q`
+        are an orthonormal basis of the row space, so the map is a projection and its
+        gain on a random input is $\sqrt{n_{\text{out}}/n_{\text{in}}} < 1$ — the
+        code below silently loses signal on exactly the layers people forget about.
+        (2) It applies the $\sqrt{2}$ ReLU correction unconditionally, so using it
+        with $\tanh$ gives a per-layer gain of 1.41 and an explosion at depth 100
+        ($1.41^{100} = 8.6\times10^{14}$). Orthogonal weights make the *matrix*
+        isometric; the activation is a separate factor and the caller must supply
+        the right one.
+      code: |
+        import numpy as np
+
+        def orthogonal_init(n_out, n_in, gain=1.0, seed=0):
+            """Semi-orthogonal weights with all singular values equal to `gain`.
+
+            For n_out <= n_in this is a scaled Stiefel matrix: W W^T = gain^2 I,
+            so sigma_max = sigma_min = gain and the condition number is 1.
+            """
+            rng = np.random.default_rng(seed)
+            a = rng.normal(size=(max(n_out, n_in), min(n_out, n_in)))
+            q, r = np.linalg.qr(a)
+            # QR's sign convention is arbitrary; fix it so the result is
+            # deterministic across LAPACK versions.
+            q = q * np.sign(np.diag(r))
+            if n_out > n_in:
+                q = q.T
+            return gain * q[:n_out, :n_in]
+
+        def activation_gain(act):
+            """The factor that repays the activation's own attenuation."""
+            if act == "relu":
+                return np.sqrt(2.0)      # E[relu(z)^2] = 0.5 E[z^2]
+            if act == "tanh":
+                return 1.0               # tanh'(0) = 1
+            if act == "sigmoid":
+                return 4.0               # sigma'(0) = 0.25
+            raise ValueError(act)
+
+        def check(W):
+            s = np.linalg.svd(np.asarray(W, float), compute_uv=False)
+            return {"sigma_max": float(s.max()), "sigma_min": float(s.min()),
+                    "condition": float(s.max() / s.min())}
+
+        if __name__ == "__main__":
+            W = orthogonal_init(256, 256, gain=activation_gain("relu"))
+            print(check(W))    # sigma_max = sigma_min = 1.414, condition 1.0
+            # 100 layers of this preserve the norm exactly, in both directions,
+            # until the ReLU dead-unit rate drifts and the mean derivative moves.
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A 40-layer network has a measured per-layer gain of 0.92. What fraction of
+        the loss gradient reaches layer 1, and how many layers would it take for the
+        gradient to fall below fp32's relative precision?
+      answerKind: short_text
+      hint: >-
+        Multiply in log space: $\log_{10}(0.92) = -0.0362$ per layer.
+      solution: >-
+        $0.92^{40} = 10^{-1.448} = 0.036$, so 3.6% of the gradient survives 40
+        layers — enough to train, which is why this network works. The exponent is
+        the problem: to fall below fp32's unit roundoff of $6.0\times10^{-8}$ you
+        need $7.22/0.0362 = 199$ layers. At depth 200 the same architecture is dead,
+        and at depth 40 it is merely slow. Nothing about the *code* changed between
+        those two runs.
+    - id: cp-2
+      question: >-
+        Two layers both have $\|W\|_F/\sqrt{n} = 1.0$. The first has
+        $\sigma_{\max} = 1.0$; the second has $\sigma_{\max} = 2.0$. Which one can
+        you stack 100 deep, and why does the other fail even though its norm looks
+        identical?
+      answerKind: short_text
+      hint: >-
+        If $\sigma_{\max} = 2$ and the RMS singular value is 1, where must the rest
+        of the spectrum be?
+      solution: >-
+        The first is orthogonal: every singular value is 1, so $\kappa = 1$ and any
+        product has gain exactly 1 at any depth. The second is a Gaussian-like
+        matrix: with $\sigma_{\max} = 2$ and an RMS singular value of 1, most of the
+        spectrum must be below 1, and a 100-fold product drives those directions to
+        $\sigma_{\min} \sim 10^{-30}$ or lower. The gradient norm can still look
+        healthy while the map is numerically singular, so the second layer "works"
+        for 10 blocks and then quietly stops propagating anything but its top
+        direction. Identical $\|W\|_F$; opposite behaviour.
+    - id: cp-3
+      question: >-
+        Your gradient grows by 1.15× per layer and you train in fp16, whose largest
+        finite value is 65,504. At what depth does it overflow from a seed of 1.0,
+        and what would you see in the logs?
+      answerKind: short_text
+      hint: >-
+        $\log_{10}(65504) = 4.816$ and $\log_{10}(1.15) = 0.0607$.
+      solution: >-
+        $4.816/0.0607 = 79$ layers. The log shows a loss that decreases normally
+        for a few hundred steps and then becomes NaN; the step immediately before it
+        has a gradient norm of `inf` and a clip coefficient of 0, and `inf * 0` is
+        `nan`. In fp32 the same growth needs 634 layers, which is why the bug appears
+        when you move to fp16 and "disappears" when you move back — the exponent
+        never changed.
+    - id: cp-4
+      question: >-
+        A residual block's branch Jacobian has $\sigma_{\max} = 0.2$. Why does the
+        gradient not decay as $0.2^{L}$, and what does it do instead?
+      answerKind: short_text
+      hint: >-
+        Write the product as $\prod(I + J_l)$ and expand the first two terms.
+      solution: >-
+        Because the backward factor is $I + J$, not $J$. The leading term of the
+        expansion is the identity, with coefficient exactly 1 at every depth, so the
+        product cannot decay below the scale of that term. Measured with $c = 0.2$:
+        the plain product is $1.6\times10^{-140}$ after 200 blocks; the residual
+        product has $\sigma_{\max} = 254$ and a typical gain of $46.9$, i.e. growth
+        of about 0.008 decades per block. The worst case still grows as
+        $(1+c)^L$, so residuals remove the decay but do not bound the explosion.
+    - id: cp-5
+      question: >-
+        Adam's $\epsilon$ is $10^{-8}$. What happens to a parameter whose gradient
+        is $10^{-12}$, and why is $10^{-6}$ different?
+      answerKind: short_text
+      hint: >-
+        The update is $\hat m/(\sqrt{\hat v} + \epsilon)$; compare $\sqrt{\hat v}$
+        with $\epsilon$.
+      solution: >-
+        At steady state $\sqrt{\hat v} \approx |g|$, so the ratio is
+        $|g|/(|g|+\epsilon)$. For $g = 10^{-12}$ that is
+        $10^{-12}/(1.01\times10^{-8}) \approx 9.9\times10^{-5}$: the step is four
+        orders of magnitude smaller than a nominal one, and the parameter does not
+        move. For $g = 10^{-6}$ it is $0.99$: a full step. The crossover is
+        $\epsilon$ itself, which is the precise sense in which Adam "fixes scale" —
+        it normalises per parameter down to $10^{-8}$ and then behaves like SGD with
+        a step proportional to $g/\epsilon$. That is also why a gradient killed by
+        $\sigma_{\min} = 4\times10^{-18}$ is beyond rescue: there is nothing left to
+        normalise.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A deep network does not compute one derivative; it multiplies one small
+        factor per layer on the way back. If that factor is below 1 the early layers
+        receive a number too small to matter, and if it is above 1 they receive a
+        number too large to survive. The interesting quantity is not the size of the
+        gradient at any single place — it is the ratio between consecutive layers,
+        raised to the depth.
+      blocks:
+        - kind: checklist
+          body: |
+            Ask four questions, in this order:
+            - What is the gain of one layer, measured (not assumed)?
+            - Is it above or below 1.0, and by how much in log10?
+            - How many layers do I have, so what is the total exponent?
+            - Is the number I am looking at a norm, or a spectrum?
+        - kind: warning
+          body: >-
+            Tier 1 deliberately contains no formula for the fix. Before reading on,
+            write down which of these you believe: "the gradient is small", "the
+            gradient is badly conditioned", or "the gradient is fine and my learning
+            rate is wrong". Two of those are wrong for the same reason.
+      checkpoint: >-
+        If a layer's gain is 0.9 and you have 50 of them, is the network broken? At
+        what depth does the same gain become fatal?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Measure first, then change one factor. The measurement is the ratio of
+        successive per-layer gradient norms; the factors are, in order of how often
+        they are the culprit: the weight scale (fan-in), the activation's derivative,
+        and the conditioning introduced by the product itself. Change the one the
+        measurement points at, and re-measure with the same seed and step count.
+      blocks:
+        - kind: checklist
+          body: |
+            - Uniform decay → weight scale or activation. Fix the exponent.
+            - One layer at ~0 → a bug in that layer (fan-in, dead units, no norm).
+            - Growth that accelerates → dtype range first, then init.
+            - Norm healthy but nothing learns → measure the condition number.
+            - Clipping hides every one of these. Disable it while diagnosing.
+      checkpoint: >-
+        Why is the ratio of successive gradient norms a better diagnostic than the
+        gradient norm at the input?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Two loops: one to collect, one to interpret. Both are cheap enough to leave
+        in the training script.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. collect
+            for each step:
+                backward()
+                for l in layers:
+                    record norm(grads[l])
+
+            # 2. interpret
+            for each layer, walking backwards from the loss:
+                gain = norm[l-1] / norm[l]
+                decades += log10(gain)
+            print per-layer gain, total decades, min gain, max gain
+
+            # 3. decide
+            if one layer is the outlier:  fix that layer
+            elif all layers drift together: fix the scale or the activation
+            else: the loss scale or the dtype is lying to you
+      checkpoint: >-
+        Where in that loop does a zero gradient break the arithmetic, and what should
+        you print instead of `nan`?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Everything follows from one inequality and one expectation. The inequality
+        bounds the product; the expectation gives the per-layer constant.
+      blocks:
+        - kind: math
+          body: |
+            $$g_0 = g_L \prod_{l=1}^{L} J_l, \qquad
+              \|g_0\|_2 \le \|g_L\|_2 \prod_{l=1}^{L} \sigma_{\max}(J_l)$$
+
+            $$\log_{10}\|g_0\|_2 \le \log_{10}\|g_L\|_2 +
+              \sum_{l=1}^{L} \log_{10}\sigma_{\max}(J_l)$$
+
+            For $W$ with entries of variance $\sigma^2$ on an $n \times n$ layer:
+            $$\mathbb{E}\|Wx\|^2 = n\sigma^2\|x\|^2 \;\Rightarrow\;
+              \sigma_{\text{crit}} = \frac{1}{\sqrt{n}}, \qquad
+              \sigma_{\max}(W) \to 2\sigma\sqrt{n} = 2.$$
+
+            With an activation, multiply the gain by $\mathbb{E}[\varphi'(z)]$:
+            $$\text{gain} = \sigma\sqrt{n}\;\mathbb{E}[\varphi'(z)]
+              \;\Rightarrow\; \sigma^2 = \frac{g^2}{n},\quad
+              g = \frac{1}{\mathbb{E}[\varphi'(z)]}.$$
+
+            Residual blocks replace $J$ with $I + J$:
+            $$\prod_{l=1}^{L}(I+J_l) = I + \sum_l J_l + \sum_{l<l'}J_lJ_{l'} + \cdots$$
+      checkpoint: >-
+        The bound says a critical-init layer has gain 2, so 50 of them should give
+        $10^{15}$. Measurement says the product's $\sigma_{\max}$ is about 5.5. Which
+        assumption in the bound is false?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A diagnostic you can drop into a training loop, plus the decision table that
+        turns its output into one change.
+      blocks:
+        - kind: warning
+          body: >-
+            Do not read this before you have written your own version. The numbers
+            are the test; the code is only notation.
+        - kind: code
+          language: python
+          body: |
+            import math
+            import numpy as np
+
+            def per_layer_gain(norms):
+                """norms[l] = ||dL/dh_l||, indexed from layer 0 to layer L-1."""
+                out = []
+                for l in range(1, len(norms)):
+                    a, b = float(norms[l - 1]), float(norms[l])
+                    if b == 0.0:
+                        out.append(float("inf") if a > 0 else 1.0)
+                    else:
+                        out.append(a / b)
+                return out
+
+            def diagnose(norms, fp_bits=24):
+                g = per_layer_gain(norms)
+                decades = [math.log10(x) for x in g if x > 0 and math.isfinite(x)]
+                total = sum(decades)
+                usable = fp_bits * math.log10(2)      # 24 bits -> 7.22 decades
+                return {
+                    "total_decades": total,
+                    "per_layer": total / len(decades),
+                    "min_gain": min(g),
+                    "max_gain": max(g),
+                    "survives_depth": (usable / abs(total / len(decades))
+                                       if total < 0 else float("inf")),
+                }
+
+            def fix_for(report):
+                if report["min_gain"] < 0.1:
+                    return "one bad layer: check fan-in, saturation, or a missing norm"
+                if abs(report["per_layer"]) > 0.05:
+                    return "uniform drift: change the weight scale or the activation"
+                if report["max_gain"] > 10.0:
+                    return "intermittent spike: clip, and check the batch that caused it"
+                return "the exponent is fine; look at the loss scale or the data"
+
+            # The two facts worth memorising:
+            #   critical init  -> RMS gain 1.0, spectral gain 2.0
+            #   fp32 mantissa  -> 7.2 usable decades, not 76
+      checkpoint: >-
+        The diagnostic reports `per_layer = -0.63` uniformly across 30 layers. Which
+        single change fixes it, and what number would you expect the re-measurement
+        to show?
+
+  problems:
+    - id: p-layer-diagnostic
+      title: "Three gains of one matrix"
+      difficulty: medium
+      prompt: >-
+        Implement `layer_diagnostic(W)` for a weight matrix $W$ of shape
+        $(n_{\text{out}}, n_{\text{in}})$. Return a dict with exactly four keys:
+        `sigma_max` (largest singular value), `sigma_min` (smallest singular value,
+        over the $\min(n_{\text{out}}, n_{\text{in}})$ of them), `condition`
+        ($\sigma_{\max}/\sigma_{\min}$, and `inf` if $\sigma_{\min} = 0$), and
+        `rms_gain` ($\|W\|_F / \sqrt{n_{\text{in}}}$, the expected amplification of
+        a random unit vector). All values are floats. Use `numpy.linalg.svd`, not
+        the eigenvalues of $W^\top W$: squaring the matrix squares the condition
+        number and loses half the digits exactly where you need them.
+      starter: |
+        import numpy as np
+        import math
+
+        def layer_diagnostic(W):
+            # your implementation here
+            pass
+      language: python
+      entry: layer_diagnostic
+      testCases:
+        - input: "[[[3.0, 0.0], [0.0, 1.0]]]"
+          expected: '{"sigma_max": 3.0, "sigma_min": 1.0, "condition": 3.0, "rms_gain": 2.23606797749979}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: "[[[1.0, 1.0], [1.0, 1.0001]]]"
+          expected: '{"sigma_max": 2.0000500012499995, "sigma_min": 4.9998750000065936e-05, "condition": 40002.000074949116, "rms_gain": 1.4142489190379466}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: "[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]]"
+          expected: '{"sigma_max": 9.52551809156511, "sigma_min": 0.5143005806586446, "condition": 18.521305341258124, "rms_gain": 6.74536878161602}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: "[[[0.1, 0.0], [0.0, 0.1]]]"
+          expected: '{"sigma_max": 0.1, "sigma_min": 0.1, "condition": 1.0, "rms_gain": 0.1}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: "[[[2.0, -1.0, 0.0], [0.0, 1.0, 1.0]]]"
+          expected: '{"sigma_max": 2.302775637731995, "sigma_min": 1.3027756377319946, "condition": 1.7675918792439984, "rms_gain": 1.5275252316519468}'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+        import math
+
+        def layer_diagnostic(W):
+            W = np.asarray(W, dtype=float)
+            if W.ndim != 2:
+                raise ValueError("W must be 2-D")
+            n_in = W.shape[1]
+            s = np.linalg.svd(W, compute_uv=False)
+            smax = float(s.max())
+            smin = float(s.min())
+            cond = (smax / smin) if smin > 0.0 else float("inf")
+            return {
+                "sigma_max": smax,
+                "sigma_min": smin,
+                "condition": cond,
+                "rms_gain": float(np.linalg.norm(W, "fro") / math.sqrt(n_in)),
+            }
+      solutionExplanation: >-
+        One matrix has three different "gains" and the point of the problem is that
+        they disagree. `rms_gain` is the root-mean-square singular value, which
+        equals the expected amplification of a random unit vector: for the 3x2 matrix
+        it is 9.539/sqrt(2) = 6.745, far above sigma_max, because that matrix is
+        elongated and its Frobenius mass sits in the large direction. `sigma_max` is
+        the worst case. `condition` is what depth multiplies: the second case is
+        almost rank-1 (two nearly identical rows) with a condition number of 40,002,
+        so a 0.1%-perturbed direction is amplified differently by four orders of
+        magnitude. Using eigvals of W.T @ W instead of the SVD squares every singular
+        value, so a condition number of 4e4 becomes 1.6e9 and the small singular
+        value is computed as a difference of nearly equal eigenvalues — the digits
+        you need are gone before you look at them.
+      complexity: "O(min(m,n)^2 * max(m,n)) time for the SVD, O(min(m,n)) space"
+      tags: [linear-algebra, svd, conditioning, gradients]
+
+    - id: p-depth-scan
+      title: "The decade budget, computed in log space"
+      difficulty: medium
+      prompt: >-
+        Implement `depth_scan(layers, threshold)`. `layers` is a list of
+        `[gain, count]` pairs, applied in order, meaning `count` consecutive layers
+        each with multiplicative gain `gain`. Return a dict with `depth` and
+        `log10_final`. `depth` is the 1-based index of the first individual layer at
+        which the cumulative product of all gains so far is strictly less than
+        `threshold`, or `-1` if it never is. `log10_final` is $\log_{10}$ of the
+        product of every gain in the list. Accumulate the logarithms, not the
+        product: with 1,200 layers at gain 0.5 the product is $5.9\times10^{-39}$ at
+        layer 127 and exactly `0.0` in float64 well before the end, so a direct
+        product reports `-inf` for a finite answer.
+      starter: |
+        import math
+
+        def depth_scan(layers, threshold):
+            # your implementation here
+            pass
+      language: python
+      entry: depth_scan
+      testCases:
+        - input: "[[[0.5, 1200]], 1e-38]"
+          expected: '{"depth": 127, "log10_final": -361.23599479676756}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: "[[[0.9, 100]], 1e-38]"
+          expected: '{"depth": -1, "log10_final": -4.575749056067511}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: "[[[1.5, 50]], 1e-38]"
+          expected: '{"depth": -1, "log10_final": 8.804562952784066}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: "[[[0.8, 200], [1.5, 10]], 1e-12]"
+          expected: '{"depth": 124, "log10_final": -17.621090011054438}'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import math
+
+        def depth_scan(layers, threshold):
+            floor = math.log10(float(threshold))
+            total = 0.0
+            depth = -1
+            idx = 0
+            for gain, count in layers:
+                lg = math.log10(float(gain))
+                for _ in range(int(count)):
+                    idx += 1
+                    total += lg
+                    if depth == -1 and total < floor:
+                        depth = idx
+            return {"depth": depth, "log10_final": total}
+      solutionExplanation: >-
+        The product of 1,200 factors of 0.5 is 5.8e-362 — below float64's smallest
+        normal of 2.2e-308, so it underflows to exactly 0.0 and its log is -inf. In
+        log space the same computation is 1,200 additions of -0.30103, giving
+        -361.236, which is finite and correct. The threshold crossing is at layer 127:
+        0.5^126 = 1.175e-38 is just above 1e-38 and 0.5^127 = 5.877e-39 is below it,
+        which is also where float32's smallest normal sits — the test is the fp32
+        underflow boundary. The fourth case mixes both directions: it crosses inside
+        the decaying block at layer 124, then the last ten layers at 1.5 add 1.76
+        decades back, so the final value is -17.62 while the depth stays 124. That is
+        the difference between "how bad did it get" and "where did it break".
+      complexity: "O(total layers) time, O(1) space"
+      tags: [log-space, underflow, depth, numerical-stability]
+
+    - id: p-clip-global-norm
+      title: "Global-norm gradient clipping"
+      difficulty: easy
+      prompt: >-
+        Implement `clip_global_norm(grads, max_norm)`. `grads` is a list of 2-D
+        arrays (a list of tensors), possibly with different shapes. Compute the
+        global L2 norm $\|\mathbf{g}\|_2 = \sqrt{\sum_i \sum_{jk} g_{ijk}^2}$ over
+        every element of every tensor, then set
+        $\text{coef} = \min(1, \text{max\_norm}/\|\mathbf{g}\|_2)$, and return a dict
+        with `grads` (the same list of arrays, each multiplied by `coef`) and `coef`.
+        If the total norm is exactly zero, use `coef = 1.0` — dividing by zero here
+        produces `nan` for every parameter in the model. Note that `coef` is computed
+        once, from the whole list: clipping each tensor to `max_norm` separately
+        changes the direction of the update, which is the one thing clipping must not
+        do.
+      starter: |
+        import numpy as np
+        import math
+
+        def clip_global_norm(grads, max_norm):
+            # your implementation here
+            pass
+      language: python
+      entry: clip_global_norm
+      testCases:
+        - input: '[[[[3.0, 4.0]], [[0.0, 0.0]]], 1.0]'
+          expected: '{"grads": [[[0.6000000000000001, 0.8]], [[0.0, 0.0]]], "coef": 0.2}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[[1.0, 2.0]], [[2.0, 3.0]]], 10.0]'
+          expected: '{"grads": [[[1.0, 2.0]], [[2.0, 3.0]]], "coef": 1.0}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[[10.0, -20.0], [0.0, 5.0]], [[3.0, 4.0]]], 2.5]'
+          expected: '{"grads": [[[1.066003581778052, -2.132007163556104], [0.0, 0.533001790889026]], [[0.3198010745334156, 0.42640143271122083]]], "coef": 0.10660035817780521}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[[0.0, 0.0]]], 1.0]'
+          expected: '{"grads": [[[0.0, 0.0]]], "coef": 1.0}'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+        import math
+
+        def clip_global_norm(grads, max_norm):
+            arrays = [np.asarray(g, dtype=float) for g in grads]
+            total = math.sqrt(sum(float(np.sum(a * a)) for a in arrays))
+            if total == 0.0:
+                coef = 1.0
+            else:
+                coef = min(1.0, float(max_norm) / total)
+            return {"grads": [a * coef for a in arrays], "coef": coef}
+      solutionExplanation: >-
+        The third case is the one to read: the tensors have norms 22.9 and 5.0, so
+        the global norm is 23.45 and the coefficient is 2.5/23.45 = 0.1066. Clipping
+        each tensor separately would have given coefficients 0.109 and 0.5, which
+        rescales the two blocks relative to each other — a different update direction,
+        and a different optimisation problem. The zero case matters because a
+        gradient that is exactly zero is common early in training (a dead ReLU block)
+        and `max_norm / 0` is `inf`, which then multiplies zero into `nan`. The first
+        case shows the arithmetic you cannot avoid: 3/5 is not representable, so the
+        answer is 0.6000000000000001 and every comparison needs a tolerance.
+      complexity: "O(total elements) time, O(total elements) space for the copies"
+      tags: [clipping, exploding-gradients, optimiser, numpy]
+
+  visualizers:
+    - id: vs-depth-decay
+      kind: loss_surface
+      title: "Turn the gain knob and watch the depth"
+      description: >-
+        Drag the per-layer gain from 0.5 to 1.5 and the depth from 1 to 200. The
+        curve is gain^depth on a log axis, with the fp32 precision floor (7.2
+        decades) and the fp32 range floor (38.5 decades) marked as horizontal lines
+        — the two thresholds a network has to stay between.
+      params:
+        minGain: 0.5
+        maxGain: 1.5
+        minDepth: 1
+        maxDepth: 200
+        mode: "decade-budget"
+
+  try_it: >-
+    Multiply 50 random $64 \times 64$ Gaussian matrices at the critical init and
+    print $\sigma_{\max}$ and $\sigma_{\min}$ of the product; you should see
+    $\sigma_{\max} \approx 5$ and $\sigma_{\min}$ near $10^{-12}$. Then compute
+    $0.25^{20}$ and $1.5^{50}$ and say which failure mode each number predicts
+    before you run anything.
+  interview_questions:
+    - question: "Why are vanishing gradients the default for saturating activations?"
+      level: mid
+      key_points:
+        - "The backward pass is a product of Jacobians, $g_0 = g_L \\prod_l J_l$, so magnitudes add in log space and a per-layer factor below 1 compounds."
+        - "The logistic derivative is $\\sigma'(z) = \\sigma(z)(1-\\sigma(z)) \\le 0.25$, attained at $z = 0$, so twenty layers cost at least $0.25^{20} = 9.1\\times10^{-13}$."
+        - "It is a property of the derivative, not of the optimiser — Adam rescales a $10^{-12}$ gradient to a step $10^{-4}$ of the nominal one, which is still nothing."
+        - "The cure changes a factor in the product: ReLU plus He init, orthogonal init, or a residual path that adds an identity term."
+      follow_up: "ReLU removes the saturation factor. Why does a ReLU net at LeCun init still vanish?"
+    - question: "Do residual connections fix exploding gradients, or only vanishing ones?"
+      level: senior
+      key_points:
+        - "The product becomes $\\prod_l (I + J_l) = I + \\sum_l J_l + \\sum_{l<l'} J_l J_{l'} + \\dots$, and the leading identity has coefficient exactly 1 at every depth."
+        - "That guarantees a signal path to layer 0; it does not bound $\\|J_l\\|$, so gradients can still grow when the residual branch amplifies."
+        - "Explosion is the same product on the other side of 1: $1.5^{50} = 6.4\\times10^8$ and $1.5^{100} = 4.1\\times10^{17}$, past fp16's maximum of 65,504."
+        - "Normalisation and a bounded residual branch are what keep the sum's norm controlled; residuals alone buy depth, not stability."
+      follow_up: "How would you detect an exploding residual branch before the loss goes to NaN?"
+    - question: "float32 spans 76 decades. Why is that not the number that saves you?"
+      level: mid
+      key_points:
+        - "The range is $1.18\\times10^{-38}$ to $3.40\\times10^{38}$, but relative precision is set by the 24-bit mantissa: unit roundoff $2^{-24} \\approx 6.0\\times10^{-8}$."
+        - "A gradient of $10^{-12}$ is representable and carries almost no information — the digits that mattered were already lost upstream."
+        - "fp16 has a maximum of 65,504, whose log is 4.816, so a per-layer gain of 1.5 over 50 layers overflows before it NaNs."
+        - "That is why mixed precision needs loss scaling rather than a wider exponent alone: the problem is underflow of small gradients, not overflow of large ones."
+  common_mistakes:
+    - "Adding a residual connection and declaring the exploding-gradient problem solved — the identity path preserves signal, it does not bound the spectral norm."
+    - "Clipping the global norm and calling it a fix: clipping bounds magnitude by distorting direction and leaves the per-layer gain untouched."
+    - "Choosing an init from fan-in alone for a ReLU net, which gives gain $1/\\sqrt{2} = 0.707$ and thirty layers at $3.05\\times10^{-5}$."
+  further_reading:
+    - label: "Glorot & Bengio, Understanding the difficulty of training deep feedforward neural networks (AISTATS 2010)"
+    - label: "He, Zhang, Ren & Sun, Delving Deep into Rectifiers (ICCV 2015)"

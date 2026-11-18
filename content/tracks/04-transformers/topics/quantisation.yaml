@@ -1,0 +1,1509 @@
+id: quantisation
+slug: quantisation
+title: "Quantisation: INT8, INT4, GPTQ, and AWQ"
+summary: >-
+  Choose a numeric format for a trained language model and predict both what it
+  costs and what it breaks: fp16 against bf16 by exponent range, int8 against
+  int4 by scale granularity, per-channel against per-tensor when one channel is
+  twenty times the others, and what GPTQ, AWQ, and SmoothQuant each minimise.
+  Ends with the roofline arithmetic that turns halved weight bytes into a
+  measured decode speedup.
+kind: lesson
+difficulty: hard
+position: 15
+estMinutes: 30
+prerequisites: [numerical-linear-algebra, transformer-block]
+phase: "serving"
+tags: [quantisation, int8, int4, fp8, bf16, gptq, awq, smoothquant, outliers, post-training-quantisation, roofline]
+
+body:
+  big_idea: >-
+    Quantisation trades exponent range for mantissa precision, and every
+    method in this topic — per-channel scales, SmoothQuant, GPTQ, AWQ — is a
+    different answer to one question: which error can this layer afford to
+    absorb?
+
+  problem:
+    - >-
+      Your 7B is 14 GB in fp16 on a 24 GB card, so batch eight does not fit:
+      decode moves 284.8 MB per token.
+    - >-
+      You quantise to int8 and outputs are subtly wrong: one channel twenty
+      times the others set the scale, leaving twelve levels of 255.
+    - >-
+      A vendor says "4-bit, no accuracy loss"; measured, 4 bits costs 1.1
+      points on a 53.6% baseline and 3 bits costs 7.5.
+
+  analogy: |
+    A shop till stocked with a fixed set of banknotes. int8 is a drawer of 255
+    notes spaced evenly from minus max to plus max: the smallest is max/127,
+    and every price is rounded to the nearest one. If one item costs twenty
+    times everything else, the notes must cover it, and every cheap item is
+    rounded to a note worth a fifth of its price.
+
+  concept_points:
+    - >-
+      **A 16-bit format is a bet about which of exponent and mantissa you can afford to lose.**
+      Measured: fp16's relative step at 1.0 is **9.77e-4** and its largest
+      finite value **65,504** (65,520 becomes inf), while bf16's step is
+      7.81e-3 — eight times coarser — and its maximum 3.39e38. A
+      4,096-dimensional dot product errs 4.7e-4 for fp16 and 3.4e-3 for bf16.
+    - >-
+      **int8 has no exponent, so its error is absolute, and it is set by max/w rather than by the bit count.**
+      With a symmetric absmax scale the step is $\Delta = \max|w|/127$. On a
+      $4096 \times 4096$ Gaussian matrix the maximum is 5.35 standard
+      deviations, so $\Delta = 0.0421\sigma$ and the measured relative
+      Frobenius error is **1.217%**, against a predicted
+      $\Delta/\sqrt{12}/\sigma$ of 1.216%.
+    - >-
+      **Granularity is the cheapest accuracy in the field, and its mechanism is the maximum, not the average.**
+      Same matrix, same bits:
+      **1.217% per-tensor, 0.868% per-channel, 0.647% per-group of 128**; at 4
+      bits, **22.07 / 15.75 / 11.73**. The max of $n$ Gaussians grows like
+      $\sqrt{2\ln n}$, so per-tensor to per-group-128 removes $0.88$ bits of
+      step size. The cost: int4 at group 128 is **4.25 effective bits**.
+    - >-
+      **One channel at twenty times the others destroys a per-tensor scale, and that single fact shapes every method here.**
+      Scale row 17 of a $4096 \times 4096$ matrix by 20 and the error goes
+      from 1.217% to **15.83% per-tensor** — 13.0x, because the global maximum
+      moved from 5.35 to 73.0 standard deviations — while per-channel stays at
+      **0.863%**. At 4 bits per-tensor reaches **95.45%**, against 15.68%
+      per-channel.
+    - >-
+      **Activations are the hard half, because you cannot rescale them offline.**
+      Measured on a $256 \times 4096$ activation matrix with three channels at
+      20x: per-tensor int8 gives **12.93%** error on $X$, per-token scales
+      **5.98%**, while the weights in the same layer give **0.74%**. The
+      activation error is **17.4x** the weight error and it reaches the next
+      layer.
+    - >-
+      **SmoothQuant migrates the outlier instead of fighting it.** Choose
+      $s_j = \max|X_j|^{\alpha}/\max|W_j|^{1-\alpha}$ with $\alpha = 0.5$ and
+      compute $(X\operatorname{diag}(s)^{-1})(\operatorname{diag}(s)W)$ — the
+      same product with the dynamic range split. Measured: the activation
+      column max over median falls **21.61 to 4.75**, and W8A8 layer output
+      error falls **12.97% to 2.98%** — 4.3x with no retraining, because the
+      diagonal scale is exact and folds into the preceding projection.
+
+  definitions:
+    - term: "Scale factor"
+      meaning: >-
+        The number that maps integers back to real values,
+        $\hat w = s \cdot q$. With symmetric absmax quantisation over $2^b$
+        levels it is $\max|w|/(2^{b-1}-1)$, so the scale carries the maximum and
+        the error inherits it.
+    - term: "Zero-point"
+      meaning: >-
+        The integer that represents real zero. Symmetric quantisation pins it to
+        0 and wastes one of the $2^b$ codes; asymmetric quantisation stores it
+        and uses the full range, which helps activations after a ReLU and costs
+        an extra parameter per group.
+    - term: "Symmetric quantisation"
+      meaning: >-
+        A grid centred on zero with $\pm(2^{b-1}-1)$ levels, so $q \in [-127,
+        127]$ for int8. It leaves 255 usable codes rather than 256, and it is
+        what weights almost always use because zero must be exactly
+        representable for sparsity and for padding to stay free.
+    - term: "Per-tensor, per-channel, per-group"
+      meaning: >-
+        How many scales you store. Per-tensor is one for the matrix, per-channel
+        is one per output row (4,096 for a square 4096 matrix), per-group is one
+        per contiguous block of the input dimension (128 weights is the GPTQ
+        default). Granularity trades metadata bytes for a smaller maximum inside
+        each scale.
+    - term: "Round-to-nearest (RTN)"
+      meaning: >-
+        The baseline quantiser: divide by the scale, round to the nearest
+        integer, multiply back. It is one vectorised pass, it has no calibration
+        data, and it is what every published method is measured against. At 4
+        bits on a Gaussian matrix it costs 22.07% relative error per-tensor and
+        11.73% per-group-128.
+    - term: "Calibration set"
+      meaning: >-
+        A few hundred sequences of real data run through the model to collect
+        activation statistics — the per-channel maxima that set scales, and the
+        $H = XX^\top$ that GPTQ inverts. Its correlation structure is not a
+        detail: the same GPTQ code gained 1.42x on activations with condition
+        number 145 and 1.03x on iid Gaussian ones.
+    - term: "Outlier channel"
+      meaning: >-
+        A single feature dimension whose magnitude is 20x or more the median,
+        typically a handful of channels in a residual stream. It is the reason
+        per-tensor activation quantisation fails: one such channel raises the
+        scale for the other 4,095 and leaves them with twelve levels instead of
+        255.
+    - term: "Weight-only quantisation (W8A16, W4A16)"
+      meaning: >-
+        Store the weights at low precision and dequantise them into fp16 for the
+        matmul, so activations stay exact. It buys bytes and nothing else, needs
+        no calibration for the activations, and is the easy half of the problem
+        — weight error at int8 per-channel is 0.74% against 12.93% for
+        per-tensor activations.
+    - term: "W8A8"
+      meaning: >-
+        Both weights and activations in int8, which is what an int8 tensor core
+        actually needs to reach its 2x throughput. It requires an activation
+        scale, so it requires calibration, and it is where SmoothQuant lives.
+    - term: "Effective bits"
+      meaning: >-
+        The real cost per weight once metadata is counted: int4 at group 128
+        with an fp16 scale and an fp16 zero is $4 + 32/128 = 4.25$ bits; at
+        group 64 it is 4.5; per-channel int8 is $8 + 16/4096 = 8.004$. A
+        "4-bit" checkpoint is never 4 bits per weight.
+    - term: "GPTQ"
+      meaning: >-
+        A one-shot weight quantiser that processes columns in order and
+        compensates each rounding error through $H^{-1}$, minimising
+        $\|WX - \hat W X\|$ rather than $\|W - \hat W\|$. Typical measured gain
+        over RTN at 4 bits: 1.42x lower layer-output error, with *higher* weight
+        error.
+    - term: "AWQ"
+      meaning: >-
+        Activation-aware weight quantisation: scale up the ~1% of weight
+        channels that the largest activations read, fold the inverse scale into
+        the preceding op, and search one exponent over a small grid. No Hessian,
+        no backprop, so no compensation of residuals — it protects channels
+        instead of correcting errors.
+    - term: "SmoothQuant"
+      meaning: >-
+        A per-input-channel diagonal rescaling that moves activation outliers
+        into the weights before quantisation:
+        $s_j = \max|X_j|^{\alpha}/\max|W_j|^{1-\alpha}$ at $\alpha = 0.5$,
+        applied as $X/s$ and $W s$. Measured here it cut activation max over
+        median from 21.61 to 4.75 and W8A8 output error from 12.97% to 2.98%.
+    - term: "FP8 E4M3 / E5M2"
+      meaning: >-
+        Two 8-bit float formats: 4 exponent bits with 3 mantissa bits and a
+        maximum of 448, or 5 exponent bits with 2 mantissa bits and a maximum of
+        57,344. E4M3 is for weights and forward activations, E5M2 for gradients,
+        which need range more than precision. Three mantissa bits is a relative
+        step of 0.125 — coarser than int8's error on a Gaussian, but with a
+        scale that varies per value.
+
+  diagrams:
+    - type: compare
+      title: "fp16 and bf16 spend the same 16 bits on opposite bets"
+      left_label: "fp16: 5 exponent, 10 mantissa"
+      left_points:
+        - "Largest finite value 65,504 — casting 65,520 returns inf"
+        - "Smallest normal 6.10e-5; subnormals to 5.96e-8"
+        - "Relative step at 1.0 is 9.77e-4, so ~1,024 levels per binade"
+        - "Median dot-product error on 4,096 Gaussian dims: 4.7e-4"
+        - "Needs loss scaling in training, because gradients underflow before activations overflow"
+      right_label: "bf16: 8 exponent, 7 mantissa"
+      right_points:
+        - "Largest finite value 3.39e38 — the whole fp32 range is preserved"
+        - "Smallest normal 1.18e-38, identical to fp32"
+        - "Relative step at 1.0 is 7.81e-3, exactly 8x coarser than fp16"
+        - "Median dot-product error on the same test: 3.4e-3, a 7.3x gap"
+        - "No loss scaling needed; the trade is that one bit of mantissa is worth more than eight bits of range at inference"
+      caption: "Both are 16 bits. The only question is whether your tensor's dynamic range exceeds 65,504 or its precision needs more than 128 steps per binade — and for inference weights the answer is usually range."
+
+    - type: plot
+      title: "Reconstruction error against bit width, and what granularity buys (4096 x 4096 Gaussian weights)"
+      chart: line
+      xLabel: "bits per weight"
+      yLabel: "relative Frobenius error (%)"
+      series:
+        - name: "per-tensor"
+          points:
+            - { x: 2, y: 98.76 }
+            - { x: 3, y: 51.44 }
+            - { x: 4, y: 22.07 }
+            - { x: 5, y: 10.30 }
+            - { x: 6, y: 4.985 }
+            - { x: 8, y: 1.217 }
+        - name: "per-channel (per output row)"
+          points:
+            - { x: 2, y: 90.93 }
+            - { x: 3, y: 36.75 }
+            - { x: 4, y: 15.75 }
+            - { x: 5, y: 7.349 }
+            - { x: 6, y: 3.556 }
+            - { x: 8, y: 0.868 }
+        - name: "per-group of 128"
+          points:
+            - { x: 2, y: 76.67 }
+            - { x: 3, y: 27.38 }
+            - { x: 4, y: 11.73 }
+            - { x: 5, y: 5.474 }
+            - { x: 6, y: 2.649 }
+            - { x: 8, y: 0.647 }
+      caption: "Three parallel curves a constant factor apart: granularity shifts the whole line, it does not change its slope. One bit of granularity is worth roughly 1.5 to 2 bits of precision, at 0.25 bits of metadata."
+
+    - type: plot
+      title: "Accuracy against bit width on the same quantiser, two tasks of different margin"
+      chart: line
+      xLabel: "bits per weight"
+      yLabel: "test accuracy (%)"
+      series:
+        - name: "hard task, 53.57% baseline"
+          points:
+            - { x: 2, y: 15.17 }
+            - { x: 3, y: 46.10 }
+            - { x: 4, y: 52.48 }
+            - { x: 5, y: 52.96 }
+            - { x: 6, y: 53.70 }
+            - { x: 8, y: 53.65 }
+        - name: "easy task, 96.08% baseline"
+          points:
+            - { x: 2, y: 70.78 }
+            - { x: 3, y: 95.71 }
+            - { x: 4, y: 95.89 }
+            - { x: 5, y: 95.94 }
+            - { x: 6, y: 96.10 }
+            - { x: 8, y: 96.06 }
+      caption: "Same 3-layer MLP, same per-channel round-to-nearest, two data distributions. At 3 bits one task loses 0.37 points and the other loses 7.47. The horizontal axis is not the only variable."
+
+    - type: architecture
+      title: "W8A8 with SmoothQuant: the outlier is moved, not removed"
+      nodes:
+        - { id: x, x: 0, y: 0, label: "activations X", kind: client, detail: "Runtime tensor, 256 x 4096. Column 3, 77 and 1900 are 20x the median; column max over median is 21.61 before any treatment." }
+        - { id: div, x: 1, y: 0, label: "divide by s", kind: worker, detail: "s_j = max|X_j|^0.5 / max|W_j|^0.5. Exact, per input channel, 4096 floats. In a real deployment this is folded into the preceding LayerNorm's gamma or the previous matmul's output, so it costs nothing at runtime." }
+        - { id: x8, x: 2, y: 0, label: "int8 activations", kind: server, detail: "Now quantised per-tensor, because the outlier has been spread into the weights. Column max over median is 4.75 instead of 21.61." }
+        - { id: gemm, x: 3, y: 0, label: "int8 GEMM", kind: gpu, detail: "The only place int8 pays: 2x the dense fp16 tensor throughput on A100 and H100, and half the bytes for the same weight count." }
+        - { id: w, x: 0, y: 1, label: "weights W", kind: storage, detail: "Static. This is the operand you can rescale offline, which is why per-channel weight quantisation is free and per-channel activation quantisation is not." }
+        - { id: mul, x: 1, y: 1, label: "multiply by s", kind: worker, detail: "W times s on the input dimension. The rescaling is exact in fp32 before quantisation; only the round after it loses anything." }
+        - { id: w8, x: 2, y: 1, label: "int8 weights", kind: storage, detail: "Quantised per output channel after scaling. Measured W8A8 output error after this path: 2.98%, against 12.97% with no smoothing." }
+        - { id: y, x: 3, y: 1, label: "Y in fp32", kind: external, detail: "Accumulate in int32 and rescale once at the end. Accumulating in int8 overflows: the code path wraps rather than saturates, so 200 becomes -56." }
+      edges:
+        - { from: x, to: div, label: "per-channel scale" }
+        - { from: div, to: x8, label: "quantise" }
+        - { from: x8, to: gemm, label: "int8" }
+        - { from: w, to: mul, label: "static" }
+        - { from: mul, to: w8, label: "quantise" }
+        - { from: w8, to: gemm, label: "int8" }
+        - { from: gemm, to: y, label: "int32 accumulate" }
+      caption: "Read the two paths in parallel: the activation outlier is divided out and multiplied into the weights, where a per-channel scale can absorb it offline."
+
+    - type: pipeline
+      title: "The post-training quantisation loop, in the order that fails least"
+      nodes:
+        - label: "Calibrate"
+          note: "512-1024 real sequences, not random data"
+          detail: "Collect per-channel activation maxima and, for GPTQ, the layer Hessian. Skipping this is why per-tensor activation quantisation is the most common failure in the topic."
+        - label: "Choose granularity"
+          note: "per-channel weights are free; per-group 128 costs 0.25 bits"
+          detail: "This is the largest single lever and the cheapest: 0.88 bits of step size for the metadata of one fp16 scale and zero per 128 weights."
+        - label: "Choose the method"
+          note: "RTN, then GPTQ, then SmoothQuant for W8A8"
+          detail: "Each buys a different error. RTN minimises nothing; GPTQ minimises layer output error on the calibration set; AWQ protects the channels the activations read; SmoothQuant fixes the activation range so W8A8 is possible at all."
+        - label: "Measure the divergence"
+          note: "KL to the fp32 distribution, not only accuracy"
+          detail: "Accuracy is a coarse instrument: it was flat from 8 bits to 4 while KL moved by 380x. A model can keep its argmax and lose its calibration."
+        - label: "Count the bytes"
+          note: "weights + cache + head, divided by bandwidth"
+          detail: "161.3 MB per decode step at int8 against 284.8 at fp16, because the unquantised KV cache is now the second largest term at 37.7 MB."
+        - label: "Ship or reject"
+          note: "the cliff is at 3 bits, not 4"
+          detail: "Measured: 4 bits cost 1.09 points on a 53.57% task, 3 bits cost 7.47. If the task margin is thin, 4 bits is already a decision that needs a per-task measurement."
+      caption: "Two of these steps are free (granularity, counting bytes) and two are where projects fail (calibration, measuring divergence)."
+
+  markdown: |
+    ## The budget is bytes
+
+    *The Full Transformer Block* priced a decode step at 284.8 MB for a
+    124M-parameter model at 1,024 tokens of context, for 0.208 GFLOP — 0.73
+    FLOP/byte against a 295 FLOP/byte ridge point. Nothing there depends on the
+    arithmetic: it is all about how many bytes each weight and cached key
+    occupies, and quantisation is the only lever that changes that without
+    changing the model.
+
+    ## What each format keeps
+
+    | format | sign | exponent | mantissa | largest finite | smallest normal | step at 1.0 |
+    |---|---|---|---|---|---|---|
+    | fp32 | 1 | 8 | 23 | 3.40e38 | 1.18e-38 | 1.19e-7 |
+    | fp16 | 1 | 5 | 10 | 65,504 | 6.10e-5 | 9.77e-4 |
+    | bf16 | 1 | 8 | 7 | 3.39e38 | 1.18e-38 | 7.81e-3 |
+    | fp8 E4M3 | 1 | 4 | 3 | 448 | 1.56e-2 | 0.125 |
+    | fp8 E5M2 | 1 | 5 | 2 | 57,344 | 6.10e-5 | 0.25 |
+    | int8 | 1 | 0 | 0 | 127 (code) | 1 (code) | 0.00787 (scaled) |
+
+    fp16 and bf16 are the same width and opposite designs. fp16 keeps ten
+    mantissa bits and pays with a five-bit exponent: 65,504 is the ceiling, and
+    anything larger becomes infinity rather than saturating. bf16 keeps fp32's
+    exponent — its range is exactly fp32's — and spends the savings on the
+    mantissa, at seven bits, eight times coarser. That is why bf16 training needs
+    no loss scaling and fp16 training does. int8 has neither: a fixed-point grid
+    of 255 levels whose spacing you choose once.
+
+    ## One scale, one step
+
+    Symmetric absmax quantisation picks
+
+    $$\Delta = \frac{A}{2^{b-1}-1}, \qquad A = \max|w|,$$
+
+    rounds each weight to the nearest multiple of $\Delta$, and stores the
+    integer. The rounding error per weight is uniform on
+    $[-\Delta/2, \Delta/2]$, so the error power is $\Delta^{2}/12$ and, with
+    $(2^{b-1}-1)$ replaced by its leading term $2^{b}/2$,
+
+    $$\operatorname{SNR}_{\text{dB}}
+      = 10\log_{10}\frac{\sigma^{2}}{\Delta^{2}/12}
+      = 6.02\,b + 4.77 - 20\log_{10}\frac{A}{\sigma}.$$
+
+    Two things follow: each bit is 6.02 dB, and the quality of the quantiser is
+    set by $A/\sigma$ — how much larger the maximum is than the typical weight,
+    which is not a property of the bit width. That is why per-channel scaling
+    works.
+
+    On a $4096\times4096$ Gaussian matrix, $A = 5.35\sigma$, so the predicted
+    error is $\Delta/\sqrt{12}/\sigma = 1.216\%$; measured, it is **1.217%**.
+    The same expression at 4 bits predicts 22.07% and the measurement is 22.07%:
+    for Gaussian weights the step is the whole story. At 2 bits it predicts
+    154.5% and the measurement stops at 98.76%, because a relative error cannot
+    exceed 100% once every weight rounds to zero or to the maximum.
+
+    ## Granularity is the cheap dial
+
+    $A$ is a maximum, so it grows with the number of elements it is taken over:
+    $\mathbb{E}[\max]$ scales like $\sigma\sqrt{2\ln n}$. Sixteen million weights
+    give $5.35\sigma$; one row of 4,096 gives $3.9\sigma$; one group of 128
+    gives about $2.9\sigma$. The error is proportional to $A$, so shrinking the
+    set shrinks the error by exactly that ratio.
+
+    | bits | per-tensor | per-channel | per-group 128 |
+    |---|---|---|---|
+    | 8 | 1.217% | 0.868% | 0.647% |
+    | 4 | 22.07% | 15.75% | 11.73% |
+    | 3 | 51.44% | 36.75% | 27.38% |
+
+    The curves are parallel: granularity moves the line, it does not bend it. The
+    cost is metadata — an fp16 scale and an fp16 zero per group is $32/128 = 0.25$
+    bits per weight, so "int4" is really 4.25 — and per-channel int8 is
+    essentially free at 8.004.
+
+    ## The outlier
+
+    Now scale one row by twenty and watch a per-tensor quantiser collapse:
+
+    | | per-tensor | per-channel |
+    |---|---|---|
+    | clean, 8 bits | 1.217% | 0.868% |
+    | one row at 20x, 8 bits | **15.83%** | **0.863%** |
+    | one row at 20x, 4 bits | **95.45%** | 15.68% |
+
+    Per-channel is unchanged because the corrupted row only corrupts its own
+    scale. Per-tensor pays 13.0x, which is the factor by which the row raised the
+    global maximum — 73.0 standard deviations against 5.35 — and at 4 bits the
+    matrix is effectively erased. A typical row, whose weights span
+    $\pm3.5\sigma$, is left with twelve levels: 3.6 bits of the 8 it paid for.
+
+    ## Activations: the half you cannot rescale
+
+    Weights are static, so their scales are computed once and folded into the
+    kernel. Activations are not. With three outlier channels at 20x, per-tensor
+    int8 gives 12.93% error on the activations and 12.97% on the layer output,
+    against 5.98% for per-token scales and 0.74% for the weights in the same
+    layer. W8A16 is therefore easy and W8A8 is not.
+
+    SmoothQuant splits the range instead of hiding it. For
+    $\alpha = 0.5$,
+
+    $$Y = XW = \underbrace{\left(X\operatorname{diag}(s)^{-1}\right)}_{\text{smaller max}}
+      \underbrace{\left(\operatorname{diag}(s)W\right)}_{\text{larger max}},
+      \qquad s_j = \frac{\max|X_j|^{\alpha}}{\max|W_j|^{1-\alpha}} .$$
+
+    The product is exact; only the rounding after it is not. Measured: activation
+    column max over median 21.61 to 4.75, and W8A8 layer-output error 12.97% to
+    2.98%. It is a diagonal rescaling, so it folds into the preceding operation
+    and costs nothing at inference.
+
+    ## Two methods, two errors
+
+    GPTQ quantises column $j$, then corrects the remaining columns with the
+    residual it created, weighted by $(H^{-1})_{:j}$ — so the layer output, not
+    the weight matrix, is what stays close. At 4 bits that is 11.69% to 8.21%,
+    while weight error *rises* 11.73% to 15.58%. On iid calibration at the same
+    sample count the gain drops to 1.03x, because $H \approx I$.
+
+    AWQ does not compensate at all: it scales the weight channels the largest
+    activations read, folds the reciprocal into the previous op, and rounds on a
+    finer grid exactly there. Its trade is robustness — it fits one calibration
+    set less tightly than GPTQ, and degrades less when the data moves.
+
+    ## The curve
+
+    | bits | accuracy (53.57% baseline) | delta | KL to fp32 |
+    |---|---|---|---|
+    | 8 | 53.65% | +0.08 | 1.7e-3 |
+    | 6 | 53.70% | +0.13 | 3.1e-2 |
+    | 5 | 52.96% | -0.61 | 0.148 |
+    | 4 | 52.48% | -1.09 | 0.642 |
+    | 3 | 46.10% | -7.47 | 3.33 |
+    | 2 | 15.17% | -38.40 | 15.1 |
+
+    Accuracy is flat and then falls off a cliff; KL moves by four orders of
+    magnitude across the same range, which is why distribution shift is the
+    better early-warning signal. The cliff's position is a property of the task's
+    margin, not of the bit count: on an easier version of the same problem
+    (96.08% baseline) 3 bits cost 0.37 points.
+
+    ## What it buys at decode
+
+    | weights | cache | bytes/step | time | tokens/s | speedup |
+    |---|---|---|---|---|---|
+    | fp16 | fp16 | 284.8 MB | 85.0 us | 11,761 | 1.00x |
+    | int8 | fp16 | 161.3 MB | 48.1 us | 20,773 | 1.77x |
+    | int8 | int8 | 142.4 MB | 42.5 us | 23,522 | 2.00x |
+    | int4 g128 | fp16 | 103.3 MB | 30.8 us | 32,415 | 2.76x |
+
+    The ceiling is bandwidth, and the honest number for weight-only int8 is
+    1.77x, not 2x: the cache did not shrink and is now 23.4% of the traffic.
+    Intensity rises 0.73 to 1.29 FLOP/byte, but the int8 ridge point rises from
+    295 to 590 with it, so the kernel is exactly as memory-bound as before —
+    quantisation shortens the transfer, it does not fill the tensor cores.
+
+    ## The longer version
+
+    Quantisation trades exponent range for mantissa precision, and every method
+    in this topic — per-channel scales, SmoothQuant, GPTQ, AWQ — is a different
+    answer to one question: which error can this layer afford to absorb?
+
+    A shop till stocked with a fixed set of banknotes. int8 is a drawer holding
+    255 notes, spaced evenly from minus max to plus max: the smallest note is
+    max/127, and every price is rounded to the nearest one. If one item in the
+    catalogue costs twenty times everything else, the notes must be big enough
+    to cover it, and every cheap item is then rounded to a note worth a fifth of
+    its price.
+
+    Floating point is a till where the denomination scales with the amount: a
+    0.001 purchase is paid with 0.0001 notes and a 10,000 purchase with 1 notes.
+    That is why fp16 keeps precision on small weights, and why the drawer jams
+    at 65,504 — the denominations stop there. bf16 is the same drawer with the
+    same top note of 3.4e38 and eight times coarser steps in between.
+
+    The analogy breaks in two places. A till rounds each price once and nobody
+    notices; a quantised layer sums 4,096 rounded products in one dot product,
+    and the errors do not average away to nothing — the median relative error
+    there was 4.7e-4 while each element was rounded to 2.1e-4. And a shopkeeper
+    can re-price one shelf at a time; one over-priced item in a per-tensor
+    quantiser changes the rounding of every other item in the matrix, which is
+    precisely the failure per-channel scaling exists to prevent.
+
+    ### What goes wrong
+
+    - Your 7B model is 14 GB in fp16 and the card has 24 GB, so a batch of
+      eight does not fit. No kernel fixes this. The decoder at 1,024 context
+      moves 284.8 MB per token, and the only number that moves is bytes —
+      which is a format decision, not a scheduling one.
+    - You quantise to int8, everything runs, and the outputs are subtly wrong.
+      Not garbage: a summariser that drops one clause, a classifier that is
+      96.1% instead of 96.5%. One channel with twenty times the magnitude of
+      the others set the scale for four thousand weights, and a typical row
+      was left with twelve levels out of the 255 it paid for.
+    - A vendor says "4-bit, no accuracy loss". Measured here, 4 bits costs 1.1
+      points on a task with a 53.6% baseline and 3 bits costs 7.5, while on an
+      easier version of the same task 3 bits costs 0.37. "No loss" is a claim
+      about one benchmark's margin, not a property of four bits.
+    - You copy a quantiser that casts a float array to int8 and forgets to
+      clamp. Two hundred becomes minus fifty-six. Nothing raises, no NaN, no
+      warning — the weights are simply wrong in a way that looks like a bad
+      fine-tune.
+    - You have three post-training methods to choose between and every blog
+      post says "better". GPTQ, AWQ, and SmoothQuant fail differently: one
+      trades weight error for output error, one protects a subset of channels,
+      one moves the outlier into the other tensor. Picking between them
+      without knowing which error each buys is guessing.
+
+    ### The full treatment
+
+    **A 16-bit format is a bet about which of exponent and mantissa you can
+    afford to lose, and both bets are exact.** fp32 spends 8 bits on the
+    exponent and 23 on the mantissa; fp16 spends 5 and 10; bf16 spends 8 and
+    7; fp8 E4M3 spends 4 and 3. Measured from the formats themselves: fp16's
+    relative step at 1.0 is 9.77e-4 and its largest finite value is 65,504, so
+    casting 65,520 to fp16 returns inf, while bf16's step is 7.81e-3 — exactly
+    eight times coarser, the 10-versus-7 mantissa — and its largest value is
+    3.39e38, so a 1e6 activation survives untouched. On a 4,096-dimensional
+    Gaussian dot product the median relative error over 21 draws was 4.7e-4
+    for fp16 and 3.4e-3 for bf16, a 7.3x gap, while int8 managed 1.7e-2. The
+    trap is "bf16 is half an fp32": it is half the bits and none of the range,
+    which is exactly why bf16 training needs no loss scaling and fp16 training
+    does.
+
+    **int8 has no exponent, so its error is absolute, and it is set by
+    max/w rather than by the bit count.** With a symmetric absmax scale the
+    step is $\Delta = \max|w|/127$. On a $4096 \times 4096$ Gaussian matrix
+    the global maximum is 5.35 standard deviations, so $\Delta = 0.0421\sigma$
+    and the measured relative Frobenius error is **1.217%** — against a
+    predicted $\Delta/\sqrt{12}/\sigma$ of 1.216%, which is the whole theory in
+    one line. Because the step is absolute, a weight at $0.1\sigma$ is rounded
+    to one of two levels while a weight near the maximum gets seventy: int8 is
+    precise where the matrix is large and blind where it is small, the
+    opposite of a float. That is why it suits LLM weights, which are close to
+    Gaussian within a row, and hurts tensors with a wide spread. Every bit
+    then buys 6 dB: measured **1.217% (8 bits), 4.985 (6), 10.30 (5), 22.07
+    (4), 51.44 (3), 98.76 (2)** — a factor of 2.0 per bit, 6.0 to 6.3 dB. Four
+    bits is not half of eight, it is eighteen times the error; at two bits
+    per-tensor the matrix is gone.
+
+    **Granularity is the cheapest accuracy in the field, and its mechanism is
+    the maximum, not the average.** Same matrix, same bits: **1.217%
+    per-tensor, 0.868% per-channel** (one scale per output row), **0.647%
+    per-group of 128**; at 4 bits, **22.07 / 15.75 / 11.73**. The error scales
+    with the absmax that set the scale, and the max of $n$ Gaussians grows
+    like $\sqrt{2\ln n}$: 16.7M weights give 5.35 standard deviations, one row
+    of 4,096 gives 3.9, a group of 128 gives about 2.9. Per-tensor to
+    per-group-128 therefore removes $\log_2(5.35/2.9) = 0.88$ bits of step
+    size. It is not free: int4 at group 128 must store an fp16 scale and an
+    fp16 zero per 128 weights, so it is **4.25 effective bits**; at group 64
+    it is 4.5, at group 32 it is 5.0. Per-channel int8 is free, at 8.004
+    effective bits — one fp16 scale per 4,096-weight row.
+
+    **One channel at twenty times the others destroys a per-tensor scale, and
+    that single fact shapes every method in this topic.** Scale row 17 of a
+    $4096 \times 4096$ Gaussian by 20 and the measured error goes from 1.217%
+    to **15.83% per-tensor** — 13.0x, which is the factor by which the row
+    raised the global maximum, 73.0 standard deviations against 5.35 — while
+    per-channel stays at **0.863%**. That is an 18.3x gap between the two
+    schemes, set by the corrupted row's own maximum rather than by the
+    matrix's. At 4 bits, per-tensor reaches **95.45%**, a matrix that no
+    longer carries signal, against 15.68% per-channel. A typical row is left
+    with **twelve levels** across its $\pm 3.5\sigma$ range: 3.6 bits of the
+    8 it paid for. Per-channel exists because it makes the scale local, not
+    because it is more accurate on average — on clean data it is only 1.4x
+    better, and the 20x case is where the whole argument lives.
+
+    **Activations are the hard half, because you cannot rescale them
+    offline.** Weights are static, so a per-channel scale can be baked into
+    the checkpoint and folded into a kernel. Activations arrive at runtime,
+    one batch at a time, and you must fix the scale before you see the values
+    or measure them per batch and pay for a reduction. Measured on a
+    $256 \times 4096$ activation matrix with three channels at 20x (column
+    max over median **21.61**): per-tensor int8 gives **12.93%** relative
+    error on $X$ and **12.97%** on the layer output $Y = XW$; per-token scales
+    give **5.98%**; the weights in the same layer, quantised per-channel, give
+    **0.74%**. So W8A16 is easy and W8A8 is not: before any cleverness the
+    activation error is 17.4 times the weight error, and it is the activation
+    error that reaches the next layer.
+
+    **SmoothQuant migrates the outlier instead of fighting it.** Choose a
+    per-input-channel scale $s_j = \max|X_j|^{\alpha} /
+    \max|W_j|^{1-\alpha}$ with $\alpha = 0.5$, then compute
+    $(X\operatorname{diag}(s)^{-1})(\operatorname{diag}(s)W)$ — the same
+    product, with the dynamic range split between the two operands. Measured:
+    activation column max over median falls **21.61 to 4.75**, and W8A8 layer
+    output error falls **12.97% to 2.98%**, a 4.3x improvement with no
+    retraining, because the diagonal scale is exact and folds into the
+    preceding projection or norm. The trap is that $\alpha = 0.5$ is a
+    compromise: it halves the outlier in both tensors rather than removing it
+    from either, and if the weights carry their own outlier channel you have
+    moved the problem into $W$, not deleted it.
+
+    **GPTQ minimises the error it cannot avoid, in the space that matters.**
+    It quantises one column at a time and pushes the residual
+    $w_j - \hat w_j$ into the not-yet-quantised columns through the inverse
+    Hessian $H^{-1} = (XX^\top)^{-1}$, so the layer output moves as little as
+    possible rather than the weights. Measured at 4 bits on a $256 \times 512$
+    layer with 4,096 calibration samples: layer output error **11.69% to
+    8.21%** (1.42x better) while weight error got *worse*, **11.73% to
+    15.58%**. That is not a bug — the objective is
+    $\|WX - \hat W X\|$, so error landing in directions $X$ does not excite
+    is free. The dependence on calibration data is total: on iid Gaussian
+    calibration, at the same sample count, the same code gains only **1.03x**,
+    because $H \approx I$ and there is no correlation to exploit. GPTQ's
+    quality is a property of your calibration set, and it costs a
+    $d_{\text{in}} \times d_{\text{in}}$ inverse per layer plus a sequential
+    column pass.
+
+    **AWQ spends bits where the activations say they matter, and the premise
+    is measurable even though the method's gains are not large.** It ranks
+    weight channels by the magnitude of the activations that read them, then
+    scales the salient ones up by $s$ before rounding — folding $1/s$ into the
+    preceding operation, so the product is unchanged — which makes the
+    rounding grid finer exactly where a small weight error produces a large
+    output error. On the activation layer from the previous two points, with
+    exact activations and 4-bit weights, 3 of 4,096 input channels (0.07%)
+    carry **23.3%** of the squared output error, and that same measurement
+    bounds what protecting them can buy: holding those three at 8 bits and the
+    other 4,093 at 4 moves the error only from **13.49% to 11.83%**, a 1.14x
+    gain, because the remaining 76.7% is spread thin. AWQ searches one
+    exponent over a grid of about twenty candidates against layer output
+    error, with no Hessian and no backpropagation. What it trades against GPTQ
+    is compensation for robustness: GPTQ corrects the residual with
+    second-order information from one calibration set and fits that set as
+    tightly as it can, while AWQ never compensates and instead makes the
+    rounding itself less damaging for the channels that matter. The published
+    claim is that this generalises better across calibration sets — a claim
+    about robustness, not about beating GPTQ on GPTQ's own data.
+
+    **The accuracy-versus-bits curve is flat, then a cliff, and where the
+    cliff sits depends on the task's margin.** Measured on a 3-layer MLP
+    (32-128-128-10) trained to **53.57%** on a ten-class Gaussian mixture,
+    per-channel round-to-nearest over three seeds: 8 bits **+0.08** points, 6
+    bits +0.13, 5 bits -0.61, 4 bits **-1.09**, 3 bits **-7.47**, 2 bits
+    **-38.40**; mean KL to the fp32 predictive distribution 1.7e-3, 3.1e-2,
+    0.148, 0.642, 3.33, 15.1. The same quantiser on an easier version of the
+    same task (96.08% baseline) cost 0.37 points at 3 bits and 25.3 at 2. So
+    "4-bit is lossless" is a statement about a margin, and the quantity that
+    predicts damage is not the bit count but how close the correct answer sat
+    to the decision boundary.
+
+    **int8 halves the weight bytes but also doubles the ridge point, so the
+    kernel stays exactly as memory-bound — the win is bytes, not
+    utilisation.** Recomputing the decode step from the transformer block at
+    1,024 context: fp16 moves **284.8 MB** in 85.0 us (11,761 tokens/s at
+    3.35 TB/s); int8 moves **161.3 MB**, 48.1 us, 20,773 tokens/s — **1.77x**,
+    not 2x, because the KV cache is still fp16 and is now 37.7 MB of the
+    remaining bytes, 23.4% of them. Quantise the cache too and it is 142.4 MB
+    and 2.00x; int4 at group 128 (4.25 effective bits) gives 103.3 MB, 30.8 us
+    and **2.76x**. Arithmetic intensity goes 0.73 to 1.29 FLOP/byte, and the
+    int8 ridge point goes from 295 to 590 — the ratio is unchanged at about
+    1/457, so int8 decode is exactly as far from the tensor cores as fp16
+    decode was.
+
+
+  derivations:
+    - title: "Step size, error power, and the 6.02 dB per bit rule"
+      latex: |
+        A symmetric absmax quantiser with integer codes
+        $-(2^{b-1}-1) \ldots 2^{b-1}-1$ and maximum magnitude $A$ has step
+
+        $$\Delta = \frac{A}{2^{b-1}-1} \approx \frac{2A}{2^{b}} ,$$
+
+        the approximation being 0.8% at $b = 8$ and 7% at $b = 4$. Rounding error
+        is uniform on $[-\Delta/2, \Delta/2]$, so its variance is
+        $\Delta^{2}/12$ regardless of the signal, and the relative error for a
+        weight with standard deviation $\sigma$ is
+
+        $$\frac{\varepsilon}{\sigma}
+          = \frac{\Delta}{\sqrt{12}\,\sigma}
+          = \frac{A/\sigma}{\sqrt{12}\,(2^{b-1}-1)} .$$
+
+        Replacing $(2^{b-1}-1)$ by $2^{b}/2$ gives the familiar decibel form
+
+        $$\operatorname{SNR}_{\text{dB}}
+          = 6.02\,b + 4.77 - 20\log_{10}\!\left(\frac{A}{\sigma}\right),$$
+
+        so every bit buys 6.02 dB and the only task-specific term is the peak to
+        RMS ratio. At $A = 5.35\sigma$ the exact expression gives 1.216% at
+        $b = 8$ and 22.07% at $b = 4$, against measurements of 1.217% and 22.07%
+        on a $4096\times4096$ Gaussian matrix — exact, because for Gaussian
+        weights the step is the whole story. At $b = 2$ it predicts 154.5% while
+        the measurement stops at 98.76%: a relative error cannot exceed 100% once
+        every weight rounds to zero or to the maximum, and the linear model has
+        nothing left to say.
+      prose: >-
+        This single formula explains why quantisation is described in bits and
+        decibels rather than in absolute error, and why the peak-to-RMS ratio
+        $A/\sigma$ is the quantity every practical method attacks. Per-channel
+        scaling reduces $A$; SmoothQuant reduces the activation's $A$; GPTQ
+        accepts the resulting $\Delta$ and spends its effort on where the error
+        lands instead.
+
+    - title: "Why the maximum, and therefore granularity, sets the error"
+      latex: |
+        With $n$ iid standard normal weights the expected maximum obeys
+
+        $$\mathbb{E}\left[\max_{i\le n} w_i\right] \approx \sigma\sqrt{2\ln n},$$
+
+        so the scale, and with it the error, grows like $\sqrt{\ln n}$:
+
+        $$n = 2^{24} \Rightarrow 5.7\sigma,\qquad
+          n = 2^{12} \Rightarrow 4.1\sigma,\qquad
+          n = 2^{7} \Rightarrow 3.1\sigma .$$
+
+        Measured on the same matrix: $5.35\sigma$ over 16.7M weights,
+        $3.9\sigma$ over a 4,096-wide row, about $2.9\sigma$ over a group of 128.
+        Since $\varepsilon \propto A$, moving from per-tensor to per-group-128
+        multiplies the error by $2.9/5.35 = 0.54$ — measured $0.647/1.217 = 0.53$
+        — and is equivalent to $\log_{2}(5.35/2.9) = 0.88$ extra bits.
+
+        An outlier channel multiplies one row's maximum by $c$, and for
+        per-tensor quantisation it multiplies *every* weight's step by $c$:
+
+        $$\varepsilon_{\text{tensor}}(c) = \frac{cA}{2^{b}}\sqrt{\frac{1}{12}}
+          \quad\text{for all rows,}\qquad
+          \varepsilon_{\text{channel}} = \frac{A}{2^{b}}\sqrt{\frac{1}{12}}$$
+
+        only for the corrupted row. That predicts a $c$-fold gap between the two
+        errors, and at $c = 20$ the measurement was 15.83% against 0.863% — a
+        ratio of 18.3, the difference from 20 being that the corrupted row's own
+        maximum was $3.65\sigma$ against the matrix maximum of $5.35\sigma$.
+      prose: >-
+        The maximum is the whole story: error is proportional to it, it grows
+        with the number of elements you take it over, and a single outlier
+        propagates it to everything sharing the scale. Every granularity
+        decision and every outlier method in this topic is an attempt to shrink
+        the set over which one maximum is taken.
+
+    - title: "GPTQ's compensation: projecting the residual through the inverse Hessian"
+      latex: |
+        Quantising a layer to minimise weight error is the wrong objective,
+        because what the network sees is $WX$. The layer-wise problem is
+
+        $$\min_{\hat W}\ \left\|(\hat W - W)X\right\|_{F}^{2}
+          = \operatorname{tr}\!\left((\hat W - W)\,H\,(\hat W - W)^{\top}\right),
+          \qquad H = XX^{\top}.$$
+
+        Process columns left to right. Having fixed column $j$ to
+        $\hat w_j = w_j + \delta_j$, the residual $\delta_j$ can be partly
+        cancelled by adjusting the columns not yet quantised. The quadratic form
+        is minimised, to second order, by
+
+        $$W_{:,j+1:} \leftarrow W_{:,j+1:}
+          - \frac{\delta_j}{(H^{-1})_{jj}}\,(H^{-1})_{j,\,j+1:},$$
+
+        which is why the algorithm needs $H^{-1}$ (damped by about 1% of the mean
+        diagonal, or the inverse does not exist) and why it must run column by
+        column rather than in one vectorised pass.
+
+        The measured consequence is the point of the derivation. At 4 bits the
+        layer output error fell from 11.69% to 8.21%, while the weight error rose
+        from 11.73% to 15.58%:
+
+        $$\frac{\|(\hat W_{\text{RTN}} - W)X\|}{\|WX\|} = 11.69\%
+          \;\longrightarrow\;
+          \frac{\|(\hat W_{\text{GPTQ}} - W)X\|}{\|WX\|} = 8.21\%,$$
+
+        with $\|\hat W_{\text{GPTQ}} - W\| > \|\hat W_{\text{RTN}} - W\|$. The
+        objective improved and the thing you would naively measure got worse.
+      prose: >-
+        GPTQ is not a better rounder; it is a different objective. It buys
+        output-error reduction with weight-error increase, and the exchange rate
+        is set entirely by the spectrum of $H$. That is why the same code gained
+        1.42x on correlated activations and 1.03x on iid Gaussian ones: with
+        $H \approx I$ the objective is $\|W - \hat W\|$ up to a constant, and
+        there is no free direction to hide the error in.
+
+  implementations:
+    - language: python
+      title: "Absmax quantisation at three granularities, and the outlier that separates them"
+      note: >-
+        Correct: this is the standard symmetric round-to-nearest quantiser, and
+        it reproduces every number quoted in the concept points. The clamp to
+        $[-2^{b-1}, 2^{b-1}-1]$ is load bearing — without it the cast to int8 in
+        a real kernel wraps rather than saturates. It is naive in one way that
+        matters: the group path assumes the input width is divisible by the group
+        size, so a 4,096-wide matrix at group 128 is fine and a 4,000-wide one
+        silently reshapes wrong. That is a scheduling bug, not an arithmetic one,
+        and it is why production kernels fix the group size in the checkpoint
+        format rather than at load time.
+      code: |
+        import numpy as np
+
+        def q(W, bits, mode="tensor", g=128):
+            lv = 2 ** (bits - 1) - 1
+            if mode == "tensor":
+                s = np.abs(W).max() / lv
+                return np.clip(np.round(W / s), -lv - 1, lv) * s
+            if mode == "channel":
+                s = np.abs(W).max(axis=1, keepdims=True) / lv
+                return np.clip(np.round(W / s), -lv - 1, lv) * s
+            d_out, d_in = W.shape
+            Wg = W.reshape(d_out, d_in // g, g)
+            s = np.abs(Wg).max(axis=2, keepdims=True) / lv
+            return (np.clip(np.round(Wg / s), -lv - 1, lv) * s).reshape(d_out, d_in)
+
+        def rel(A, B):
+            return np.linalg.norm(A - B) / np.linalg.norm(B)
+
+        rng = np.random.default_rng(0)
+        W = rng.standard_normal((4096, 4096))
+        print("absmax %.3f sigma   step %.4f sigma"
+              % (np.abs(W).max() / W.std(), np.abs(W).max() / 127 / W.std()))
+
+        for b in (8, 4):
+            print("bits %d  tensor %.4f  channel %.4f  group128 %.4f"
+                  % (b, rel(q(W, b), W), rel(q(W, b, "channel"), W), rel(q(W, b, "group"), W)))
+
+        W2 = W.copy()
+        W2[17] *= 20.0
+        print("outlier row  tensor8 %.4f  channel8 %.4f  tensor4 %.4f  channel4 %.4f"
+              % (rel(q(W2, 8), W2), rel(q(W2, 8, "channel"), W2),
+                 rel(q(W2, 4), W2), rel(q(W2, 4, "channel"), W2)))
+        print("levels left for a typical row: %.1f"
+              % (2 * 3.5 * W.std() / (np.abs(W2).max() / 127)))
+        # absmax 5.352 sigma   step 0.0421 sigma
+        # bits 8  tensor 0.0122  channel 0.0087  group128 0.0065
+        # bits 4  tensor 0.2207  channel 0.1575  group128 0.1173
+        # outlier row  tensor8 0.1583  channel8 0.0086  tensor4 0.9545  channel4 0.1568
+        # levels left for a typical row: 12.2
+
+    - language: python
+      title: "Per-tensor activation quantisation — numerically WRONG for W8A8"
+      note: >-
+        This is wrong as an implementation of an 8-bit layer, and it is here
+        because it is what people ship. Quantising activations per-tensor after
+        three 20x outlier channels gives 12.93% relative error and propagates it
+        straight into the output, against 5.98% for per-token scales and 2.98%
+        for the SmoothQuant path — so the "8-bit" layer is carrying a 13% error
+        into the next of twelve blocks. The last line is worse than inaccurate:
+        `astype(np.int8)` on 200 does not saturate, it wraps to -56, because a
+        float-to-int cast discards the high bits. A kernel that omits the clamp
+        produces weights that are wrong by a factor of 3.5 in sign-flipped
+        directions and raises nothing at all.
+      code: |
+        import numpy as np
+
+        def q_tensor(X, bits):
+            lv = 2 ** (bits - 1) - 1
+            s = np.abs(X).max() / lv
+            return np.clip(np.round(X / s), -lv - 1, lv) * s
+
+        def q_perchannel(W, bits):
+            lv = 2 ** (bits - 1) - 1
+            s = np.abs(W).max(axis=1, keepdims=True) / lv
+            return np.clip(np.round(W / s), -lv - 1, lv) * s
+
+        rng = np.random.default_rng(1)
+        X = rng.standard_normal((256, 4096))
+        X[:, [3, 77, 1900]] *= 20.0                 # three outlier channels
+        W = rng.standard_normal((4096, 512)) / np.sqrt(4096)
+        Y = X @ W
+        rel = lambda A, B: np.linalg.norm(A - B) / np.linalg.norm(B)
+
+        print("column max/median %.2f" % (np.abs(X).max(0).max() / np.median(np.abs(X).max(0))))
+        print("naive W8A8  X %.4f  Y %.4f"
+              % (rel(q_tensor(X, 8), X), rel(q_tensor(X, 8) @ q_perchannel(W, 8), Y)))
+
+        # SmoothQuant: move the outlier into the weights with a diagonal scale
+        s = np.abs(X).max(0) ** 0.5 / np.abs(W).max(1) ** 0.5
+        Xs, Ws = X / s, W * s[:, None]
+        print("smoothquant  X %.4f  Y %.4f  max/median %.2f"
+              % (rel(q_tensor(Xs, 8), Xs),
+                 rel(q_tensor(Xs, 8) @ q_perchannel(Ws, 8), Y),
+                 np.abs(Xs).max(0).max() / np.median(np.abs(Xs).max(0))))
+        # where the 4-bit weight error actually comes from: each input channel
+        # contributes a rank-1 term, so its share is separable exactly
+        D = W - q_perchannel(W, 4)
+        contrib = (X ** 2).sum(0) * (D ** 2).sum(1)
+        print("3 outlier channels carry %.1f%% of the 4-bit output error"
+              % (100 * contrib[[3, 77, 1900]].sum() / contrib.sum()))
+
+        print("unclamped cast: 200 ->", np.float32(200).astype(np.int8))
+        # column max/median 21.61
+        # naive W8A8  X 0.1293  Y 0.1297
+        # smoothquant  X 0.0322  Y 0.0298  max/median 4.75
+        # 3 outlier channels carry 23.3% of the 4-bit output error
+        # unclamped cast: 200 -> -56
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        You are serving a model whose residual stream reaches magnitudes of
+        about 1e5 on some tokens, and the deployment target is a GPU with fp16
+        and bf16 tensor cores. Which format do you pick, and what exactly breaks
+        if you pick the other one?
+      answerKind: short_text
+      hint: >-
+        Look at the largest finite value in each format, not at the bit count.
+        Both are 16 bits; they differ in what they cannot represent.
+      solution: >-
+        bf16. fp16's largest finite value is 65,504, so a 1e5 activation becomes
+        infinity, and everything downstream of it becomes NaN — casting 65,520
+        to fp16 already returns inf. bf16 has fp32's eight-bit exponent and
+        therefore fp32's range, up to 3.39e38, so 1e5 is unremarkable. What you
+        pay is mantissa: bf16 has 7 bits against fp16's 10, so its relative step
+        at 1.0 is 7.81e-3 against 9.77e-4, exactly 8x coarser, and on a
+        4,096-dimensional Gaussian dot product the median relative error is
+        3.4e-3 against 4.7e-4. The other option is to keep fp16 and constrain
+        the dynamic range — which is what fp16 training does with loss scaling,
+        and what you cannot do at inference because you do not control the
+        input.
+    - id: cp-2
+      question: >-
+        A weight matrix is 4,096 by 4,096 Gaussian weights, and row 17 has
+        twenty times the magnitude of the others. Predict the per-tensor and
+        per-channel int8 error, then say what happens at 4 bits and why.
+      answerKind: short_text
+      hint: >-
+        Per-channel rescues the rows that are not corrupted; per-tensor charges
+        every row for the outlier. The error is proportional to the maximum that
+        set the scale.
+      solution: >-
+        Per-channel is 0.863% — statistically identical to the 0.868% on the
+        clean matrix, because only row 17's scale changed. Per-tensor is 15.83%,
+        a factor of 18.3 worse than per-channel: the outlier multiplies the
+        scale, and the scale multiplies every weight's step. The factor is 18.3
+        rather than 20 because the corrupted row's own maximum was 3.65 standard
+        deviations against the matrix maximum of 5.35. At 4 bits per-tensor
+        reaches 95.45%: the step is coarse enough that most rows quantise to a
+        handful of distinct values and the matrix no longer carries its
+        information, while per-channel holds at 15.68%. A typical row is left
+        with twelve levels across its plus-or-minus 3.5-sigma range — 3.6 bits of
+        the 8 it paid for.
+    - id: cp-3
+      question: >-
+        You run GPTQ at 4 bits and measure that the weight error got worse than
+        round-to-nearest, while the layer output error got better. Is the
+        implementation broken? What would convince you either way?
+      answerKind: short_text
+      hint: >-
+        Write down the objective GPTQ minimises. It is not the one you are
+        measuring.
+      solution: >-
+        Not broken — that is the method working. GPTQ minimises
+        the layer output error, which is the quadratic form with the Hessian of
+        the calibration activations; error that lands in directions the input
+        does not excite costs nothing. Measured here: output error 11.69% to
+        8.21%, weight error 11.73% to 15.58%. To check an implementation, measure
+        the quantity the objective names, and check the calibration dependence:
+        the same code gains 1.42x when the calibration activations have condition
+        number 145 and 1.03x when they are iid, because with H close to the
+        identity there is no direction to hide the error in. If the gain is
+        identical on both, the compensation is not running.
+    - id: cp-4
+      question: >-
+        Weight-only int8 cuts the model's bytes in half, so why is the measured
+        decode speedup 1.77x rather than 2x — and why does quantising the KV
+        cache as well not make it 3x?
+      answerKind: short_text
+      hint: >-
+        Write the byte budget as weights plus cache plus LM head, and shrink only
+        the terms that are actually quantised.
+      solution: >-
+        At 1,024 context the fp16 step moves 284.8 MB: 169.9 MB of block weights,
+        77.2 MB of LM head, 37.7 MB of KV cache. int8 shrinks the first two to
+        84.97 and 38.6, leaving 161.3 MB — a 1.77x reduction, because 37.7 MB of
+        cache did not move and is now 23.4% of the traffic. Quantising the cache
+        to int8 as well gives 142.4 MB and 2.00x, and int4 weights at group 128
+        (4.25 effective bits) give 103.3 MB and 2.76x. Both are bandwidth
+        ceilings, so they are what you get only if the kernel is purely
+        memory-bound; dequantisation arithmetic, activation quantisation, and
+        kernel launch overhead all eat into them.
+    - id: cp-5
+      question: >-
+        A colleague reports "4-bit is lossless on our benchmark" and another
+        reports "4 bits cost us 1.1 points". Both ran the same method. What
+        single number reconciles them, and what would you measure before
+        shipping?
+      answerKind: short_text
+      hint: >-
+        Accuracy is a threshold on a continuous quantity. What decides whether a
+        small perturbation flips a prediction?
+      solution: >-
+        The margin — how far the correct class's score sat above the runner-up
+        on the evaluation set. The same per-channel quantiser cost 1.09 points
+        on a task with a 53.57% baseline and 0.19 points on a version with a
+        96.08% baseline, and at 3 bits the two diverge to 7.47 and 0.37. Before
+        shipping I would measure KL divergence to the fp32 predictive
+        distribution, not just accuracy: on the hard task KL moved from 1.7e-3 at
+        8 bits to 0.642 at 4 bits — a 380x change while accuracy moved 1.1
+        points — because a model can keep its argmax and lose its calibration,
+        and calibration is what matters the moment you sample or threshold.
+    - id: cp-6
+      question: >-
+        Your weights have a per-output-channel outlier and your activations have
+        a per-input-channel outlier. Which of per-channel weight quantisation,
+        per-token activation quantisation, and SmoothQuant fixes which — and
+        what does SmoothQuant leave behind?
+      answerKind: short_text
+      hint: >-
+        A scale is per-axis. Ask which axis each method takes its maximum over,
+        and which axis the outlier lives on.
+      solution: >-
+        Per-channel weight quantisation takes the maximum over the input axis
+        within each output row, so it fixes a weight outlier that lives on the
+        output axis — measured 15.83% to 0.863% on a corrupted row. Per-token
+        activation quantisation takes the maximum over each token's features, so
+        it fixes a *token* whose whole vector is large, but it does nothing for
+        a channel that is large in every token: that is the residual-stream
+        outlier case, and per-token only got 12.93% down to 5.98%. SmoothQuant
+        takes the maximum per input channel and divides it out — 21.61 to 4.75 —
+        which handles the channel outlier. What it leaves behind is the weight
+        side: the same scale multiplies W's columns, so if W has its own outlier
+        channel you have enlarged it by s and moved the problem rather than
+        removing it.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A number format is a budget, not a label. Bits go to an exponent, which
+        decides what magnitudes you can represent at all, and to a mantissa,
+        which decides how finely you can distinguish nearby values. Integer
+        formats give up the exponent entirely: they represent a fixed grid whose
+        spacing you choose once, and every value is rounded to the nearest point
+        on that grid.
+
+        That single difference decides everything else. A float's error is
+        proportional to the value — small numbers keep small absolute error. An
+        integer's error is the same for every value in the tensor, so it is
+        negligible for the largest weights and enormous for the smallest. And
+        because the grid's spacing is proportional to the largest magnitude in
+        the tensor, one outlier sets the precision of everything that shares the
+        scale with it.
+      blocks:
+        - kind: checklist
+          body: |
+            - Exponent buys range; mantissa buys precision. You cannot have both in 16 bits
+            - int8 has no exponent, so its error is absolute and uniform
+            - The step is proportional to the maximum of whatever set the scale
+            - The error is proportional to the step
+            - So: shrink the set you take the maximum over, and the error shrinks with it
+            - Every method in this topic is a different answer to "which maximum?"
+      checkpoint: >-
+        Before reading on: if a matrix has one row twenty times larger than the
+        rest, and you use a single scale for the whole matrix, how much worse is
+        the error than if you used one scale per row? Answer in one number, then
+        check it against the measurement later in the topic.
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in one order: bytes, then granularity, then method, then
+        verification. Bytes first because it tells you whether you need 8 bits or
+        4 — the decode budget is a division, and you can do it before you touch a
+        checkpoint. Granularity second because it is the largest lever per unit
+        of effort and it costs almost nothing: per-channel weights are free and
+        per-group-128 costs 0.25 bits. Method third, and only after you know
+        which half is broken: if weights alone at int8 cost 0.74% and per-tensor
+        activations cost 12.93%, no weight-only method will save you and you need
+        SmoothQuant before you need GPTQ.
+
+        Verify with a distributional metric, not accuracy. Accuracy is a
+        threshold on a continuous quantity, so it hides small damage until it
+        suddenly does not.
+      blocks:
+        - kind: checklist
+          body: |
+            - Compute bytes per decode step before choosing a bit width
+            - Per-channel weights, always; it is free and it kills row outliers
+            - Per-group 128 only if you need 4 bits; count the 0.25 bits of metadata
+            - If activations are the problem, SmoothQuant; if weights are, GPTQ or AWQ
+            - Measure KL to the fp32 distribution, not only accuracy
+            - Re-count bytes after the cache decision, not just the weights
+      checkpoint: >-
+        Your weights quantise to 0.74% error and your activations to 12.93%.
+        Which of GPTQ, AWQ, and SmoothQuant would you reach for first, and why
+        are the other two the wrong tool?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The quantiser itself is four lines; the engineering is in choosing the
+        axis and the maximum. Write the scale computation as a function of the
+        axis, then everything else is the same code.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # symmetric absmax, any granularity
+            lv    = 2^(bits-1) - 1
+            s     = max(|W|, axis) / lv          # the only line that changes
+            q     = clamp(round(W / s), -lv-1, lv)
+            W_hat = q * s
+
+            # metadata cost
+            effective_bits = bits + (scale_bits + zero_bits) / group_size
+
+            # the check that matters
+            error = ||W_hat - W||_F / ||W||_F
+
+            # and the deployment question, which is not about error
+            bytes_per_step = n_params * bits_w / 8
+                           + n_kv_fp16 * bits_kv / 16
+            seconds_per_step = bytes_per_step / bandwidth
+
+            # SmoothQuant, before the quantiser
+            s_j  = max|X_j|^alpha / max|W_j|^(1-alpha)
+            X, W = X / s_j, W * s_j
+      checkpoint: >-
+        In that pseudocode, `s` is computed from `W` and then used to divide `W`.
+        What changes if you compute it from `W_hat` instead — and why is that not
+        a fixed-point iteration you want to run?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three lines get you the whole theory: the step, the error power, and the
+        maximum.
+      blocks:
+        - kind: math
+          body: |
+            With $2^{b}$ levels and maximum $A$,
+
+            $$\Delta = \frac{2A}{2^{b}-1}, \qquad
+              \varepsilon^{2} = \frac{\Delta^{2}}{12}
+              \;\Longrightarrow\;
+              \frac{\varepsilon}{\sigma} = \frac{A}{\sigma\,2^{b}\sqrt{3}}.$$
+
+            In decibels, $\operatorname{SNR} = 6.02b + 4.77 -
+            20\log_{10}(A/\sigma)$: 6 dB per bit, and the peak-to-RMS ratio is
+            the only task-dependent term.
+
+            The maximum of $n$ Gaussians grows like $\sqrt{2\ln n}$, so
+
+            $$\frac{\varepsilon_{\text{group}}}{\varepsilon_{\text{tensor}}}
+              = \frac{\sqrt{2\ln 128}}{\sqrt{2\ln 2^{24}}}
+              = \frac{3.1}{5.7} = 0.54,$$
+
+            measured as $0.647/1.217 = 0.53$.
+
+            An outlier of magnitude $c$ in one row multiplies the per-tensor step
+            for every row by $c$, so
+
+            $$\varepsilon_{\text{tensor}} \approx c\,\varepsilon_{\text{channel}} ,$$
+
+            measured at $c = 20$ as a ratio of 18.3.
+      checkpoint: >-
+        The 6 dB rule says each bit halves the error. The measured curve goes
+        1.217% at 8 bits to 22.07% at 4 — a factor of 18.1 rather than 16. Where
+        does the extra factor come from, and why does the same formula
+        under-predict at 2 bits by an even wider margin?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete quantiser, the granularity comparison, and the deployment
+        arithmetic — which is the part people skip and then cannot explain why
+        their 2x expected speedup arrived as 1.77x.
+      blocks:
+        - kind: warning
+          body: >-
+            Two failures here do not raise. Casting to int8 without clamping
+            wraps: 200 becomes -56, and the weights are silently wrong in
+            sign-flipped directions. And a group size that does not divide the
+            input width reshapes into the wrong groups rather than erroring, so a
+            4,000-wide matrix at group 128 quantises across the wrong axis.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def q(W, bits, mode="tensor", g=128):
+                """Symmetric absmax quantise-dequantise. mode: tensor|channel|group."""
+                W = np.asarray(W, dtype=np.float64)
+                lv = 2 ** (bits - 1) - 1
+                if mode == "tensor":
+                    s = np.abs(W).max() / lv
+                    return np.clip(np.round(W / s), -lv - 1, lv) * s
+                if mode == "channel":
+                    s = np.abs(W).max(axis=1, keepdims=True) / lv
+                    return np.clip(np.round(W / s), -lv - 1, lv) * s
+                d_out, d_in = W.shape
+                assert d_in % g == 0, "group size must divide the input width"
+                Wg = W.reshape(d_out, d_in // g, g)
+                s = np.abs(Wg).max(axis=2, keepdims=True) / lv
+                return (np.clip(np.round(Wg / s), -lv - 1, lv) * s).reshape(d_out, d_in)
+
+            def rel(A, B):
+                return float(np.linalg.norm(A - B) / np.linalg.norm(B))
+
+            def effective_bits(bits, g=None, scale_bits=16, zero_bits=16):
+                return bits if g is None else bits + (scale_bits + zero_bits) / g
+
+            def decode_step(n_params, kv_fp16_bytes, bits_w, bits_kv, bw):
+                total = n_params * bits_w / 8 + kv_fp16_bytes * bits_kv / 16
+                return {"bytes": total, "us": total / bw * 1e6,
+                        "tok_s": bw / total, "intensity": 0.208e9 / total}
+
+            rng = np.random.default_rng(0)
+            W = rng.standard_normal((4096, 4096))
+            for b in (8, 4):
+                print(b, "tensor %.4f  channel %.4f  group %.4f"
+                      % (rel(q(W, b), W), rel(q(W, b, "channel"), W), rel(q(W, b, "group"), W)))
+            print("int4 g128 effective bits", effective_bits(4, 128))
+            print(decode_step(123_568_896, 37.7e6, 8, 16, 3.35e12))
+        - kind: code
+          language: python
+          title: "GPTQ, which is RTN plus a Hessian correction — 40 lines to reproduce the 1.42x"
+          body: |
+            import numpy as np
+
+            def quant_cols(W, bits, g=128):
+                lv = 2 ** (bits - 1) - 1
+                d_out, d_in = W.shape
+                Wg = W.reshape(d_out, d_in // g, g)
+                s = np.abs(Wg).max(axis=2, keepdims=True) / lv
+                return (np.clip(np.round(Wg / s), -lv - 1, lv) * s).reshape(d_out, d_in)
+
+            def gptq(W, X, bits, g=128, damp=0.01):
+                """Column-wise RTN with Hessian compensation; returns W_hat."""
+                lv = 2 ** (bits - 1) - 1
+                Wq = W.copy()
+                H = X.T @ X
+                H += damp * np.diag(np.diag(H)) + 1e-8 * np.eye(W.shape[1])
+                U = np.linalg.cholesky(np.linalg.inv(H)).T     # U^T U = H^-1
+                for j in range(W.shape[1]):
+                    lo = (j // g) * g
+                    s = np.abs(W[:, lo:lo + g]).max(axis=1) / lv
+                    w = Wq[:, j].copy()
+                    q = np.clip(np.round(w / s), -lv - 1, lv) * s
+                    Wq[:, j] = q
+                    Wq[:, j + 1:] -= np.outer((w - q) / U[j, j], U[j, j + 1:])
+                return Wq
+
+            rng = np.random.default_rng(3)
+            W = rng.standard_normal((256, 512)) / np.sqrt(512)
+            Q, _ = np.linalg.qr(rng.standard_normal((512, 512)))
+            C = Q * np.logspace(0, -1, 512)[None, :]          # cond(H) ~ 1e2
+            X = rng.standard_normal((4096, 512)) @ C.T
+            X /= X.std()
+            rel = lambda A, B: np.linalg.norm(A - B) / np.linalg.norm(B)
+            for name, Wh in (("rtn", quant_cols(W, 4)), ("gptq", gptq(W, X, 4))):
+                print(name, "out %.4f  w %.4f" % (rel(X @ Wh.T, X @ W.T), rel(Wh, W)))
+            # rtn  out 0.1169  w 0.1173
+            # gptq out 0.0821  w 0.1558
+      checkpoint: >-
+        `decode_step` returns intensity using a fixed 0.208 GFLOP. Why does that
+        number not change when you halve the weight bits — and why does that mean
+        quantisation cannot move you towards the ridge point?
+
+  problems:
+    - id: p-quant-error
+      title: "Quantisation error at three granularities"
+      difficulty: medium
+      prompt: >-
+        Implement `quant_error(W, bits, mode="tensor", group_size=128)` returning
+        the relative Frobenius error of a symmetric absmax quantise-dequantise,
+        as a float. `W` is a 2-D matrix. For `mode="tensor"` use one scale from
+        the global maximum; for `"channel"` one scale per row; for `"group"` one
+        scale per contiguous block of `group_size` values along each row (clip
+        `group_size` to the row width if it is larger, and assume it divides the
+        width otherwise). Levels are `2**(bits-1)-1` and the integer codes are
+        clamped to `[-(levels+1), levels]`. The error is
+        `||W_hat - W||_F / ||W||_F`.
+      starter: |
+        import numpy as np
+
+        def quant_error(W, bits, mode="tensor", group_size=128):
+            # your implementation here
+            pass
+      language: python
+      entry: quant_error
+      testCases:
+        - input: '[[[1.0, -2.0], [3.0, 0.5]], 8, "tensor"]'
+          expected: '0.0031288165914922237'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0, -2.0], [3.0, 0.5]], 8, "channel"]'
+          expected: '0.002332082195901934'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0, -2.0], [3.0, 0.5]], 4, "tensor"]'
+          expected: '0.05676567244564473'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[0.1, 0.2, -0.3, 0.4], [0.05, -0.1, 0.2, -0.05], [0.3, 0.1, -0.2, 0.25], [2.0, -3.0, 4.0, -5.0]], 4, "tensor"]'
+          expected: '0.10649308846653323'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[0.1, 0.2, -0.3, 0.4], [0.05, -0.1, 0.2, -0.05], [0.3, 0.1, -0.2, 0.25], [2.0, -3.0, 4.0, -5.0]], 4, "channel"]'
+          expected: '0.047758495140063'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0, 2.0, 3.0, 4.0], [0.5, 1.5, 2.5, 3.5]], 4, "group", 2]'
+          expected: '0.030006001800600236'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def quant_error(W, bits, mode="tensor", group_size=128):
+            W = np.asarray(W, dtype=np.float64)
+            lv = 2 ** (bits - 1) - 1
+            if mode == "tensor":
+                s = np.abs(W).max() / lv
+                Q = np.clip(np.round(W / s), -lv - 1, lv) * s
+            elif mode == "channel":
+                s = np.abs(W).max(axis=1, keepdims=True) / lv
+                Q = np.clip(np.round(W / s), -lv - 1, lv) * s
+            else:
+                d_out, d_in = W.shape
+                g = min(int(group_size), d_in)
+                Wg = W.reshape(d_out, d_in // g, g)
+                s = np.abs(Wg).max(axis=2, keepdims=True) / lv
+                Q = (np.clip(np.round(Wg / s), -lv - 1, lv) * s).reshape(d_out, d_in)
+            return float(np.linalg.norm(Q - W) / np.linalg.norm(W))
+      solutionExplanation: >-
+        The only thing that changes between modes is the axis of the maximum —
+        `max()` for per-tensor, `axis=1, keepdims=True` for per-channel, and a
+        reshape so that the last axis is the group. Everything else is one
+        expression, which is the point: granularity is a choice of maximum, not a
+        different algorithm. The first two cases differ by only 1.34x because both
+        rows happen to have similar maxima (3.0 and 3.0); the fourth and fifth
+        cases put a 20x row in the matrix and the ratio between tensor and channel
+        jumps to 2.23x, because now the two axes really are different maxima. The
+        last case is the one that catches a wrong reshape: with a 2x4 matrix and
+        `group_size=2` there are two groups per row, and the row `[1,2,3,4]`
+        must split as `[1,2]` and `[3,4]` — splitting by stride instead gives
+        `[1,3]` and `[2,4]`, a different answer with identical shapes. Note the
+        `min(group_size, d_in)` clamp: a group larger than the row is one scale
+        per row, which is per-channel.
+      complexity: "O(n) time and space in the number of elements"
+      tags: [quantisation, absmax, granularity, per-channel, per-group]
+
+    - id: p-quant-bytes
+      title: "Bytes per decode step, and what quantisation actually buys"
+      difficulty: easy
+      prompt: >-
+        Implement `decode_cost(n_params, n_kv_fp16_bytes, weight_bits, kv_bits,
+        bandwidth)` returning a dict with keys `bytes`, `microseconds` and
+        `tokens_per_second`. The weight term is `n_params * weight_bits / 8`;
+        `n_kv_fp16_bytes` is the cache size at fp16 and must be scaled by
+        `kv_bits / 16`; the total is their sum. Time is total bytes over
+        `bandwidth` (in seconds, converted to microseconds) and throughput is
+        `bandwidth / total_bytes`. This is the bandwidth ceiling for one decode
+        step, so it ignores kernel overhead — which is exactly why measured
+        speedups come in below it.
+      starter: |
+        def decode_cost(n_params, n_kv_fp16_bytes, weight_bits, kv_bits, bandwidth):
+            # your implementation here
+            pass
+      language: python
+      entry: decode_cost
+      testCases:
+        - input: '[123568896, 37700000.0, 16, 16, 3350000000000.0]'
+          expected: '{"bytes": 284837792.0, "microseconds": 85.02620656716418, "tokens_per_second": 11761.079793793655}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[123568896, 37700000.0, 8, 16, 3350000000000.0]'
+          expected: '{"bytes": 161268896.0, "microseconds": 48.13996895522388, "tokens_per_second": 20772.75955308828}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[123568896, 37700000.0, 8, 8, 3350000000000.0]'
+          expected: '{"bytes": 142418896.0, "microseconds": 42.51310328358209, "tokens_per_second": 23522.15958758731}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[123568896, 37700000.0, 4.25, 16, 3350000000000.0]'
+          expected: '{"bytes": 103345976.0, "microseconds": 30.849545074626867, "tokens_per_second": 32415.388868164544}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[7000000000, 1000000000.0, 4.25, 16, 3350000000000.0]'
+          expected: '{"bytes": 4718750000.0, "microseconds": 1408.5820895522388, "tokens_per_second": 709.933774834437}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def decode_cost(n_params, n_kv_fp16_bytes, weight_bits, kv_bits, bandwidth):
+            weights = float(n_params) * float(weight_bits) / 8.0
+            kv = float(n_kv_fp16_bytes) * float(kv_bits) / 16.0
+            total = weights + kv
+            return {"bytes": total,
+                    "microseconds": total / float(bandwidth) * 1e6,
+                    "tokens_per_second": float(bandwidth) / total}
+      solutionExplanation: >-
+        The second case is the one people get wrong by quoting 2x: int8 weights
+        alone give 161.3 MB against 284.8 MB, which is 1.77x, because the fp16
+        cache's 37.7 MB did not shrink and is now 23.4% of the traffic. The third
+        case quantises the cache too and lands on exactly 2.00x. The fourth uses
+        `weight_bits = 4.25`, the effective width of int4 at group 128 once the
+        fp16 scale and zero are counted — using 4.0 there overstates the speedup
+        by 6%. The fifth case is a 7B model with a 1 GB fp16 cache at 1,024
+        context: 4.72 GB per step, 1,409 microseconds, 710 tokens per second —
+        a bandwidth ceiling that no amount of batching at fixed memory will beat,
+        because batching does not reduce the weight term per sequence.
+      complexity: "O(1) time and space"
+      tags: [roofline, decode, memory-bandwidth, effective-bits]
+
+    - id: p-quant-quantise
+      title: "Quantise and dequantise a matrix with an outlier row"
+      difficulty: easy
+      prompt: >-
+        Implement `quantise(W, bits, mode="tensor")` returning the
+        quantise-dequantised matrix as nested Python lists of floats. Use
+        symmetric absmax: `levels = 2**(bits-1)-1`, `s = max|W| / levels` for
+        `mode="tensor"` or one scale per row for `mode="channel"`, round to the
+        nearest integer, clamp the integer codes to `[-(levels+1), levels]`, and
+        multiply back by the scale. Return the dequantised values, not the
+        integers.
+      starter: |
+        import numpy as np
+
+        def quantise(W, bits, mode="tensor"):
+            # your implementation here
+            pass
+      language: python
+      entry: quantise
+      testCases:
+        - input: '[[[0.4, -1.0], [9.0, 20.0]], 8, "tensor"]'
+          expected: '[[0.47244094488188976, -0.9448818897637795], [8.976377952755906, 20.0]]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[0.4, -1.0], [9.0, 20.0]], 8, "channel"]'
+          expected: '[[0.4015748031496063, -1.0], [8.976377952755906, 20.0]]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[0.4, -1.0], [9.0, 20.0]], 4, "channel"]'
+          expected: '[[0.42857142857142855, -1.0], [8.571428571428571, 20.0]]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0, -1.0], [1.0, -1.0]], 3, "channel"]'
+          expected: '[[1.0, -1.0], [1.0, -1.0]]'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def quantise(W, bits, mode="tensor"):
+            W = np.asarray(W, dtype=np.float64)
+            lv = 2 ** (bits - 1) - 1
+            if mode == "tensor":
+                s = np.abs(W).max() / lv
+            else:
+                s = np.abs(W).max(axis=1, keepdims=True) / lv
+            return (np.clip(np.round(W / s), -lv - 1, lv) * s).tolist()
+      solutionExplanation: >-
+        The first case is the whole argument in four numbers. With a per-tensor
+        scale of 20/127, the small weights 0.4 and -1.0 land on codes 3 and -6
+        and reconstruct as 0.472 and -0.945 — errors of 18% and 5.5% — while 9.0
+        and 20.0 reconstruct within 3%. With a per-channel scale the first row
+        gets its own maximum of 1.0, and 0.4 becomes 0.4016: the same bit budget,
+        fifty times less error on the small values. The second row is identical
+        in both cases, which is the point about locality — the outlier only
+        corrupts what shares its scale. The third case at 4 bits shows the
+        collapse: the first row now has 15 levels, so 0.4 reconstructs as 0.4286
+        (7% error) and -1.0 survives only because it is exactly the maximum. The
+        fourth case is the identity check: values at the maximum reconstruct
+        exactly at any bit width, which is the cheapest sanity test for a
+        quantiser and catches sign, scale, and offset bugs at once.
+      complexity: "O(n) time and space"
+      tags: [quantisation, round-to-nearest, outlier, per-channel]
+
+  visualizers:
+    - id: vs-quant-granularity
+      kind: tensor
+      title: "One matrix, three scales"
+      description: >-
+        Pick a granularity and watch a 4,096-wide row of Gaussian weights land on
+        its grid. Per-tensor uses the global maximum of 5.35 standard deviations,
+        per-channel uses the row maximum of 3.9, per-group-128 uses about 2.9 —
+        and the measured reconstruction error follows: 1.217%, 0.868%, 0.647% at
+        8 bits, and 22.07%, 15.75%, 11.73% at 4. Scale one row by 20 and the
+        per-tensor grid coarsens for every row at once while per-channel is
+        unchanged.
+      params:
+        d_model: 4096
+        group_size: 128
+        bits: 4
+        outlier_row: 17
+        outlier_scale: 20.0
+
+
+  try_it: >-
+    Quantise a 4096-by-4096 Gaussian matrix three ways — per-tensor, per-channel and per-group of
+    128 — and measure the relative error at 4 bits. You should see 22.07%, 15.75% and 11.73%;
+    then scale one row by 20 and watch the 8-bit per-tensor error jump from 1.217% to 15.83%.
+  interview_questions:
+    - question: 'Why does int8 error depend on max|w| rather than on the bit count alone?'
+      level: mid
+      key_points:
+        - 'int8 has no exponent, so its error is absolute and set by the step Delta = max|w| / 127.'
+        - 'On a 4096-by-4096 Gaussian matrix the global maximum is 5.35 standard deviations, giving Delta = 0.0421 sigma.'
+        - 'One large weight therefore sets the resolution for every weight that shares its scale, which is why the maximum, not the mean, controls the error.'
+        - 'That is the mechanism behind every granularity improvement: smaller groups mean smaller maxima.'
+    - question: 'You have GPTQ, AWQ and SmoothQuant. Which do you use for a 4-bit weight-only deployment, and why?'
+      level: senior
+      key_points:
+        - 'GPTQ quantises one column at a time and pushes the residual into the not-yet-quantised columns through H^-1 = (XX^T)^-1, minimising layer-output error rather than weight error.'
+        - 'AWQ ranks channels by the magnitude of the activations that read them, scales the salient ones up before rounding and folds 1/s into the preceding operation.'
+        - 'SmoothQuant migrates the activation outlier into the weights with s_j = max|X_j|^alpha / max|W_j|^(1-alpha) at alpha = 0.5, which is an int8 activation story.'
+        - 'So weight-only 4-bit belongs to GPTQ or AWQ, and the activation-outlier problem belongs to SmoothQuant.'
+      follow_up: 'Why can a weight scale be baked into the checkpoint while an activation scale cannot?'
+    - question: 'Granularity is described as the cheapest accuracy in the field. Give the numbers and the mechanism.'
+      level: mid
+      key_points:
+        - 'At 8 bits per-tensor is 1.217%, per-channel 0.868% and per-group of 128 0.647%.'
+        - 'At 4 bits the same ladder is 22.07%, 15.75% and 11.73%.'
+        - 'The error scales with the absmax of whatever shares the scale, so making the group smaller makes the maximum smaller.'
+        - 'Scaling one row of the matrix by 20 moves per-tensor error from 1.217% to 15.83%, a 13.0x increase, which is the outlier problem in one line.'
+  common_mistakes:
+    - 'Using one scale per tensor on a matrix with a single 20x channel, where per-tensor error goes from 1.217% to 15.83%.'
+    - 'Choosing bf16 for its 8-bit exponent and then losing accuracy to its 7-bit mantissa in a layer that needs precision, or picking fp16 for range it does not have.'
+    - 'Expecting int8 to improve MFU, when it halves the bytes and doubles the ridge point and leaves the kernel exactly as memory-bound.'
+  further_reading:
+    - label: "Frantar, Ashkboos, Hoefler & Alistarh, GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers (ICLR 2023)"
+    - label: "Dettmers, Lewis, Belkada & Zettlemoyer, LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale (NeurIPS 2022)"

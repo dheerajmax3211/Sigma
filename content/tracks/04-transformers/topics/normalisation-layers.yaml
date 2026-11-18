@@ -1,0 +1,1426 @@
+id: normalisation-layers
+slug: normalisation-layers
+title: "LayerNorm, BatchNorm, and RMSNorm"
+summary: >-
+  Normalise each token's own feature vector rather than a batch, so the layer
+  depends on neither the batch size nor the sequence; then place it so the
+  residual path stays an identity. Measure what pre-norm buys at depth 48, what
+  RMSNorm drops when it removes the mean, and how epsilon placement decides
+  whether a dead layer recovers or explodes.
+kind: lesson
+difficulty: medium
+position: 4
+estMinutes: 26
+prerequisites: [batchnorm-layernorm, mlp-from-scratch]
+phase: block-assembly
+tags: [layernorm, rmsnorm, batchnorm, pre-norm, post-norm, residual-stream, epsilon, transformers]
+
+body:
+  big_idea: >-
+    A transformer normalises each token's own features, so the layer depends
+    on neither batch nor sequence — and where the norm sits, and whether it
+    centres, decide whether deep stacks have an identity path.
+
+  problem:
+    - >-
+      You port `BatchNorm` into a transformer: at batch 8 the loss is noise,
+      at batch 1 it is `nan`, and padding contaminates the statistics.
+    - >-
+      You put the LayerNorm after the residual add and at 24 layers it
+      diverges at a learning rate pre-norm accepted.
+    - >-
+      You swap LayerNorm for RMSNorm, retrain, lose 0.4 points, and cannot say
+      whether the norm or the dropped bias caused it.
+
+  analogy: |
+    A recording studio. Per-track gain staging is LayerNorm: each track is
+    levelled against its own peak, so adding a take changes nothing already
+    recorded. Per-session normalisation is BatchNorm: one gain for the whole
+    session, so one loud take re-levels everything. Pre-norm versus post-norm
+    is where the compressor sits — on each instrument before the mix, or on
+    the mix bus after every pass.
+
+  concept_points:
+    - >-
+      **LayerNorm's statistic is per token, so nothing crosses the batch or the sequence.**
+      With $d_{\text{model}} = 768$ the reduction runs over 768 numbers
+      belonging to one token: perturb one other token by $+1.0$ and the first
+      token's LayerNorm output moves by exactly **0.0**, while its BatchNorm
+      output moves by **0.2355**. Sweeping batch size from 1 to 64: LayerNorm
+      **0.0**, BatchNorm **2.4038**. The axis *is* the function.
+    - >-
+      **Padding settles the argument, because padding is a future token from the statistic's point of view.**
+      Pad sequences of length 12, 7 and 4 to length 12 and the 12-token
+      sequence's own representation shifts by **1.2643** under BatchNorm, and
+      by exactly **0.0** under LayerNorm. Masking the loss cannot repair it:
+      the statistic is computed before the loss exists.
+    - >-
+      **LayerNorm's Jacobian annihilates the all-ones direction, and that is the price of mean-centring.**
+      A uniform cotangent through one LayerNorm gives a gradient of norm
+      **8.97e-16** — zero to machine precision, because
+      $\mathbf{1}^\top J = 0$. The same probe through an RMSNorm of the same
+      width returns norm **11.95**. An LN is a projection onto the zero-mean
+      subspace; an RMSNorm is not.
+    - >-
+      **RMSNorm is a shrunk LayerNorm plus a token-dependent multiple of the gain.**
+      With token mean $\mu$, standard deviation $\sigma$ and root mean square
+      $\rho$: RMS $(x) = (\sigma/\rho)\,\mathrm{LN}(x) + (\mu/\rho)\,\gamma$,
+      and $\sigma/\rho = \sqrt{\sigma^2/(\sigma^2+\mu^2)} \le 1$. Measured at
+      $\mu = 0.8$, $\sigma = 2$: scale **0.9285**, mean coefficient **0.3714**,
+      outputs differing by **37.82%** relative. At $\mu = 0$ they agree to
+      **8.9e-16**.
+    - >-
+      **Epsilon goes inside the square root, and outside is a different function.**
+      With $\varepsilon = 10^{-5}$ the realised gain
+      $\sigma/\sqrt{\sigma^2+\varepsilon}$ at $\sigma = 10^{-2}$ is **0.9535**
+      against **0.9990** for $\sigma/(\sigma+\varepsilon)$; at
+      $\sigma = 10^{-3}$ it is **0.3015** against **0.9901**. On a row that
+      has underflowed to zero, the outside form's gain is
+      $1/\varepsilon = 10^{5}$, which overflows fp16's 65,504; the inside form
+      gives **316.2**.
+    - >-
+      **Pre-norm is $x + f(\mathrm{LN}(x))$; post-norm is $\mathrm{LN}(x + f(x))$, and only the first has an identity path.**
+      Zero the block's output projection and pre-norm returns its input
+      exactly: max shift **0.0**, gradient ratio $g_0/g_L$ = **1.000000**,
+      $\cos(h_0, h_{24})$ = **1.000000**. The same ablation under post-norm
+      still transforms the stream (relative shift **0.1647**, $g_0/g_L$ =
+      **1.0115**), because the LN is not the identity.
+
+  definitions:
+    - term: "LayerNorm"
+      meaning: >-
+        Per-token normalisation over the feature axis: subtract the token's own
+        mean, divide by its own standard deviation, then apply a learned gain
+        and bias. At $d_{\text{model}} = 768$ each token is normalised by 768
+        numbers that belong to it alone, so the layer is identical in training
+        and inference and identical at any batch size or sequence length.
+    - term: "BatchNorm"
+      meaning: >-
+        Normalisation over the batch axis, with one mean and variance per
+        feature computed across all examples (and, in a sequence model, all
+        positions) in the batch. It needs running statistics at inference and,
+        in a language model, it lets a token's representation depend on tokens
+        it is not allowed to see.
+    - term: "RMSNorm"
+      meaning: >-
+        LayerNorm without the mean subtraction: divide by the root mean square
+        of the token's features and apply the gain, no bias. Exactly equal to
+        LayerNorm when the token's mean is zero (measured agreement 8.9e-16),
+        and a shrunk LayerNorm plus a multiple of the gain when it is not.
+    - term: "Normalisation axis"
+      meaning: >-
+        The set of numbers a statistic is computed over. Feature axis means one
+        statistic per token; batch axis means one per feature across examples;
+        batch-and-time means one per feature across the whole padded batch.
+        Everything that differs between LayerNorm and BatchNorm in a transformer
+        follows from this choice alone.
+    - term: "Pre-norm"
+      meaning: >-
+        $x + f(\mathrm{LN}(x))$: the norm sits on the branch, inside the
+        sublayer's input, and the residual add is untouched. The block is the
+        exact identity when $f$ is zero, which is what makes depth 48 trainable
+        without a warmup.
+    - term: "Post-norm"
+      meaning: >-
+        $\mathrm{LN}(x + f(x))$: the norm sits on the residual stream, after the
+        add. The block is never the identity — measured relative shift 0.1647
+        even with the branch zeroed — so every block re-projects the stream and
+        the original transformer paired it with a 4,000-step warmup.
+    - term: "Residual stream"
+      meaning: >-
+        The $d_{\text{model}}$-wide vector each token carries through the whole
+        stack, which every block reads and adds to. Under pre-norm it is a sum
+        of the embedding and every block's contribution, so its norm follows
+        $\sqrt{1 + L\alpha^2}$ — measured 2.07x at depth 48 — and it needs a
+        final LayerNorm before the unembedding.
+    - term: "Gain and bias"
+      meaning: >-
+        The learned $\gamma, \beta \in \mathbb{R}^{d}$ an affine normalisation
+        applies after standardising, initialised to ones and zeros so the layer
+        starts as a pure normaliser. RMSNorm usually drops $\beta$: the
+        following linear layer already has a bias, and the mean-direction
+        information is the thing RMSNorm is deliberately keeping.
+    - term: "Epsilon"
+      meaning: >-
+        The constant added before the square root to keep the division finite.
+        Convention is $10^{-5}$ for LayerNorm in fp32 and $10^{-6}$ for RMSNorm
+        in bf16. Its placement — inside the root, as
+        $\sqrt{\sigma^2+\varepsilon}$ — is part of the function, not a detail:
+        outside the root the gain on a dead row is $1/\varepsilon = 10^5$, which
+        is past fp16's 65,504.
+    - term: "Final LayerNorm (ln_f)"
+      meaning: >-
+        The one norm applied to the residual stream after the last block and
+        before the unembedding. Required by pre-norm, because the stream's norm
+        grows with depth; without it the logit scale is a function of depth
+        (measured standard deviation 1.0498 against 0.1606 at 24 blocks).
+    - term: "DC component"
+      meaning: >-
+        The projection of a token's vector onto the all-ones direction, that is,
+        its mean times $\mathbf{1}$. LayerNorm removes it exactly — its Jacobian
+        annihilates that direction, measured norm 8.97e-16 — while RMSNorm keeps
+        it, which is the entire difference between the two layers up to a
+        scalar.
+    - term: "Warmup"
+      meaning: >-
+        A learning-rate schedule that starts near zero and rises over the first
+        few thousand steps. Post-norm stacks need it because their early-layer
+        gradients are not protected by an identity path; pre-norm stacks train
+        without it, which is most of why every model after GPT-2 is pre-norm.
+
+  diagrams:
+    - type: architecture
+      title: "Where the norm sits, and the stream it protects"
+      nodes:
+        - { id: embed, x: 0, y: 0, label: "token embedding", kind: client, detail: "One d_model vector per token. Everything after this is an addition to it, never a replacement." }
+        - { id: stream, x: 1, y: 1, label: "residual stream h", kind: storage, detail: "The bus. Every block reads it, computes a branch, and adds the branch back. Its norm grows as sqrt(1 + L alpha^2): measured 1.63x at 24 blocks and 2.07x at 48." }
+        - { id: ln1, x: 2, y: 0, label: "LayerNorm 1", kind: server, detail: "Per token, over 768 features. Two reductions: mean, then variance. Its Jacobian projects out the all-ones direction, so no constant offset survives it." }
+        - { id: attn, x: 3, y: 0, label: "attention", kind: model, detail: "Multi-head attention from the previous two topics. It reads the normalised copy of the stream, never the stream itself." }
+        - { id: ln2, x: 2, y: 2, label: "LayerNorm 2", kind: server, detail: "The same layer, in front of the MLP. Two norms per block is the standard count; they are 1,536 parameters each at d_model=768." }
+        - { id: mlp, x: 3, y: 2, label: "MLP (4x, GELU)", kind: model, detail: "The block from MLP: Layers, Activations, and Initialisation, widened by 4 and projected back down. 4,718,592 parameters at d_model=768." }
+        - { id: lnf, x: 0, y: 1, label: "final LayerNorm", kind: server, detail: "Not optional under pre-norm: the stream has grown 6.56x by block 24, and the unembedding would inherit that factor as a temperature change." }
+        - { id: unembed, x: 0, y: 2, label: "unembed -> logits", kind: client, detail: "Logit standard deviation 0.1606 with ln_f against 1.0498 without, at depth 24. Maximum softmax probability 0.0188 against 0.3677." }
+      edges:
+        - { from: embed, to: stream, label: "write once" }
+        - { from: stream, to: ln1, label: "read" }
+        - { from: ln1, to: attn, label: "normalised copy" }
+        - { from: attn, to: stream, label: "add branch", style: solid }
+        - { from: stream, to: ln2, label: "read" }
+        - { from: ln2, to: mlp, label: "normalised copy" }
+        - { from: mlp, to: stream, label: "add branch", style: solid }
+        - { from: stream, to: lnf, label: "read at the end" }
+        - { from: lnf, to: unembed, label: "logits" }
+
+    - type: compare
+      title: "Post-norm against pre-norm, same block, same weights"
+      left_label: "Post-norm: LN(x + f(x))"
+      left_points:
+        - "Block is never the identity: with the branch zeroed the stream still moves by 16.5% relative"
+        - "Cannot carry a constant offset: add +5 to every feature and the output moves by 2e-15 — zero to machine precision"
+        - "Stream norm pinned at 1.00x at every depth, so the input's share of the final state decays: cos(h0, h24) = 0.451 against 0.607"
+        - "Bottom-layer gradient ratio is init-dependent: 1.64 to 5.58 across 12 seeds at depth 48"
+        - "Needs a warmup: the 2017 transformer used 4,000 steps, and BERT inherited it"
+      right_label: "Pre-norm: x + f(LN(x))"
+      right_points:
+        - "Block is the exact identity with a zeroed branch: measured shift 0.0, gradient ratio 1.000000, cos(h0, h24) = 1.000000"
+        - "Propagates a constant offset untouched: +5 in, 5.0 out"
+        - "Stream accumulates as sqrt(1 + L alpha^2): 1.35x, 1.63x, 2.07x at depths 12, 24, 48 with alpha constant to three digits"
+        - "Bottom-layer gradient follows the same law: 1.382, 1.705, 2.190 — predictable from depth alone"
+        - "Requires a final LayerNorm before the unembedding, and trains at depth without warmup"
+
+    - type: pipeline
+      title: "Two reductions or one: what RMSNorm actually saves"
+      nodes:
+        - label: "pass 1: sum x, sum x^2"
+          note: "one read of the row"
+          detail: "LayerNorm can fuse these into a single streaming pass, but it still needs both moments; RMSNorm needs only sum x^2. On a 768-wide row that is 768 multiply-adds either way."
+        - label: "mean and variance"
+          note: "LayerNorm only"
+          detail: "mu = sum x / d, sigma^2 = sum x^2 / d - mu^2. Biased, dividing by d, so that the layer is exactly scale-invariant at eps = 0. RMSNorm stops here and uses rho^2 = sum x^2 / d directly."
+        - label: "rsqrt(var + eps)"
+          note: "eps inside the root"
+          detail: "1/sqrt(sigma^2 + eps), not 1/(sqrt(sigma^2) + eps). At sigma = 1e-2 the two differ by 4.6%; on a dead row they differ by a factor of 316."
+        - label: "scale by gamma, shift by beta"
+          note: "beta is optional"
+          detail: "1,536 parameters at d_model=768 for LayerNorm, 768 for RMSNorm. That is 0.0217% of the block it sits in — the choice is never about parameter count."
+      # measured: 0.2089 s against 0.1646 s, forward plus backward, 8192x4096 float64
+
+    - type: plot
+      title: "Residual stream norm against depth: accumulation versus renormalisation"
+      chart: line
+      xLabel: "block index"
+      yLabel: "mean per-token norm / input norm"
+      series:
+        - name: "pre-norm, unit-scale branch"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 12, y: 4.55 }
+            - { x: 24, y: 6.56 }
+            - { x: 48, y: 8.88 }
+        - name: "pre-norm, small branch (alpha = 0.26)"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 12, y: 1.35 }
+            - { x: 24, y: 1.63 }
+            - { x: 48, y: 2.07 }
+        - name: "post-norm, either branch"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 12, y: 1.0 }
+            - { x: 24, y: 1.01 }
+            - { x: 48, y: 1.0 }
+
+    - type: plot
+      title: "Realised gain of the normaliser as the input gets small"
+      chart: line
+      xLabel: "input standard deviation (points at 1, 0.1, 0.01, 0.001, 0.00001)"
+      yLabel: "gain, sigma / denominator"
+      series:
+        - name: "eps inside the root (sqrt(var + eps))"
+          points:
+            - { x: 0, y: 0.999995 }
+            - { x: 1, y: 0.9995 }
+            - { x: 2, y: 0.953463 }
+            - { x: 3, y: 0.301511 }
+            - { x: 5, y: 0.003162 }
+        - name: "eps outside the root (sqrt(var) + eps)"
+          points:
+            - { x: 0, y: 0.999990 }
+            - { x: 1, y: 0.9999 }
+            - { x: 2, y: 0.999001 }
+            - { x: 3, y: 0.990099 }
+            - { x: 5, y: 0.5 }
+
+  markdown: |
+    ## The axis decides the function
+
+    The previous topic derived what normalisation does: it measures the
+    variance and divides by it, which makes the loss invariant to the weight
+    scale and moves the quantity you are tuning from $\eta$ to
+    $\eta/\|W\|^2$. That derivation did not care which axis the statistic was
+    taken over. This topic is about the axis, and about the two placements that
+    follow from it.
+
+    LayerNorm reduces over the feature axis of one token:
+
+    $$\operatorname{LN}(x) = \gamma \odot \frac{x - \mu}{\sqrt{\sigma^2 + \varepsilon}} + \beta,
+      \qquad \mu = \frac{1}{d}\sum_{i=1}^{d} x_i,
+      \qquad \sigma^2 = \frac{1}{d}\sum_{i=1}^{d}(x_i - \mu)^2,$$
+
+    with $\gamma, \beta \in \mathbb{R}^{d}$ and the variance biased — divided by
+    $d$, not $d-1$ — so the layer is exactly scale-invariant when
+    $\varepsilon = 0$. Everything below follows from the subscript on that sum:
+    $i$ runs over the 768 features of a single token, never over the batch and
+    never over the sequence.
+
+    That single fact has consequences you can measure rather than argue about:
+
+    | probe | BatchNorm | LayerNorm |
+    |---|---|---|
+    | perturb one other token in the batch by +1.0 | 0.2355 | 0.0 |
+    | same token, batch size swept 1 → 64 | 2.4038 | 0.0 |
+    | 3 sequences padded to length 12 | 1.2643 | 0.0 |
+
+    The third row decides the architecture. A causal model's token at position
+    $t$ may not depend on position $t+1$, and a batch-time statistic makes it
+    one — at training time only, which is worse than either failure mode,
+    because the leak improves the number you watch and vanishes from the
+    artifact you ship. Masking the loss does not help: the statistic is
+    computed before the loss exists.
+
+    ## Post-norm and pre-norm
+
+    There are two places to put the norm, and they differ by one parenthesis:
+
+    $$\text{post-norm: } h_{l+1} = \operatorname{LN}\!\left(h_l + f(h_l)\right),
+      \qquad
+      \text{pre-norm: } h_{l+1} = h_l + f\!\left(\operatorname{LN}(h_l)\right).$$
+
+    The residual block's whole value is that it becomes the identity when $f$ is
+    zero, which is what keeps a product of fifty Jacobians from decaying. Only
+    pre-norm keeps that promise. Zero the block's output projection and measure:
+    pre-norm returns its input bit for bit — max shift **0.0**, gradient ratio
+    $g_0/g_L$ = **1.000000**, $\cos(h_0,h_{24})$ = **1.000000** — while
+    post-norm still transforms the stream, because a LayerNorm is not the
+    identity. Its relative shift is **0.1647** and its gradient ratio
+    **1.0115**, and neither of those is zero no matter how small the branch is.
+
+    The same difference shows up as a failure to carry information. Add $+5$ to
+    every feature of the input: pre-norm's output moves by **5.000000** and
+    post-norm's by **0.000000**, because the LayerNorm projects out the
+    all-ones direction at every block. Mean-centring is a projection onto the
+    zero-mean subspace, and a residual path that runs through one cannot hold a
+    constant.
+
+    Under pre-norm the stream accumulates, and its growth is the
+    square-root law of a sum of independent increments:
+
+    $$\left\|h_L\right\|^2 = \left\|h_0\right\|^2\left(1 + L\alpha^2\right).$$
+
+    Measured stream growth is **1.35x, 1.63x, 2.07x** at depths 12, 24, 48,
+    which inverts to $\alpha$ = **0.2615, 0.2627, 0.2615** — the same constant to
+    three digits, so this is a law and not a curve fit. The bottom-layer
+    gradient follows the same curve (**1.382, 1.705, 2.190**), because each
+    block contributes one more term to the product. Post-norm pins the stream at
+    **1.00x**, which sounds tidier and is not: it means the input's share of the
+    final state shrinks, $\cos(h_0,h_{24})$ falling from **0.607** to **0.451**
+    on the same weights, and its bottom-layer gradient ratio spanning **1.64 to
+    5.58** across twelve seeds — a property of the draw rather than of the
+    depth.
+
+    Accumulation has a price, and it is the final LayerNorm. At depth 24 with a
+    unit-scale branch the stream is **6.56x** its starting norm, and the
+    unembedding inherits the factor: measured logit standard deviation
+    **1.0498** and maximum softmax probability **0.3677** without `ln_f`,
+    against **0.1606** and **0.0188** with it. A pre-norm model missing its
+    final norm looks badly initialised and behaves as if its temperature
+    depended on depth.
+
+    ## RMSNorm
+
+    RMSNorm deletes the mean subtraction and keeps the gain:
+
+    $$\operatorname{RMS}(x) = \gamma \odot \frac{x}{\sqrt{\rho^2 + \varepsilon}},
+      \qquad \rho^2 = \frac{1}{d}\sum_{i=1}^{d} x_i^2 .$$
+
+    It is not an approximation of LayerNorm; it is a different projection. Write
+    $x = \mu\mathbf{1} + \sigma\hat{x}$ with $\hat{x}$ unit-variance and
+    zero-mean, and
+
+    $$\operatorname{RMS}(x) = \frac{\sigma}{\rho}\,\operatorname{LN}(x) + \frac{\mu}{\rho}\,\gamma,
+      \qquad \frac{\sigma}{\rho} = \sqrt{\frac{\sigma^2}{\sigma^2+\mu^2}} \le 1 .$$
+
+    So the RMSNorm output is a *shrunk* LayerNorm plus a token-dependent
+    multiple of the gain vector. On activations with $\mu = 0.8$ and
+    $\sigma = 2$ the measured scale is **0.9285** and the measured mean
+    coefficient **0.3714**, matching $\mu/\rho$; the outputs differ by
+    **0.6974** in absolute value, **37.82%** in relative Frobenius norm. At
+    $\mu = 0$ the two agree to **8.9e-16**, which is the clean statement of what
+    "LayerNorm without the mean" means: identical on zero-mean tokens, and
+    otherwise a rescale plus a re-injection along one direction.
+
+    The direction that gets re-injected is the one LayerNorm destroys. A uniform
+    cotangent through a LayerNorm comes back with norm **8.97e-16** — the
+    Jacobian annihilates $\mathbf{1}$, exactly — while through a RMSNorm it
+    comes back with norm **11.95** and cosine **0.928** with $\mathbf{1}$. Since
+    that direction is the one carrying each token's DC offset, RMSNorm keeps
+    information that LayerNorm discards, and models train equally well: the
+    stabilising property is invariance to scale, and $\rho$ supplies it as well
+    as $\sigma$ does.
+
+    What it buys is one reduction instead of two: measured on 8192x4096 float64
+    arrays, forward plus backward, **0.2089 s** for LayerNorm against
+    **0.1646 s** for RMSNorm — **1.269x**. The parameter difference (768 against
+    1,536 per layer, 0.0217% of a block) is irrelevant; the gain is memory
+    traffic, and it is largest where the norm is fused into a surrounding
+    kernel.
+
+    ## Epsilon, and the convention that is not cosmetic
+
+    $\varepsilon$ exists to keep the division finite, and its placement changes
+    the function. Inside the root, the realised gain on an input of standard
+    deviation $\sigma$ is $\sigma/\sqrt{\sigma^2+\varepsilon}$; outside, it is
+    $\sigma/(\sigma+\varepsilon)$:
+
+    | $\sigma$ | inside: $\sigma/\sqrt{\sigma^2+\varepsilon}$ | outside: $\sigma/(\sigma+\varepsilon)$ |
+    |---|---|---|
+    | 1 | 0.999995 | 0.999990 |
+    | $10^{-2}$ | 0.953463 | 0.999001 |
+    | $10^{-3}$ | 0.301511 | 0.990099 |
+    | $10^{-5}$ | 0.003162 | 0.500000 |
+    | 0 | 0 | 0 |
+
+    The outside form looks better behaved on this table and is worse in
+    practice, because the case that matters is a row whose variance has
+    underflowed to zero: there its gain is $1/\varepsilon = 10^{5}$, past fp16's
+    maximum finite value of 65,504, so the layer produces `inf` on the next
+    step, while the inside form gives $1/\sqrt{\varepsilon} = 316.2$. Hence
+    $\sqrt{\sigma^2+\varepsilon}$, with $\varepsilon = 10^{-5}$ in fp32 and
+    $10^{-6}$ in bf16: it degrades instead of overflowing.
+
+    ## What to ship
+
+    Per-token norm, pre-norm placement, and a final norm before the
+    unembedding. Choose LayerNorm or RMSNorm on bandwidth — RMSNorm is one
+    reduction cheaper and gives up one direction out of 768, and every open
+    model of the last three years has decided that direction carried nothing.
+    Choose the axis on causality, where there is no choice. Keep epsilon inside
+    the root, and check the gain table before blaming the initialisation for a
+    layer that stopped learning.
+
+    ## The longer version
+
+    A transformer normalises each token's own feature vector, which makes the
+    layer a per-token function that depends on neither the batch nor the
+    sequence — and the two decisions that follow, where the norm sits relative
+    to the residual add and whether it subtracts the mean, are what decide
+    whether a 48-block stack has an identity path and whether a step costs one
+    reduction or two.
+
+    A recording studio with two ways to set levels. Per-track normalisation is
+    LayerNorm: each track is gain-staged against its own peak, so a quiet vocal
+    and a loud drum bus both arrive at the desk at the same level, and adding a
+    take to the session changes nothing about the tracks already recorded.
+    Per-session normalisation is BatchNorm: one gain for the whole session,
+    computed from whatever happens to be in it, so dropping in one loud take
+    re-levels everything.
+
+    Pre-norm versus post-norm is where the compressor sits. Post-norm puts the
+    compressor on the mix bus, after the instruments have been summed: every
+    pass through the bus re-levels the entire mix, and after forty passes the
+    original performance is a small fraction of what you hear. Pre-norm
+    compresses each instrument before it joins the mix, so the mix is a sum that
+    keeps growing and whatever the performer actually played is still in there,
+    scaled.
+
+    The analogy breaks in two places, and both matter. First, gain-staging is a
+    fixed linear rescale applied after the fact; normalisation is inside the
+    differentiable graph, and its Jacobian — not its gain — is what decides how
+    a gradient travels through forty of them. Second, "level" here is not a
+    musical property: after LayerNorm a token cannot use its own mean as
+    information, because the mean has been projected out, and everything that
+    mean encoded has to survive in the other 767 directions or not at all. That
+    is exactly the direction RMSNorm chooses to keep.
+
+    ### What goes wrong
+
+    - You port a vision backbone's `BatchNorm` into a transformer because it
+      worked on your ResNet. At batch size 8 the loss is noise, at batch size
+      1 it is `nan`, and every padded sequence contaminates the statistics of
+      every other one. Nothing in the code is wrong. The axis is.
+    - You rebuild GPT-2's block from a diagram and put the LayerNorm after the
+      residual add, because that is where the 2017 paper put it. At 24 layers
+      the run diverges at a learning rate the pre-norm baseline accepted
+      without complaint, and the fix you are offered — "add warmup" — does not
+      say what warmup is compensating for.
+    - You swap LayerNorm for RMSNorm because it is "20% faster", retrain, and
+      lose 0.4 points on your eval. You cannot say what changed: your
+      implementation also dropped the bias, and nobody knows which of the two
+      mattered.
+    - You write the denominator as `sqrt(var) + eps` because it reads the same
+      as `sqrt(var + eps)`. A layer whose activations collapse produces a
+      gradient of 1e5 instead of 316, and the run is `nan` by step 300 — in
+      the one situation the epsilon existed to handle.
+    - An interviewer asks why transformers do not use BatchNorm, and "because
+      sequences" is not an answer. The answer is a specific leak, with a
+      direction and a measured size, and it comes with the reason pre-norm
+      replaced post-norm in every model after GPT-2.
+
+    ### The full treatment
+
+    **LayerNorm's statistic is per token, so nothing crosses the batch or the
+    sequence.** With $d_{\text{model}} = 768$ the reduction runs over 768
+    numbers belonging to one token: perturb one other token in the batch by
+    $+1.0$ and the first token's LayerNorm output moves by exactly **0.0**,
+    while its BatchNorm output moves by **0.2355**. Sweep the batch size from
+    1 to 64 with the token held fixed: LayerNorm **0.0**, BatchNorm **2.4038**.
+    The trap is the sentence "normalisation stabilises training, so the axis
+    is an implementation detail" — the axis *is* the function, and only one of
+    the two axes is legal in a causal model.
+
+    **Padding is the argument that settles it, because padding is a future
+    token from the statistic's point of view.** Pad three sequences of length
+    12, 7 and 4 to a common length of 12, and the 12-token sequence's own
+    representation shifts by **1.2643** under BatchNorm — its first token now
+    depends on two other sequences and on how much zero padding they carried
+    — and by exactly **0.0** under LayerNorm. Masking the loss does not repair
+    this: the statistic is computed before the loss exists, and the leak makes
+    the training number better than the servable model.
+
+    **LayerNorm's Jacobian annihilates the all-ones direction, and that is the
+    price of mean-centring.** Back-propagate a uniform cotangent through one
+    LayerNorm and the gradient is **8.97e-16** in norm — zero to machine
+    precision, because $\mathbf{1}^\top J = 0$. The same probe through a
+    RMSNorm of the same width returns a vector of norm **11.95** (per element
+    **0.43**, cosine with $\mathbf{1}$ equal to **0.928**). So an LN is a
+    projection onto the zero-mean subspace and an RMSNorm is not; the
+    consequence is that no residual path through an LN can carry a constant
+    offset, which is measurable in the forward pass and is what the placement
+    section turns on.
+
+    **RMSNorm is a shrunk LayerNorm plus a token-dependent multiple of the
+    gain.** With $\mu$ the token mean, $\sigma$ its standard deviation and
+    $\rho$ its root mean square, RMS$(x) = (\sigma/\rho)\,\mathrm{LN}(x) +
+    (\mu/\rho)\,\gamma$, and $\sigma/\rho = \sqrt{\sigma^2/(\sigma^2+\mu^2)}
+    \le 1$. Measured on activations with $\mu = 0.8$ and $\sigma = 2$: scale
+    **0.9285**, mean coefficient **0.3714** — which is exactly the mean of the
+    RMSNorm output you measure — with the two outputs differing by **0.6974**
+    max absolute and **37.82%** relative, against LayerNorm's mean of
+    **-2.0e-17**. At $\mu = 0$ the two agree to
+    **8.9e-16**. What is dropped is one direction out of 768; what is kept is
+    the DC component, at full strength.
+
+    **Why RMSNorm works: the scale is the part that stabilises, the centring
+    is the part that does not.** The stabilising property derived in the
+    previous topic is invariance to the weight scale, and $\rho$ delivers it
+    just as $\sigma$ does. What the mean subtraction removes is a rank-one
+    component that the following linear layer can only partly reconstruct,
+    since $\mu$ varies per token — and removing it is measurably unnecessary:
+    Llama, Gemma and Mistral all ship RMSNorm, and published ablations show it
+    matching LayerNorm. The bill is one reduction instead of two: measured
+    **1.269x** faster on 8192x4096 float64 arrays forward plus backward
+    (0.2089 s against 0.1646 s), because the mean pass is half the memory
+    traffic of the kernel. The trap is quoting the FLOP saving — it is about
+    one operation per element; the whole gain is bandwidth.
+
+    **Epsilon goes inside the square root, and outside is a different
+    function.** With $\varepsilon = 10^{-5}$ the realised gain
+    $\sigma/\sqrt{\sigma^2+\varepsilon}$ at $\sigma = 10^{-2}$ is **0.9535**
+    against **0.9990** for $\sigma/(\sigma+\varepsilon)$, and at
+    $\sigma = 10^{-3}$ it is **0.3015** against **0.9901**. On a row that has
+    underflowed to zero the outside form's gain is $1/\varepsilon = 10^{5}$,
+    which overflows fp16's largest finite value of 65,504; the inside form
+    gives $1/\sqrt{\varepsilon} = 316.2$. The trap is that
+    `x / (sqrt(var) + eps)` reads like `x / sqrt(var + eps)` and behaves
+    differently in exactly the regime where the guard matters — the dead
+    layer you are trying to rescue.
+
+    **Pre-norm is $x + f(\mathrm{LN}(x))$; post-norm is
+    $\mathrm{LN}(x + f(x))$, and only the first has an identity path.** Zero
+    the block's output projection and pre-norm returns its input exactly:
+    measured max shift **0.0** on the forward pass, gradient ratio
+    $g_0/g_L$ = **1.000000**, and $\cos(h_0, h_{24})$ = **1.000000** over 24
+    blocks. The same ablation under post-norm still transforms the stream
+    (relative shift **0.1647**, $g_0/g_L$ = **1.0115**), because the LN is
+    still there and it is not the identity. The trap is treating placement as
+    style: it is the difference between a block that can be made transparent
+    and one that cannot.
+
+    **Pre-norm's residual stream accumulates, and the growth is a square-root
+    law you can predict.** If each block adds an increment of relative size
+    $\alpha$, then $\|h_L\|^2 = \|h_0\|^2 (1 + L\alpha^2)$. Measured stream
+    growth **1.35x, 1.63x, 2.07x** at depths 12, 24, 48, which inverts to
+    $\alpha$ = **0.2615, 0.2627, 0.2615** — the same constant to three digits,
+    so the law is real and not a fit. The bottom-layer gradient follows the
+    same curve: **1.382, 1.705, 2.190**, with $\alpha \approx 0.28$. Post-norm
+    pins the stream at **1.00x** but its bottom-gradient ratio spans
+    **1.64 to 5.58** across twelve seeds at depth 48 with a unit-scale branch:
+    a property of the draw, not of the depth.
+
+    **Because the stream accumulates, pre-norm needs a final LayerNorm, and
+    the reason is visible in the logits.** At depth 24 with a unit-scale
+    branch the stream is **6.56x** its input norm. Feed that to the
+    unembedding and the logits inherit the factor: measured logit standard
+    deviation **1.0498** and maximum softmax probability **0.3677** without a
+    final norm, against **0.1606** and **0.0188** with one. The trap is
+    reading a model that starts life over-confident as a bad initialisation;
+    it is a missing normalisation, and it makes the effective temperature a
+    function of depth.
+
+    **The norm is 0.02% of the parameters and 0.03% of the FLOPs, so never
+    trade it for either.** At $d_{\text{model}} = 768$ a LayerNorm carries
+    $2d = 1536$ parameters and an RMSNorm $d = 768$, against **7,077,888** in
+    the attention-plus-MLP block beside it: **0.0217%**. The forward cost is
+    about $5nd$ operations against $2n \cdot 7{,}077{,}888$: **0.027%**. The
+    only currencies that matter are bandwidth, latency and the shape of the
+    gradient path — which is why the three-way choice in this topic is made on
+    those and not on capacity.
+
+
+  derivations:
+    - title: "LayerNorm's Jacobian is a projection that annihilates the all-ones direction"
+      latex: |
+        Write $\hat{x} = (x-\mu)/\sigma$ with $\sigma = \sqrt{\operatorname{var}(x)+\varepsilon}$
+        and $y = \gamma \odot \hat{x} + \beta$. Differentiating,
+
+        $$d\hat{x} = \frac{1}{\sigma}\left(I - \frac{\mathbf{1}\mathbf{1}^\top}{d}
+          - \frac{\hat{x}\hat{x}^\top}{d}\right) dx ,$$
+
+        so the Jacobian is a symmetric projection scaled by $1/\sigma$: it
+        removes the mean direction and the direction of the token itself, and
+        leaves the remaining $d-2$ dimensions alone. Applying it to
+        $\mathbf{1}$:
+
+        $$J^\top \mathbf{1} = \frac{1}{\sigma}\left(\mathbf{1} -
+          \frac{\mathbf{1}\,d}{d} - \frac{\hat{x}\,(\hat{x}^\top\mathbf{1})}{d}\right)
+          = \frac{1}{\sigma}\left(\mathbf{1} - \mathbf{1} - 0\right) = \mathbf{0},$$
+
+        because $\hat{x}$ has zero mean. Measured: a uniform cotangent returns a
+        gradient of norm **8.97e-16**. The same probe through RMSNorm, whose
+        Jacobian is $\rho^{-1}(I - \hat{x}_{r}\hat{x}_{r}^\top/d)$ with
+        $\hat{x}_r = x/\rho$, gives
+
+        $$J_{\text{rms}}^\top\mathbf{1} = \frac{1}{\rho}\left(\mathbf{1} -
+          \frac{x\,(\sum_i x_i)}{d\rho}\right) \ne \mathbf{0},$$
+
+        measured norm **11.95** and cosine **0.928** with $\mathbf{1}$.
+
+        Two consequences. A gradient can never enter the DC direction through a
+        LayerNorm, so whatever the mean of a token encoded is not learnable
+        through that path. And a residual stream that passes through a
+        LayerNorm cannot carry a constant: adding $+5$ to every feature changes
+        the post-norm output by zero to machine precision (2e-15) and the
+        pre-norm output by **5.000000**.
+      prose: >-
+        The projection is why "LayerNorm subtracts the mean" is a structural
+        statement and not a preprocessing step: it deletes one direction from
+        the representation and one direction from every gradient that passes
+        through it. RMSNorm keeps that direction, which is the only substantive
+        difference between the two layers — the scalar $1/\rho$ versus
+        $1/\sigma$ is a rescale, and rescaling is what normalisation was for.
+
+    - title: "RMSNorm is a shrunk LayerNorm plus a multiple of the gain"
+      latex: |
+        Decompose the token into its mean and its zero-mean part,
+        $x = \mu\mathbf{1} + \sigma\hat{x}$, where $\hat{x}$ has zero mean and
+        unit variance. Then
+
+        $$\rho^2 = \frac{1}{d}\sum_i x_i^2 = \mu^2 + \sigma^2,$$
+
+        because the cross term $\frac{2\mu}{d}\sum_i (x_i-\mu)$ vanishes. Hence
+
+        $$\operatorname{RMS}(x) = \frac{\gamma \odot x}{\sqrt{\mu^2+\sigma^2}}
+          = \frac{\sigma}{\sqrt{\mu^2+\sigma^2}}\cdot
+            \frac{\gamma\odot(x-\mu\mathbf{1})}{\sigma}
+            + \frac{\mu}{\sqrt{\mu^2+\sigma^2}}\,\gamma
+          = \frac{\sigma}{\rho}\operatorname{LN}(x) + \frac{\mu}{\rho}\gamma .$$
+
+        The scale factor is at most 1 and equals 1 exactly when $\mu = 0$, which
+        is why the two layers are identical on zero-mean tokens: measured
+        agreement **8.9e-16**. On activations with $\mu = 0.8$, $\sigma = 2$:
+        $\sigma/\rho = 2/\sqrt{4.64} = 0.9285$ and $\mu/\rho = 0.8/2.154 =
+        0.3714$, matching the measured output mean of **0.3714** and the
+        measured relative difference of **37.82%**.
+      prose: >-
+        This is the whole of "LayerNorm without the mean-centring": a per-token
+        rescale by a factor in $(0,1]$ plus a per-token multiple of one fixed
+        direction, the gain. What is lost is the removal of the DC component;
+        what is gained is that the mean never has to be computed, which is one
+        reduction and half the memory traffic of the kernel.
+
+    - title: "The residual stream grows as the square root of depth"
+      latex: |
+        Under pre-norm the stream is a sum of independent contributions,
+
+        $$h_L = h_0 + \sum_{l=1}^{L} f_l\!\left(\operatorname{LN}(h_{l-1})\right).$$
+
+        If each branch output has norm $\alpha\|h_0\|$ and the directions are
+        uncorrelated — which is what random initialisation gives — the cross
+        terms average to zero and
+
+        $$\mathbb{E}\left\|h_L\right\|^2 = \left\|h_0\right\|^2\left(1 + L\alpha^2\right)
+          \quad\Longrightarrow\quad
+          \frac{\left\|h_L\right\|}{\left\|h_0\right\|} = \sqrt{1 + L\alpha^2}.$$
+
+        Measured mean per-token norms at depths 12, 24, 48: **1.35x, 1.63x,
+        2.07x**. Inverting each,
+
+        $$\alpha = \sqrt{\frac{r^2-1}{L}} = 0.2615,\ 0.2627,\ 0.2615,$$
+
+        constant to three digits across a 4x change in depth, which is the
+        evidence that the law holds rather than merely fitting. The
+        bottom-layer gradient obeys the same curve with $\alpha \approx 0.28$
+        (**1.382, 1.705, 2.190**), since it is the same product of $L$ nearly
+        independent factors.
+
+        Post-norm has no such sum: each block replaces the stream with a
+        normalised version of it, so $\|h_L\| = \|h_0\|$ for every $L$ —
+        measured **1.00x** — and the input's share of the final state falls as
+        $1/\sqrt{1+L\alpha^2}$. Measured $\cos(h_0,h_{24})$: **0.607** under
+        pre-norm, **0.451** under post-norm with a small branch, and **0.157**
+        against **0.009** with a unit-scale one.
+      prose: >-
+        The square-root law is the useful part: it says a 48-block pre-norm
+        stack does not have an exploding stream, it has a stream whose norm is
+        predictable from one measured constant, and it says exactly why
+        pre-norm needs a final LayerNorm — the unembedding sees whatever that
+        law produced, and at depth 24 with a unit-scale branch that is 6.56x the
+        input, which turns into logits 6.5x too large and a maximum softmax
+        probability of 0.3677 instead of 0.0188.
+
+  implementations:
+    - language: python
+      title: "LayerNorm and RMSNorm, per token, with the three diagnostics that matter"
+      note: >-
+        Correct, and deliberately narrow: it reduces over the last axis only, so
+        it is the layer you can use in a transformer and the one that reproduces
+        the measured numbers below. The three prints are the checks worth
+        keeping — batch independence (0.0, against 0.2355 for the batch-axis
+        version in the next block), the LayerNorm/RMSNorm gap on a non-zero-mean
+        token (0.6974), and the uniform-cotangent probe that shows LayerNorm's
+        Jacobian annihilating the all-ones direction (8.97e-16 against 11.95).
+        It is numerically naive in one way that matters at scale: it computes
+        the mean and the variance in two separate passes, so it reads the row
+        twice.
+      code: |
+        import numpy as np
+
+        def layernorm(x, gamma, beta, eps=1e-5):
+            x = np.asarray(x, dtype=np.float64)
+            mu = x.mean(axis=-1, keepdims=True)          # per token, over d
+            var = x.var(axis=-1, keepdims=True)          # biased: divide by d
+            return (x - mu) / np.sqrt(var + eps) * gamma + beta
+
+        def rmsnorm(x, gamma, eps=1e-5):
+            x = np.asarray(x, dtype=np.float64)
+            ms = (x * x).mean(axis=-1, keepdims=True)    # one moment, not two
+            return x / np.sqrt(ms + eps) * gamma
+
+        def ln_backward(dy, x, gamma, eps=1e-5):
+            """d/dx of layernorm, for the projection probe."""
+            mu = x.mean(-1, keepdims=True)
+            var = x.var(-1, keepdims=True)
+            inv = 1.0 / np.sqrt(var + eps)
+            xh = (x - mu) * inv
+            dxh = dy * gamma
+            n = x.shape[-1]
+            return (inv / n) * (n * dxh - dxh.sum(-1, keepdims=True)
+                                - xh * (dxh * xh).sum(-1, keepdims=True))
+
+        def rms_backward(dy, x, gamma, eps=1e-5):
+            r = 1.0 / np.sqrt((x * x).mean(-1, keepdims=True) + eps)
+            y = x * r * gamma
+            return r * (gamma * dy) - (r * r / x.shape[-1]) * x * (y * dy).sum(-1, keepdims=True)
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            d = 768
+            g = np.ones(d)
+
+            tok = rng.standard_normal((1, d))
+            alone = layernorm(tok, g, 0.0)[0]
+            batch = np.vstack([tok] + [rng.standard_normal((1, d)) for _ in range(7)])
+            print("batch independence ", float(np.abs(alone - layernorm(batch, g, 0.0)[0]).max()))
+
+            # exact construction: every row has mean 0.8 and standard deviation 2
+            x = rng.standard_normal((256, d))
+            x = (x - x.mean(axis=-1, keepdims=True)) / x.std(axis=-1, keepdims=True) * 2.0 + 0.8
+            gap = layernorm(x, g, 0.0) - rmsnorm(x, g)
+            print("max |LN - RMS|     ", float(np.abs(gap).max()))
+            print("relative gap       ", float(np.linalg.norm(gap) / np.linalg.norm(layernorm(x, g, 0.0))))
+            print("RMSNorm output mean", float(rmsnorm(x, g).mean()))
+
+            zero_mean = x - x.mean(axis=-1, keepdims=True)
+            print("same, mean removed ", float(np.abs(layernorm(zero_mean, g, 0.0) - rmsnorm(zero_mean, g)).max()))
+
+            one = np.ones((1, d))
+            print("J^T 1 norms        ",
+                  float(np.linalg.norm(ln_backward(one, x[:1], g))),
+                  float(np.linalg.norm(rms_backward(one, x[:1], g))))
+            # 0.0, 0.6974, 0.3782, 0.3714, 8.88e-16, 8.97e-16, 11.95
+
+    - language: python
+      title: "The batch-axis version — numerically wrong for a sequence"
+      note: >-
+        This is WRONG for a transformer and is here to be reproduced, not
+        shipped. `norm_batch_axis` reduces over axis 0, so every token's output
+        depends on every other token in the batch, including later positions and
+        padding. Measured symptoms: perturbing token 7 moves token 0 by
+        **0.2355**, padding three sequences to a common length moves the
+        longest sequence by **1.2643**, and the same token at batch size 1 and
+        at batch size 64 differs by **2.4038**. Nothing raises, the shapes are
+        right, the loss goes down, and the trained model cannot be served on a
+        single request. Epsilon is correctly inside the root here, so the axis
+        is the only bug — which is the point: this one is invisible to every
+        test that uses a single example.
+      code: |
+        import numpy as np
+
+        def norm_batch_axis(x, gamma, beta, eps=1e-5):
+            """WRONG for sequences: statistics over axis 0 = batch (and time)."""
+            mu = x.mean(axis=0, keepdims=True)          # leaks across examples
+            var = x.var(axis=0, keepdims=True)
+            return (x - mu) / np.sqrt(var + eps) * gamma + beta
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            d = 16
+            g, b = np.ones(d), np.zeros(d)
+
+            tokens = rng.standard_normal((8, d)) * 1.5 + 0.3
+            base = norm_batch_axis(tokens, g, b)
+            perturbed = tokens.copy()
+            perturbed[7] += 1.0
+            print("leak into token 0  ", float(np.abs(norm_batch_axis(perturbed, g, b)[0] - base[0]).max()))
+            # 0.2355 -- token 0's representation now depends on token 7
+
+            padded = np.zeros((3, 12, d))
+            for i, n in enumerate((12, 7, 4)):
+                padded[i, :n] = rng.standard_normal((n, d))
+            flat = norm_batch_axis(padded.reshape(-1, d), g, b).reshape(3, 12, d)
+            print("padding shift      ", float(np.abs(flat[0] - norm_batch_axis(padded[0], g, b)).max()))
+            # 1.2643 -- the longest sequence moved because of the shortest one
+
+            tok = rng.standard_normal((1, d))
+            outs = []
+            for m in (1, 2, 8, 64):
+                batch = np.vstack([tok] + [rng.standard_normal((1, d)) for _ in range(m - 1)])
+                outs.append(norm_batch_axis(batch, g, b)[0])
+            print("batch-size drift   ", float(max(np.abs(o - outs[0]).max() for o in outs)))
+            # 2.4038 -- the same token, four different batches, four answers
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        You are training a causal language model and someone replaces the
+        LayerNorm with BatchNorm over the batch-and-time axis. Name the two
+        distinct things that break, and give the measured size of each.
+      answerKind: short_text
+      hint: >-
+        One break is about which tokens may influence which others; the other is
+        about what happens when sequences in a batch have different lengths.
+      solution: >-
+        First, causality: the statistic at position t is computed over every
+        position in the batch, including t+1, so the representation at t becomes
+        a function of the future. Measured: perturbing one other token by +1.0
+        moves the first token's output by 0.2355. Second, padding: sequences of
+        length 12, 7 and 4 padded to a common length give the 12-token sequence a
+        representation that shifts by 1.2643 depending on what it is batched
+        with. A third, milder break is batch dependence: the same token at batch
+        size 1 and batch size 64 differs by 2.4038, so train and inference are
+        different functions unless you carry running statistics. The LayerNorm
+        numbers for all three probes are exactly 0.0.
+    - id: cp-2
+      question: >-
+        RMSNorm removes the mean subtraction. State exactly what the layer still
+        computes, in terms of LayerNorm, and say what evidence would convince
+        you that the removed direction was not carrying anything.
+      answerKind: short_text
+      hint: >-
+        Write x as its mean plus its zero-mean part and see what the root mean
+        square becomes. Then think about what a model with RMSNorm would look
+        like if the DC direction mattered.
+      solution: >-
+        With x = mu*1 + sigma*xhat, the root mean square satisfies
+        rho^2 = mu^2 + sigma^2, so RMS(x) = (sigma/rho)*LN(x) + (mu/rho)*gamma:
+        a shrunk LayerNorm plus a token-dependent multiple of the gain. The scale
+        is at most 1 and equals 1 exactly when mu = 0, which is why the two
+        layers agree to 8.9e-16 on zero-mean tokens. Measured on activations
+        with mu = 0.8 and sigma = 2, the scale is 0.9285, the mean coefficient
+        0.3714 and the outputs differ by 37.82% relative. The evidence that the
+        removed direction does not matter is that models trained with RMSNorm
+        match LayerNorm quality while keeping that direction at full strength —
+        Llama, Gemma and Mistral all ship it — plus the structural point that the
+        LayerNorm Jacobian annihilates the all-ones direction (measured norm
+        8.97e-16), so under LayerNorm that component never receives a gradient
+        anyway.
+    - id: cp-3
+      question: >-
+        Your denominator is `sqrt(var) + eps` rather than `sqrt(var + eps)`. At
+        what input scale does the difference become material, and what happens
+        at the scale where the epsilon is supposed to save you?
+      answerKind: short_text
+      hint: >-
+        Compare sigma/sqrt(sigma^2 + eps) with sigma/(sigma + eps) at a few
+        values of sigma. Then take sigma to zero and look at the gradient rather
+        than the output.
+      solution: >-
+        At sigma = 1e-2 the inside form gives gain 0.953463 and the outside form
+        0.999001; at sigma = 1e-3 it is 0.301511 against 0.990099; at
+        sigma = 1e-5, 0.003162 against 0.5. So the outside form is nearly exact
+        where the inside form starts compressing, and the two disagree most in
+        the small-input regime. That sounds like an argument for the outside
+        form until you take the derivative: on a row that has underflowed to
+        zero, the outside form's gain is 1/eps = 1e5 — past fp16's largest finite
+        value of 65,504, so the layer produces inf on the next step — while the
+        inside form's is 1/sqrt(eps) = 316.2. The convention is eps inside the
+        root, 1e-5 in fp32 and 1e-6 in bf16, because it degrades instead of
+        overflowing.
+    - id: cp-4
+      question: >-
+        Somebody deletes the final LayerNorm from a 24-block pre-norm model
+        because "the last block already normalises". What changes at
+        initialisation, and why does the symptom look like a bad init?
+      answerKind: short_text
+      hint: >-
+        The last block normalises its own input, not its output. What does the
+        unembedding actually see, and how does that scale compare with the
+        input?
+      solution: >-
+        Pre-norm's block output is x + f(LN(x)), so the stream at the end is a
+        sum of the embedding and 24 branch outputs, not a normalised vector: at
+        depth 24 with a unit-scale branch it is 6.56x its input norm. The
+        unembedding multiplies that, so the logits inherit the factor. Measured:
+        logit standard deviation 1.0498 without ln_f against 0.1606 with it, and
+        maximum softmax probability 0.3677 against 0.0188. It looks like a bad
+        initialisation because the model starts over-confident and the effective
+        temperature is a function of depth, which is exactly what a badly scaled
+        init also produces; the difference is that no init fixes it, because the
+        growth is structural.
+    - id: cp-5
+      question: >-
+        You have to defend pre-norm over post-norm to someone who points out
+        that post-norm keeps the residual stream at a constant norm, which
+        sounds more stable. Give the measurement that answers the argument.
+      answerKind: short_text
+      hint: >-
+        Constant norm is not the property that matters. Ask what the block
+        computes when its branch is zero, and what the stream's cosine with its
+        own input does with depth.
+      solution: >-
+        Zero the block's output projection. Pre-norm returns its input exactly —
+        max shift 0.0, gradient ratio g0/gL = 1.000000, cos(h0,h24) = 1.000000
+        over 24 blocks — so every block has a transparent path and the stack can
+        always fall back on the identity. Post-norm still transforms the stream
+        (relative shift 0.1647, gradient ratio 1.0115), because LN is applied
+        after the add and is not the identity; it also cannot carry a constant
+        offset at all (+5 in, 0.0 out). Constant stream norm is bought by
+        renormalising away the accumulation, and the cost is visible as
+        cos(h0,h24) falling from 0.607 to 0.451 on the same weights, plus a
+        bottom-layer gradient ratio that spans 1.64 to 5.58 across twelve seeds
+        — the scale of the early gradients becomes a property of the draw rather
+        than of the depth.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Normalisation is a measurement plus a division, and the measurement
+        needs a set of numbers to be taken over. In a transformer the only set
+        that makes sense is one token's own features: a token is the unit of
+        computation, it must not be allowed to see other tokens, and it must be
+        normalised the same way whether it arrives alone or in a batch of 512.
+
+        Once that is fixed, two questions remain and they are independent. Where
+        does the norm sit relative to the residual add — on the branch, or on
+        the stream after the sum? And does the layer subtract the mean, or only
+        divide by the root mean square? The first question decides whether a
+        block can ever be the identity. The second decides whether the token's
+        DC component survives, and it costs one reduction.
+      blocks:
+        - kind: checklist
+          body: |
+            - The axis is the function: feature axis is per token, batch axis is per example
+            - A batch-axis statistic in a causal model is a leak, not a speedup
+            - Padding changes a batch-axis statistic and cannot change a per-token one
+            - Pre-norm puts the norm on the branch; post-norm puts it on the stream
+            - Mean-centring deletes one direction; RMSNorm keeps it
+            - Epsilon is inside the square root, always
+      checkpoint: >-
+        Before reading on: a LayerNorm has 1,536 parameters at d_model = 768 and
+        a BatchNorm has the same. If the parameter counts are identical, what
+        exactly is different about the two layers?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Do not reason about stability in adjectives; measure the probes. For the
+        axis, hold one token fixed and vary everything else — the batch it sits
+        in, the padding beside it, one other token's value — and record how far
+        its own output moves. Per-token normalisation gives 0.0 on all three;
+        anything else gives a number you can quote.
+
+        For the placement, the decisive probe is the zero-branch ablation: set
+        the block's output projection to zero and ask whether the block became
+        the identity. That is the property the residual connection exists to
+        provide, and it is binary. For RMSNorm, compare it to LayerNorm
+        analytically rather than empirically — decompose a token into its mean
+        and its zero-mean part and see what the root mean square becomes.
+      blocks:
+        - kind: checklist
+          body: |
+            - Axis: perturb one other token, sweep batch size, add padding — expect 0.0
+            - Placement: zero the branch, then check output shift and gradient ratio
+            - Depth: measure the stream norm at 12, 24, 48 blocks and fit sqrt(1 + L a^2)
+            - RMSNorm: decompose x into mean plus zero-mean part before comparing
+            - Epsilon: compare sigma/sqrt(sigma^2+eps) with sigma/(sigma+eps) at small sigma
+            - Never compare normalisers by parameter count: it is 0.02% of a block
+      checkpoint: >-
+        Which of those probes is a property of the *function* and which is a
+        property of a particular initialisation? Say why the distinction
+        matters when you are choosing an architecture.
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Two shapes and two placements. Write the shapes down before the code:
+        the norm always reduces over the last axis, and the placement decides
+        what goes inside the branch.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # per-token normalisation: reduce over the LAST axis only
+            def layernorm(x, gamma, beta, eps):
+                mu  = mean(x, axis=features)          # one number per token
+                var = mean((x - mu)^2, axis=features) # biased: divide by d
+                return (x - mu) / sqrt(var + eps) * gamma + beta
+
+            def rmsnorm(x, gamma, eps):
+                ms = mean(x^2, axis=features)         # no mean subtraction
+                return x / sqrt(ms + eps) * gamma
+
+            # placement: one parenthesis apart
+            block_post(x): return layernorm(x + f(x))      # norm on the stream
+            block_pre(x):  return x + f(layernorm(x))      # norm on the branch
+
+            # the probe that settles the placement
+            block_pre(x)  with f = 0  ->  x                    # exact identity
+            block_post(x) with f = 0  ->  layernorm(x)         # not the identity
+
+            # residual stream growth, once you have measured alpha
+            norm_at_depth(L) = h0_norm * sqrt(1 + L * alpha^2)
+      checkpoint: >-
+        In the pseudocode, `f` is applied to `layernorm(x)` under pre-norm and to
+        `x` under post-norm. Which of the two makes the gradient at the bottom
+        of a 48-block stack depend on the initialisation, and why?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three results: what LayerNorm's Jacobian removes, what RMSNorm's output
+        is in terms of LayerNorm's, and how the stream's norm grows with depth.
+      blocks:
+        - kind: math
+          body: |
+            LayerNorm's Jacobian, with xhat = (x - mu)/sigma and
+            sigma = sqrt(var + eps):
+
+            $$J = \frac{1}{\sigma}\left(I - \frac{\mathbf{1}\mathbf{1}^\top}{d}
+              - \frac{\hat{x}\hat{x}^\top}{d}\right),
+              \qquad
+              J^\top\mathbf{1} = \frac{1}{\sigma}\left(\mathbf{1} - \mathbf{1}
+              - \frac{\hat{x}\,(\hat{x}^\top\mathbf{1})}{d}\right) = \mathbf{0}.$$
+
+            The mean direction is removed from the signal and from every
+            gradient. Measured: uniform cotangent in, norm 8.97e-16 out. For
+            RMSNorm the corresponding probe returns 11.95 with cosine 0.928
+            against the all-ones vector.
+
+            RMSNorm as a shrunk LayerNorm, with x = mu*1 + sigma*xhat:
+
+            $$\rho^2 = \frac{1}{d}\sum_i x_i^2 = \mu^2 + \sigma^2,
+              \qquad
+              \mathrm{RMS}(x) = \frac{\sigma}{\rho}\mathrm{LN}(x)
+              + \frac{\mu}{\rho}\gamma .$$
+
+            At mu = 0 the two agree exactly (measured 8.9e-16); at mu = 0.8,
+            sigma = 2 the scale is 0.9285 and the mean coefficient 0.3714,
+            matching the measured output mean.
+
+            Stream growth under pre-norm, with independent increments:
+
+            $$\mathbb{E}\|h_L\|^2 = \|h_0\|^2\left(1 + L\alpha^2\right)
+              \quad\Longrightarrow\quad
+              \alpha = \sqrt{\frac{r^2 - 1}{L}} .$$
+
+            Measured growth factors 1.35, 1.63, 2.07 at depths 12, 24, 48 give
+            alpha = 0.2615, 0.2627, 0.2615 — constant to three digits, so the
+            square-root law is the right model and not a fit.
+      checkpoint: >-
+        The LayerNorm Jacobian removes two directions — the all-ones direction
+        and the token's own direction — and leaves d-2. Does RMSNorm remove
+        either? Work out which one it keeps and what that implies for a residual
+        stream that runs through 48 of them.
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The two layers, the two placements, and the diagnostics that tell you
+        which one you have.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the diagnostics before the code. A per-token normaliser must
+            return 0.0 when the batch changes and 0.0 when padding is added; any
+            non-zero value means you are reducing over the wrong axis. A
+            zeroed-branch pre-norm block must return its input bit for bit
+            (0.0); under post-norm the same block shifts by 16.5% relative. And
+            eps belongs inside the root: `sqrt(var) + eps` is a different
+            function whose gain on a dead row is 1e5, past fp16's 65504.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def layernorm(x, gamma, beta, eps=1e-5):
+                x = np.asarray(x, dtype=np.float64)
+                mu = x.mean(-1, keepdims=True)
+                var = x.var(-1, keepdims=True)
+                return (x - mu) / np.sqrt(var + eps) * gamma + beta
+
+            def rmsnorm(x, gamma, eps=1e-5):
+                x = np.asarray(x, dtype=np.float64)
+                ms = (x * x).mean(-1, keepdims=True)
+                return x / np.sqrt(ms + eps) * gamma
+
+            def block(x, W1, W2, gamma, beta, eps, placement):
+                f = lambda u: np.maximum(u @ W1.T, 0.0) @ W2.T
+                if placement == "pre":
+                    return x + f(layernorm(x, gamma, beta, eps))
+                return layernorm(x + f(x), gamma, beta, eps)
+
+            def diagnose(x, gamma, beta, W1, W2, eps=1e-5):
+                pre_zero  = block(x, W1, np.zeros_like(W2), gamma, beta, eps, "pre")
+                post_zero = block(x, W1, np.zeros_like(W2), gamma, beta, eps, "post")
+                out = {}
+                out["pre_identity_error"] = float(np.abs(pre_zero - x).max())    # 0.0
+                out["post_identity_error"] = float(np.abs(post_zero - x).max())  # 0.9917
+                out["ln_rms_gap"] = float(np.abs(layernorm(x, gamma, 0.0, eps)
+                                                 - rmsnorm(x, gamma, eps)).max())
+                # +5 on every feature: post-norm cannot carry a constant
+                out["pre_dc"] = float(np.abs(block(x + 5.0, W1, np.zeros_like(W2),
+                                                   gamma, beta, eps, "pre") - pre_zero).max())
+                out["post_dc"] = float(np.abs(block(x + 5.0, W1, np.zeros_like(W2),
+                                                    gamma, beta, eps, "post") - post_zero).max())
+                return out
+
+            if __name__ == "__main__":
+                rng = np.random.default_rng(0)
+                x = rng.standard_normal((2, 4))
+                W1 = rng.standard_normal((5, 4))
+                W2 = rng.standard_normal((4, 5))
+                g, b = np.ones(4), np.zeros(4)
+                print(diagnose(x, g, b, W1, W2))
+                # pre_identity_error 0.0, post_identity_error 0.9917,
+                # ln_rms_gap 0.8991, pre_dc 5.0, post_dc 2.4e-15
+      checkpoint: >-
+        `pre_identity_error` comes back 0.0 and `post_identity_error` comes back
+        0.9917. If the post-norm number were also 0.0, what would that tell you
+        about the block — and which single line of the implementation would you
+        suspect?
+
+  problems:
+    - id: p-layernorm-forward
+      title: "LayerNorm, per token"
+      difficulty: easy
+      prompt: >-
+        Implement `layernorm(x, gamma, beta, eps)`, returning a nested list of
+        the same shape as `x`. Normalise over the last axis only: for each row,
+        subtract that row's own mean, divide by the square root of that row's
+        own variance plus `eps`, then multiply elementwise by `gamma` and add
+        `beta`. Use the biased variance — divide by the feature count, not by
+        the feature count minus one — so each row's output has zero mean and unit
+        variance before the gain. `eps` is added inside the square root. A
+        constant row must come back as exactly `beta`, and two rows that differ
+        only by a positive scale factor must come back identical.
+      starter: |
+        import numpy as np
+
+        def layernorm(x, gamma, beta, eps):
+            # your implementation here
+            pass
+      language: python
+      entry: layernorm
+      testCases:
+        - input: '[[[1.0, 2.0, 3.0, 4.0]], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 1e-05]'
+          expected: "[[-1.3416354199689269, -0.447211806656309, 0.447211806656309, 1.3416354199689269]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 3.0, 4.0], [0.1, 0.2, 0.3, 0.4]], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 1e-05]'
+          expected: "[[-1.3416354199689269, -0.447211806656309, 0.447211806656309, 1.3416354199689269], [-1.3411044519645503, -0.4470348173215167, 0.4470348173215167, 1.3411044519645505]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 3.0], [10.0, 20.0, 30.0], [-1.0, 0.0, 1.0]], [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], 1e-05]'
+          expected: "[[-1.2247356859083902, 0.0, 1.2247356859083902], [-1.224744779535734, 0.0, 1.224744779535734], [-1.2247356859083902, 0.0, 1.2247356859083902]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[5.0, 5.0, 5.0], [1.0, -1.0, 0.0]], [2.0, 2.0, 2.0], [1.0, 1.0, 1.0], 1e-05]'
+          expected: "[[1.0, 1.0, 1.0], [3.4494713718167804, -1.4494713718167804, 1.0]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 3.0, 4.0]], [1.0, 2.0, 0.5, -1.0], [0.0, 1.0, -1.0, 0.5], 1e-05]'
+          expected: "[[-1.3416354199689269, 0.105576386687382, -0.7763940966718454, -0.8416354199689269]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 3.0, 4.0]], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 1.0]'
+          expected: "[[-1.0, -0.3333333333333333, 0.3333333333333333, 1.0]]"
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+        def layernorm(x, gamma, beta, eps):
+            x = np.asarray(x, dtype=np.float64)
+            g = np.asarray(gamma, dtype=np.float64)
+            b = np.asarray(beta, dtype=np.float64)
+            mu = x.mean(axis=-1, keepdims=True)          # one mean per token
+            var = x.var(axis=-1, keepdims=True)          # biased: divide by d
+            xhat = (x - mu) / np.sqrt(var + eps)         # eps inside the root
+            return (xhat * g + b).tolist()
+      solutionExplanation: >-
+        Four details decide whether this passes. First, the reduction is over the
+        last axis: the three-row case has rows [1,2,3], [10,20,30] and [-1,0,1],
+        and the first two must come back identical because they differ by a
+        positive scale factor — a reduction over axis 0 instead of axis 1 gives
+        three different answers and fails there. Second, the variance is biased:
+        for the four-element row the variance is 1.25, so the output is
+        1.5/sqrt(1.25 + 1e-5) = 1.3416; the unbiased variance (divide by 3)
+        gives 1.1619 and fails every case. Third, eps is inside the root: the
+        last case uses eps = 1.0 against a variance of 1.25, so the divisor is
+        sqrt(2.25) = 1.5 and the output is +-1.0 and +-0.3333, while
+        sqrt(1.25) + 1.0 = 2.118 gives +-0.708. Fourth, a constant row has zero
+        numerator, so the whole row is exactly beta — the first row of the fourth
+        case is [5,5,5] with gamma 2 and beta 1, and the answer is [1,1,1], not
+        zeros and not the input.
+      complexity: "O(n d) time and O(1) extra space beyond the output"
+      tags: [layernorm, per-token, biased-variance, epsilon, normalisation-axis]
+
+    - id: p-rmsnorm-forward
+      title: "RMSNorm, and where it stops agreeing with LayerNorm"
+      difficulty: easy
+      prompt: >-
+        Implement `rmsnorm(x, gamma, eps)`, returning a nested list. For each
+        row, divide the row by the square root of the mean of its squares plus
+        `eps`, then multiply elementwise by `gamma`. There is no mean
+        subtraction and no bias. A row of zeros returns zeros; a row with zero
+        mean returns exactly what LayerNorm with the same gain would return.
+      starter: |
+        import numpy as np
+
+        def rmsnorm(x, gamma, eps):
+            # your implementation here
+            pass
+      language: python
+      entry: rmsnorm
+      testCases:
+        - input: '[[[1.0, 2.0, 3.0, 4.0]], [1.0, 1.0, 1.0, 1.0], 1e-05]'
+          expected: "[[0.3651481282381064, 0.7302962564762128, 1.0954443847143192, 1.4605925129524255]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, -1.0, 1.0, -1.0]], [1.0, 1.0, 1.0, 1.0], 1e-05]'
+          expected: "[[0.9999950000374997, -0.9999950000374997, 0.9999950000374997, -0.9999950000374997]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[3.0, 4.0]], [1.0, 1.0], 1e-05]'
+          expected: "[[0.8485277980128058, 1.1313703973504077]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 3.0, 4.0], [0.0, 0.0, 0.0, 0.0]], [1.0, 1.0, 1.0, 1.0], 1e-05]'
+          expected: "[[0.3651481282381064, 0.7302962564762128, 1.0954443847143192, 1.4605925129524255], [0.0, 0.0, 0.0, 0.0]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 3.0, 4.0]], [2.0, 0.5, 1.0, -1.0], 1e-05]'
+          expected: "[[0.7302962564762128, 0.3651481282381064, 1.0954443847143192, -1.4605925129524255]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[0.001, 0.002]], [1.0, 1.0], 0.01]'
+          expected: "[[0.009998750234326182, 0.019997500468652365]]"
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+        def rmsnorm(x, gamma, eps):
+            x = np.asarray(x, dtype=np.float64)
+            g = np.asarray(gamma, dtype=np.float64)
+            ms = (x * x).mean(axis=-1, keepdims=True)     # one moment, not two
+            return (x / np.sqrt(ms + eps) * g).tolist()
+      solutionExplanation: >-
+        The row [1,-1,1,-1] is the case that pins the definition down: its mean
+        is zero, so its root mean square equals its standard deviation and
+        RMSNorm must return exactly what LayerNorm returns, which is
+        +-0.999995 — the small deficit is eps, not a bug. The row [3,4] checks
+        the arithmetic on a two-element row: root mean square sqrt(12.5) =
+        3.53553, so the outputs are 0.8485 and 1.1314. The all-zero row checks
+        the guard: the numerator is zero so the answer is zero, and no warning is
+        raised because eps is inside the root — with `sqrt(ms) + eps` the same
+        row still returns zero but its gradient is 1/eps = 1e5. The last case is
+        the one that distinguishes the two epsilon placements: with a row of
+        magnitude 1e-3 and eps = 1e-2, inside the root gives denominator
+        sqrt(2.5e-6 + 1e-2) = 0.100 and outputs near 0.01 and 0.02, while
+        outside the root gives denominator 0.00158 + 0.01 = 0.01158 and outputs
+        0.0863 and 0.1727 — nearly nine times larger.
+      complexity: "O(n d) time and O(1) extra space beyond the output"
+      tags: [rmsnorm, per-token, epsilon-placement, root-mean-square]
+
+    - id: p-norm-block
+      title: "Pre-norm and post-norm in one block"
+      difficulty: medium
+      prompt: >-
+        Implement `norm_block(x, W1, W2, gamma, beta, eps, placement)`. The
+        sublayer is `f(u) = relu(u @ W1.T) @ W2.T`; `W1` is (hidden, d) and `W2`
+        is (d, hidden). If `placement` is `"pre"`, return `x + f(LN(x))`; if it
+        is `"post"`, return `LN(x + f(x))`. `LN` is the per-token LayerNorm over
+        the last axis with the same `gamma`, `beta` and `eps`, with `eps` inside
+        the square root. Return a nested list. With `W2` all zeros the pre-norm
+        result must equal `x` exactly, and the post-norm result must not.
+      starter: |
+        import numpy as np
+
+        def norm_block(x, W1, W2, gamma, beta, eps, placement):
+            # your implementation here
+            pass
+      language: python
+      entry: norm_block
+      testCases:
+        - input: '[[[1.0, 2.0, 3.0, 4.0], [0.5, -1.5, 2.5, 0.5]], [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, -1.0, 0.0]], [[0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0]], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 1e-05, "pre"]'
+          expected: "[[1.0, 2.0, 3.0, 4.0], [0.5, -1.5, 2.5, 0.5]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 3.0, 4.0], [0.5, -1.5, 2.5, 0.5]], [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, -1.0, 0.0]], [[0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0]], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 1e-05, "post"]'
+          expected: "[[-1.3416354199689269, -0.447211806656309, 0.447211806656309, 1.3416354199689269], [0.0, -1.4142100268524473, 1.4142100268524473, 0.0]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 3.0, 4.0], [0.5, -1.5, 2.5, 0.5]], [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, -1.0, 0.0]], [[0.5, 0.0, 0.0, 0.0, 1.0], [0.0, 0.5, 0.0, 0.0, -1.0], [0.0, 0.0, 0.5, 0.0, 0.5], [0.0, 0.0, 0.0, 0.5, 0.0]], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 1e-05, "pre"]'
+          expected: "[[1.0, 2.0, 3.2236059033281546, 4.670817709984464], [0.5, -1.5, 3.2071050134262236, 0.5]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 3.0, 4.0], [0.5, -1.5, 2.5, 0.5]], [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, -1.0, 0.0]], [[0.5, 0.0, 0.0, 0.0, 1.0], [0.0, 0.5, 0.0, 0.0, -1.0], [0.0, 0.0, 0.5, 0.0, 0.5], [0.0, 0.0, 0.0, 0.5, 0.0]], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 1e-05, "post"]'
+          expected: "[[-1.3416384013670581, -0.44721280045568607, 0.44721280045568607, 1.3416384013670581], [-0.10050363714369547, -1.3065472828680411, 1.5075545571554319, -0.10050363714369547]]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[1.0, 2.0, 3.0, 4.0], [0.5, -1.5, 2.5, 0.5]], [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, -1.0, 0.0]], [[0.5, 0.0, 0.0, 0.0, 1.0], [0.0, 0.5, 0.0, 0.0, -1.0], [0.0, 0.0, 0.5, 0.0, 0.5], [0.0, 0.0, 0.0, 0.5, 0.0]], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 0.001, "pre"]'
+          expected: "[[1.0, 2.0, 3.2235174086607583, 4.670552225982275], [0.5, -1.5, 3.206930070754902, 0.5]]"
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+        def norm_block(x, W1, W2, gamma, beta, eps, placement):
+            x = np.asarray(x, dtype=np.float64)
+            W1 = np.asarray(W1, dtype=np.float64)
+            W2 = np.asarray(W2, dtype=np.float64)
+            g = np.asarray(gamma, dtype=np.float64)
+            b = np.asarray(beta, dtype=np.float64)
+
+            def ln(a):
+                mu = a.mean(axis=-1, keepdims=True)
+                var = a.var(axis=-1, keepdims=True)
+                return (a - mu) / np.sqrt(var + eps) * g + b
+
+            def f(u):
+                return np.maximum(u @ W1.T, 0.0) @ W2.T
+
+            if placement == "pre":
+                return (x + f(ln(x))).tolist()
+            return ln(x + f(x)).tolist()
+      solutionExplanation: >-
+        The whole problem is one parenthesis. With `W2` zero the branch is zero:
+        pre-norm returns `x + 0` exactly — the first case comes back bit-identical
+        to the input, max shift 0.0 — while post-norm returns `LN(x + 0)`,
+        which re-centres and rescales the stream and moves the first row by 2.658
+        in absolute value. That is the identity path, and it is the property the
+        residual connection exists to provide. The third and fourth cases pin the
+        ordering with a live branch: pre-norm normalises before the sublayer and
+        adds the result to the raw `x`, post-norm adds first and normalises the
+        sum, and the two disagree on every element. The fifth case changes only
+        eps, from 1e-5 to 1e-3, and moves the third element by 8.8e-5 — small,
+        but it is the difference between `sqrt(var + eps)` and `sqrt(var) + eps`
+        that would move it much further, and it is why the case exists. Note the
+        gain is ones and the bias zeros throughout, so any error in the placement
+        shows up as a shift in the values rather than being absorbed by the
+        affine parameters.
+      complexity: "O(n d h) time for the two matmuls, O(n d) extra space"
+      tags: [pre-norm, post-norm, identity-path, residual-stream, layer-norm]
+
+  visualizers:
+    - id: vs-norm-axis
+      kind: tensor
+      title: "One token, three axes"
+      description: >-
+        Send the same token through a feature-axis norm and a batch-axis norm
+        while changing what else is in the batch. The feature-axis statistic
+        does not move (0.0); the batch-axis statistic moves by up to 2.4038, and
+        adding padding to a neighbouring sequence moves it by 1.2643.
+      params:
+        d_model: 768
+        batch_sizes: [1, 2, 8, 64]
+        sequences: [12, 7, 4]
+        show_drift: true
+
+
+  try_it: >-
+    Pad three sequences of length 12, 7 and 4 to a common length of 12 and measure how far the
+    12-token sequence's own representation moves under BatchNorm versus LayerNorm. BatchNorm
+    shifts it by 1.2643; LayerNorm moves it by exactly 0.0.
+  interview_questions:
+    - question: 'Why do transformers normalise per token rather than per batch?'
+      level: mid
+      key_points:
+        - 'The reduction runs over the 768 features of one token, so nothing crosses the batch or the sequence axis.'
+        - 'Perturb one other sequence in the batch by +1.0 and this token LayerNorm output moves by exactly 0.0 while its BatchNorm output does not.'
+        - 'Padding is the argument that settles it, because a pad is a future token from the statistic point of view: at lengths 12, 7 and 4 padded to 12, BatchNorm shifts the 12-token representation by 1.2643.'
+        - 'It also carries no running state, so train and eval are the same function and batch size 1 works.'
+    - question: 'Pre-norm or post-norm at depth 48 — what breaks, and what does pre-norm cost you?'
+      level: senior
+      key_points:
+        - 'Only pre-norm keeps an identity path: zero the block output projection and pre-norm returns its input with a measured max shift of 0.0 and a gradient ratio g_0/g_L of 1.000000.'
+        - 'Post-norm computes LN(x + f(x)), which puts the LayerNorm Jacobian on the skip route and gives no exact identity.'
+        - 'Pre-norm cost is accumulation: the stream grows 1.35x, 1.63x and 2.07x at depths 12, 24 and 48, and 6.56x in the depth-24 unit-scale measurement.'
+        - 'That accumulation is why a final LayerNorm is mandatory: without it the unembedding sees a stream 6.56x its expected scale and the logits inherit the factor.'
+      follow_up: 'If the stream grows as sqrt(1 + L alpha^2), how would you set the branch scale to keep the final norm near 1?'
+    - question: 'What does RMSNorm drop, and why does it still stabilise training?'
+      level: mid
+      key_points:
+        - 'RMS(x) = (sigma/rho) LN(x) + (mu/rho) gamma, with rho the root mean square and sigma/rho at most 1.'
+        - 'It drops the mean subtraction and the bias, keeping the division by the root mean square.'
+        - 'The stabilising property is invariance to the weight scale, and rho delivers it exactly as sigma does.'
+        - 'What the mean subtraction removes is a rank-one component, so the price is a shift in the token representation rather than a loss of stability, and it costs one reduction instead of two.'
+  common_mistakes:
+    - 'Porting BatchNorm into a transformer, where padding shifts a sequence own representation by 1.2643 and batch size 8 turns the loss into noise.'
+    - 'Putting epsilon outside the square root, which changes the realised gain from 0.9535 to 0.9990 at sigma = 1e-2 and destroys the cap at 1/sqrt(eps).'
+    - 'Dropping the final LayerNorm after a pre-norm stack, so the unembedding sees a stream 6.56x the scale it expects.'
+  further_reading:
+    - label: "Ba, Kiros & Hinton, Layer Normalization (2016)"
+    - label: "Zhang & Sennrich, Root Mean Square Layer Normalization (NeurIPS 2019)"

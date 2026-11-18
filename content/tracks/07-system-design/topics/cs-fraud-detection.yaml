@@ -1,0 +1,633 @@
+id: cs-fraud-detection
+slug: cs-fraud-detection
+title: "Case Study: Real-Time Fraud Detection"
+summary: >-
+  Design a fraud system where the threshold is set by a cost matrix, not by F1 —
+  and discover that at 0.1% prevalence the best model beats flagging nothing by
+  only 4.7%.
+kind: lesson
+difficulty: expert
+position: 4
+estMinutes: 18
+prerequisites: [system-design-foundations, time-series]
+phase: system-design
+tags: [fraud, threshold, cost-sensitive, realtime, class-imbalance]
+
+body:
+  big_idea: >-
+    Fraud detection is not a classification problem but a decision problem
+    with asymmetric costs: the optimal threshold is a ratio of those costs,
+    and at 0.1% prevalence it flags 6,000 transactions to catch 103.
+  problem:
+    - "You report 90% recall and the fraud team asks what it costs: 6,000 false positives a day, and the friction budget was the real constraint."
+    - "You optimise F1 and ship a balanced-looking threshold that is 1.5% worse in dollars on a 484K USD/day cost base."
+    - "You build the best model the data supports and it beats flagging nothing by 4.7%: an economic fact of 0.1% prevalence, not a model failure."
+  analogy: >-
+    A security guard who can search one bag in a thousand. Every search costs
+    a customer two minutes of irritation; every missed weapon costs far more.
+    The threshold — how suspicious before searching — is a policy decision
+    derived from those costs, not from the guard's eyesight. At a thousandth
+    prevalence, searching six bags to find one weapon means five innocent
+    customers delayed.
+  concept_points:
+    - "**The optimal threshold is a cost ratio, not a modelling choice.** Flag when the posterior exceeds $c_{fp}/(c_{fp}+c_{fn})$. With a false positive costing 5 USD and a missed fraud 500 USD, that is $5/505 = 0.0099$ — flag at **under 1% predicted probability**. A fine-grained sweep over 1,200 thresholds found the minimum at **0.0095** against the theoretical 0.0099."
+    - "**At 0.1% prevalence the optimal operating point is precision 1.7%.** Measured on 1,000,000 transactions with 1,016 frauds, the cost-optimal threshold flags **103 true positives and 5,914 false positives** — precision 0.0171, recall 0.1014. You catch 10% of fraud and 98.3% of alerts are innocent customers. Both numbers are correct for this cost matrix."
+    - "**The honest business case is small.** Doing nothing costs $1{,}016 \\times 500 = 508{,}000$. The model at its optimal threshold costs **486,070 USD** — a saving of **21,930 USD, or 4.3%**. A model with modest separation barely pays for itself at this prevalence, and a proposal quoting accuracy instead of this number is hiding the economics."
+    - "**F1 is the wrong objective and the cost of using it is measurable.** The F1-optimal threshold is 0.0175 with F1 0.0397 and cost 491,020 USD — **1.5% worse** than the cost-optimal 483,890 USD. F1 treats a false positive and a false negative as equally bad, which they are not, by a factor of 100."
+    - "**Latency budgets here are tens of milliseconds.** A 100 ms p99 at 10k peak TPS decomposes into roughly 40 ms features, 30 ms model, 20 ms rules, 10 ms slack. At 50 us per row batched, scoring 10k rows/s is about **0.5 cores** — the model is not the bottleneck; feature computation and network hops are."
+    - "**Rules and models compose, in that order.** Deterministic rules — block lists, impossible geography, velocity caps — run before and alongside the model because they are auditable, instant and explainable to a regulator. The model scores what the rules do not already decide, which means its training data must exclude rule-caught cases or it learns a distribution it will never see."
+  definitions:
+    - { term: "Cost matrix", meaning: "The dollar cost of each error type. Sets the optimal threshold: flag when posterior exceeds c_fp/(c_fp+c_fn)." }
+    - { term: "Prevalence", meaning: "Base rate of positives. 0.1% here; drives precision down and makes accuracy meaningless." }
+    - { term: "Cost-optimal threshold", meaning: "The decision boundary minimising expected dollars, not F1 or accuracy." }
+    - { term: "Calibration", meaning: "Mapping scores to true probabilities. Without it, a threshold is an arbitrary number on an arbitrary scale." }
+    - { term: "Velocity feature", meaning: "Count or sum over a recent window, e.g. transactions in 10 minutes. Must be computed identically online and offline." }
+    - { term: "Train/serve skew", meaning: "Divergence between offline feature computation and online serving, typically from time-travel joins or different aggregation windows." }
+    - { term: "Chargeback", meaning: "A disputed transaction reversed later. The label for fraud arrives weeks after the event, so training data is always stale." }
+    - { term: "Concept drift", meaning: "A change in the relationship between features and label. In fraud it is adversarial and fast." }
+    - { term: "Alert queue", meaning: "Human review of flagged transactions. Its capacity, not model recall, is often the real system constraint." }
+    - { term: "Block vs review", meaning: "Two different actions with different costs: block immediately, or hold for manual review. Each needs its own threshold." }
+    - { term: "Feedback loop", meaning: "The model only learns outcomes for what it flagged; unflagged fraud surfaces later as a chargeback, if at all." }
+
+  diagrams:
+    - type: plot
+      title: "Expected cost versus threshold, with the F1 optimum marked"
+      chart: "line"
+      xLabel: "posterior threshold"
+      yLabel: "daily cost, thousands of dollars"
+      series:
+        - name: "total cost"
+          points:
+            - { x: 0.001, y: 1511.8 }
+            - { x: 0.005, y: 522.4 }
+            - { x: 0.0099, y: 486.1 }
+            - { x: 0.02, y: 494.5 }
+            - { x: 0.05, y: 505.7 }
+            - { x: 0.2, y: 508.0 }
+            - { x: 0.5, y: 508.0 }
+    - type: compare
+      title: "Two thresholds, two stories"
+      left_label: "Cost-optimal (0.0099)"
+      left_points:
+        - "103 frauds caught, 5,914 false positives"
+        - "Precision 0.0171, recall 0.1014"
+        - "Daily cost 486,070 USD"
+        - "1.7% of alerts are real — and that is correct"
+      right_label: "F1-optimal (0.0175)"
+      right_points:
+        - "F1 0.0397, the metric-maximising point"
+        - "Daily cost 491,020 USD, 1.5% worse"
+        - "Assumes an FP and an FN cost the same"
+        - "Defensible only if the cost matrix is 1:1"
+    - type: pipeline
+      title: "The 100 ms decision path"
+      nodes:
+        - label: "Rules"
+          note: "blocklists, geography, velocity caps"
+          detail: "Deterministic, auditable, instant. Decides a small fraction outright and must be excluded from model training data or the model learns a distribution it never sees."
+        - label: "Features"
+          note: "40 ms of the budget"
+          detail: "Velocity windows, device graph, merchant history. The real bottleneck: 40 of 100 ms, and the component most likely to diverge between offline and online."
+        - label: "Model"
+          note: "30 ms, ~0.5 cores at 10k TPS"
+          detail: "50 us per row batched. Cheap relative to feature computation, which is why model upgrades rarely move latency and feature additions always do."
+        - label: "Act"
+          note: "block, review, or allow"
+          detail: "Three actions with three thresholds, not one. Review capacity is a hard constraint: an alert queue of fixed size caps how many you may flag."
+    - type: architecture
+      title: "Offline and online must agree"
+      nodes:
+        - { id: stream, x: 0, y: 0, label: "Event stream", kind: client, detail: "Transactions at 10k peak TPS. Every event carries an event-time timestamp that both paths must use." }
+        - { id: onf, x: 1, y: 0, label: "Online features", kind: worker, detail: "Computed at request time from the same window definitions. 40 ms budget; a slower window is a different feature." }
+        - { id: off, x: 1, y: 2, label: "Offline features", kind: database, detail: "Backfilled from the same stream with event-time semantics. A join that sees future events inflates offline AUC and cannot be reproduced." }
+        - { id: model, x: 2, y: 0, label: "Scorer", kind: model, detail: "Calibrated output, so the threshold is a probability. Uncalibrated scores made 0.5 mean 'half of all traffic'." }
+        - { id: label, x: 2, y: 2, label: "Chargebacks", kind: external, detail: "Labels arrive weeks late. Training data is always stale and always partial — only flagged cases get fast feedback." }
+      edges:
+        - { from: stream, to: onf, label: "realtime" }
+        - { from: stream, to: off, label: "event-time" }
+        - { from: onf, to: model, label: "features" }
+        - { from: model, to: label, label: "flagged", style: "async" }
+        - { from: label, to: off, label: "labels", style: "async" }
+
+  markdown: |
+    ## The threshold is arithmetic, not opinion
+
+    Two error costs, one decision. Flagging a legitimate transaction costs
+    $c_{fp}$; missing a fraud costs $c_{fn}$. Expected cost at threshold $t$ is
+
+    $$C(t) = c_{fp}\cdot \mathrm{FP}(t) + c_{fn}\cdot \mathrm{FN}(t),$$
+
+    whose minimum sits where the posterior crosses
+
+    $$t^\star = \frac{c_{fp}}{c_{fp} + c_{fn}}.$$
+
+    With 5 USD per false positive and 500 USD per missed fraud,
+    $t^\star = 5/505 = 0.0099$. **Flag anything above a 1% chance.**
+
+    A 1,200-point sweep over a calibrated model put the measured minimum at
+    **0.0095** with a daily cost of 483,890 USD — the theory is not an
+    approximation here, it is the answer.
+
+    ## What that operating point actually looks like
+
+    | Threshold | TP | FP | FN | Precision | Recall | Cost |
+    |---|---|---|---|---|---|---|
+    | 0.5 | 0 | 0 | 1,016 | — | 0.00 | 508,000 |
+    | 0.05 | 5 | 38 | 1,011 | 0.116 | 0.005 | 505,690 |
+    | 0.02 | 36 | 905 | 980 | 0.038 | 0.035 | 494,525 |
+    | **0.0099** | **103** | **5,914** | **913** | **0.017** | **0.101** | **486,070** |
+    | 0.001 | 730 | 273,759 | 286 | 0.003 | 0.719 | 1,511,795 |
+
+    Read the 0.0099 row carefully. You catch **103 of 1,016 frauds** and you
+    raise **5,914 alerts**, 98.3% of them innocent. Push the threshold down to
+    0.001 and recall climbs to 0.72 — at a cost of 1.5 million USD, because
+    273,759 false positives times 5 USD dwarfs the fraud you save.
+
+    That is the whole design in one row: **the system is deliberately bad at
+    precision because precision is expensive.**
+
+    ## The uncomfortable business case
+
+    Flagging nothing costs $1{,}016 \times 500 = 508{,}000$ USD a day. The optimal
+    model costs 486,070. **The model is worth 21,930 USD per day — 4.3%.**
+
+    A model with modest separation, evaluated at the right threshold, on data
+    where positives are one in a thousand, is a marginal improvement. That is
+    not a reason to skip it — 22,000 USD a day is real money — but it is a
+    reason to write the business case in dollars, because "90% recall" sounds
+    transformative and 4.3% does not.
+
+    It also tells you where to invest: improving separation far from the
+    operating point buys almost nothing, while reducing false-positive cost
+    (better review tooling, softer friction) moves the threshold and the
+    economics directly.
+
+    ## Where the analogy breaks
+
+    The security guard sees every bag. This model sees only what it flagged.
+
+    **The adversary is in the loop.** Fraud patterns shift in response to
+    blocking, so the distribution the model was trained on is not the one it
+    serves. Static evaluation flatters it every quarter.
+
+    **Labels arrive weeks late and only for some cases.** A chargeback takes
+    weeks; an unflagged fraud may never be labelled at all. Training data is
+    therefore both stale and selected by the current policy — the feedback loop,
+    with an adversary choosing what to send.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Fraud detection is not a classification problem, it is a **decision problem with asymmetric costs**. The optimal threshold is a ratio of those costs, not a property of the model, and at 0.1% prevalence it produces a system that flags 6,000 transactions to catch 103 frauds — precision 1.7% — because missing a fraud costs 100 times more than annoying a customer. Any design that reports F1 instead of dollars has chosen the wrong objective.
+
+    ### The analogy, in full
+
+    A security guard who can search one bag in a thousand. Every search costs a customer two minutes of irritation; every missed weapon costs far more. The guard's threshold — how suspicious before searching — is a policy decision derived from those two costs, not from the guard's eyesight. At a thousandth prevalence, the arithmetic is uncomfortable: searching six bags to find one weapon means five innocent customers delayed. The guard is right to do it, and the queue looks broken. Two ways the analogy breaks. First, the fraudster adapts: a blocked pattern moves to a neighbouring one, so the adversary shifts the distribution underneath the model, which a queue of static bags never does. Second, the guard sees every bag, while the model only learns from what it flagged — the feedback loop again, now with an adversary choosing what to send.
+
+    ### Failure modes, in full
+
+    - You report 90% recall and the fraud team asks what it costs. The answer is 6,000 false positives a day, and the customer-friction budget is the actual constraint — recall was never the number that mattered.
+    - You optimise F1 and ship a threshold that looks balanced. It is 1.5% worse in dollars than the cost-optimal one, and on a 484K USD/day cost base that is money you can see on a P&L.
+    - You build the best model the data supports and it beats flagging nothing by **4.7%**. Not a model failure — an economic fact of 0.1% prevalence, and the reason the project's business case needs to say so before it is built.
+    - You check the score distribution and the threshold of 0.5 catches nothing, because the model's output was never calibrated to a probability and 0.5 was never a meaningful number.
+    - You serve features from a batch pipeline with an hourly refresh and the model scores a transaction using data from before the fraud ring started. Train/serve skew here is measured in minutes, not weeks.
+
+    ### The mechanisms, in full
+
+    - **The optimal threshold is a cost ratio, not a modelling choice.** Flag when the posterior exceeds $c_{fp}/(c_{fp}+c_{fn})$. With a false positive costing 5 USD and a missed fraud costing 500 USD, that is $5/505 = 0.0099$ — flag at **under 1% predicted probability**. Confirmed numerically: a fine-grained sweep over 1,200 thresholds found the minimum cost at **0.0095**, against the theoretical 0.0099.
+    - **At 0.1% prevalence, the optimal operating point is precision 1.7%.** Measured on 1,000,000 transactions with 1,016 frauds, the cost-optimal threshold flags **103 true positives and 5,914 false positives** — precision 0.0171, recall 0.1014. You catch 10% of fraud and 98.3% of your alerts are innocent customers. Both numbers are correct for this cost matrix, and either one alone reads as a broken system.
+    - **The honest business case is small.** Doing nothing costs $1{,}016 \times 500 = 508{,}000$. The model at its optimal threshold costs **486,070 USD** — a saving of **21,930 USD, or 4.3%**. A model with modest separation barely pays for itself at this prevalence, and a project proposal that quotes accuracy instead of this number is hiding the economics.
+    - **F1 is the wrong objective and the cost of using it is measurable.** The F1-optimal threshold is 0.0175 with F1 0.0397 and cost 491,020 USD — **1.5% worse** than the cost-optimal 483,890 USD on the fine grid. F1 treats a false positive and a false negative as equally bad, which they are not, by a factor of 100.
+    - **An uncalibrated score makes every threshold meaningless.** At 0.5 the initial raw-score model caught **nothing** and cost 508,000 USD — the same as flagging no transactions at all. The score was $N(0,1)$ for legitimate traffic, so "0.5" meant "half of all traffic", not "50% probability". Calibrating via Bayes changed the optimal threshold to 0.0099 and the cost curve became coherent.
+    - **Cost matrices move the threshold by orders of magnitude.** At $c_{fp}=5$, $c_{fn}=500$ the threshold is 0.0099; at $c_{fp}=50$ it is 0.0909 — ten times higher, 9× fewer alerts, and a materially higher miss rate. The threshold is a business input. Changing the customer-friction budget changes the model you should ship, without retraining anything.
+    - **Latency budgets here are measured in tens of milliseconds.** A 100 ms p99 at 10k peak TPS decomposes into roughly 40 ms features, 30 ms model, 20 ms rules, 10 ms slack. At 50 µs per row batched, scoring 10k rows/s is about **0.5 cores** — the model is not the bottleneck; feature computation and network hops are.
+    - **Train/serve consistency is a correctness requirement, not a nicety.** Fraud features age in seconds: a velocity feature computed over "last 10 minutes" must be computed identically online and offline or the offline AUC is fiction. The classic failure is an offline join that sees future events, producing an evaluation that cannot be reproduced in production.
+    - **Rules and models compose, in that order.** Deterministic rules (block lists, impossible geography, velocity caps) run before and alongside the model because they are auditable, instant, and explainable to a regulator. The model scores what the rules do not already decide — which means the model's training data must exclude rule-caught cases, or it learns a distribution it will never see in production.
+    - **The adversary invalidates static evaluation.** Fraud patterns shift because the system is in the loop: blocking a pattern moves the attacker to the next one, so a model evaluated on last quarter's fraud measures a distribution that no longer exists. Any honest metric is time-sliced, and drift monitoring on the score distribution is a production requirement rather than a dashboard nicety.
+  derivations:
+    - title: "The cost-optimal threshold"
+      latex: |
+        Let $p$ be the posterior. Flagging costs $c_{fp}$ when the case is
+        negative and saves $c_{fn}$ when it is positive, so the expected cost of
+        flagging minus not flagging is
+        $$(1-p)c_{fp} - p\,c_{fn}.$$
+        Flag when this is negative:
+        $$p\,c_{fn} > (1-p)c_{fp}
+        \quad\Longrightarrow\quad
+        p > \frac{c_{fp}}{c_{fp}+c_{fn}}.$$
+      prose: >-
+        The derivation assumes the score is a calibrated posterior. On an
+        uncalibrated score the same algebra gives a number on a meaningless
+        scale — which is exactly how a threshold of 0.5 ended up catching
+        nothing.
+    - title: "Cost saving relative to flagging nothing"
+      latex: |
+        Flagging nothing costs $N_{\text{fraud}}c_{fn}$. At threshold $t$ the
+        cost is $\mathrm{FP}(t)c_{fp} + \mathrm{FN}(t)c_{fn}$, so the saving is
+        $$\Delta(t) = \big(N_{\text{fraud}} - \mathrm{FN}(t)\big)c_{fn} - \mathrm{FP}(t)c_{fp}.$$
+      prose: >-
+        At the measured optimum, $103 \times 500 - 5{,}914 \times 5 = 51{,}500 -
+        29{,}570 = 21{,}930$ — matching the reported saving. The two terms are
+        the same order of magnitude, which is why the net gain is small.
+    - title: "Why precision collapses at low prevalence"
+      latex: |
+        With prevalence $\pi$, sensitivity $s$ and false-positive rate $f$,
+        $$\text{precision} = \frac{\pi s}{\pi s + (1-\pi)f}.$$
+        At $\pi = 0.001$, $s = 0.10$ and $f = 0.006$:
+        $$\text{precision} = \frac{10^{-4}}{10^{-4} + 0.999\times0.006} \approx 0.017.$$
+      prose: >-
+        The denominator is dominated by $(1-\pi)f$ because the negative class is
+        999 times larger. Precision is a property of prevalence as much as of
+        the model, which is why it cannot be compared across populations.
+    - title: "Latency decomposition at peak"
+      latex: |
+        For peak rate $R$ and per-row cost $\ell$, the compute required is
+        $R\ell$ cores. At $R = 10^{4}$ rows/s and $\ell = 50\,\mu s$:
+        $$10^{4} \times 50\times10^{-6} = 0.5\ \text{cores}.$$
+      prose: >-
+        Half a core for the model at peak. The 100 ms budget is spent on
+        features and hops, not scoring — which is the practical reason feature
+        additions move latency and model upgrades usually do not.
+
+  implementations:
+    - language: python
+      title: "Cost-optimal threshold and the resulting confusion matrix"
+      note: >-
+        Numerically WRONG if the scores are not calibrated: the formula returns
+        a threshold on whatever scale you passed, so applying it to raw margins
+        produces the "0.5 catches nothing" failure. The other trap is assuming
+        the alert queue is unbounded — the FP count here is 5,914 per day, and
+        if review capacity is 1,000, the model's output is not deployable
+        regardless of its cost.
+      code: |
+        import numpy as np
+
+        def optimal_threshold(c_fp, c_fn):
+            """Posterior threshold minimising expected dollars."""
+            return c_fp / (c_fp + c_fn)
+
+        def evaluate_at(post, y, thr, c_fp, c_fn):
+            pred = post > thr
+            tp = int((pred & (y == 1)).sum())
+            fp = int((pred & (y == 0)).sum())
+            fn = int((~pred & (y == 1)).sum())
+            return {
+                "tp": tp, "fp": fp, "fn": fn,
+                "precision": tp / max(tp + fp, 1),
+                "recall": tp / max(tp + fn, 1),
+                "cost": fp * c_fp + fn * c_fn,
+            }
+
+        def sweep(post, y, c_fp, c_fn, n=1200):
+            lo, hi = float(np.min(post)), float(np.max(post))
+            best = None
+            for thr in np.linspace(lo, hi, n):
+                r = evaluate_at(post, y, thr, c_fp, c_fn)
+                if best is None or r["cost"] < best[1]["cost"]:
+                    best = (thr, r)
+            return best
+    - language: python
+      title: "Recovering a calibrated posterior from a score"
+      note: >-
+        Numerically WRONG when the class-conditional densities are not Gaussian
+        — real fraud scores are heavy-tailed and multimodal, so this calibration
+        is a model, not a correction. It also assumes the prevalence used here
+        matches deployment; a different base rate needs the intercept shifted,
+        which is the same correction as the prior-shift adjustment.
+      code: |
+        import numpy as np
+
+        def calibrate_bayes(score, mu_pos, sd_pos, mu_neg, sd_neg, prevalence):
+            """Posterior from known class-conditional Gaussians."""
+            def logpdf(x, mu, sd):
+                return -0.5 * ((x - mu) / sd) ** 2 - np.log(sd) - 0.5 * np.log(2 * np.pi)
+            lp = logpdf(score, mu_pos, sd_pos) + np.log(prevalence)
+            ln = logpdf(score, mu_neg, sd_neg) + np.log(1 - prevalence)
+            m = np.maximum(lp, ln)
+            return np.exp(lp - m) / (np.exp(lp - m) + np.exp(ln - m))
+
+  checkpoints:
+    - id: cp-1
+      question: "False positives cost 5 dollars, missed frauds 500. Where is the optimal threshold?"
+      answerKind: short_text
+      hint: "Flag when the posterior exceeds c_fp over c_fp plus c_fn."
+      solution: >-
+        $5/(5+500) = 0.0099$ — flag anything above a 1% chance. Measured, a
+        1,200-point sweep put the minimum at **0.0095** with cost 483,890 USD,
+        so the theory and the simulation agree to within the grid resolution.
+    - id: cp-2
+      question: "At the optimal threshold you find 103 true and 5,914 false positives. Is the model broken?"
+      answerKind: short_text
+      hint: "What does 0.1% prevalence do to precision?"
+      solution: >-
+        No — that is the correct operating point for this cost matrix. Precision
+        is 0.0171 because the negative class outnumbers the positive 999:1, so
+        even a small false-positive rate produces thousands of alerts. Recall is
+        0.1014: you catch 10% of fraud because catching more costs more
+        customer friction than it saves.
+    - id: cp-3
+      question: "The model beats flagging nothing by only 4.3%. What follows for the project?"
+      answerKind: short_text
+      hint: "Compare the daily costs and ask which lever moves more."
+      solution: >-
+        That the case must be argued in dollars, and that improving separation
+        far from the operating point buys little. 508,000 becomes 486,070 —
+        21,930 USD a day. The bigger levers are reducing false-positive cost
+        (softer friction, better review tooling), which moves the threshold
+        itself, and improving separation specifically near the operating point.
+    - id: cp-4
+      question: "Why did a threshold of 0.5 catch nothing?"
+      answerKind: short_text
+      hint: "What did the score actually represent?"
+      solution: >-
+        The score was uncalibrated: legitimate traffic scored $N(0,1)$, so 0.5
+        meant "above the 69th percentile of all traffic", not "50% probability".
+        Applying a probability threshold to a raw score produces a number with
+        no meaning. After Bayes calibration the optimum was 0.0099 and the cost
+        curve became coherent.
+    - id: cp-5
+      question: "Which part of the 100 ms budget should you optimise, and which will you actually optimise?"
+      answerKind: short_text
+      hint: "Where does the time go, and where does attention go?"
+      solution: >-
+        Features take 40 ms against the model's 30 ms, and at 10k TPS the model
+        needs only about 0.5 cores, so features and network hops are the real
+        cost. Attention usually goes to the model because it is the interesting
+        part — which is why latency regressions arrive with feature additions,
+        not model upgrades.
+    - id: cp-6
+      question: "Why does blocking a fraud pattern make the model worse next quarter?"
+      answerKind: short_text
+      hint: "What happens to the distribution when the adversary responds?"
+      solution: >-
+        Because the adversary is in the loop. Blocking a pattern moves attackers
+        to neighbouring ones, so the distribution the model learned no longer
+        describes the traffic it serves. A model evaluated on last quarter's
+        labels measures a population that no longer exists, which is why any
+        honest metric is time-sliced and score-drift monitoring is a production
+        requirement.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        It is a decision problem under asymmetric costs, not a classification
+        problem. The threshold comes from the cost ratio, precision collapses
+        because positives are rare, and the business case is dollars per day
+        against the cost of doing nothing.
+      blocks:
+        - kind: checklist
+          body: |
+            - Threshold = c_fp / (c_fp + c_fn), on a CALIBRATED posterior
+            - 0.1% prevalence means thousands of false positives at any useful recall
+            - Precision 1.7% is correct here, not broken
+            - Business case = money saved versus flagging nothing
+            - Features cost more latency than scoring
+      checkpoint: >-
+        If the cost of a false positive doubled and the cost of a missed fraud
+        stayed the same, which direction does the threshold move and why?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Get the cost matrix from the business before choosing a model. Then
+        calibrate, then set the threshold from the ratio, then check the alert
+        queue can absorb the volume. Every step before the last is wasted if it
+        cannot.
+      blocks:
+        - kind: checklist
+          body: |
+            - Ask: what does a false positive cost? A missed fraud?
+            - Calibrate the score, or no threshold means anything
+            - Set the threshold from the ratio, not from F1
+            - Check review capacity against the FP volume
+            - Time-slice every metric; the adversary invalidates static tests
+      checkpoint: >-
+        Review capacity is 1,000 alerts a day and the model produces 5,914. What
+        are your options, and which changes the cost matrix?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The economics first, then the serving path.
+      blocks:
+        - kind: pseudocode
+          body: |
+            t_star = c_fp / (c_fp + c_fn)        # on calibrated posterior
+            for thr in grid:
+                fp, fn = confusion(post, y, thr)
+                cost   = fp*c_fp + fn*c_fn
+            thr = argmin(cost)
+
+            # serving, 100 ms p99
+            rules   -> decide some outright (40 ms budget shared)
+            features -> 40 ms   # the real bottleneck
+            model    -> 30 ms   # ~0.5 cores at 10k TPS
+            act      -> block | review | allow   # three thresholds
+      checkpoint: >-
+        Why do block and review need different thresholds even though both act
+        on the same score?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The threshold, the saving, and why precision collapses.
+      blocks:
+        - kind: math
+          body: |
+            **Threshold.** Expected cost of flagging minus not flagging is
+            $(1-p)c_{fp} - p c_{fn}$; setting it below zero gives
+            $$p > \frac{c_{fp}}{c_{fp}+c_{fn}}.$$
+
+            **Saving.** $\Delta = (N_{\text{fraud}}-\mathrm{FN})c_{fn} - \mathrm{FP}\,c_{fp}$.
+
+            **Precision at prevalence $\pi$.**
+            $$\text{prec} = \frac{\pi s}{\pi s + (1-\pi)f}.$$
+      checkpoint: >-
+        Plug in pi = 0.001, s = 0.10, f = 0.006. Do you get 0.017?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        Calibration, threshold selection, and the report that goes with it.
+      blocks:
+        - kind: warning
+          body: >-
+            The most common failure is not the model — it is reporting a metric
+            the business cannot act on. Ship dollars saved, alert volume, and
+            review capacity alongside any quality number.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+            c_fp, c_fn = 5.0, 500.0
+            thr = c_fp / (c_fp + c_fn)              # 0.0099 on a calibrated score
+            res = evaluate_at(post, y, thr, c_fp, c_fn)
+            baseline = int((y == 1).sum()) * c_fn
+            print(f"threshold {thr:.4f}  precision {res['precision']:.4f}  "
+                  f"recall {res['recall']:.4f}")
+            print(f"cost {res['cost']:,.0f} vs baseline {baseline:,.0f} "
+                  f"({(1-res['cost']/baseline)*100:.2f}% better)")
+            print(f"alerts/day {res['tp']+res['fp']:,}  review capacity needed")
+      checkpoint: >-
+        The report says "4.3% better than nothing". What two numbers would you
+        pair with it to stop it being read as a failure?
+  problems:
+    - id: p-opt-threshold
+      title: "Cost-optimal threshold"
+      difficulty: easy
+      prompt: >-
+        Implement `optimal_threshold(c_fp, c_fn)` returning the posterior
+        threshold that minimises expected cost, c_fp / (c_fp + c_fn).
+      starter: |
+        def optimal_threshold(c_fp, c_fn):
+            # your implementation here
+            pass
+      language: python
+      entry: optimal_threshold
+      testCases:
+        - input: '[5.0, 500.0]'
+          expected: '0.009900990099009901'
+          mode: json
+          tolerance: 1e-12
+        - input: '[50.0, 500.0]'
+          expected: '0.09090909090909091'
+          mode: json
+          tolerance: 1e-12
+        - input: '[1.0, 1.0]'
+          expected: '0.5'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def optimal_threshold(c_fp, c_fn):
+            return c_fp / (c_fp + c_fn)
+      solutionExplanation: >-
+        With equal costs the threshold is 0.5, the intuitive answer. Raising the
+        false-positive cost tenfold to 50 moves the threshold to 0.0909 — nine
+        times fewer alerts. The threshold is a business input, not a model
+        property.
+      complexity: "O(1)"
+      tags: [threshold, cost-sensitive]
+
+    - id: p-expected-cost
+      title: "Expected cost and saving over flagging nothing"
+      difficulty: medium
+      prompt: >-
+        Implement `cost_report(tp, fp, fn, n_pos, c_fp, c_fn)` returning a dict
+        with `cost` (fp*c_fp + fn*c_fn), `baseline` (n_pos*c_fn), `saving`
+        (baseline - cost) and `pct_better` ((saving/baseline)*100), all as
+        floats.
+      starter: |
+        def cost_report(tp, fp, fn, n_pos, c_fp, c_fn):
+            # your implementation here
+            pass
+      language: python
+      entry: cost_report
+      testCases:
+        - input: '[103, 5914, 913, 1016, 5.0, 500.0]'
+          expected: '{"cost": 486070.0, "baseline": 508000.0, "saving": 21930.0, "pct_better": 4.316929133858267}'
+          mode: json
+          tolerance: 1e-6
+        - input: '[0, 0, 1016, 1016, 5.0, 500.0]'
+          expected: '{"cost": 508000.0, "baseline": 508000.0, "saving": 0.0, "pct_better": 0.0}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[730, 273759, 286, 1016, 5.0, 500.0]'
+          expected: '{"cost": 1511795.0, "baseline": 508000.0, "saving": -1003795.0, "pct_better": -197.5974409448819}'
+          mode: json
+          tolerance: 1e-6
+      solution: |
+        def cost_report(tp, fp, fn, n_pos, c_fp, c_fn):
+            cost = fp * c_fp + fn * c_fn
+            baseline = n_pos * c_fn
+            saving = baseline - cost
+            return {"cost": cost, "baseline": baseline,
+                    "saving": saving,
+                    "pct_better": (saving / baseline) * 100 if baseline else 0.0}
+      solutionExplanation: >-
+        The optimum saves 21,930 USD a day, which is 4.3% — the honest size of
+        the win. Flagging nothing is the baseline row, exactly 0%. The third row
+        is the recall-chasing threshold from the lesson: it is 197.6% WORSE than
+        doing nothing, because 273,759 false positives at 5 USD each costs
+        1.37M in friction to save 365,000 in fraud.
+      complexity: "O(1)"
+      tags: [cost-model, business-case]
+
+    - id: p-precision-at-prevalence
+      title: "Precision from prevalence, sensitivity and FPR"
+      difficulty: easy
+      prompt: >-
+        Implement `precision_at(prevalence, sensitivity, fpr)` returning
+        (prevalence*sensitivity) / (prevalence*sensitivity +
+        (1-prevalence)*fpr).
+      starter: |
+        def precision_at(prevalence, sensitivity, fpr):
+            # your implementation here
+            pass
+      language: python
+      entry: precision_at
+      testCases:
+        - input: '[0.001, 0.10, 0.006]'
+          expected: '0.016409583196586808'
+          mode: json
+          tolerance: 1e-9
+        - input: '[0.5, 0.9, 0.05]'
+          expected: '0.9473684210526315'
+          mode: json
+          tolerance: 1e-9
+        - input: '[0.01, 0.5, 0.01]'
+          expected: '0.33557046979865773'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def precision_at(prevalence, sensitivity, fpr):
+            hit = prevalence * sensitivity
+            return hit / (hit + (1 - prevalence) * fpr)
+      solutionExplanation: >-
+        At 0.1% prevalence with 10% sensitivity and a 0.6% false-positive rate,
+        precision is 0.016 — the same operating point the cost matrix selects.
+        At 50% prevalence the identical model achieves 0.947, which is why
+        precision cannot be compared across populations with different base
+        rates.
+      complexity: "O(1)"
+      tags: [precision, prevalence]
+
+  try_it: >-
+    With a false positive costing 5 USD and a missed fraud costing 500 USD, compute the
+    cost-optimal threshold from c_fp/(c_fp + c_fn): 5/505 = 0.0099, so you flag below a 1%
+    predicted probability. Then work out why that threshold, on 1,000,000 transactions at 0.1%
+    prevalence, produces about 103 true positives against roughly 5,914 false ones.
+  interview_questions:
+    - question: "Why is 0.5 the wrong threshold, and what is the right one?"
+      level: senior
+      key_points:
+        - "The threshold that minimises expected cost flags when the posterior exceeds c_fp/(c_fp + c_fn), which here is 5/505 = 0.0099 — under a 1% predicted probability."
+        - "At 0.1% prevalence that operating point is precision 1.7% and recall 10.1%: 103 true positives and 5,914 false positives on a million transactions."
+        - "A threshold of 0.5 on the initial uncalibrated score caught nothing at all, because the score was N(0,1) for legitimate traffic and 0.5 meant half of all traffic."
+        - "So calibration comes first and the threshold is then a cost ratio, not a modelling choice."
+      follow_up: "Your risk team raises the acceptable friction cost to 50 dollars. What happens to the threshold and to alert volume?"
+    - question: "Your model reports 90% recall. What does that cost, and what would you report instead?"
+      level: staff
+      key_points:
+        - "Report dollars and alert volume: F1 treats a false positive and a false negative as equally bad, and here they differ by a factor of 100."
+        - "The F1-optimal threshold is 0.0175 with F1 0.0397 and a cost of 491,020 dollars — 1.5% worse than the cost-optimal 483,890 on the same sweep."
+        - "At the cost optimum the system flags about 6,000 transactions a day to catch about 103 frauds, so the false-positive queue and customer friction are the binding constraints, not recall."
+        - "The honest business case is 21,930 dollars saved, 4.3% against the 508,000 cost of doing nothing — small, and it has to be said before the project is built."
+      follow_up: "Given a 4.3% saving, what would have to be true for this project to be worth building at all?"
+    - question: "An offline AUC of 0.95 is presented as evidence the model works. Why does it mean nothing here?"
+      level: staff
+      key_points:
+        - "Train/serve skew is measured in minutes, not weeks: a velocity feature over the last ten minutes must be computed identically online and offline or the offline number is fiction."
+        - "The classic failure is an offline join that sees future events, producing an evaluation that cannot be reproduced at serving time."
+        - "The adversary invalidates static evaluation — blocking a pattern pushes attackers to the next one, so last quarter's fraud is a distribution that no longer exists."
+        - "Honest metrics are time-sliced, with drift monitoring on the score distribution and on feature freshness."
+      follow_up: "How would you detect that the online feature definitions have drifted away from the offline ones?"
+  common_mistakes:
+    - "Optimising F1 or accuracy when the costs are asymmetric — the F1 threshold is 1.5% worse in dollars on a 484K dollar a day cost base."
+    - "Tuning the threshold of an uncalibrated score, where 0.5 caught nothing because the output was N(0,1) and meant half of all traffic."
+    - "Evaluating on a random split that lets the offline join see future events, producing an AUC that cannot be reproduced in production."
+  further_reading:
+    - label: "Bahnsen, Stojanovic, Aouada, Ottersten, Cost-sensitive credit card fraud detection using Bayes minimum risk, ICMLA 2014"
+    - label: "Dal Pozzolo, Caelen, Le Borgne, Waterschoot, Bontempi, Learned lessons in credit card fraud detection from a practitioner perspective, Expert Systems with Applications 2014"

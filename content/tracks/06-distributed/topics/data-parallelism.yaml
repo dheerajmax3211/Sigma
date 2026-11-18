@@ -1,0 +1,1333 @@
+id: data-parallelism
+slug: data-parallelism
+title: "Data Parallelism: All-Reduce, Bucketing, and Scaling"
+summary: >-
+  Split a batch across workers, average the gradients so the step is exactly the
+  one a W-times-larger batch would have taken, and then price the synchronisation
+  honestly: 23.45 GB per rank and 78 ms on NVLink for a 7B model, 2(N-1)/N times
+  the model bytes on every step, and the reason strong scaling collapses while
+  weak scaling does not.
+kind: lesson
+difficulty: hard
+position: 1
+estMinutes: 26
+prerequisites: [backpropagation, gradient-descent-variants]
+phase: distributed-training
+tags: [data-parallelism, all-reduce, ring-allreduce, bucketing, ddp, parameter-server, scaling-efficiency, communication, distributed-training]
+
+body:
+  big_idea: >-
+    The mean of the workers' gradients is not an approximation of the
+    large-batch gradient — it is that gradient. Data parallelism changes the
+    batch size and the bill, never the mathematics.
+  problem:
+    - "A second GPU makes the run 1.7x faster, not 2x, and the missing 30% is a collective you cannot see in the Python profile."
+    - "Someone divides the loss by world_size before backward, so the model needs a learning rate eight times larger and the direction still looks perfect."
+    - "A 64-GPU job reports 35% scaling efficiency with accelerators idle 60% inside one collective: bandwidth, batch, buckets or topology?"
+  analogy: >-
+    Eight surveyors measure a valley, each walking a different eighth and
+    radioing back one average elevation. The coordinator averages the eight
+    averages and gets the valley's mean exactly — a mean of means weighted by
+    area is the mean over all the area. The radio report is one number per
+    grid cell, so its cost is fixed however much land each surveyor covered.
+  concept_points:
+    - "**The mean of the shard gradients is the full-batch gradient, exactly.** Measured over 8 shards of an 8,192-example logistic regression: max absolute difference **1.4e-17** in float64 and **6.8e-08** in float32 — round-off. A mean of means weighted by shard size is the mean over the union. Divide by $W$ as well and each worker's already-averaged loss is averaged twice: the gradient is $W$ times too small."
+    - "**Any positive scalar preserves the descent direction, so the sum bug is invisible in every direction-based check.** $\\cos(c\\,g, g) = 1$ for $c > 0$; measured, $\\|\\sum_w g_w\\| / \\|\\operatorname{mean}_w g_w\\|$ is exactly **8.000000** at $W = 8$. The step is not invisible: at $\\eta = 1.9/\\lambda_{\\max}$ the mean rule reaches **0.262** in 60 steps, the sum rule **9.8e135**."
+    - "**Ring all-reduce costs $2(N-1)S/N$ bytes per rank and saturates at $2S$.** Instrumented on a 32 MB payload: **32.0, 48.0, 56.0 MB** per rank at $N = 2, 4, 8$. For a 7B fp16 model ($S = 13.4$ GB) that is **23.45 GB per rank at 8** and **26.38 GB at 64**, against the **214.4 GB** a parameter server's NIC carries at $N = 8$ — a factor of **9.1**."
+    - "**It is bandwidth-bound by four orders of magnitude.** At $N = 8$, $S = 13.4$ GB the reduce does $5.86\\times10^{9}$ additions — **5.9 us** at 989 TFLOP/s — against **78.2 ms** of transfer at 300 GB/s, a factor of **13,187**. Arithmetic intensity is **0.25 FLOP/byte** against a 295 FLOP/byte ridge, so the tensor cores are idle by design and only fewer bytes or a wider pipe help."
+    - "**Bucketing reduces collective calls, not bytes, and only matters when the message is small.** At $\\alpha = 8\\,\\mu$s and 300 GB/s a 200 MB gradient in 1,000 tensors costs **8.667 ms** unbucketed against **0.731 ms** in 8 buckets — **11.9x** — while the 13.4 GB gradient gains only **1.18x**. Bucket size has an interior optimum $b^\\star = S\\sqrt{2\\alpha/T_{\\text{step}}}$, and the real payoff is overlap with the backward pass."
+    - "**Scaling efficiency is $T_{\\text{compute}}/(T_{\\text{compute}} + T_{\\text{comm}})$, set by tokens per accelerator, not by worker count.** With the global batch pinned at 65,536 tokens, efficiency falls from **91.4%** at 8 GPUs to **54.2%** at 64 and **22.6%** at 256; holding 8,192 tokens per GPU it stays **91.4%, 90.4%, 90.3%**. The per-rank bill does not grow — the work amortising it shrinks."
+  definitions:
+    - term: "Data parallelism"
+      meaning: >-
+        Replicating the whole model on every worker and splitting the batch
+        instead. Each worker runs forward and backward on its own shard, the
+        gradients are averaged across workers, and every worker applies the same
+        update. Parameters and optimizer state are duplicated $W$ times, which
+        is why it is the cheapest topology to implement and the first to run out
+        of memory.
+    - term: "Rank"
+      meaning: >-
+        One participating process in a collective, numbered $0 \ldots N-1$.
+        Ranks are not the same thing as devices — one rank per GPU is the common
+        mapping, but a rank can own a NUMA socket or be a CPU process in a
+        simulation. Every rank in a ring all-reduce sends exactly the same
+        number of bytes, which is what makes the algorithm symmetric.
+    - term: "All-reduce"
+      meaning: >-
+        A collective that combines a buffer across all ranks and leaves the
+        result in every rank's buffer. Data parallelism needs it because every
+        worker must apply the same averaged gradient; a one-rank reduction would
+        leave the others with stale weights. Cost: $2(N-1)S/N$ bytes per rank
+        for a ring, and it is the single largest communication cost in training.
+    - term: "Reduce-scatter and all-gather"
+      meaning: >-
+        The two halves of a ring all-reduce. Reduce-scatter sums each chunk
+        around the ring so that rank $r$ ends up owning one fully reduced chunk;
+        all-gather then circulates those chunks so every rank has all of them.
+        Each half moves $(N-1)S/N$ bytes per rank, which is why the total is
+        twice that and why neither half alone is a full all-reduce.
+    - term: "Ring all-reduce"
+      meaning: >-
+        The bandwidth-optimal all-reduce: $N$ ranks in a cycle, $2(N-1)$ steps
+        of $S/N$ bytes each. Optimal because every link carries the minimum
+        possible traffic and no node is a hotspot; its weakness is latency,
+        since the steps are sequential, which is why trees win for small
+        messages and large $N$.
+    - term: "Parameter server"
+      meaning: >-
+        The older alternative: workers push gradients to a central server (or a
+        sharded set of them), which averages and pushes parameters back. Two
+        hops of latency instead of $2(N-1)$, and it supports asynchronous and
+        stale updates, but the server's NIC must carry $2NS$ bytes per step, so
+        it does not scale past a few dozen workers without sharding itself.
+    - term: "Gradient bucket"
+      meaning: >-
+        A fixed-size buffer that many small gradient tensors are copied into so
+        that one collective can carry all of them. Buckets exist to amortise
+        per-collective launch latency (about $8\,\mu$s) and to give the
+        communication a granularity it can overlap with the backward pass.
+        They do not reduce bytes.
+    - term: "Effective batch size"
+      meaning: >-
+        The number of examples that produced one optimizer step: $B \cdot W$
+        for $B$ per worker across $W$ workers, times the accumulation steps if
+        you are also accumulating. Every learning-rate rule, every schedule, and
+        every "we trained on 300B tokens" claim is stated in terms of it, which
+        is why the same script at 8 GPUs and 64 GPUs is two different
+        experiments.
+    - term: "Linear scaling rule"
+      meaning: >-
+        $\eta' = W\eta$ when the batch grows by $W$: it holds $\eta/B_{\text{eff}}$
+        constant, which keeps the SGD stationary distribution — and therefore
+        the loss floor — fixed. It is exact for small steps and fails as the
+        step approaches $2/\lambda_{\max}$; the square-root rule
+        $\eta' = \sqrt{W}\eta$ trades speedup for stability when it does.
+    - term: "Critical batch size"
+      meaning: >-
+        The batch beyond which doubling the batch no longer halves the number of
+        steps needed. Below it, gradient noise dominates and a bigger batch is
+        nearly free progress; above it, curvature dominates and the extra
+        parallelism is wasted. It is a property of the problem and the current
+        weights, not a constant, which is why "$B = 4$M tokens" works for one
+        model and destroys another.
+    - term: "Scaling efficiency"
+      meaning: >-
+        Speedup divided by worker count, or equivalently
+        $T_{\text{compute}}/(T_{\text{compute}} + T_{\text{comm}})$ when
+        communication is not hidden. It is a statement about the ratio of work
+        to bytes per worker, so it is set by tokens per accelerator per step and
+        by interconnect bandwidth — not by the number of workers, which cancels.
+
+  diagrams:
+    - type: architecture
+      title: "One data-parallel step: four shards in, one averaged gradient out"
+      nodes:
+        - { id: batch, x: 0, y: 1, label: "global batch  8,192 tokens", kind: client, detail: "Split into four contiguous shards of 2,048 tokens each. Contiguous, not strided, so each rank's shard is still a valid sample of the data distribution." }
+        - { id: r0, x: 1, y: 0, label: "rank 0  forward + backward", kind: gpu, detail: "2,048 tokens. Produces a full gradient vector of 6.7e9 fp16 values: 13.4 GB, the same size as the weights. Every rank holds a complete copy of the model and of the optimizer state." }
+        - { id: r1, x: 1, y: 1, label: "rank 1  forward + backward", kind: gpu, detail: "Identical work on a different shard. The four backward passes are independent and take 2/3 of the step's FLOPs; nothing is shared until the gradients are ready." }
+        - { id: r2, x: 1, y: 2, label: "rank 2  forward + backward", kind: gpu, detail: "Each rank's gradient is a mean over its own 2,048 examples, which is why the correct reduction across ranks is also a mean." }
+        - { id: r3, x: 1, y: 3, label: "rank 3  forward + backward", kind: gpu, detail: "The smallest shard in the last batch of an epoch is the one that breaks the unweighted mean: see the checkpoint on uneven shards." }
+        - { id: ar, x: 2, y: 1, label: "all-reduce  2(N-1)/N x 13.4 GB", kind: server, detail: "20.1 GB per rank at N=4 (1.5S), 67 ms at 300 GB/s: reduce-scatter then all-gather, 2(N-1)=6 steps of S/4 bytes each. A ring has no hotspot; a parameter server would put 4 x 13.4 GB through one NIC twice." }
+        - { id: opt, x: 3, y: 1, label: "optimizer step  theta -= eta g", kind: model, detail: "Every rank applies the identical averaged gradient to identical weights, so the replicas stay bit-identical without a broadcast. This is the invariant that makes data parallelism work at all." }
+      edges:
+        - { from: batch, to: r0, label: "shard 0" }
+        - { from: batch, to: r1, label: "shard 1" }
+        - { from: batch, to: r2, label: "shard 2" }
+        - { from: batch, to: r3, label: "shard 3" }
+        - { from: r0, to: ar, label: "g0" }
+        - { from: r1, to: ar, label: "g1" }
+        - { from: r2, to: ar, label: "g2" }
+        - { from: r3, to: ar, label: "g3" }
+        - { from: ar, to: opt, label: "g average" }
+        - { from: opt, to: r0, label: "same update, no broadcast", style: async }
+      caption: "Read the loop: the only cross-rank edge is the all-reduce. Everything else in the diagram is duplicated work, which is why data parallelism scales the batch and the memory footprint, and never the model."
+
+    - type: compare
+      title: "Parameter server vs ring all-reduce, N = 64, 13.4 GB of fp16 gradients, 50 GB/s links"
+      left_label: "Parameter server"
+      left_points:
+        - "Total traffic 2NS = 1.716 TB per step"
+        - "All of it crosses the server's NIC: 34.3 s per step"
+        - "Two hops of latency, so it wins on small messages"
+        - "Supports asynchronous updates with stale gradients"
+        - "Hotspot and single point of failure: one slow worker stalls the server"
+      right_label: "Ring all-reduce"
+      right_points:
+        - "Total traffic 2(N-1)S = 1.688 TB per step — 1.7% less"
+        - "Per-rank 26.38 GB, spread evenly: 0.528 s per step"
+        - "2(N-1) = 126 sequential steps, so latency-bound below ~1 MB"
+        - "Synchronous: every rank must arrive, every step"
+        - "No hotspot, and bandwidth-optimal on every link"
+
+    - type: plot
+      title: "Scaling efficiency against worker count, 7B model at 40% MFU"
+      chart: line
+      xLabel: "workers (N)"
+      yLabel: "efficiency (%)"
+      series:
+        - name: "NVLink 300 GB/s, weak scaling (8,192 tokens/GPU)"
+          points:
+            - { x: 1, y: 100.0 }
+            - { x: 8, y: 91.4 }
+            - { x: 64, y: 90.4 }
+            - { x: 256, y: 90.3 }
+            - { x: 1024, y: 90.3 }
+        - name: "IB 400 Gb/s, weak scaling (8,192 tokens/GPU)"
+          points:
+            - { x: 1, y: 100.0 }
+            - { x: 8, y: 64.0 }
+            - { x: 64, y: 61.2 }
+            - { x: 256, y: 60.9 }
+            - { x: 1024, y: 60.9 }
+        - name: "NVLink 300 GB/s, strong scaling (65,536-token global batch)"
+          points:
+            - { x: 1, y: 100.0 }
+            - { x: 8, y: 91.4 }
+            - { x: 64, y: 54.2 }
+            - { x: 256, y: 22.6 }
+            - { x: 1024, y: 6.8 }
+        - name: "IB 400 Gb/s, strong scaling (65,536-token global batch)"
+          points:
+            - { x: 1, y: 100.0 }
+            - { x: 8, y: 64.0 }
+            - { x: 64, y: 16.5 }
+            - { x: 256, y: 4.6 }
+            - { x: 1024, y: 1.2 }
+
+    - type: pipeline
+      title: "A bucketed backward pass: communication hidden behind computation"
+      nodes:
+        - label: "forward  (8,192 tokens)"
+          note: "329 TFLOP at 40% MFU = 0.83 s per step, per rank"
+          detail: "6 x 6.7e9 parameters x 8,192 tokens. Activations are kept for backward, which is why the activation memory of a data-parallel run grows with tokens per worker and not with worker count."
+        - label: "backward from the last block"
+          note: "gradients arrive in reverse layer order"
+          detail: "Block 27's gradients are ready first. A bucket that contains only block-27 tensors can be sealed and launched immediately — this is why bucket order follows the backward pass and not parameter order."
+        - label: "bucket 0 sealed  (25 MB)"
+          note: "146 us of ring at 300 GB/s, launched now"
+          detail: "2(N-1)/N x 25 MB = 43.75 MB per rank at N=8, which is 146 us. If the rest of the backward takes 555 ms, this is free."
+        - label: "buckets 1..535"
+          note: "one collective per bucket, overlapped"
+          detail: "536 buckets of 25 MB cover 13.4 GB. Each launch costs about 8 us of CPU, so the whole run pays 4.3 ms of launch overhead against 78 ms of transfer."
+        - label: "final bucket  (exposed)"
+          note: "the only communication you actually wait for"
+          detail: "Whatever is still in flight when the last gradient lands is the exposed cost. With sane bucketing it is one bucket, about 146 us on 8 NVLink GPUs — which is why the measured penalty is a few percent and not the full 78 ms."
+        - label: "optimizer step, all ranks"
+          note: "identical weights, no broadcast"
+          detail: "The next forward pass cannot start until this finishes, which is why overlap is a backward-pass-only trick: there is nothing to hide the last all-reduce behind."
+
+    - type: sequence
+      title: "Ring all-reduce with four ranks: what each step sends"
+      items:
+        - "Chunks are numbered 0-3, one per rank, each S/4 bytes. Rank r starts holding all four of its own chunks."
+        - "Reduce-scatter, step k=0: rank r sends chunk r to rank r+1 and adds the chunk it receives from rank r-1 into its own copy. Every rank moves S/4 bytes."
+        - "Reduce-scatter, step k=1: rank r sends chunk (r-1) and adds the chunk arriving from r-1. After this step each chunk has been summed on two ranks."
+        - "Reduce-scatter, step k=2: after three steps rank r holds chunk (r+1) fully reduced, having summed contributions from all four ranks. Total sent: 3S/4."
+        - "All-gather, step k=0: rank r sends its reduced chunk to r+1 and stores the chunk arriving from r-1. No addition, just a copy."
+        - "All-gather, steps k=1,2: the reduced chunks circulate until every rank holds all four. Another 3S/4 bytes."
+        - "Total per rank: 2(N-1)S/N = 1.5S. Total across all links: 2(N-1)S = 6S. Every link carries exactly 1.5S, which is the definition of bandwidth-optimal."
+
+  markdown: |
+    ## One equation
+
+    A data-parallel step is a statement about a gradient, not about a network.
+
+    $$g_{\text{avg}} = \frac{1}{W}\sum_{w=1}^{W}
+      \frac{1}{B}\sum_{i \in \text{shard } w} \nabla_\theta \ell_i
+      = \frac{1}{WB}\sum_{i=1}^{WB} \nabla_\theta \ell_i = g_{\text{full}}$$
+
+    The inner mean is what each worker's loss already computes, because you
+    wrote `.mean()` in the model. The outer mean is the only thing the
+    framework adds. Nothing about the model changes — same layers, same
+    optimizer, same schedule — but the batch is $W$ times larger, the gradient
+    is $\sqrt{W}$ times less noisy, and you owe the interconnect a fixed toll on
+    every step.
+
+    ## Three quantities that are easy to confuse
+
+    | reduction across workers | direction | magnitude | what it does to the step |
+    |---|---|---|---|
+    | mean | the full-batch gradient | $1$ | $\eta\, g_{\text{full}}$ — what you meant |
+    | sum | *the same direction* | $W$ | $W\eta\, g_{\text{full}}$ — a $W\times$ learning rate |
+    | mean, unweighted shards | cosine 0.9406 with the truth | $1$ | a biased update that no test catches |
+
+    The middle row is the one that costs people weeks. Cosine similarity with
+    the true gradient is **1.000000** for the sum, because scaling a vector
+    cannot change its direction — so every gradient-check you know how to run
+    passes. Measured, $\|{\sum_w g_w}\|/\|{\operatorname{mean}_w g_w}\| = 8.000000$
+    at $W=8$, and at a learning rate of $1.9/\lambda_{\max}$ the sum rule takes
+    a quadratic from $2.1575$ to $9.8\times10^{135}$ in 60 steps while the mean
+    rule converges to $0.262$.
+
+    ## The bill
+
+    Ring all-reduce is reduce-scatter then all-gather: $N-1$ steps of $S/N$
+    bytes, twice.
+
+    $$B_{\text{rank}} = 2(N-1)\frac{S}{N}, \qquad
+      B_{\text{total}} = 2(N-1)S .$$
+
+    | $N$ | bytes per rank | for a 7B model in fp16 | per-rank time at 300 GB/s |
+    |---|---|---|---|
+    | 2 | $1.000\,S$ | 13.40 GB | 44.7 ms |
+    | 8 | $1.750\,S$ | 23.45 GB | 78.2 ms |
+    | 64 | $1.969\,S$ | 26.38 GB | 87.9 ms |
+    | 512 | $1.996\,S$ | 26.75 GB | 89.2 ms |
+
+    That saturation is the most important number in the topic. Adding workers
+    does not add communication per worker — the limit is $2S$, twice the model
+    — so the all-reduce bill is a property of the model, not of the cluster.
+    What changes with $N$ is how much computation each rank has to amortise it
+    over.
+
+    The operation is also almost pure bandwidth. At $N = 8$ the reduce performs
+    $5.86\times10^{9}$ additions — 5.9 microseconds at 989 TFLOP/s — against
+    78.2 ms of transfer. Intensity is 0.25 FLOP/byte, roughly 1,180x below the
+    ridge point of an H100. There is nothing to optimise in the arithmetic; the
+    only levers are fewer bytes or a wider pipe.
+
+    ## Bucketing
+
+    A framework cannot issue one collective for a 13.4 GB buffer, because the
+    buffer does not exist until the last backward kernel finishes. It issues one
+    per bucket, and a bucket is sealed and launched as soon as its last tensor
+    lands.
+
+    | gradient | tensors | unbucketed | 8 buckets | gain |
+    |---|---|---|---|---|
+    | 200 MB (100M params) | 1,000 | 8.667 ms | 0.731 ms | 11.9x |
+    | 13.4 GB (7B params) | 1,000 | 52.667 ms | 44.675 ms | 1.18x |
+
+    Bucketing does not reduce a single byte. It reduces the number of
+    collectives, and so the launch latency and the number of times the ring has
+    to be started. When the message is large the transfer dominates and the gain
+    is 18%; when it is small the launches dominate and the gain is 12x. Its
+    larger value is that it gives the communication a granularity it can be
+    overlapped at.
+
+    The optimum trades launch overhead against waiting: a bucket of size $b$ has
+    $S/b$ launches at $\alpha$ each, and its first tensor waits on average
+    $b/(2r)$ where $r = S/T_{\text{step}}$ is the rate at which gradients are
+    produced.
+
+    $$T(b) = \frac{\alpha S}{b} + \frac{b\,T_{\text{step}}}{2S}
+      \quad\Longrightarrow\quad
+      b^\star = S\sqrt{\frac{2\alpha}{T_{\text{step}}}} .$$
+
+    At $\alpha = 8\,\mu$s and $T_{\text{step}} = 0.832$ s that is 58.8 MB for a
+    7B model and 5.7 MB for a 100M model with a 20 ms step. PyTorch's 25 MB
+    default is a compromise that is within 2.4x of both.
+
+    ## Two topologies
+
+    A parameter server and a ring move within 2% of the same total bytes, and
+    they behave nothing alike, because the question is not how many bytes but
+    how many NICs they cross.
+
+    | | parameter server | ring |
+    |---|---|---|
+    | total traffic | $2NS$ | $2(N-1)S$ |
+    | at $N = 64$ | 1.716 TB | 1.688 TB |
+    | bottleneck | one NIC: 34.3 s at 50 GB/s | every link equally: 0.528 s |
+    | latency | 2 hops | $2(N-1)$ sequential steps |
+    | failure mode | server is a hotspot and a SPOF | one straggler stalls every step |
+    | updates | can be asynchronous and stale | synchronous by construction |
+
+    The parameter server is not obsolete; it is the right answer when messages
+    are small, when workers are unreliable, or when you want stale-synchronous
+    updates. It is the wrong answer for a 7B model at 64 workers, where the
+    server's NIC becomes a $65\times$ penalty.
+
+    ## Scaling efficiency
+
+    $$\text{efficiency} = \frac{T_{\text{compute}}}{T_{\text{compute}} +
+      T_{\text{comm}}}, \qquad
+      T_{\text{compute}} = \frac{6ND_{\text{local}}}{P\cdot\text{MFU}},
+      \qquad
+      T_{\text{comm}} = \frac{2(N-1)S}{N\cdot\text{BW}} .$$
+
+    Both terms are per rank, and $N$ cancels out of the ratio almost entirely:
+    $T_{\text{comm}}$ saturates at $2S/\text{BW}$ and $T_{\text{compute}}$ is set
+    by $D_{\text{local}}$, the tokens each rank processes per step. So
+    efficiency is a function of tokens per accelerator and interconnect
+    bandwidth, not of worker count.
+
+    Two different quantities are called efficiency in this topic, and they
+    multiply. The **optimization** efficiency — 1.0000 down to 0.3358 above, as
+    linear scaling runs out of curvature — is the fraction of the ideal loss
+    decrease you get for the data you consumed; its fixes are the batch size and
+    the learning rate. The **systems** efficiency below is the fraction of the
+    ideal step rate you get for the hardware you bought; its fixes are
+    bandwidth, topology, and bucket size. A run at 90% of one and 20% of the
+    other needs completely different work.
+
+    That has two consequences, and they look contradictory until you write the
+    two tables.
+
+    | 7B, 40% MFU | $N=8$ | $N=64$ | $N=256$ |
+    |---|---|---|---|
+    | strong scaling, 65,536-token global batch, NVLink | 91.4% | 54.2% | 22.6% |
+    | weak scaling, 8,192 tokens per GPU, NVLink | 91.4% | 90.4% | 90.3% |
+    | strong scaling, 65,536-token global batch, 100 GbE | 30.7% | 4.7% | 1.2% |
+
+    Strong scaling holds the batch fixed, so each rank's work falls as $1/N$
+    while its communication bill stays at $2S$. Weak scaling grows the batch
+    with the cluster, so the ratio is constant and the efficiency curve is flat.
+    "We got 35% efficiency at 64 GPUs" is therefore not a fact about the
+    interconnect until you say what the global batch was — at a 65,536-token
+    batch on 100 GbE, 4.7% is the *expected* result and no amount of engineering
+    fixes it. The fix is a bigger batch, and the question is whether the
+    optimizer can tolerate one.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    The average of the workers' gradients is not an approximation of the large-batch gradient, it is that gradient — so data parallelism changes the batch size and the bill, never the mathematics, and the bill is $2(N-1)S/N$ bytes per rank on every single step.
+
+    ### The analogy, in full
+
+    Eight surveyors are sent to measure the average elevation of a valley. Each walks a different eighth of it and radios back the average elevation of the land they covered. The coordinator averages the eight averages and gets the average elevation of the whole valley — exactly, not approximately, because a mean of means weighted by area is the mean over all the area. The cost is the radio call, and it is paid once per day regardless of how much land each surveyor covered. The report is a fixed size — one number per grid cell, not one per measurement — so a team that doubles its land per person does not pay more to synchronise, while a team that halves its land per person pays the same radio bill for half the work. That is the entire shape of the scaling problem, and it is a statement about the report, not about the valley. The analogy breaks in three places, and each break is a real bug. The surveyors might report a total instead of a mean, and the coordinator's average of totals is eight times too large — invisible in direction, fatal in step size. One surveyor's plot might be a tenth the size of the others, so the unweighted mean over-weights it; equal-area sharding is a correctness requirement, not a convenience. And the radio is not free while walking: a good coordinator starts averaging the first hill before the last one is measured, which is what bucketing is for and where the real engineering lives.
+
+    ### Failure modes, in full
+
+    - You add a second GPU and the run gets 1.7x faster, not 2x. Nothing crashed, the loss curve looks plausible, and there is no error message to search for — the missing 30% is a collective you cannot see in the Python profile.
+    - Someone adds `loss = loss / world_size` before backward "to be safe", and now the model needs a learning rate eight times larger to move at all. The gradient's direction is perfect, which is exactly why the bug survives review: you cannot see a factor of eight in a cosine similarity.
+    - Your 64-GPU job reports 35% scaling efficiency and the profiler shows the accelerators idle 60% of the time inside one collective. You need to know whether the answer is more bandwidth, a larger batch, fewer buckets, or a different topology — and those four cost very different amounts of money.
+    - You inherit two 64-worker runs on identical hardware, one built on a parameter server and one on NCCL, and their step times differ by 65x. The total bytes on the wire are within 2% of each other, so the explanation is not volume; it is where the bytes have to pass through.
+    - The last batch of the epoch has 37 examples instead of 1,024, and the framework's unweighted mean tilts the update by 36% in relative norm without raising anything. That is a correctness bug that looks like noise.
+
+    ### The mechanisms, in full
+
+    - **The mean of the shard gradients is the full-batch gradient, exactly.** Not an estimator of it — the same number. Measured over 8 shards of an 8,192-example logistic regression in float64: max absolute difference **1.4e-17**, which is round-off, and in float32 at $d = 1024$ it is **6.8e-08**. It is the associativity of addition: a mean of means, weighted by shard size, is the mean over the union. The trap is the framework's local loss reduction: if each worker's loss is already a mean over its shard and you also divide by $W$ before backward, you have averaged twice and the gradient is $W$ times too small.
+    - **Any positive scalar preserves the descent direction, so the sum bug is invisible in every direction-based check.** $\cos(c\,g, g) = 1$ for any $c > 0$; measured, $\|{\sum_w g_w}\| / \|{\operatorname{mean}_w g_w}\|$ is exactly **8.000000** at $W = 8$ and the cosine with the full-batch gradient is identical for both. What changes is the step: with a learning rate already at $1.9/\lambda_{\max}$ (inside the $2/\lambda_{\max}$ stability limit), the mean rule takes a quadratic from $f = 2.1575$ to **0.262** in 60 steps while the sum rule reaches **9.8e135**. The bug is a learning rate of $W\eta$, and you will find it in a loss curve, never in a gradient check.
+    - **Averaging shrinks gradient noise as $1/\sqrt{BW}$, and $B$ is not $BW$.** Standard deviation of the averaged gradient's projection, 2,000 trials, $B = 32$ per worker: **1.0000, 0.6847, 0.5071, 0.3461, 0.2352** for $W = 1, 2, 4, 8, 16$, against the predicted $1, 0.7071, 0.5, 0.3536, 0.25$. But eight workers of 32 examples see 256 of the 8,192, and that averaged gradient still has cosine **0.8154** with the full-batch gradient (minimum over 2,000 draws: 0.5790). Synchronising does not remove the noise inside the batch; it just stops you from having to wait for a bigger one.
+    - **The effective batch is $B \cdot W$, so the learning rate has to move with it — and linear scaling is only free until curvature notices.** Measured per-step loss decrease on a condition-100 quadratic, relative to $W$ times the $W=1$ decrease, with $\eta = W\eta_0$: **1.0000, 0.9791, 0.9373, 0.8499, 0.6797, 0.3358** at $W = 1, 2, 4, 8, 16, 32$. The loss per step grows, but sublinearly, because the second-order term grows as $\eta^2 = W^2$ while the first-order term grows as $W$. At $W = 32$, $\eta = 1.6$ is 80% of the $2/\lambda_{\max} = 2.0$ wall and the decrease actually *falls* below $W=16$ (1.5211 against 1.5394). The trap is a "linear scaling" recipe applied at a batch size where the step is already at the stability edge.
+    - **Ring all-reduce costs $2(N-1)S/N$ bytes per rank, and it saturates at $2S$ instead of growing.** Instrumented ring implementation on a 32 MB payload: **32.0, 48.0, 56.0 MB** per rank at $N = 2, 4, 8$, matching $2(N-1)S/N$ to the byte. At $N = 8$ that is $1.75S$; at $N = 64$, $1.969S$; at $N = 512$, $1.996S$. For a 7B model in fp16 ($S = 13.4$ GB) that is **23.45 GB per rank at 8** and **26.38 GB at 64** — against the **214.4 GB** a single-node parameter server's NIC must carry at $N = 8$ ($2NS$), a factor of **9.1**, and the reason the per-rank number does not explode when you add workers.
+    - **It is bandwidth-bound by four orders of magnitude, so there is nothing to optimise in the arithmetic.** $N = 8$, $S = 13.4$ GB: the reduce does $5.86\times10^{9}$ additions, which is **5.9 microseconds** at 989 TFLOP/s, against **78.2 ms** of transfer at 300 GB/s — a factor of **13,187**. The arithmetic intensity is **0.25 FLOP/byte** against a 295 FLOP/byte ridge point, so the tensor cores are idle by design. The trap is quantising the accumulator or fusing the add: the bytes are the bill, and the only levers that matter are sending fewer of them or sending them over a wider pipe.
+    - **Bucketing reduces the number of collective calls, not the bytes, and that only matters when the message is small.** At $\alpha = 8\,\mu$s of launch latency and 300 GB/s: a 200 MB gradient split into 1,000 tensors costs **8.667 ms** unbucketed and **0.731 ms** in 8 buckets — **11.9x**; a 13.4 GB gradient in 1,000 tensors costs **52.667 ms** against **44.675 ms** — **1.18x**, because 44.7 ms of that is transfer. The real payoff is overlap: a bucket can be launched the moment its last gradient lands, so the ring runs behind the backward pass instead of after it.
+    - **Bucket size has an interior optimum, $b^\star = S\sqrt{2\alpha/T_{\text{step}}}$, and the defaults are near it.** At $\alpha = 8\,\mu$s, $S = 13.4$ GB and a 0.832 s step: $b^\star =$ **58.8 MB**; for a 100M model (200 MB of gradients, 20 ms step) it is **5.7 MB**. PyTorch's 25 MB default sits within 2.4x of the 7B answer. Too small and you pay $8\,\mu$s a hundred times over; too large and the first gradient in the bucket waits for the last one, which is dead time in the middle of the backward pass.
+    - **A parameter server and a ring move almost the same total bytes, and that is the number people compare.** $2NS$ against $2(N-1)S$: at $N = 64$ that is 1.716 TB against 1.688 TB, a 1.7% difference. But the parameter server funnels all of it through one NIC — **34.3 s** per step at 50 GB/s, against the ring's **0.528 s** per rank, a factor of **65**. The ring's weakness is the opposite one: $2(N-1) = 126$ sequential hops, so at $\alpha = 10\,\mu$s it has 1.26 ms of pure latency, which is why small messages at large $N$ go to a tree instead.
+    - **Scaling efficiency is $T_{\text{compute}}/(T_{\text{compute}} + T_{\text{comm}})$, and it is set by tokens per accelerator, not by worker count.** 7B model, 40% MFU, 989 TFLOP/s per GPU, 300 GB/s NVLink: with the global batch pinned at 65,536 tokens, efficiency falls from **91.4%** at 8 GPUs to **54.2%** at 64 and **22.6%** at 256; with 8,192 tokens per GPU held fixed it is **91.4%, 90.4%, 90.3%** at the same three sizes. The all-reduce bill per rank does not grow with $N$; what shrinks is the work each rank has to amortise it over. This is the whole reason strong scaling is a different problem from weak scaling, and why "we only got 35%" is usually a statement about the batch size you chose.
+  derivations:
+    - title: "Why the average is the full-batch gradient, and why the sum is not"
+      latex: |
+        Each worker computes a mean over its own shard,
+
+        $$g_w = \frac{1}{B}\sum_{i \in \text{shard } w} \nabla_\theta \ell_i ,$$
+
+        and the framework reduces across workers. Averaging,
+
+        $$g_{\text{avg}} = \frac{1}{W}\sum_{w=1}^{W} g_w
+          = \frac{1}{W}\sum_{w=1}^{W}\frac{1}{B}\sum_{i \in \text{shard } w}
+            \nabla_\theta \ell_i
+          = \frac{1}{WB}\sum_{i=1}^{WB}\nabla_\theta \ell_i ,$$
+
+        which is exactly the gradient of the mean loss over the union batch of
+        $WB$ examples — provided every shard has the same size $B$. With
+        unequal sizes $B_w$ the correct reduction is weighted,
+
+        $$\bar g = \frac{\sum_w B_w g_w}{\sum_w B_w},$$
+
+        and the unweighted mean $\frac{1}{W}\sum_w g_w$ is a different vector
+        whenever the $B_w$ differ.
+
+        Now scale: for any $c > 0$,
+
+        $$\cos(c\,g_{\text{avg}}, g_{\text{full}}) = \cos(g_{\text{avg}},
+          g_{\text{full}}) = 1, \qquad
+          \|c\,g_{\text{avg}}\| = c\,\|g_{\text{avg}}\| .$$
+
+        So the direction is invariant and the magnitude is not. A step
+        $\theta - \eta\,(W g_{\text{avg}})$ is the step
+        $\theta - (W\eta)\,g_{\text{avg}}$, which is why the sum bug presents as
+        a learning rate $W$ times too large and never as a wrong gradient.
+      prose: >-
+        The only thing that makes the mean correct is that a mean of means,
+        weighted by the number of examples in each, is the mean over the union.
+        Everything else in data parallelism — the sharding, the collective, the
+        determinism of the replicas — is machinery for delivering those $W$
+        means to one place. And the failure mode is arithmetic, not
+        architectural: a factor of $W$ on a quantity whose direction you are
+        checking and whose scale you are not.
+
+    - title: "Ring all-reduce: 2(N-1)S/N bytes per rank"
+      latex: |
+        Number the chunks $0 \ldots N-1$, each of size $S/N$, and put the ranks
+        in a cycle so rank $r$ sends to $r+1$.
+
+        **Reduce-scatter.** At step $k = 0 \ldots N-2$, rank $r$ sends chunk
+        $(r-k) \bmod N$ to rank $r+1$ and adds the chunk it receives from
+        $r-1$. After $N-1$ steps chunk $(r+1) \bmod N$ has been summed over all
+        $N$ ranks:
+
+        $$B_{\text{rs}} = (N-1)\frac{S}{N} .$$
+
+        **All-gather.** The $N$ reduced chunks circulate the same way, with no
+        arithmetic, in another $N-1$ steps:
+
+        $$B_{\text{ag}} = (N-1)\frac{S}{N} .$$
+
+        Summing,
+
+        $$B_{\text{rank}} = \frac{2(N-1)S}{N}, \qquad
+          B_{\text{total}} = N \cdot B_{\text{rank}} = 2(N-1)S ,$$
+
+        with every link carrying the same $2(N-1)S/N$ bytes. As $N \to \infty$
+        this tends to $2S$, so the per-rank cost is bounded by twice the model
+        size no matter how many workers you add.
+
+        The arithmetic inside the ring is $\frac{N-1}{N}S$ additions per rank
+        against $2\frac{N-1}{N}S$ bytes moved, an intensity of $1/2$ add per
+        byte — 0.25 FLOP/byte for fp16 gradients, against a ridge point of 295
+        FLOP/byte on an H100.
+      prose: >-
+        Two facts come out of this and they drive every later topic. Per-rank
+        communication is bounded by $2S$, so a data-parallel job's all-reduce
+        bill does not grow with cluster size — the model size sets it. And the
+        operation is 1,000x below the machine's ridge point, so no kernel-level
+        cleverness helps; only fewer bytes (sharding the optimizer state,
+        compressing gradients) or more bandwidth changes the time.
+
+    - title: "Why the learning rate scales with the effective batch, and where linear scaling dies"
+      latex: |
+        With $W$ workers of batch $B$ the effective batch is $B_{\text{eff}} =
+        WB$ and the averaged gradient has mean $g$ and covariance
+        $\Sigma/(WB)$. Expanding the loss after one step
+        $\theta' = \theta - \eta g_{\text{avg}}$ to second order,
+
+        $$\mathbb{E}\left[f(\theta') - f(\theta)\right]
+          = -\eta\,\|g\|^2
+          + \frac{\eta^2}{2}\left(g^\top H g
+            + \frac{\operatorname{tr}(H\Sigma)}{WB}\right),$$
+
+        where $H$ is the Hessian at $\theta$. The first term is progress and
+        grows linearly in $\eta$; the second is the curvature penalty and grows
+        quadratically. Setting $\eta = W\eta_0$ and comparing against $W$ times
+        the $W=1$ decrease gives
+
+        $$\text{efficiency}(W) \;\approx\;
+          1 - \frac{W\eta_0}{2}\cdot
+            \frac{g^\top H g}{\|g\|^2},$$
+
+        and the fraction is a Rayleigh quotient bounded by
+        $\lambda_{\min} \le \cdot \le \lambda_{\max}$. Measured on a
+        condition-100 quadratic with $\eta_0 = 0.05$ and a Rayleigh quotient of
+        0.8202, this predicts 0.9786, 0.9357, 0.8499, 0.6784, 0.3354 at
+        $W = 2, 4, 8, 16, 32$ against measured 0.9791, 0.9373, 0.8499, 0.6797,
+        0.3358.
+
+        The step is stable only while
+
+        $$\eta < \frac{2}{\lambda_{\max}},$$
+
+        which at $\eta = W\eta_0$ caps $W$ at
+        $2/(\eta_0\lambda_{\max})$ — 40 in the measured case, and at $W = 32$
+        the decrease has already fallen below its value at $W = 16$.
+      prose: >-
+        Linear scaling is not a law, it is the small-step limit of a
+        second-order expansion. Doubling the batch doubles the progress per step
+        at first, then less than doubles, then goes backwards once the step
+        approaches the curvature limit. That is what a critical batch size is:
+        the point where $\frac{W\eta_0}{2}(g^\top H g/\|g\|^2)$ stops being
+        negligible. Schedules that warm up exist for the same reason — the
+        largest eigenvalue at initialisation is what the step has to survive.
+
+  implementations:
+    - language: python
+      title: "One data-parallel step, with the ring all-reduce instrumented"
+      note: >-
+        Correct, and deliberately written so the three claims are printed rather
+        than asserted: the averaged gradient equals the full-batch gradient to
+        float32 round-off (6.8e-08 on a 1,024-dimensional model, not an
+        approximation), the byte counter agrees with $2(N-1)S/N$ exactly, and
+        the sum is eight times the mean while pointing the same way. The ring
+        is a genuine implementation — reduce-scatter then all-gather, with the
+        chunk indices rotating — not a call to `np.sum`; that is what makes the
+        byte count real rather than a formula typed twice. It is single-process:
+        each "rank" is a numpy array, so this measures the algorithm and its
+        bytes, not the interconnect's latency.
+      code: |
+        import numpy as np
+
+
+        def ring(bufs, W):
+            """Ring all-reduce over W simulated ranks. Returns reduced buffers + bytes/rank."""
+            bufs = [b.copy() for b in bufs]
+            S = bufs[0].size
+            p = S // W
+            sl = lambda i: slice(i * p, (i + 1) * p)
+            sent = 0
+            for phase in (0, 1):                      # 0 = reduce-scatter, 1 = all-gather
+                for k in range(W - 1):
+                    if phase == 0:
+                        snap = [bufs[r][sl((r - k) % W)].copy() for r in range(W)]
+                        for r in range(W):
+                            bufs[r][sl((r - k - 1) % W)] += snap[(r - 1) % W]
+                    else:
+                        snap = [bufs[r][sl((r - k + 1) % W)].copy() for r in range(W)]
+                        for r in range(W):
+                            bufs[r][sl((r - k) % W)] = snap[(r - 1) % W]
+                    sent += p * bufs[0].itemsize
+            return bufs, sent
+
+
+        rng = np.random.default_rng(0)
+        n, d = 8192, 1024
+        X = rng.standard_normal((n, d)).astype(np.float32)
+        wt = rng.standard_normal(d).astype(np.float32) / np.sqrt(d)
+        y = (rng.random(n) < 1 / (1 + np.exp(-X @ wt))).astype(np.float32)
+        w = np.zeros(d, dtype=np.float32)
+
+
+        def grad(idx):
+            z = X[idx] @ w
+            s = 1 / (1 + np.exp(-z))
+            return X[idx].T @ (s - y[idx]) / len(idx)
+
+
+        full = grad(np.arange(n))
+        shards = np.array_split(np.arange(n), 8)
+        gs = np.array([grad(s) for s in shards])
+        red, sent = ring(gs, 8)
+        avg = red[0] / 8.0
+        print("max|avg - full|      %.3e" % np.max(np.abs(avg - full)))
+        print("cos(avg, full)       %.6f" % (avg @ full / (np.linalg.norm(avg) * np.linalg.norm(full))))
+        print("bytes/rank           %d   formula %.0f" % (sent, 2 * 7 / 8 * gs[0].nbytes))
+        print("||sum||/||avg||      %.4f" % (np.linalg.norm(red[0]) / np.linalg.norm(avg)))
+
+        S = 6.7e9 * 2
+        for W in (8, 64):
+            print("W=%3d comm %5.2f GB  %.0f ms at 300 GB/s  %.0f ms at 50 GB/s"
+                  % (W, 2 * (W - 1) / W * S / 1e9, 2 * (W - 1) / W * S / 300e9 * 1e3,
+                     2 * (W - 1) / W * S / 50e9 * 1e3))
+
+        # max|avg - full|      6.799e-08
+        # cos(avg, full)       1.000000
+        # bytes/rank           7168   formula 7168
+        # ||sum||/||avg||      8.0000
+        # W=  8 comm 23.45 GB  78 ms at 300 GB/s  469 ms at 50 GB/s
+        # W= 64 comm 26.38 GB  88 ms at 300 GB/s  528 ms at 50 GB/s
+
+    - language: python
+      title: "Summed shards and unweighted means — numerically WRONG"
+      note: >-
+        Both bugs are real, both are here on purpose, and neither raises. The
+        unweighted mean of shard means is wrong whenever the shards are unequal:
+        with a final shard of 37 examples against seven of 1,024, the reduced
+        gradient is **35.8% off in relative norm** with cosine **0.94056** to
+        the true gradient, and with a final shard of one example it is 283% off
+        with cosine 0.332. It is not noise — it is a systematic tilt towards
+        whichever shard is smallest, and it is why DDP with uneven inputs is a
+        known footgun. The sum is the other bug: it produces a gradient eight
+        times too large but pointing exactly the right way, so it passes every
+        gradient check and destroys the run through the learning rate. Note the
+        asymmetry in the outputs — the size-weighted line is correct to 3.5e-17,
+        and the sum's damage only shows up once you iterate.
+      code: |
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+        d, n = 64, 7205
+        X = rng.standard_normal((n, d))
+        wt = rng.standard_normal(d) / np.sqrt(d)
+        y = (rng.random(n) < 1 / (1 + np.exp(-X @ wt))).astype(float)
+        w = rng.standard_normal(d) * 0.1
+
+
+        def grad(idx):
+            z = X[idx] @ w
+            s = 1 / (1 + np.exp(-z))
+            return X[idx].T @ (s - y[idx]) / len(idx)
+
+
+        sizes = [1024] * 7 + [37]
+        bounds = np.cumsum([0] + sizes)
+        shards = [np.arange(bounds[i], bounds[i + 1]) for i in range(8)]
+        gs = np.array([grad(s) for s in shards])
+
+        true = grad(np.arange(n))
+        correct = sum(sizes[i] * gs[i] for i in range(8)) / sum(sizes)
+        wrong_avg = gs.mean(axis=0)            # BUG 1: shard sizes differ
+        wrong_sum = gs.sum(axis=0)             # BUG 2: summed, not averaged
+        print("BUG 1  unweighted mean of shard means:")
+        print("       rel err %.4f   cos %.5f" % (np.linalg.norm(wrong_avg - true) / np.linalg.norm(true),
+                                                  wrong_avg @ true / (np.linalg.norm(wrong_avg) * np.linalg.norm(true))))
+        print("       size-weighted: max|.-true| %.2e" % np.max(np.abs(correct - true)))
+        print("BUG 2  sum instead of mean: ||sum||/||mean|| = %.4f" % (np.linalg.norm(wrong_sum) / np.linalg.norm(wrong_avg)))
+
+        # sum with an unchanged learning rate at the stability edge
+        lam = np.logspace(-2, 0, 100)
+        H = np.diag(lam)
+        th = rng.standard_normal(100) * 0.5
+        eta = 1.9 / lam.max()
+
+
+        def run(scale, steps=60):
+            t = th.copy()
+            for _ in range(steps):
+                t = t - eta * scale * (H @ t + 0.05 * rng.standard_normal(100))
+            return 0.5 * t @ H @ t
+
+
+        f0 = 0.5 * th @ H @ th
+        print("       f0 %.4f  mean-rule f59 %.3e  sum-rule f59 %.3e" % (f0, run(1.0), run(8.0)))
+
+        # BUG 1  unweighted mean of shard means:
+        #        rel err 0.3581   cos 0.94056
+        #        size-weighted: max|.-true| 3.47e-17
+        # BUG 2  sum instead of mean: ||sum||/||mean|| = 8.0000
+        #        f0 2.1575  mean-rule f59 2.620e-01  sum-rule f59 9.816e+135
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        Your framework averages gradients across workers. A colleague "fixes" a
+        loss-scaling bug by summing them instead, and every gradient check still
+        passes — cosine with the true gradient is 1.000000. Explain why the
+        check cannot see the bug, what the bug actually is, and what you would
+        measure instead.
+      answerKind: short_text
+      hint: >-
+        A cosine compares directions. What does multiplying a vector by eight
+        do to its direction, and what does it do to a gradient-descent step at a
+        fixed learning rate?
+      solution: >-
+        Scaling a vector by a positive constant cannot change its direction, so
+        $\cos(8g, g) = 1$ exactly: any direction-based test is blind to it by
+        construction. The bug is that the step becomes $\eta \cdot 8g =
+        8\eta\,g$ — a learning rate eight times larger than the one you set —
+        and the failure is stability, not correctness of the gradient. Measured
+        at a learning rate of $1.9/\lambda_{\max}$, the mean rule converges from
+        $f = 2.1575$ to 0.262 in 60 steps while the sum rule reaches
+        $9.8\times10^{135}$. What you measure instead is the *magnitude*: the
+        ratio $\|g_{\text{reduced}}\|/\|g_{\text{single rank}}\|$ should be
+        about 1 for a mean and about $W$ for a sum. The same test catches the
+        double-averaging variant, where the ratio is $1/W$.
+    - id: cp-2
+      question: >-
+        Eight GPUs, 4,096 tokens each, a 7B model in fp16, NVLink at 300 GB/s
+        and 40% MFU. What fraction of the step is communication if nothing is
+        overlapped, and what does bucketing change about that number?
+      answerKind: short_text
+      hint: >-
+        Compute time is $6ND_{\text{local}}/(P \cdot \text{MFU})$ per rank.
+        Communication is $2(N-1)S/N$ bytes at 300 GB/s. Do them separately
+        before comparing.
+      solution: >-
+        Compute: $6 \times 6.7\times10^{9} \times 4096 = 1.647\times10^{14}$
+        FLOP, over $989\times10^{12} \times 0.4 = 3.956\times10^{14}$ FLOP/s,
+        is **0.416 s**. Communication: $2 \cdot 7/8 \cdot 13.4$ GB $=$
+        **23.45 GB**, at 300 GB/s is **78.2 ms** — 15.8% of the step, so 84.2%
+        efficiency if nothing overlaps. Bucketing does not reduce those bytes by
+        one; it lets the ring start on the last layers while the earlier ones
+        are still computing, so what remains exposed is roughly the final
+        bucket's 146 us rather than the full 78 ms. Overlap is the entire
+        difference between 84% and "a few percent", which is why the bucket size
+        and the backward-pass order are performance-critical and the collective
+        itself is not.
+    - id: cp-3
+      question: >-
+        A 7B model at 64 GPUs reaches 90.4% efficiency with 8,192 tokens per
+        GPU, and 54.2% with a fixed 65,536-token global batch on the same
+        hardware. Both numbers are correct. What changed, and which one would
+        you quote to somebody deciding whether to buy more GPUs?
+      answerKind: short_text
+      hint: >-
+        $T_{\text{comm}}$ saturates at $2S/\text{BW}$ and does not depend on
+        $N$; $T_{\text{compute}}$ depends only on tokens per rank. What happens
+        to the ratio when you hold the global batch fixed?
+      solution: >-
+        In the first case the cluster grows the batch with it — weak scaling —
+        so each rank keeps 8,192 tokens of work to amortise a communication bill
+        that is pinned near $2S/\text{BW}$. The ratio is constant, so efficiency
+        is flat. In the second case the global batch is fixed, so each rank's
+        work falls as $1/N$ (1,024 tokens at 64 GPUs) while its 26.38 GB of
+        communication stays the same; the ratio falls as $1/N$ and efficiency
+        collapses. Both are correct because efficiency is a function of tokens
+        per accelerator, not of worker count — which is why "90% at 64 GPUs" is
+        meaningless without the batch. For a purchasing decision the honest
+        number is the strong-scaling one, because your batch is bounded by the
+        optimizer: buying GPUs at a fixed batch buys you a smaller share of a
+        fixed step time, not a proportionally shorter one.
+    - id: cp-4
+      question: >-
+        You have 1,000 gradient tensors. Bucketing them into 8 buckets speeds
+        the collective up 11.9x on a 200 MB gradient and 1.18x on a 13.4 GB one.
+        Why the difference, and what does that tell you about what bucketing
+        actually buys?
+      answerKind: short_text
+      hint: >-
+        Time per collective is latency plus bytes over bandwidth. Which term is
+        bigger for 200 KB, and which for 13.4 MB?
+      solution: >-
+        With $\alpha = 8\,\mu$s and 300 GB/s, one 0.2 MB message costs
+        $8 + 0.67 = 8.67\,\mu$s, so latency is 92% of it and 1,000 of them cost
+        8.667 ms. One 1.675 GB bucket costs $8\,\mu$s $+$ 5.58 ms, so latency is
+        0.1% of it and 8 buckets cost 0.731 ms — a 11.9x win from removing
+        launches. At 13.4 GB, one of 1,000 messages is 13.4 MB, which is
+        44.7 $\mu$s of transfer against 8 $\mu$s of latency, so 1,000 launches
+        add 8 ms to 44.7 ms: 52.667 against 44.675, a 1.18x win. Bucketing buys
+        *fewer round trips*, not fewer bytes, so it only matters when the
+        message is small enough for latency to dominate — and its real value in
+        training is the granularity it gives the overlap, not either number.
+    - id: cp-5
+      question: >-
+        At 64 workers a parameter server and a ring all-reduce move 1.716 TB and
+        1.688 TB per step — a 1.7% difference — yet the parameter server takes
+        34.3 s and the ring 0.528 s. Reconcile those numbers, and say when you
+        would still choose the parameter server.
+      answerKind: short_text
+      hint: >-
+        Total bytes are an aggregate. What matters is bytes per link, and how
+        many links carry them.
+      solution: >-
+        The ring spreads $2(N-1)S/N = 26.38$ GB across 64 links, each carrying
+        its own share in parallel, so the per-rank time is 26.38 GB / 50 GB/s =
+        0.528 s. The parameter server sends $2NS = 1.716$ TB through a single
+        NIC — every worker's upload and every parameter download — so one link
+        carries 64 times the ring's per-link load: 34.3 s. Same bytes, different
+        number of links, 65x. You still choose a parameter server when the
+        messages are small enough that $2(N-1)$ sequential hops dominate (a
+        1 MB gradient at $\alpha = 10\,\mu$s is 1.26 ms of pure latency), when
+        workers are unreliable and you want stale-synchronous updates, or when
+        the parameter set is sparse enough that each worker only needs a slice.
+    - id: cp-6
+      question: >-
+        The last batch of an epoch has 37 examples on rank 7 and 1,024 on the
+        other seven. The framework reduces with an unweighted mean. Quantify
+        what goes wrong, and give two fixes with their costs.
+      answerKind: short_text
+      hint: >-
+        Weighted mean versus unweighted mean of eight numbers, one of which
+        represents 37 examples and seven of which represent 1,024 each. What
+        fraction of the update is the small shard getting, and what fraction
+        should it get?
+      solution: >-
+        The small shard should carry $37/7{,}205 = 0.5\%$ of the weight and
+        instead carries $1/8 = 12.5\%$ — a 24x over-weighting. Measured on a
+        64-dimensional logistic regression: the reduced gradient is **35.8% off
+        in relative norm** with cosine **0.94056** to the true gradient; with a
+        single example in the last shard it is **283% off** with cosine 0.332.
+        It is systematic, not noisy: the update tilts towards one shard every
+        epoch-end. Fixes: (a) weight by shard size before the reduction, which
+        is exact and costs one extra scalar per rank but requires the framework
+        to expose per-rank counts; (b) drop or pad the partial batch so every
+        rank has the same count, which costs $0.5\%$ of the epoch's data and no
+        communication, and is what `drop_last=True` does. A third option —
+        letting the short rank idle while the others continue — is what
+        `join`-style uneven-input support does, and it costs a stalled
+        collective for the duration of the imbalance.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Two things are being conflated whenever data parallelism is discussed:
+        the *statistics* of a batch that happens to be spread over several
+        machines, and the *plumbing* that puts the pieces back together. The
+        statistics are the easy half and they are exact — a mean of means is the
+        mean, so the gradient you get is the gradient of the larger batch, not an
+        estimate of it. That is why data parallelism changes the batch size and
+        the step count, never the model.
+
+        The plumbing is where everything interesting lives. The report each
+        worker sends is the size of the whole model, it must be sent on every
+        step, and it must be sent through a network that is one to three orders
+        of magnitude slower than the memory the model sits in. Every design
+        decision in this topic — ring versus server, bucket size, how many
+        workers — is an attempt to make that report cheaper or to hide it behind
+        work that is already happening.
+      blocks:
+        - kind: checklist
+          body: |
+            - The averaged gradient IS the large-batch gradient, exactly
+            - The bill is twice the model size per rank, no matter how many ranks
+            - Bytes, not flops: the reduce does almost no arithmetic
+            - Bucketing saves round trips, never bytes
+            - Efficiency is set by work per worker, not by worker count
+            - Unequal shards break the mean silently
+      checkpoint: >-
+        Before reading on: if the per-rank communication cost stops growing once
+        you have a few dozen workers, what *does* keep growing when you add
+        workers — and why does that make efficiency fall anyway?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Separate every question in this topic into a *statistics* question and a
+        *bytes* question, then answer them in that order. Statistics: what batch
+        did this step actually see, and is the learning rate appropriate for it?
+        Bytes: how many bytes must each rank send per step, over how many links,
+        and how long is that at the bandwidth I have?
+
+        For anything about a collective, refuse to reason about "total traffic"
+        until you have written down bytes per link. Totals hide the only
+        difference between a parameter server and a ring, and they hide the
+        reason a small message at large $N$ prefers a tree. For anything about
+        scaling, refuse to quote an efficiency without the batch size — the
+        number is meaningless on its own, because the same cluster is 90% or 5%
+        depending on tokens per worker.
+      blocks:
+        - kind: checklist
+          body: |
+            - Is the reduction a mean, and is it weighted by shard size?
+            - What is the effective batch, and was the LR scaled for it?
+            - Bytes per rank = 2(N-1)/N x model bytes, in the dtype you send
+            - Bytes per *link*, not total, decides the topology
+            - Time = max(compute, communication) if overlapped, sum if not
+            - Efficiency quoted without a batch size is not a number
+      checkpoint: >-
+        You are asked whether 8 buckets or 64 buckets will make a 70B model's
+        step faster on 512 GPUs. Which of the two questions above answers it,
+        and which number do you need before you can say anything at all?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Write the step, the ring, and the bill as three separate pieces before
+        writing any code. The step is four lines; the ring is two nested loops
+        of $N-1$; the bill is one multiplication per term.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # one data-parallel step, on rank r
+            shard   = batch[r*B : (r+1)*B]
+            g_local = grad(loss(model(shard)))        # mean over B examples
+            g_avg   = all_reduce_mean(g_local)        # ring, 2(N-1)S/N bytes
+            theta  -= lr * g_avg                      # identical on every rank
+
+            # ring all-reduce of one buffer split into N chunks
+            for k in 0 .. N-2:                        # reduce-scatter
+                send chunk (r-k) mod N to r+1
+                add chunk received from r-1 into its own slot
+            for k in 0 .. N-2:                        # all-gather
+                send chunk (r-k+1) mod N to r+1
+                store chunk received from r-1
+
+            # the bill
+            bytes_per_rank = 2*(N-1)/N * S
+            seconds        = bytes_per_rank / bandwidth
+            compute        = 6*N_params*tokens_per_rank / (peak*mfu)
+            efficiency     = compute / (compute + seconds)
+
+            # bucket size that balances launch overhead against waiting
+            b_star = S * sqrt(2*latency / step_time)
+      checkpoint: >-
+        In that pseudocode, `all_reduce_mean` appears once but the ring loops run
+        twice. What is the second loop for, and what would go wrong if you
+        returned after the first one?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three lines of algebra, one byte count, and one second-order expansion.
+      blocks:
+        - kind: math
+          body: |
+            The reduction. Each worker's gradient is a mean over its shard:
+
+            $$g_w = \frac{1}{B}\sum_{i \in \text{shard } w}\nabla_\theta \ell_i,
+              \qquad
+              \frac{1}{W}\sum_{w=1}^{W} g_w
+              = \frac{1}{WB}\sum_{i=1}^{WB}\nabla_\theta \ell_i ,$$
+
+            with unequal shard sizes requiring
+            $\bar g = \sum_w B_w g_w / \sum_w B_w$.
+
+            The ring. Reduce-scatter and all-gather are each $N-1$ steps of
+            $S/N$ bytes:
+
+            $$B_{\text{rank}} = \frac{2(N-1)S}{N}
+              \;\xrightarrow[N \to \infty]{}\; 2S .$$
+
+            The step. Expanding the loss after
+            $\theta' = \theta - \eta g$ to second order,
+
+            $$\mathbb{E}[\Delta f] = -\eta\|g\|^2
+              + \frac{\eta^2}{2}\left(g^\top H g
+                + \frac{\operatorname{tr}(H\Sigma)}{WB}\right),$$
+
+            so at $\eta = W\eta_0$ the progress term grows like $W$ and the
+            curvature penalty like $W^2$:
+
+            $$\text{efficiency}(W) \approx 1 -
+              \frac{W\eta_0}{2}\cdot\frac{g^\top H g}{\|g\|^2},
+              \qquad \eta < \frac{2}{\lambda_{\max}} .$$
+      checkpoint: >-
+        That efficiency formula contains no bandwidth at all, and the
+        critical-batch-size condition contains no network either. So what are
+        the two different quantities both called "efficiency" in this topic, and
+        which one does each formula describe?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete picture: a correct reduction, a ring you can count bytes
+        on, the two bucket regimes, and the scaling table that tells you which
+        of the two efficiencies is your problem.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the diagnostics before the code. Three of the four failure modes
+            here do not raise: a sum instead of a mean (8x learning rate), an
+            unweighted mean over uneven shards (36% biased), and a bucket size
+            chosen for the wrong regime (a 12x win or an 18% one, depending on
+            the model). The fourth — a parameter server at scale — looks like a
+            hardware problem and is a topology problem.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def ring_allreduce(bufs, N, itemsize):
+                bufs = [b.copy() for b in bufs]
+                S, p = bufs[0].size, bufs[0].size // N
+                sl = lambda i: slice(i * p, (i + 1) * p)
+                sent = 0
+                for phase in (0, 1):
+                    for k in range(N - 1):
+                        if phase == 0:
+                            snap = [bufs[r][sl((r - k) % N)].copy() for r in range(N)]
+                            for r in range(N):
+                                bufs[r][sl((r - k - 1) % N)] += snap[(r - 1) % N]
+                        else:
+                            snap = [bufs[r][sl((r - k + 1) % N)].copy() for r in range(N)]
+                            for r in range(N):
+                                bufs[r][sl((r - k) % N)] = snap[(r - 1) % N]
+                        sent += p * itemsize
+                return bufs, sent
+
+
+            def reduce_grads(shard_grads, shard_sizes):
+                total = float(sum(shard_sizes))
+                return [sum(n * g[j] for g, n in zip(shard_grads, shard_sizes)) / total
+                        for j in range(len(shard_grads[0]))]
+
+
+            def step_budget(params, world, tokens_per_gpu, bw_gbps, dtype=2,
+                            mfu=0.40, peak_tflops=989.0):
+                comm = 2 * (world - 1) / world * params * dtype
+                tc = 6 * params * tokens_per_gpu / (peak_tflops * 1e12 * mfu)
+                cc = comm / (bw_gbps * 1e9)
+                return {"bytes_per_rank": comm, "compute_s": tc, "comm_s": cc,
+                        "efficiency": tc / (tc + cc),
+                        "serial_s": tc + cc,
+                        "overlapped_s": max(tc, cc)}
+
+
+            def bucket_seconds(S, n_tensors, bucket_bytes, bw, latency=8e-6):
+                k = min(n_tensors, max(1, int(np.ceil(S / bucket_bytes))))
+                return {"seconds": k * latency + S / bw, "collectives": k}
+
+
+            if __name__ == "__main__":
+                print(step_budget(6.7e9, 8, 8192, 300.0))
+                print(step_budget(6.7e9, 64, 1024, 50.0))
+                for b in (25e6, 58.8e6, 250e6):
+                    print(b, bucket_seconds(13.4e9, 1000, b, 300e9))
+      checkpoint: >-
+        `step_budget(6.7e9, 64, 1024, 50.0)` returns an efficiency near 16%. If
+        you cannot change the batch, the network, or the model, what is left —
+        and which later topic in this track is it?
+
+  problems:
+    - id: p-weighted-mean
+      title: "Reduce gradients across uneven shards"
+      difficulty: easy
+      prompt: >-
+        Implement `average_gradients(grads, sizes)`, which reduces per-worker
+        gradient vectors into one gradient. `grads` is a list of $W$ equally
+        long lists of floats — each one a mean over that worker's shard —
+        and `sizes` is the number of examples in each shard. Return the
+        size-weighted mean as a list of floats, so that the result equals the
+        gradient of the mean loss over all the examples. Do not assume the
+        shards are the same size, and do not assume the sizes sum to a power of
+        two.
+      starter: |
+        def average_gradients(grads, sizes):
+            # your implementation here
+            pass
+      language: python
+      entry: average_gradients
+      testCases:
+        - input: '[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], [2, 1, 1]]'
+          expected: '[2.5, 3.5]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0, 2.0], [3.0, 4.0]], [1, 1]]'
+          expected: '[2.0, 3.0]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0, 0.0], [0.0, 1.0], [4.0, 4.0]], [1, 1, 2]]'
+          expected: '[2.25, 2.25]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[2.0, -3.0]], [17]]'
+          expected: '[2.0, -3.0]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0, -1.0, 0.5], [0.0, 2.0, -2.0]], [3, 7]]'
+          expected: '[0.3, 1.1, -1.25]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]], [8, 4, 2, 1]]'
+          expected: '[1.7333333333333334, 1.7333333333333334]'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def average_gradients(grads, sizes):
+            total = float(sum(sizes))
+            n = len(grads[0])
+            out = [0.0] * n
+            for g, m in zip(grads, sizes):
+                for j in range(n):
+                    out[j] += m * g[j]
+            return [v / total for v in out]
+      solutionExplanation: >-
+        The whole problem is one word: weighted. An unweighted
+        `mean(grads)` is correct only when every shard has the same number of
+        examples, which is true for every batch in the middle of an epoch and
+        false for the last one. The third case is the smallest one that fails
+        loudly: shards of 1, 1 and 2 examples, where the third shard deserves
+        half the weight and gets a third — 2.25 against 2.0. The last case is
+        the realistic version, sizes 8, 4, 2, 1 on vectors proportional to their
+        index, which distinguishes weighted (1.733) from unweighted (2.5). The
+        fourth case guards the edge: a single shard must return it unchanged,
+        which catches an implementation that divides by `len(grads)` instead of
+        `sum(sizes)` — identical for equal shards, wrong for one, and wrong for
+        every uneven shard. On real data the error is not small: a final shard of
+        37 examples against seven of 1,024 puts the reduced gradient 35.8% off
+        in relative norm.
+      complexity: "O(W * n) time, O(n) space"
+      tags: [data-parallelism, weighted-mean, uneven-shards, reduction]
+
+    - id: p-ring-allreduce
+      title: "Ring all-reduce, and the bytes it costs"
+      difficulty: medium
+      prompt: >-
+        Implement `ring_allreduce(arrays)`, where `arrays` is a list of $N$
+        equally long lists of floats, one per rank. Return a dict with exactly
+        three keys: `sum` — the element-wise sum of all $N$ arrays, as a list of
+        floats; `bytes_per_rank` — the number of payload bytes rank 0 sends
+        during the algorithm, counting every step of both phases, with each value
+        stored as a 4-byte float32; and `steps` — the total number of
+        send steps rank 0 performs. Implement the ring algorithm (reduce-scatter
+        then all-gather, $N-1$ steps of $S/N$ bytes each), not a direct sum: the
+        byte count is graded, so an implementation that never actually moves
+        chunks will not produce the right number.
+      starter: |
+        def ring_allreduce(arrays):
+            # your implementation here
+            pass
+      language: python
+      entry: ring_allreduce
+      testCases:
+        - input: '[[[1.0, 2.0], [2.0, 4.0]]]'
+          expected: '{"sum": [3.0, 6.0], "bytes_per_rank": 8, "steps": 2}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0], [3.0, 6.0, 9.0, 12.0], [4.0, 8.0, 12.0, 16.0]]]'
+          expected: '{"sum": [10.0, 20.0, 30.0, 40.0], "bytes_per_rank": 24, "steps": 6}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0], [3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0], [4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0], [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0], [6.0, 12.0, 18.0, 24.0, 30.0, 36.0, 42.0, 48.0], [7.0, 14.0, 21.0, 28.0, 35.0, 42.0, 49.0, 56.0], [8.0, 16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0]]]'
+          expected: '{"sum": [36.0, 72.0, 108.0, 144.0, 180.0, 216.0, 252.0, 288.0], "bytes_per_rank": 56, "steps": 14}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0], [2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0], [3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0, 27.0, 30.0, 33.0, 36.0]]]'
+          expected: '{"sum": [6.0, 12.0, 18.0, 24.0, 30.0, 36.0, 42.0, 48.0, 54.0, 60.0, 66.0, 72.0], "bytes_per_rank": 64, "steps": 4}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def ring_allreduce(arrays):
+            W = len(arrays)
+            buf = [[float(x) for x in a] for a in arrays]
+            S = len(buf[0])
+            p = S // W
+            sent = 0
+
+            def chunk(r, idx):
+                b = (idx % W) * p
+                return buf[r][b:b + p]
+
+            for k in range(W - 1):
+                snap = [chunk(r, r - k) for r in range(W)]
+                for r in range(W):
+                    b = ((r - k - 1) % W) * p
+                    src = snap[(r - 1) % W]
+                    for j in range(p):
+                        buf[r][b + j] += src[j]
+                sent += p * 4
+            for k in range(W - 1):
+                snap = [chunk(r, r - k + 1) for r in range(W)]
+                for r in range(W):
+                    b = ((r - k) % W) * p
+                    src = snap[(r - 1) % W]
+                    for j in range(p):
+                        buf[r][b + j] = src[j]
+                sent += p * 4
+            return {"sum": buf[0], "bytes_per_rank": sent, "steps": 2 * (W - 1)}
+      solutionExplanation: >-
+        Three details decide this. First, the index arithmetic. At reduce-scatter
+        step $k$ rank $r$ sends chunk $(r-k) \bmod N$ and receives the chunk
+        being sent by $r-1$, which is $(r-1-k) \bmod N = (r-k-1) \bmod N$ — the
+        same index it is about to accumulate into. Taking a snapshot of every
+        outgoing chunk before the accumulation loop matters: without it, a rank
+        that has already overwritten a chunk sends the wrong data, and the error
+        is data-dependent, so it shows up as a small wrong answer rather than a
+        crash. Second, `bytes_per_rank` is $2(N-1) \cdot (S/N) \cdot 4$, which
+        the four cases pin at 8, 24, 56 and 64 bytes. A direct `sum` gives the
+        right `sum` key and the wrong bytes, which is why that key is graded: the
+        third case ($N=8$, 8 elements, one element per chunk) is the one that
+        distinguishes $2(N-1)S/N = 56$ from the $2S = 64$ that somebody who
+        remembers only the limit will write. Third, `steps` is $2(N-1)$, not
+        $N$ — 14 for eight ranks. Both phases send exactly the same number of
+        bytes, which is the structural fact the whole cost model rests on.
+      complexity: "O(N * S) time, O(N * S) space"
+      tags: [all-reduce, ring, collective, byte-accounting]
+
+    - id: p-scaling-report
+      title: "The step budget and the efficiency it implies"
+      difficulty: hard
+      prompt: >-
+        Implement `scaling_report(params, world_size, tokens_per_gpu,
+        bandwidth_gbs, mfu=0.40, peak_tflops=989.0, dtype_bytes=2)`, returning
+        a dict with exactly five keys. `comm_bytes_per_rank` is
+        $2(N-1)S/N$ with $S$ the model size in `dtype_bytes`. `comm_seconds` is
+        that divided by the link bandwidth in bytes per second, where
+        `bandwidth_gbs` is a **byte** rate: 300.0 means 300 GB/s, i.e.
+        $300\times10^{9}$ bytes per second. `compute_seconds` is
+        $6 \cdot \text{params} \cdot \text{tokens\_per\_gpu}$ divided by the
+        per-GPU achievable rate `peak_tflops * 1e12 * mfu`. `efficiency` is
+        `compute_seconds / (compute_seconds + comm_seconds)`.
+        `tokens_per_gpu_for_90pct` is the token count at which that efficiency
+        would be exactly 0.90 — derive it, do not search for it.
+      starter: |
+        def scaling_report(params, world_size, tokens_per_gpu, bandwidth_gbps,
+                           mfu=0.40, peak_tflops=989.0, dtype_bytes=2):
+            # your implementation here
+            pass
+      language: python
+      entry: scaling_report
+      testCases:
+        - input: '[6700000000.0, 8, 8192, 300.0]'
+          expected: '{"comm_bytes_per_rank": 23450000000.0, "comm_seconds": 0.07816666666666666, "compute_seconds": 0.8324529828109202, "efficiency": 0.9141610147425326, "tokens_per_gpu_for_90pct": 6923.000000000002}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[6700000000.0, 64, 8192, 50.0]'
+          expected: '{"comm_bytes_per_rank": 26381250000.0, "comm_seconds": 0.527625, "compute_seconds": 0.8324529828109202, "efficiency": 0.6120626856192913, "tokens_per_gpu_for_90pct": 46730.250000000015}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[6700000000.0, 64, 1024, 50.0]'
+          expected: '{"comm_bytes_per_rank": 26381250000.0, "comm_seconds": 0.527625, "compute_seconds": 0.10405662285136502, "efficiency": 0.16472953951337221, "tokens_per_gpu_for_90pct": 46730.250000000015}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[1000000000.0, 16, 4096, 100.0]'
+          expected: '{"comm_bytes_per_rank": 3750000000.0, "comm_seconds": 0.0375, "compute_seconds": 0.06212335692618807, "efficiency": 0.6235822486107939, "tokens_per_gpu_for_90pct": 22252.499999999996}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[70000000000.0, 512, 4096, 400.0]'
+          expected: '{"comm_bytes_per_rank": 279453125000.0, "comm_seconds": 0.6986328125, "compute_seconds": 4.348634984833165, "efficiency": 0.8615819804787973, "tokens_per_gpu_for_90pct": 5922.410156249999}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def scaling_report(params, world_size, tokens_per_gpu, bandwidth_gbs,
+                           mfu=0.40, peak_tflops=989.0, dtype_bytes=2):
+            comm_bytes = 2.0 * (world_size - 1) / world_size * params * dtype_bytes
+            comm_s = comm_bytes / (bandwidth_gbs * 1e9)
+            comp_s = 6.0 * params * tokens_per_gpu / (peak_tflops * 1e12 * mfu)
+            return {
+                "comm_bytes_per_rank": comm_bytes,
+                "comm_seconds": comm_s,
+                "compute_seconds": comp_s,
+                "efficiency": comp_s / (comp_s + comm_s),
+                "tokens_per_gpu_for_90pct": 9.0 * comm_s * peak_tflops * 1e12 * mfu / (6.0 * params),
+            }
+      solutionExplanation: >-
+        The two traps are the $2(N-1)/N$ factor and the 90% inversion. Using
+        $2S$ instead of $2(N-1)S/N$ is 14% high at $N=8$ and 1.6% high at
+        $N=64$ — the kind of error that survives a code review because it is
+        right at one end of the range. For the inversion, set
+        $T_c/(T_c + T_{\text{comm}}) = 0.9$ and solve:
+        $T_c = 9\,T_{\text{comm}}$, so
+        $6Pt/(P_{\text{peak}}\cdot\text{MFU}) = 9\,T_{\text{comm}}$ and
+        $t = 9\,T_{\text{comm}}\,P_{\text{peak}}\,\text{MFU}/(6P)$. Note that
+        this depends only on communication and the model — not on the batch or
+        the world size directly, which is why the second and third cases share
+        the same 46,730 tokens despite efficiencies of 61% and 16%. The third
+        case is the important one: cutting the tokens per GPU by 8 at fixed
+        $N$ drops efficiency from 61% to 16.5% while every byte count stays
+        identical. The last case is a 70B model at 512 GPUs on 400 GB/s links:
+        279 GB per rank, 0.70 s of communication per step, 86% efficiency only
+        because the step is 4.3 s long — the same byte count on a 20ms step
+        would be hopeless.
+      complexity: "O(1) time and space"
+      tags: [scaling-efficiency, all-reduce, cost-model, roofline]
+
+  visualizers:
+    - id: vs-dp-budget
+      kind: computation_graph
+      title: "The three-way trade: workers, tokens per worker, and bandwidth"
+      description: >-
+        Move the worker count, the tokens per GPU, and the link bandwidth and
+        watch two curves cross. Bytes per rank saturates at 2S no matter what
+        you do, while compute per rank is linear in tokens per GPU — so
+        efficiency is flat in the worker count for weak scaling and collapses as
+        1/N for strong scaling. At 7B parameters, 40% MFU, 300 GB/s and 8,192
+        tokens per GPU the model reports 91.4% at 8 workers and 90.4% at 64;
+        pin the global batch at 65,536 tokens and the same two points become
+        91.4% and 54.2%.
+      params:
+        params: 6700000000
+        dtype_bytes: 2
+        world_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+        tokens_per_gpu: 8192
+        global_batch: 65536
+        bandwidths_gbps: [12.5, 50, 300]
+        mfu: 0.40
+
+  try_it: >-
+    Take a 7B model in fp16, so the gradient buffer is 13.4 GB, and compute the ring all-reduce
+    bytes per rank at N = 8 from 2(N − 1)S/N. You should get 23.45 GB, or 1.75S. Then time the
+    two halves: 5.86e9 additions at 989 TFLOP/s is 5.9 microseconds, and 23.45 GB at 300 GB/s is
+    78.2 ms — work out the ratio before you decide what to optimise.
+  interview_questions:
+    - question: "Adding a second GPU gives 1.7× rather than 2×. Where does the missing 30% go, and what do you measure first?"
+      level: mid
+      key_points:
+        - "The gradient all-reduce runs every step and is bandwidth-bound: 2(N − 1)S/N bytes per rank, which is 23.45 GB at N = 8 for 13.4 GB of gradients, or 1.75S."
+        - "The arithmetic in the collective is irrelevant — 5.86e9 additions take 5.9 microseconds at 989 TFLOP/s against 78.2 ms of transfer at 300 GB/s, a factor of 13,187."
+        - "Scaling efficiency is compute time over compute plus communication, and at a fixed global batch it falls with worker count because tokens per accelerator falls."
+        - "Measure the step-time split and bytes per rank before touching the model or the batch size."
+      follow_up: "Which is cheaper for a fixed global batch — a faster interconnect or more workers? Why?"
+    - question: "Someone divides the loss by world_size before backward 'to be safe'. What breaks, and why does code review not catch it?"
+      level: senior
+      key_points:
+        - "The framework already averages gradients across ranks, so dividing again scales every gradient by 1/W and the effective learning rate falls by that factor."
+        - "The descent direction is untouched: cos(c g, g) = 1 for any positive c, so every direction-based sanity check passes."
+        - "Measured at W = 8, the ratio of the summed gradient norm to the mean gradient norm is exactly 8.000000, with an identical cosine to the full-batch gradient."
+        - "The symptom is a model that needs a learning rate eight times larger to move, which reads as a tuning problem rather than a bug."
+      follow_up: "You fix it by multiplying the learning rate by eight. What else in the recipe is now wrong?"
+    - question: "Bucketing cut a 200 MB gradient exchange by 11.9×. Why does the same trick do almost nothing for a 13.4 GB gradient?"
+      level: mid
+      key_points:
+        - "Bucketing changes the number of collective launches, not the bytes: latency is alpha times the call count plus bytes over bandwidth."
+        - "At alpha = 8 microseconds and 300 GB/s, 200 MB in 1,000 tensors costs 8.667 ms unbucketed and 0.731 ms in 8 buckets; 13.4 GB is dominated by the byte term either way."
+        - "Bucket size has an interior optimum b* = S sqrt(2 alpha / T_step): 58.8 MB for the 7B and 5.7 MB for a 100M model, so PyTorch's 25 MB default is within 2.4× of the right answer at both ends."
+        - "Buckets too large delay the first collective and lose overlap with the backward pass, which is the other half of the trade."
+      follow_up: "At what step time would a 25 MB default stop being near-optimal for the 7B model?"
+  common_mistakes:
+    - "Dividing the loss by world_size on top of the framework's averaging — the direction is identical and the gradient is scaled by 1/W, so nothing looks wrong."
+    - "Explaining a slow all-reduce with bytes: at N = 64 a parameter server and a ring move within 1.7% of the same volume yet differ 65× because one funnels through a single NIC (34.3 s against 0.528 s per rank)."
+    - "Averaging the last short batch unweighted — 37 examples against 1,024 tilts the update by 36% in relative norm and looks like noise."
+  further_reading:
+    - label: "Sergeev, Del Balso, Horovod: fast and easy distributed deep learning in TensorFlow"
+    - label: "Li et al., PyTorch Distributed: Experiences on Accelerating Data Parallel Training, VLDB 2020"

@@ -1,0 +1,714 @@
+id: cs-tiktok-recommendation
+slug: cs-tiktok-recommendation
+title: "Case Study: TikTok-Scale Video Recommendation"
+summary: >-
+  Size a recommendation system end to end — funnel, GPUs, ANN index, feature
+  store, latency budget — and then measure the feedback loop that makes it
+  collapse its own catalogue if you never explore.
+kind: lesson
+difficulty: expert
+position: 2
+estMinutes: 19
+prerequisites: [system-design-foundations, clustering]
+phase: system-design
+tags: [recommendation, system-design, ann, feedback-loop, capacity]
+
+body:
+  big_idea: >-
+    A recommender is a funnel under a latency budget, not a model: ten million
+    items enter, ten reach the user, and each stage exists because the one
+    above cannot afford the next model on everything.
+  problem:
+    - "You propose a two-tower model over 10M items in 200 ms: exhaustive scoring is 2.3e13 distance operations per second at peak."
+    - "You tune the ranker for a week and nothing moves: 1,000 candidates were chosen by a retrieval stage an order of magnitude cheaper."
+    - "Engagement is up and after three months 263 of 1,000 items were ever served: the feedback loop did exactly what it was asked."
+  analogy: >-
+    A newspaper with one page and a million stories. You cannot print a
+    million stories to decide which one belongs on the page, so you keep a
+    shortlist of a thousand that plausibly fit today's reader, read a hundred
+    properly, and lay out ten. Every stage bets that the previous stage did
+    not throw away the winner, which is why retrieval is judged by recall-at-k
+    and ranking by precision.
+  concept_points:
+    - "**Traffic first, models second.** 1 billion users x 10 sessions x 20 items is 2.0e11 requests per day, a mean of 2.3148e6 rps and a **peak of 6.9444e6 rps** at 3x. Every later number divides by this one. A design that quotes architecture without a QPS figure has no engineering content yet."
+    - "**Exhaustive scoring is arithmetically impossible, not merely slow.** Against 10M items at mean traffic, brute force is 10e6 x 2.3148e6 = **2.315e13 distance operations per second**. An IVF index probing 64 clusters does 64/10e6 = **6.40e-06** of that work, 1.481e8 ops/s — a factor of **156,250**. Approximate retrieval is the only reason the problem has a solution."
+    - "**The funnel is sized by what each stage can afford.** Retrieve 10M → 1000 → 100 → 10. At 60 us of GPU time per request the ranker serves 16,667 rps per GPU, so peak needs **417 GPUs**; the pre-ranker at 15 us needs **104**. The expensive model touches 100 candidates and the cheap one 1,000 — that inversion is the architecture."
+    - "**The latency budget is a waterfall that must sum to the SLO.** For 200 ms p99: network in 25, ANN 30, pre-rank 15, rank 60, re-rank 10, business logic 15, network out 25 = **180 ms**, leaving 20 ms for queueing. At 90% utilisation a single-server queue adds about 9x its service time, which is why serving sits near 50%."
+    - "**The feature store is dominated by users, not items.** 1e9 users x 128 dims x 4 bytes = **512 GB** of embeddings against 10e6 items x 128 x 4 = **5.12 GB**. The last-100-interactions table adds 1e9 x 100 x 8 bytes = **0.80 TB**. The item side is cacheable in memory; the user side is a sharded KV store."
+    - "**The feedback loop collapses the catalogue, measurably.** Pure exploitation over 1,000 items with 10 slots for 200 rounds served only **263 items (26.3%)**, effective item count **22.1**. Per-slot exploration at eps = 0.1 lifts that to **391 items** and 36.3 effective for a cumulative reward cost of **-5.44%**; at eps = 0.02 it is 298 items for -1.10%."
+  definitions:
+    - { term: "Candidate generation", meaning: "First funnel stage: cheap recall of ~1,000 plausible items from a catalogue of millions. Judged by recall-at-k, not precision." }
+    - { term: "Two-tower model", meaning: "Separate user and item encoders producing embeddings compared by dot product, so item vectors can be precomputed and indexed." }
+    - { term: "ANN", meaning: "Approximate nearest neighbour search. Trades a small recall loss for orders of magnitude less work; IVF with nprobe=64 does 6.4e-06 of exhaustive work." }
+    - { term: "Pre-ranking", meaning: "A cheap model over ~1,000 candidates that reduces them to ~100 for the expensive ranker." }
+    - { term: "Recall-at-k", meaning: "Fraction of relevant items present in the top k of a stage. The correct metric for retrieval, not precision." }
+    - { term: "Position bias", meaning: "Items shown higher get more engagement regardless of quality, so naive training learns the ranking policy rather than the preference." }
+    - { term: "Feedback loop", meaning: "Training only on served items, so the model never learns about what it did not show. Causes catalogue collapse." }
+    - { term: "Effective number of items", meaning: "exp(entropy of the impression distribution). A diversity measure that reads as 'how many items are actually competing'." }
+    - { term: "Cold start", meaning: "An item or user with no interaction history. Requires content features or forced exploration." }
+    - { term: "Exploration budget", meaning: "The fraction of slots deliberately allocated to uncertain items. Directly trades reward for catalogue coverage." }
+    - { term: "Freshness tier", meaning: "Batch, nearline, or realtime feature computation, chosen per feature by how fast its value decays." }
+    - { term: "Latency waterfall", meaning: "The per-stage p99 budget that must sum to the SLO, with the remainder available for queueing." }
+
+  diagrams:
+    - type: pipeline
+      title: "The funnel: 10M candidates to 10 slots"
+      nodes:
+        - label: "Retrieval (ANN)"
+          note: "10M to 1,000 at 30 ms"
+          detail: "IVF probing 64 of 10M clusters: 6.40e-06 of exhaustive work. The budget stage — everything downstream is bounded by the recall you buy here."
+        - label: "Pre-rank"
+          note: "1,000 to 100 at 15 ms"
+          detail: "A small model over a thousand candidates. 104 GPUs at peak: cheap per candidate, many candidates."
+        - label: "Rank"
+          note: "100 to 10 at 60 ms"
+          detail: "The expensive model. 417 GPUs at peak because it does far more work per candidate on far fewer candidates."
+        - label: "Re-rank"
+          note: "diversity, freshness, business rules"
+          detail: "Not a model stage. Enforces constraints the ranker cannot: dedupe, author spread, sponsored slots."
+        - label: "Serve"
+          note: "10 items, 25 ms out"
+          detail: "Total waterfall 180 ms of a 200 ms p99, leaving 20 ms for queueing — which is why utilisation stays near 50%."
+    - type: architecture
+      title: "Storage and compute split"
+      nodes:
+        - { id: u, x: 0, y: 0, label: "User features", kind: database, detail: "512 GB of embeddings at 1e9 users x 128 x 4B. Sharded KV; the dominant store." }
+        - { id: i, x: 0, y: 2, label: "Item index", kind: database, detail: "5.12 GB for 10M x 128 x 4B, plus the ANN graph. Small enough to keep resident." }
+        - { id: ann, x: 1, y: 2, label: "ANN service", kind: worker, detail: "Serves 1,000 candidates per request at 30 ms. Scales with QPS, not with model size." }
+        - { id: rk, x: 2, y: 1, label: "Ranker fleet", kind: model, detail: "417 GPUs at peak for 100 candidates at 60 us per request. Scales with candidates x QPS." }
+        - { id: log, x: 1, y: 0, label: "Impression log", kind: external, detail: "The training set — and the reason for the feedback loop: only served items appear in it." }
+      edges:
+        - { from: u, to: rk, label: "features" }
+        - { from: i, to: ann, label: "vectors" }
+        - { from: ann, to: rk, label: "candidates" }
+        - { from: rk, to: log, label: "impressions" }
+        - { from: log, to: rk, label: "training", style: "async" }
+    - type: plot
+      title: "Exploration buys catalogue coverage and costs reward"
+      chart: "line"
+      xLabel: "per-slot exploration eps"
+      yLabel: "effective items served"
+      series:
+        - name: "effective items"
+          points:
+            - { x: 0, y: 22.1 }
+            - { x: 0.001, y: 23.35 }
+            - { x: 0.005, y: 23.24 }
+            - { x: 0.02, y: 25.24 }
+            - { x: 0.1, y: 36.29 }
+        - name: "reward change, % (shifted +22)"
+          points:
+            - { x: 0, y: 22.1 }
+            - { x: 0.001, y: 22.24 }
+            - { x: 0.005, y: 22.2 }
+            - { x: 0.02, y: 21.0 }
+            - { x: 0.1, y: 16.66 }
+    - type: compare
+      title: "Exploit versus explore, measured"
+      left_label: "Pure exploitation (eps = 0)"
+      left_points:
+        - "263 of 1,000 items ever served (26.3%)"
+        - "Effective item count 22.1"
+        - "Top item share 8.75% of all impressions"
+        - "Cumulative true reward 279,178 (the maximum measured)"
+      right_label: "With exploration (eps = 0.1)"
+      right_points:
+        - "391 of 1,000 items ever served (+48.7%)"
+        - "Effective item count 36.3 (+64%)"
+        - "Top item share 2.50%"
+        - "Cumulative true reward 264,001 (-5.44%)"
+
+  markdown: |
+    ## Start with the arithmetic, not the model
+
+    One billion users, ten sessions a day, twenty items a session:
+
+    $$1\times10^{9} \times 10 \times 20 = 2.0\times10^{11}\ \text{requests/day}
+    = 2.3148\times10^{6}\ \text{rps}$$
+
+    At a 3× peak factor that is **6.9444e6 rps**. This single number decides
+    whether your design is possible.
+
+    Now try exhaustive retrieval against 10M items:
+
+    $$10\times10^{6} \times 2.3148\times10^{6} = 2.315\times10^{13}\ \text{ops/s}$$
+
+    No cluster does that. Probing 64 IVF clusters instead does
+
+    $$\frac{64}{10^{7}} = 6.40\times10^{-6}$$
+
+    of the work — a factor of 156,250 — for a recall loss you can measure.
+    Approximate retrieval is not an optimisation; it is the precondition.
+
+    ## The funnel, and why the models are inverted
+
+    | Stage | In | Out | Time | GPUs at peak |
+    |---|---|---|---|---|
+    | Retrieval (ANN) | 10M | 1,000 | 30 ms | — (CPU/GPU index) |
+    | Pre-rank | 1,000 | 100 | 15 µs/req | **104** |
+    | Rank | 100 | 10 | 60 µs/req | **417** |
+    | Re-rank | 10 | 10 | 10 ms | — |
+
+    The expensive model sees 100 candidates; the cheap one sees 1,000. At
+    60 µs per request one GPU serves 16,667 rps, so peak needs 417 — and the
+    pre-ranker at 15 µs needs 104. **The cost lives in candidates × QPS**, and
+    the funnel exists to make that product affordable.
+
+    ## The latency waterfall has to close
+
+    | Component | p99 |
+    |---|---|
+    | Network in | 25 ms |
+    | ANN retrieval | 30 ms |
+    | Pre-rank | 15 ms |
+    | Rank | 60 ms |
+    | Re-rank | 10 ms |
+    | Business logic | 15 ms |
+    | Network out | 25 ms |
+    | **Total** | **180 ms** |
+
+    180 of a 200 ms budget leaves 20 ms for queueing — and a queue at 90%
+    utilisation adds roughly nine times its service time. That is why serving
+    runs near 50% utilisation and why "417 GPUs" is a floor, not a plan.
+
+    ## The failure that no dashboard shows
+
+    Train only on what you served and the catalogue dies quietly. Simulated over
+    1,000 items, 10 slots, 200 rounds:
+
+    | eps | Items ever served | Effective items | Cumulative reward |
+    |---|---|---|---|
+    | 0 | 263 (26.3%) | 22.1 | 279,178 |
+    | 0.001 | 266 | 23.4 | +0.14% |
+    | 0.02 | 298 | 25.2 | −1.10% |
+    | 0.10 | **391 (39.1%)** | **36.3** | **−5.44%** |
+
+    With pure exploitation, **74% of the catalogue is never shown once**, and
+    the impressions concentrate into an effective 22 items. Every metric that
+    watches served items looks healthy; the metric that would catch it is the
+    one nobody plots — how much of the catalogue has ever been seen.
+
+    And the headroom is large: the true best ten items average **0.7548**
+    against a catalogue mean of **0.2835**. A collapsed system is not near that
+    ceiling. It is serving whichever ten it happened to measure first.
+
+    ## Where the analogy breaks
+
+    The newspaper analogy says each stage bets the previous one kept the winner.
+    Two things it cannot express:
+
+    **The act of serving is the act of measuring.** You learn nothing about
+    items you do not show, so the training set is a record of your own policy.
+    This is not a data-quality problem you can clean; it is the data-generating
+    process.
+
+    **Position bias contaminates the labels.** An item shown first gets clicked
+    more because it was first. Train on that naively and the model learns your
+    ranking, then reproduces it — which looks like agreement and is actually a
+    loop.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A recommender is a **funnel under a latency budget**, not a model. Ten million items enter, ten reach the user, and every stage exists because the stage above it cannot afford to run the next model on everything. The design question is never "which ranker" — it is "how many candidates can this latency and this GPU bill pay for", and the answer fixes every model choice downstream.
+
+    ### The analogy, in full
+
+    A newspaper with one page and a million stories. You cannot print a million stories to decide which one belongs on the page, so you keep a shortlist of a thousand that plausibly fit today's reader, read a hundred of those properly, and lay out ten. Every stage is a bet that the previous stage did not throw away the winner. That is why retrieval is judged by recall-at-k and ranking by precision: they are answering different questions, and a perfect ranker over a shortlist that excluded the right story is worthless. Two ways the analogy breaks. First, the newspaper's readership is fixed; here the act of choosing the story changes what you know about the reader and about the story, so tomorrow's shortlist is built from today's decisions. Second, the newspaper can print a story nobody reads and learn nothing — the recommender learns *only* from what it served, so unserved items stay permanently unknown.
+
+    ### Failure modes, in full
+
+    - You propose a two-tower retrieval model at 10M-item scale and a latency budget of 200 ms. Exhaustive scoring is 2.3e13 distance operations per second at peak traffic — the design is not slow, it is impossible, and the arithmetic that proves it takes one line.
+    - You tune the ranking model for a week and the product metrics do not move, because 1,000 candidates were chosen by a retrieval stage an order of magnitude cheaper than the model you tuned. You improved the wrong stage.
+    - Your system works, engagement is up, and after three months the catalogue is dead: 263 of 1,000 items were ever served, and the effective number of items shown per round is 22. Nothing failed. The feedback loop did exactly what it was asked.
+    - You add exploration to fix the catalogue and engagement drops 5.4%. That is not a bug either — it is the price, and you need to know it in advance to argue for it.
+    - An interviewer asks for a design and gets a list of components with no capacity numbers. The components are all correct and the design is not: there is no way to tell whether it fits in a datacentre or a laptop.
+
+    ### The mechanisms, in full
+
+    - **Traffic first, models second.** 1 billion users × 10 sessions × 20 items is 2.0e11 requests per day, a mean of 2.3148e6 rps and a **peak of 6.9444e6 rps** at 3×. Every later number divides by this one. A design that quotes model architecture without a QPS figure has no engineering content yet.
+    - **Exhaustive scoring is arithmetically impossible, not merely slow.** Against 10M items at mean traffic, brute force is 10e6 × 2.3148e6 = **2.315e13 distance operations per second**. An IVF index probing 64 clusters does 64/10e6 = **6.40e-06** of that work, or 1.481e8 ops/s — a factor of 156,250. Approximate retrieval is not an optimisation you add later; it is the only reason the problem has a solution.
+    - **The funnel is sized by what each stage can afford.** Retrieve 10M → 1000 → 100 → 10. At 60 µs of GPU time per request for the ranker, one GPU serves 16,667 rps, so peak needs **417 GPUs**; the cheap pre-ranker at 15 µs needs **104**. The expensive model touches 100 candidates and the cheap one touches 1,000 — that inversion is the entire architecture.
+    - **The latency budget is a waterfall that must sum to the SLO.** For a 200 ms p99: network in 25, ANN 30, pre-rank 15, rank 60, re-rank 10, business logic 15, network out 25 = **180 ms**, leaving 20 ms for queueing. Queueing is not free and it is not in the model — at 90% utilisation a single-server queue adds roughly 9× its service time, which is why serving sits near 50% utilisation and why the GPU count is not `peak_rps × latency`.
+    - **Ranking cost scales with candidates; retrieval cost scales with catalogue.** Doubling the candidate list doubles ranker GPUs (417 → 834) but leaves the ANN index the same size. Doubling the catalogue doubles the index (10M → 20M vectors) and barely touches the ranker. Knowing which side of the funnel you are changing tells you what breaks.
+    - **The feature store is dominated by users, not items.** 1e9 users × 128 dims × 4 bytes = **512 GB** of embeddings against 10e6 items × 128 × 4 = **5.12 GB**. Add the last-100-interactions table at 1e9 × 100 × 8 bytes = **0.80 TB**. The item side is cacheable in memory; the user side is a sharded KV store, and that asymmetry decides your entire storage layer.
+    - **Freshness tiers are a cost decision, not a modelling one.** Batch features (hourly) are cheap and stale; nearline (seconds) costs a stream processor; realtime (per-request) costs a feature computation in the latency budget. Reserve realtime for the handful of features whose value decays in seconds, and measure that decay rather than assuming it.
+    - **The feedback loop collapses the catalogue, measurably.** Pure exploitation over 1,000 items with 10 slots for 200 rounds served only **263 items (26.3%)** and produced an effective item count of **22.1** — 2.2% of the catalogue carrying almost all impressions. Nothing errored. The system optimised its estimate, and the estimate only existed for what it had served.
+    - **Exploration buys coverage at a measured price.** Per-slot exploration at eps = 0.1 lifts items ever served from 263 to **391** (+48.7%) and effective items from 22.1 to **36.3** (+64%) for a cumulative reward cost of **−5.44%**. At eps = 0.02 the trade is 298 items and 25.2 effective for −1.10%. Those are the two rows to bring to a product argument.
+    - **The headroom is real, which is why the trade is worth having.** The oracle top-10 items average true quality **0.7548** against a catalogue mean of **0.2835** — a 2.7× gap between "the best ten" and "a random ten". A collapsed system is not serving the best ten either: it is serving whichever ten it happened to measure first.
+  derivations:
+    - title: "GPU count from latency and traffic"
+      latex: |
+        If one request occupies a device for $L$ microseconds, one device
+        completes $1/L$ requests per microsecond, i.e. $10^{6}/L$ per second.
+        For peak traffic $R$ requests per second the device count is
+        $$N = \left\lceil \frac{R \cdot L}{10^{6}} \right\rceil.$$
+        At $R = 6.9444\times10^{6}$ and $L = 60\,\mu s$:
+        $$N = \left\lceil \frac{6.9444\times10^{6} \times 60}{10^{6}} \right\rceil
+        = \lceil 416.7 \rceil = 417.$$
+      prose: >-
+        The formula assumes perfect packing and no queueing, so it is a lower
+        bound. Add the 50% utilisation target and the real fleet is roughly
+        double.
+    - title: "Work ratio of approximate retrieval"
+      latex: |
+        Exhaustive scoring compares a query against all $n$ items. An IVF index
+        with $n_{\text{probe}}$ probes compares against
+        $n_{\text{probe}}$ clusters, so the work ratio is
+        $$\rho = \frac{n_{\text{probe}}}{n}.$$
+        For $n = 10^{7}$ and $n_{\text{probe}} = 64$:
+        $$\rho = 6.40\times10^{-6}.$$
+      prose: >-
+        The complement $1-\rho$ is the fraction of the catalogue you never look
+        at, which is exactly the recall you are gambling. Measuring
+        recall-at-k against a brute-force reference on a sample is the only way
+        to know whether the gamble is acceptable.
+    - title: "Effective number of items from an impression distribution"
+      latex: |
+        With $p_i$ the share of impressions item $i$ received, the effective
+        count is
+        $$N_{\text{eff}} = \exp\!\left(-\sum_i p_i \log p_i\right).$$
+        Uniform over $k$ items gives $N_{\text{eff}} = k$; a single item
+        receiving everything gives $N_{\text{eff}} = 1$.
+      prose: >-
+        Measured, pure exploitation produced $N_{\text{eff}} = 22.1$ out of
+        1,000 — the impression mass behaved as if only 22 items existed. It is
+        the one-line diagnostic that catches catalogue collapse before it
+        becomes a business problem.
+    - title: "Why exploration costs reward, quantitatively"
+      latex: |
+        If a fraction $\epsilon$ of slots is spent uniformly at random instead
+        of on the current best estimate, the expected quality of a served slate
+        is
+        $$Q(\epsilon) = (1-\epsilon)\,Q_{\text{best}} + \epsilon\,\bar{q},$$
+        where $\bar{q}$ is the catalogue mean.
+      prose: >-
+        With measured $Q_{\text{best}}$ near the served average and
+        $\bar{q} = 0.2835$ against an oracle 0.7548, even small $\epsilon$ costs
+        real reward: at $\epsilon = 0.1$ the model predicts a visible loss, and
+        the simulation measured −5.44%. The formula tells you the price before
+        you run the experiment.
+
+  implementations:
+    - language: python
+      title: "Capacity estimator: GPUs, latency, and the ANN work ratio"
+      note: >-
+        Numerically WRONG as a planning tool in one specific way: it assumes
+        perfect packing and 100% utilisation, so it returns the absolute floor.
+        Real fleets run near 50% utilisation to keep queueing bounded, which
+        roughly doubles the answer. It also ignores GPU memory — a ranker whose
+        model does not fit is not a ranker at any GPU count.
+      code: |
+        import math
+
+        def gpu_count(peak_rps, latency_us, utilisation=1.0):
+            """Lower bound on devices. Divide by utilisation for a real fleet."""
+            return int(math.ceil(peak_rps * latency_us / 1e6 / utilisation))
+
+        def ann_work_ratio(n_items, n_probe):
+            """Fraction of exhaustive work an IVF probe does."""
+            return n_probe / n_items
+
+        def latency_waterfall(stages, slo_ms):
+            total = sum(v for _, v in stages)
+            return {
+                "total_ms": total,
+                "headroom_ms": slo_ms - total,
+                "fits": total <= slo_ms,
+                "stages": dict(stages),
+            }
+    - language: python
+      title: "Feedback-loop simulation: does your catalogue collapse?"
+      note: >-
+        Numerically WRONG as written for a real system because the reward model
+        is stationary — true item quality never changes, and there is no
+        position bias. A real loop also drifts: creators respond to exposure, so
+        the catalogue the model collapses onto is not the one it started with.
+        Read the numbers as a lower bound on collapse, not a forecast.
+      code: |
+        import numpy as np
+
+        def simulate(n_items=1000, k=10, rounds=200, traffic=2000,
+                     eps=0.0, seed=0):
+            rng = np.random.default_rng(seed)
+            q = np.random.default_rng(3).beta(2, 5, n_items)
+            n = np.zeros(n_items); s = np.zeros(n_items)
+            imp = rng.integers(0, n_items, traffic)      # with replacement
+            s[imp] += rng.random(traffic) < q[imp]; n[imp] += 1
+            served = np.zeros(n_items)
+            for _ in range(rounds):
+                est = np.where(n > 0, s / np.maximum(n, 1), 0.0)
+                k_ex = int(rng.binomial(k, eps)) if eps > 0 else 0
+                best = list(np.argsort(-est))
+                pick = []
+                if k_ex:                                  # per-SLOT exploration
+                    cand = [a for a in rng.permutation(n_items)
+                            if a not in set(best[:k])]
+                    pick = list(cand[:k_ex])
+                for a in best:
+                    if len(pick) >= k: break
+                    if a not in pick: pick.append(a)
+                pick = np.array(pick[:k])
+                served[pick] += 1
+                per = traffic // k
+                for a in pick:
+                    s[a] += (rng.random(per) < q[a]).sum(); n[a] += per
+            p = served / served.sum(); p = p[p > 0]
+            return {
+                "effective_items": float(np.exp(-np.sum(p * np.log(p)))),
+                "ever_served": int((served > 0).sum()),
+                "top_share": float(p.max()),
+            }
+
+  checkpoints:
+    - id: cp-1
+      question: "Why is exhaustive retrieval impossible here, and what is the one number that proves it?"
+      answerKind: short_text
+      hint: "Multiply catalogue size by peak requests per second."
+      solution: >-
+        10e6 items × 2.3148e6 rps = **2.315e13 distance operations per second**.
+        No cluster sustains that. Probing 64 of 10M IVF clusters does
+        64/10e6 = 6.40e-06 of the work — a factor of 156,250 — which is why
+        approximate retrieval is the precondition for the design rather than an
+        optimisation on top of it.
+    - id: cp-2
+      question: "The ranker costs 60 us/request and the pre-ranker 15 us, yet the ranker needs four times as many GPUs. Why?"
+      answerKind: short_text
+      hint: "What does each stage see, and how does that combine with QPS?"
+      solution: >-
+        Cost is candidates × QPS, not per-candidate latency alone. At peak
+        6.9444e6 rps, the ranker at 60 µs needs ceil(6.9444e6 × 60/1e6) = **417**
+        GPUs and the pre-ranker at 15 µs needs **104**. The ranker is four times
+        more expensive per request despite seeing one tenth the candidates,
+        because 60 µs is four times 15 µs — the funnel reduces candidate count
+        while the per-request price rises faster.
+    - id: cp-3
+      question: "Engagement is flat for a quarter and the catalogue is 74% unserved. What happened, and what is the diagnostic?"
+      answerKind: short_text
+      hint: "What does the model train on, and which items appear there?"
+      solution: >-
+        The feedback loop. Training only on served items means unserved items
+        have no estimate, so they are never served — measured, pure exploitation
+        touched **263 of 1,000 items (26.3%)** with an effective item count of
+        **22.1**. The diagnostic is the effective number of items,
+        exp(entropy of impressions), which reads 22.1 where a healthy system
+        reads in the hundreds.
+    - id: cp-4
+      question: "You add exploration and engagement falls 5.4%. Is the change wrong?"
+      answerKind: short_text
+      hint: "What are you buying with the reward, and what does the oracle say?"
+      solution: >-
+        No — that is the measured price. At eps = 0.1, items ever served rose
+        263 → **391** (+48.7%) and effective items 22.1 → **36.3** (+64%) for
+        **−5.44%** cumulative reward. The reason it is worth paying: the true
+        best ten average **0.7548** against a catalogue mean of 0.2835, so the
+        headroom is large and the collapsed system is nowhere near it.
+    - id: cp-5
+      question: "Why does the latency budget have to close, and what is not in the waterfall?"
+      answerKind: short_text
+      hint: "What happens to service time as utilisation approaches 100%?"
+      solution: >-
+        The stages sum to 180 ms of a 200 ms p99, leaving **20 ms** — and
+        queueing is absent from the table. At 90% utilisation a queue adds
+        roughly nine times its service time, which alone exceeds the remainder.
+        So the waterfall must close with slack, and the fleet is sized for ~50%
+        utilisation: 417 GPUs becomes about double in practice.
+    - id: cp-6
+      question: "Which storage dominates, users or items, and why does it change the architecture?"
+      answerKind: short_text
+      hint: "Multiply counts by dimensions by bytes for both."
+      solution: >-
+        Users dominate. 1e9 users × 128 dims × 4 B = **512 GB**, against 10e6
+        items × 128 × 4 = **5.12 GB** — a 100× asymmetry, before the
+        0.80 TB of last-100-interactions. Item vectors fit resident next to the
+        ANN index; user features must live in a sharded KV store, which is why
+        the retrieval and ranking tiers have completely different storage
+        shapes.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        It is a funnel under a latency budget. Every stage exists because the
+        next model cannot afford to see everything, and every stage is judged by
+        a different metric: recall for retrieval, precision for ranking. Start
+        from QPS, not from architecture.
+      blocks:
+        - kind: checklist
+          body: |
+            - QPS first: 2.0e11/day = 2.3148e6 rps mean, 6.9444e6 peak
+            - Exhaustive retrieval is 2.315e13 ops/s — impossible
+            - Cost is candidates x QPS, not latency alone
+            - Latency waterfall must sum under the SLO with room for queues
+            - The feedback loop is the failure no dashboard shows
+      checkpoint: >-
+        Given the funnel 10M → 1000 → 100 → 10, which stage's GPU count changes
+        if you double the catalogue, and which changes if you double the
+        candidate list?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Two numbers decide the design: peak QPS and the p99 budget. Everything
+        else is derived. Then, separately, decide your exploration policy —
+        because the default of zero will collapse the catalogue in a quarter.
+      blocks:
+        - kind: checklist
+          body: |
+            - Compute peak rps before choosing any model
+            - Prove retrieval is impossible exhaustively, then size the index
+            - Size each stage from candidates x QPS / latency
+            - Keep the waterfall under the SLO with 20% slack for queueing
+            - Plot effective items over time; it is your catalogue-health alarm
+      checkpoint: >-
+        Why is recall-at-k the right metric for retrieval and precision the
+        right metric for ranking?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The capacity arithmetic and the serving loop, in about twenty lines.
+      blocks:
+        - kind: pseudocode
+          body: |
+            peak_rps = dau * sessions * items_per_session / 86400 * peak_factor
+            ann_ratio = n_probe / n_items                  # 6.4e-06 at 64/10M
+            gpus(stage) = ceil(peak_rps * latency_us / 1e6)
+
+            # serving
+            candidates = ann_search(user_emb, n_probe=64, k=1000)
+            short      = pre_rank(candidates, k=100)        # cheap, many
+            ranked     = rank(short, k=10)                  # expensive, few
+            slate      = rerank(ranked, rules)
+
+            # health
+            N_eff = exp(-sum(p * log(p)))                  # 22.1 means collapse
+      checkpoint: >-
+        If N_eff drops from 300 to 25 over a month while engagement is flat, what
+        is the most likely cause and what is the cheapest first action?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three results to have memorised: GPU count, ANN work ratio, effective
+        items.
+      blocks:
+        - kind: math
+          body: |
+            **GPU count.** One device completes $10^6/L$ requests per second for
+            per-request latency $L$ microseconds:
+            $$N = \left\lceil \frac{R\,L}{10^{6}} \right\rceil.$$
+
+            **ANN work ratio.** Probing $n_{\text{probe}}$ of $n$ items:
+            $$\rho = \frac{n_{\text{probe}}}{n}.$$
+
+            **Effective items.** With impression shares $p_i$:
+            $$N_{\text{eff}} = \exp\!\left(-\sum_i p_i\log p_i\right).$$
+
+            **Exploration cost.** For per-slot exploration rate $\epsilon$:
+            $$Q(\epsilon) = (1-\epsilon)Q_{\text{best}} + \epsilon\bar q.$$
+      checkpoint: >-
+        Using Q(eps), estimate the reward cost of eps = 0.1 given measured
+        Q_best and catalogue mean 0.2835. Does it match the simulated -5.44%?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete capacity model plus the health simulation — the two things
+        you actually need in an interview or a design review.
+      blocks:
+        - kind: warning
+          body: >-
+            The capacity numbers are a floor: perfect packing, no queueing, no
+            memory constraint. Doubling them is the honest starting estimate.
+        - kind: code
+          language: python
+          body: |
+            import math, numpy as np
+
+            def capacity(dau=1e9, sessions=10, per_session=20, peak_factor=3.0,
+                         stages=(("ann", 30_000), ("pre", 15), ("rank", 60))):
+                rps = dau * sessions * per_session / 86400
+                peak = rps * peak_factor
+                out = {"mean_rps": rps, "peak_rps": peak}
+                for name, lat_us in stages:
+                    out[f"gpus_{name}"] = math.ceil(peak * lat_us / 1e6)
+                out["ann_ratio_64_of_10m"] = 64 / 1e7
+                out["exhaustive_ops_per_s"] = 1e7 * rps
+                return out
+
+            def exploration_sweep(n_items=1000, k=10, epsilons=(0.0, 0.02, 0.1)):
+                return {e: simulate(n_items, k, eps=e) for e in epsilons}
+      checkpoint: >-
+        Capacity says 417 ranker GPUs at peak. What utilisation would you
+        provision for, and what does that do to the bill?
+  problems:
+    - id: p-gpu-count
+      title: "GPU count from traffic and latency"
+      difficulty: easy
+      prompt: >-
+        Implement `gpu_count(peak_rps, latency_us)` returning the number of
+        devices needed, rounding up: ceil(peak_rps * latency_us / 1e6).
+      starter: |
+        import math
+
+        def gpu_count(peak_rps, latency_us):
+            # your implementation here
+            pass
+      language: python
+      entry: gpu_count
+      testCases:
+        - input: '[6944444, 60]'
+          expected: '417'
+          mode: json
+          tolerance: 1e-9
+        - input: '[1000000, 50]'
+          expected: '50'
+          mode: json
+          tolerance: 1e-9
+        - input: '[2314815, 15]'
+          expected: '35'
+          mode: json
+          tolerance: 1e-9
+        - input: '[1000, 100]'
+          expected: '1'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+
+        def gpu_count(peak_rps, latency_us):
+            return int(math.ceil(peak_rps * latency_us / 1e6))
+      solutionExplanation: >-
+        The rounding up matters: 6.9444e6 x 60 / 1e6 = 416.6664, which needs 417
+        devices, not 416. The last case shows the floor behaviour — one device
+        handles 10,000 rps at 100 microseconds, so 1,000 rps needs one.
+      complexity: "O(1)"
+      tags: [capacity, system-design]
+
+    - id: p-ann-ratio
+      title: "ANN work ratio"
+      difficulty: easy
+      prompt: >-
+        Implement `ann_work_ratio(n_items, n_probe)` returning the fraction of
+        exhaustive work an IVF probe performs: n_probe / n_items.
+      starter: |
+        def ann_work_ratio(n_items, n_probe):
+            # your implementation here
+            pass
+      language: python
+      entry: ann_work_ratio
+      testCases:
+        - input: '[10000000, 64]'
+          expected: '6.4e-06'
+          mode: json
+          tolerance: 1e-12
+        - input: '[1000000, 100]'
+          expected: '0.0001'
+          mode: json
+          tolerance: 1e-15
+        - input: '[50000, 32]'
+          expected: '0.00064'
+          mode: json
+          tolerance: 1e-15
+      solution: |
+        def ann_work_ratio(n_items, n_probe):
+            return n_probe / n_items
+      solutionExplanation: >-
+        At 64 probes over 10M items the ratio is 6.4e-06, a factor of 156,250
+        less work than exhaustive search. The complement, 0.9999936, is the
+        fraction of the catalogue the probe never examines — which is precisely
+        the recall you are betting on.
+      complexity: "O(1)"
+      tags: [ann, retrieval]
+
+    - id: p-effective-items
+      title: "Effective number of items"
+      difficulty: medium
+      prompt: >-
+        Implement `effective_items(counts)` returning exp(-sum(p log p)) where p
+        is counts normalised to sum 1, ignoring zero counts.
+      starter: |
+        import numpy as np
+
+        def effective_items(counts):
+            # your implementation here
+            pass
+      language: python
+      entry: effective_items
+      testCases:
+        - input: '[[1,1,1,1]]'
+          expected: '4.0'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[10,0,0,0]]'
+          expected: '1.0'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[5,5]]'
+          expected: '2.0'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1,1,1]]'
+          expected: '2.9999999999999996'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[3,1,1]]'
+          expected: '2.586409289858933'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def effective_items(counts):
+            p = np.asarray(counts, dtype=float)
+            p = p / p.sum()
+            p = p[p > 0]
+            return float(np.exp(-np.sum(p * np.log(p))))
+      solutionExplanation: >-
+        Uniform over k items returns exactly k, and a single item receiving
+        everything returns 1 — the two reference points. The measured collapse
+        case read 22.1 out of 1,000 items, which is what "the catalogue is dead"
+        looks like as a number.
+      complexity: "O(n)"
+      tags: [diversity, feedback-loop]
+
+  try_it: >-
+    Compute the request rate first: 1 billion users × 10 sessions × 20 items is 2.0e11 requests
+    a day, a mean of 2.3148e6 rps and a peak of 6.9444e6 at 3×. Multiply the mean by 10M items
+    to get 2.315e13 distance operations per second, then work out what an IVF probe of 64
+    clusters costs as a fraction of that.
+  interview_questions:
+    - question: "Why is exhaustive scoring impossible here rather than merely slow?"
+      level: senior
+      key_points:
+        - "Ten million items at 2.3148e6 mean rps is 2.315e13 distance operations per second — one line of arithmetic, and the design is already excluded."
+        - "An IVF index probing 64 of 10 million clusters does 6.40e−6 of that work, 1.481e8 operations per second, a factor of 156,250."
+        - "So approximate retrieval is a precondition of the product rather than an optimisation applied afterwards."
+        - "The funnel of 10M to 1,000 to 100 to 10 is the shape each stage can afford, not a convention copied from a paper."
+      follow_up: "What would you tell a product owner who insists on exact nearest neighbours?"
+    - question: "Where does the GPU budget actually go, and why does the cheaper model see ten times more candidates?"
+      level: staff
+      key_points:
+        - "Ranking cost scales with candidates while retrieval cost scales with catalogue, which is why the two stages sit on different budgets."
+        - "At 60 microseconds of GPU time per request the ranker serves 16,667 rps per GPU, so peak traffic needs 417 GPUs; the pre-ranker at 15 microseconds needs 104."
+        - "The expensive model touches 100 candidates and the cheap one touches 1,000 — that inversion is the entire reason a funnel exists."
+        - "Doubling the candidate list doubles ranker GPUs, 417 to 834, while the ANN index is unchanged; doubling the catalogue does the reverse."
+      follow_up: "You are given 100 more GPUs. Which stage gets them, and what do you measure to know it worked?"
+    - question: "After three months only 263 of 1,000 items had ever been served. What happened, and what does fixing it cost?"
+      level: staff
+      key_points:
+        - "Pure exploitation over 1,000 items with 10 slots for 200 rounds served 263 items, 26.3%, with an effective item count of 22.1 — 2.2% of the catalogue carrying almost all impressions."
+        - "Nothing errored: the system optimised its own estimate, and that estimate is biased by what it chose to show."
+        - "Per-slot exploration at eps = 0.1 lifts coverage to 391 items (+48.7%) and effective items to 36.3 (+64%) for a cumulative reward cost of 5.44%; eps = 0.02 gives 298 and 25.2 for 1.10%."
+        - "The headroom justifies the trade: oracle top-10 items average 0.7548 against a catalogue mean of 0.2835, a 2.7× gap between the best ten and a random ten."
+      follow_up: "How would you choose eps for a new market with no interaction history at all?"
+  common_mistakes:
+    - "Tuning the ranker for a week when the 1,000 candidates came from a retrieval stage an order of magnitude cheaper — the product metric cannot move."
+    - "Quoting a model architecture without peak QPS, when 6.9444e6 rps is the number every later capacity claim divides by."
+    - "Adding exploration without pricing it: eps = 0.1 costs 5.44% of cumulative reward to lift effective items 64%, and that trade has to be argued before launch."
+  further_reading:
+    - label: "Covington, Adams, Sargin, Deep Neural Networks for YouTube Recommendations, RecSys 2016"
+    - label: "Zhao et al., Recommending What Video to Watch Next: A Multitask Ranking System, RecSys 2019"

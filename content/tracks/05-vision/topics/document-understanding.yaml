@@ -1,0 +1,1461 @@
+id: document-understanding
+slug: document-understanding
+title: "Document and Chart Understanding"
+summary: >-
+  A page is a detection problem followed by an ordering problem, and both are
+  constrained by one number: how many tokens the page becomes. You measure why
+  top-to-bottom sorting cannot read a two-column page, what a 4,096-token
+  context buys in dots per inch, how OCR and an end-to-end VLM differ by a
+  factor of forty in tokens and by how their errors compound, and why a table's
+  accuracy falls as a power of its rule-detection rate.
+kind: lesson
+difficulty: hard
+position: 8
+estMinutes: 26
+prerequisites: [multimodal-fusion, tokenisation]
+phase: vision-foundations
+tags:
+  - document-ai
+  - layout-analysis
+  - reading-order
+  - xy-cut
+  - ocr
+  - table-extraction
+  - chart-understanding
+  - resolution
+  - token-budget
+  - dpi
+  - detection
+  - structured-output
+
+body:
+  big_idea: >-
+    Document understanding is two problems wearing one name — deciding where
+    the text is and in what order to read it — and both are governed by the
+    resolution you can afford.
+
+  problem:
+    - >-
+      Your document QA works on invoices and fails on annual reports with two
+      columns and a full-width chart, and your evaluation does not separate
+      them.
+    - >-
+      Your OCR reports 99.4% word accuracy and finance says the totals are
+      wrong, because an account number is right only if every character is.
+    - >-
+      You downscale the page to fit the context and the model confuses 8 with
+      3, because a footnote glyph is smaller than one patch.
+
+  analogy: |
+    Photocopy a newspaper page, then read it by cutting it into horizontal
+    strips and reading each left to right. On a single-column page that is
+    exactly right. On a two-column page it interleaves: strip three holds the
+    end of the left column's second paragraph and the start of the right one,
+    read as one sentence. A headline spanning both columns belongs to no
+    strip.
+
+  concept_points:
+    - >-
+      **A page is 8.7 million pixels and 34 thousand tokens, and the second number is the one that binds.**
+      A4 at 300 DPI is 2480 × 3508 = 8,699,840 pixels; at patch 16 that is
+      **33,945 tokens**, 8.29 times a 4,096-token context. The attention
+      matrix is **1,152,263,025** entries — 2.15 GiB per head in fp16, 34.4
+      GiB across 16 heads, for one layer.
+    - >-
+      **Invert the context window and it becomes a resolution mandate.** A
+      4,096-token budget at patch 16 is a 64 × 64 grid: 1,024 × 1,024 pixels,
+      87.6 DPI on A4's height. A 6 pt footnote glyph there is 7.30 px —
+      **0.456 of one patch**. At 32,768 tokens the same page is 247.7 DPI and
+      20.64 px; resolution grows as the square root of the budget.
+    - >-
+      **A character is five patches at 300 DPI and half a patch at 100.** A 10
+      pt character cell is 25 × 50 px at 300 DPI — **4.88 patches**. At 200
+      DPI it is **2.17** patches, at 150 DPI 1.22, at 100 DPI **0.54**. Below
+      one patch per character the model sees mixtures of strokes, which is
+      where l/1, rn/m and 0/O confusion appears.
+    - >-
+      **Reading order is a linear extension of a partial order, and top-to-bottom sorting is a different order entirely.**
+      Over 2,000 synthetic pages, sorting by (y_top, x_left) reproduces the
+      true order on **1.0000** of single-column pages and **0.0000** of two-
+      and three-column pages, with Kendall tau **0.2719** and 0.3513 — 27% and
+      35% of block pairs reversed. It is structurally incapable of expressing
+      "column A precedes column B".
+    - >-
+      **The failure rate is predictable in advance: $(k-1)/(2k)$.** With $k$
+      independently placed columns a cross-column pair inverts with
+      probability one half, and those pairs are $(k-1)/k$ of all pairs, so the
+      expected Kendall tau is $(k-1)/(2k)$ — **0.2500** at two columns,
+      **0.3333** at three; measured 0.2719 and 0.3513. That is a floor
+      independent of detector, model and image quality. A better detector
+      cannot fix it.
+    - >-
+      **OCR and an end-to-end VLM differ by 39.6 times in tokens, and by how their errors compound.**
+      A 3,000-character page is about **857 tokens** at 3.5 characters per
+      token; as pixels at 300 DPI and patch 16 it is **33,945**. At 0.5%
+      character error a 12-character field is exact **0.9416** of the time and
+      a 20-character field **0.9046**.
+
+  definitions:
+    - term: "Layout analysis"
+      meaning: >-
+        Locating and classifying the regions of a page — title, paragraph,
+        table, figure, caption, footnote, header — as bounding boxes with
+        labels. It is object detection with a handful of classes, evaluated
+        with IoU and mAP, and it is the stage that decides what the reader is
+        allowed to see.
+    - term: "Intersection over union (IoU)"
+      meaning: >-
+        Area of overlap divided by area of union between a predicted box and a
+        true box. A 4 px shift costs a 1000 x 60 line 13% of its IoU (0.8685)
+        and a 120 x 20 footnote 37% (0.6304), which is why small blocks fail
+        first at a fixed threshold.
+    - term: "Reading order"
+      meaning: >-
+        A permutation of the page's blocks that matches the order a human would
+        read them. It is a linear extension of a partial order, not a sort key:
+        the constraint is "every block in column 1 precedes every block in
+        column 2", which no single scalar can express.
+    - term: "XY-cut"
+      meaning: >-
+        Recursive page segmentation: find the widest fully empty horizontal or
+        vertical band, cut there, and recurse into each side. Correct whenever
+        the page is a guillotine partition; it has no way to represent a
+        spanning element, so it fails on any page that needs one.
+    - term: "Kendall tau distance"
+      meaning: >-
+        The fraction of all unordered pairs that two orderings disagree about,
+        normalised by the number of pairs. Unlike adjacent-pair accuracy it
+        does not reward getting the easy pairs right, so it is the honest
+        metric for reading order: 0.2719 means 27% of pairs reversed.
+    - term: "DPI"
+      meaning: >-
+        Dots per inch of the rendered page, and therefore the linear resolution
+        the model sees. Tokens scale as DPI squared and attention entries as
+        DPI to the fourth, so 300 DPI is 16.36 times the attention work of
+        150 DPI on the same page.
+    - term: "Visual token / patch"
+      meaning: >-
+        One embedding of a patch x patch pixel square after the vision tower.
+        A page of W x H pixels at patch p is (W/p)(H/p) tokens: 33,945 at 300
+        DPI and patch 16, 8,393 at 150 DPI, 3,723 at 100 DPI.
+    - term: "Optical character recognition (OCR)"
+      meaning: >-
+        A separate model that maps a rendered text line to a character stream.
+        It costs about one token per 3.5 characters downstream, gives you
+        character-level confidence and boxes, and introduces per-character
+        errors that compound across a field: 0.5% per character is 9.5% per
+        20-character field.
+    - term: "End-to-end document parsing"
+      meaning: >-
+        A vision-language model that emits the page's structure directly —
+        markdown, HTML, or JSON with boxes — from pixels, with no OCR stage.
+        It keeps figures, layout and handwriting, costs the full page in visual
+        tokens (39.6 times the OCR text of the same page), and gives you no
+        per-character evidence to audit.
+    - term: "Cell F1"
+      meaning: >-
+        Cell-level precision and recall after aligning a predicted table grid
+        to the true grid. It is the standard table metric and it is
+        systematically optimistic, because one missed rule corrupts a whole
+        column band while leaving most cells correct.
+    - term: "TEDS"
+      meaning: >-
+        Tree-edit-distance similarity between the HTML trees of the predicted
+        and true table. It penalises structural errors that cell F1 forgives —
+        a shifted column changes the tree, a single wrong character does not.
+    - term: "Tiling"
+      meaning: >-
+        Cutting a high-resolution page into overlapping crops, encoding each
+        separately, and stitching the results. It bounds the attention matrix
+        per tile without reducing the token count, so it buys feasibility, not
+        context.
+    - term: "Spanning element"
+      meaning: >-
+        A block that crosses the column structure — a headline, a full-width
+        chart, a pull quote. It is the object that makes reading order a graph
+        problem rather than a recursive partition, because it has no single
+        column to belong to and constrains the blocks on both sides of it.
+
+  diagrams:
+    - type: architecture
+      title: "A page becomes structure in four stages, and every stage is a number"
+      caption: >-
+        Resolution is chosen first and it constrains everything after it. The
+        detector works on pixels, the ordering stage works on boxes, and the
+        decoder works on tokens; each stage has its own failure mode and its
+        own metric.
+      nodes:
+        - id: render
+          x: 0
+          y: 1
+          label: "render page at 300 DPI"
+          kind: client
+          detail: "A4 becomes 2480 x 3508 = 8,699,840 pixels. At 150 DPI it is 1240 x 1754, a quarter of the pixels and a quarter of the tokens."
+        - id: img
+          x: 0
+          y: 0
+          label: "page image"
+          kind: client
+          detail: "The only place the true resolution exists. Every later stage sees a resampled version and cannot recover information lost here."
+        - id: detect
+          x: 1
+          y: 0
+          label: "layout detector"
+          kind: model
+          detail: "Object detection over page regions. Scored with IoU and mAP at 0.5: a 4 px error costs a footnote 37% of its IoU but a long text line only 13%."
+        - id: graph
+          x: 1
+          y: 1
+          label: "block graph"
+          kind: storage
+          detail: "Boxes plus precedence edges. A spanning figure adds edges from every block above it to every block below it, which is what makes the order a linear extension rather than a sort."
+        - id: order
+          x: 2
+          y: 0
+          label: "reading order"
+          kind: worker
+          detail: "Recursive XY-cut scores 0.7895 exact on two-column pages and 0.0000 on pages with a full-width figure. The graph version is what fixes the second case."
+        - id: budget
+          x: 2
+          y: 1
+          label: "token budget"
+          kind: worker
+          detail: "33,945 tokens at 300 DPI and patch 16, 8,393 at 150 DPI, 3,723 at 100. This is the stage that decides whether the page can be sent at all."
+        - id: decode
+          x: 3
+          y: 0
+          label: "decoder"
+          kind: model
+          detail: "Markdown, HTML or JSON with boxes. Output length is a fifth constraint: a full table serialises to more tokens than the page consumed."
+        - id: out
+          x: 3
+          y: 1
+          label: "structured record"
+          kind: worker
+          detail: "Fields, rows and spans. Validate here, not upstream: a row-sum check catches the shifted-column failure that cell F1 hides."
+      edges:
+        - { from: render, to: img, label: "resample" }
+        - { from: img, to: detect, label: "pixels" }
+        - { from: detect, to: graph, label: "boxes" }
+        - { from: detect, to: order, label: "boxes" }
+        - { from: graph, to: budget, label: "index order" }
+        - { from: order, to: decode, label: "block stream" }
+        - { from: budget, to: decode, label: "tokens" }
+        - { from: decode, to: out, label: "JSON" }
+
+    - type: compare
+      title: "OCR then language model, against one end-to-end VLM"
+      left_label: "OCR then LLM (two stages)"
+      left_points:
+        - "857 tokens for a 3,000-character page at 3.5 characters per token, against 33,945 visual tokens for the same page as pixels: 39.6 times cheaper"
+        - "Per-character confidence and character boxes exist, so a low-confidence field can be routed to a human instead of guessed"
+        - "Errors compound per field: 0.5% character error gives 0.9416 exact on a 12-character field and 0.9046 on a 20-character one"
+        - "Figures, charts, stamps and handwriting are invisible; a scanned chart becomes an empty region with a caption"
+        - "Layout must be recovered by a second model, and the two models' boxes disagree, so the table and its text can be misaligned"
+      right_label: "End-to-end VLM (one stage)"
+      right_points:
+        - "33,945 visual tokens at 300 DPI and patch 16, or 8,393 at 150 DPI: 8.3 and 2.0 times a 4,096-token context for one page"
+        - "No per-character error, but no per-character evidence either: the output is fluent whether or not it is grounded"
+        - "Keeps figures, layout, stamps and handwriting, because nothing was thrown away before the model looked"
+        - "Cannot be pointed at a crop after the fact, so a misread digit costs a full page re-request"
+        - "Structurally limited by resolution: at 87.6 DPI, the resolution a 4,096 context buys on A4, a 6 pt glyph is 7.3 px"
+
+    - type: plot
+      title: "Tokens per A4 page against render DPI, at patch 16 and patch 8"
+      chart: line
+      xLabel: "render resolution (DPI)"
+      yLabel: "visual tokens per page"
+      series:
+        - name: "patch 16"
+          points:
+            - { x: 72, y: 1924 }
+            - { x: 100, y: 3723 }
+            - { x: 150, y: 8393 }
+            - { x: 200, y: 15038 }
+            - { x: 300, y: 33945 }
+        - name: "patch 8"
+          points:
+            - { x: 72, y: 7770 }
+            - { x: 100, y: 15038 }
+            - { x: 150, y: 33945 }
+            - { x: 200, y: 60152 }
+            - { x: 300, y: 135780 }
+
+    - type: plot
+      title: "Exact page order against column count: sorting versus XY-cut"
+      chart: line
+      xLabel: "columns on the page"
+      yLabel: "fraction of pages exactly right"
+      series:
+        - name: "sort by y, then x"
+          points:
+            - { x: 1, y: 1.0 }
+            - { x: 2, y: 0.0 }
+            - { x: 3, y: 0.0 }
+        - name: "recursive XY-cut"
+          points:
+            - { x: 1, y: 1.0 }
+            - { x: 2, y: 0.7895 }
+            - { x: 3, y: 0.6925 }
+
+    - type: pipeline
+      title: "Table extraction: five stages, and the fourth is where the totals break"
+      nodes:
+        - label: "detect cells and rules"
+          note: "boxes for every cell, plus the vertical and horizontal rules"
+          detail: "Recall here is the single most important number in the pipeline: a missed vertical rule does not lose one cell, it shifts every cell to its right."
+        - label: "cluster rows and columns"
+          note: "1-D clustering on cell centres with a pixel tolerance"
+          detail: "Tolerance is a trade: too small and a 2 px baseline jitter splits one row into two, too large and a real row boundary is merged away."
+        - label: "resolve spans"
+          note: "rowspan and colspan from missing boundaries"
+          detail: "A merged cell has no internal rule, so its centre lands in the gutter and centre-based clustering invents a column for it. This is the stage that produces a 7-column prediction for a 6-column table."
+        - label: "serialise"
+          note: "HTML, CSV or JSON with coordinates"
+          detail: "CSV cannot express a span, so a merged header silently becomes an empty cell in the column beside it."
+        - label: "validate"
+          note: "row sums, column counts, units"
+          detail: "A checksum is the only metric that catches the correlated failure: cell F1 stays at 0.97 while every total in the table is wrong."
+
+  markdown: |
+    ## The page is a token object, not an image
+
+    The first number to compute for any document system is not accuracy, it is
+    how many tokens a page becomes. A4 is 8.2677 by 11.6929 inches, so at 300
+    DPI it rasterises to $2480 \times 3508 = 8{,}699{,}840$ pixels. A patch of
+    $p$ pixels on a side turns it into
+
+    $$N = \left\lfloor \frac{W}{p} \right\rfloor
+           \left\lfloor \frac{H}{p} \right\rfloor$$
+
+    tokens: 33,945 at $p = 16$, 135,780 at $p = 8$, 11,000 at $p = 28$. The
+    first of those is 8.29 times a 4,096-token context. The attention matrix
+    over it holds $N^2 = 1{,}152{,}263{,}025$ entries, which is 2.15 GiB per
+    head in fp16 and 34.4 GiB across 16 heads — per layer, per page. That, and
+    not the FLOP count, is why nobody runs full attention over a page at native
+    resolution: 113.3 TFLOP per page is affordable, 34 GiB of live score matrix
+    is not.
+
+    | DPI | pixels | tokens (p16) | $N^2$ | GiB per head | KV, 24 layers |
+    |---|---|---|---|---|---|
+    | 72 | 595 x 842 | 1,924 | 3.70e6 | 0.01 | 180 MiB |
+    | 150 | 1240 x 1754 | 8,393 | 7.04e7 | 0.13 | 787 MiB |
+    | 200 | 1654 x 2339 | 15,038 | 2.26e8 | 0.42 | 1,410 MiB |
+    | 300 | 2480 x 3508 | 33,945 | 1.15e9 | 2.15 | 3,182 MiB |
+
+    ## Inverting the budget gives the resolution you can actually afford
+
+    Turn the relation around. A context of $C$ tokens at patch $p$ allows a
+    square page of side $\sqrt{C}\,p$ pixels, which on A4's height is
+
+    $$\text{DPI}_{\max} = \frac{\sqrt{C}\,p}{11.6929}.$$
+
+    At $C = 4096$, $p = 16$: 1,024 px, or 87.6 DPI. At 8,192: 123.2 DPI. At
+    32,768: 247.7 DPI. Resolution grows as $\sqrt{C}$, so a 4x context buys a 2x
+    sharper page. And 87.6 DPI is not enough for footnotes: a 6 pt glyph is
+    $6/72 \times 87.6 = 7.30$ px, under half of one 16 px patch. At 100 DPI a
+    10 pt character cell — 6 pt advance by 12 pt line — covers 0.54 of a patch;
+    at 300 DPI it covers 4.88.
+
+    That is the binding constraint, and it is why every serious document system
+    does one of three things: crops to regions of interest and sends only
+    those, tiles at high resolution and pays in token count rather than in
+    attention, or pools the patch grid and accepts that a 2x2 pool halves
+    linear resolution. Pooling a 300 DPI page 2x2 gives 8,486 tokens — still
+    2.07 contexts.
+
+    ## Layout is detection; order is a graph
+
+    Layout analysis is object detection with eight or so classes, scored with
+    IoU and mAP. The threshold does the work: at 0.5, a 4 px shift leaves a
+    1000 x 60 text line at IoU 0.8685 but a 120 x 20 footnote at 0.6304, and an
+    8 px shift puts the footnote at 0.3889 — a miss — while the line is still
+    at 0.7540. Small blocks fail first, and mean average precision hides it
+    because large blocks dominate the average.
+
+    Ordering is a different kind of object. Define a partial order on blocks:
+    $a \prec b$ when $a$ must be read before $b$. Within a column that is
+    $y$-order; across columns it is column order, which $y$ cannot express. A
+    reading order is any linear extension of $\prec$. Sorting by
+    $(y_{\text{top}}, x_{\text{left}})$ is a linear extension of a *different*
+    relation, and the disagreement is measurable: over 2,000 synthetic pages,
+    Kendall tau 0.2719 at two columns and 0.3513 at three, with the exact
+    order reproduced on 0.0000 of them.
+
+    The cost of a better segmenter is bounded. Recursive XY-cut — cut at the
+    widest empty band, alternate axes, recurse — reaches 0.7895 exact on two
+    columns and 0.6925 on three (tau 0.0318 and 0.0260), and 0.0000 on any page
+    with a full-width figure, because a spanning element is not a guillotine
+    cut. The fix is not a better cut, it is to stop cutting: build the graph,
+    add edges for spans, and topologically sort. XY-cut is the fast path;
+    the DAG is the fallback, and the fallback is what annual reports need.
+
+    ## OCR against the VLM, in tokens and in compounding
+
+    A 3,000-character page is about 857 tokens of text at 3.5 characters per
+    token, against 33,945 visual tokens at 300 DPI. That factor of 39.6 is the
+    entire economic argument for OCR, and it is why OCR survives in pipelines
+    that could afford a VLM.
+
+    What it costs is compounding. A field is correct only if every character is
+    correct, so with per-character error $\epsilon$ over a field of length $L$,
+
+    $$P(\text{exact}) = (1-\epsilon)^{L}.$$
+
+    At $\epsilon = 0.005$: 0.9607 for eight characters, 0.9416 for twelve,
+    0.9046 for twenty. At $\epsilon = 0.01$: 0.8864 and 0.8179. Word accuracy
+    of 99.4% looks like a solved problem; a twenty-character account number is
+    right nine times in ten.
+
+    ## Tables fail in bands
+
+    A six-column table has five internal rules. Each is detected with
+    probability $r$, and the table is exactly right only if all five are:
+
+    $$P(\text{table exact}) = r^{C-1}.$$
+
+    At $r = 0.99$ that is 0.9510; measured 0.9485, with cell accuracy 0.9738.
+    At $r = 0.95$: 0.7738 predicted, 0.7768 measured, cell accuracy 0.8838.
+    The gap between cell accuracy and table accuracy is the whole point — a
+    missed rule shifts an entire column band, so the cells that survive are the
+    ones to the left of the error, and the totals that customers check are the
+    ones to the right.
+
+    Two numbers are worth carrying into any table product: how many rules the
+    table has, because that exponent is the sensitivity, and whether a row-sum
+    check passes, because that is the only cheap signal that catches a shifted
+    band.
+
+    ## Charts are calibration
+
+    A chart adds one step that tables do not have: mapping pixels to units.
+    With a plot area $h_{\text{px}}$ tall spanning a range $\Delta$, one pixel
+    is $\Delta / h_{\text{px}}$ units, and a mark detector with one pixel of
+    centre error has exactly that much value error. A 300 px plot spanning
+    0 to 100 gives 0.333 units per pixel; render the same figure at 100 DPI and
+    the plot is 100 px tall, so the error is 1.0 unit. Nothing about the model
+    changed. The information was destroyed by the resampler.
+
+    ## What to take away
+
+    Four numbers price a document system. Tokens per page at the DPI you ship:
+    33,945 at 300 and patch 16, 8,393 at 150. The resolution that context buys:
+    87.6 DPI at 4,096 tokens. The reading-order error of the method you use, in
+    Kendall tau: 0.2719 for a sort, 0.0318 for XY-cut, and 0.14 for both on a
+    page with a spanning figure. And the exponent in $r^{C-1}$ for the tables
+    you care about, because that is how fast a 99% rule detector becomes a
+    table that is wrong one time in twenty.
+
+    ## The longer version
+
+    Document understanding is two problems wearing one name — deciding where the
+    text is and deciding in what order to read it — and both are governed by the
+    resolution you can afford, because a page at 300 DPI is 8.7 million pixels
+    and 34 thousand tokens before a single character is recognised.
+
+    Photocopy a newspaper page, then read it by cutting it into horizontal
+    strips with scissors and reading each strip left to right. On a
+    single-column page this is exactly right, and it is how most people
+    actually read. On a two-column page it interleaves the columns: strip three
+    contains the end of the left column's second paragraph and the start of the
+    right column's second paragraph, and you read them as one sentence.
+
+    The analogy maps cleanly onto the mechanism. The strips are y-bands, the
+    scissor cut is a projection onto the vertical axis, and reading each strip
+    left to right is the tie-break on x. What it shows is that top-to-bottom
+    sorting is not a weak heuristic that is usually right — it is a *different
+    order*, one that cannot express "finish this column before starting the
+    next", and the fraction of pairs it reverses is predictable in advance.
+
+    It breaks at the thing that matters most on real documents. Scissors can
+    only cut the page into pieces that do not overlap, so a headline or a chart
+    that spans both columns has nowhere to go: it belongs to no strip, and every
+    strip below it silently swaps its columns. Real pages are not trees. They
+    are graphs with precedence constraints, and a spanning element is exactly
+    the constraint a tree cannot represent.
+
+    ### What goes wrong
+
+    - Your document question-answering feature works on invoices and fails on
+      annual reports. The invoices are single-column forms with a table at the
+      bottom; the reports have two columns, a full-width chart per page, and
+      footnotes. The model is the same. The layout is not, and nothing in your
+      evaluation separates the two.
+    - Your OCR pipeline reports 99.4% word accuracy and the finance team still
+      says the totals are wrong. Word accuracy is not the metric they care
+      about: an account number is exactly right only if every character is
+      right, so 99.4% per word is roughly 90% per twenty-character field.
+    - You try to feed the page at native resolution and the request either
+      exceeds the context window or the attention matrix exceeds the GPU. You
+      downscale and the model starts confusing 8 with 3, because at the
+      resolution that fits, a footnote glyph is smaller than one patch.
+    - Your table extractor reports 0.97 cell F1 and half the extracted tables
+      are unusable, because the 3% of cells that are wrong are not scattered —
+      they are every cell to the right of one missed vertical rule.
+    - You have to choose between OCR plus a language model and an end-to-end
+      VLM, and the token bill differs by 39.6 times per page. The cheap option
+      loses figures and layout; the expensive one loses the ability to put
+      four pages in one request.
+
+    ### The full treatment
+
+    **A page is 8.7 million pixels and 34 thousand tokens, and the second
+    number is the one that binds.** A4 at 300 DPI is 2480 x 3508 =
+    8,699,840 pixels. At patch 16 that is 155 x 219 = 33,945 tokens, which is
+    8.29 times a 4,096-token context before the question, the system prompt
+    or the answer. The attention matrix over those tokens is 1,152,263,025
+    entries — 2.15 GiB per head in fp16 and 34.4 GiB across 16 heads, for one
+    page and one layer. Nothing about the image is too large; the quadratic
+    is. The trap is quoting a DPI in the product spec without computing that
+    the context is 8.29 pages short of it.
+
+    **Invert the context window and it becomes a resolution mandate.** A
+    4,096-token budget at patch 16 is a 64 x 64 grid, so 1,024 x 1,024 pixels,
+    which on A4's 11.69-inch height is 87.6 DPI. A 6 pt footnote glyph there
+    is 7.30 px tall — 0.456 of one patch. At 8,192 tokens the same page is
+    1,440 px and 123.2 DPI, with the glyph at 10.26 px; at 32,768 it is 2,896
+    px, 247.7 DPI and 20.64 px (1.29 patches). Resolution grows as the square
+    root of the token budget, so quadrupling the context only doubles the
+    DPI. The trap is treating context as a quality dial: it is, but a
+    logarithmic-feeling one.
+
+    **A character is five patches at 300 DPI and half a patch at 100.** A
+    10 pt character cell — 6 pt advance by 12 pt line — is 25 x 50 px at 300
+    DPI, 1,250 square pixels, 4.88 patches of 16 x 16. At 200 DPI the same
+    cell is 2.17 patches, at 150 DPI 1.22, at 100 DPI 0.54. Below one patch
+    per character the model is not seeing glyphs, it is seeing mixtures of
+    strokes, which is precisely where l/1, rn/m and 0/O confusion appears.
+    The trap is measuring quality in DPI rather than in patches per
+    character, which is the same number divided by the patch size.
+
+    **Layout analysis is object detection, and small blocks pay for
+    localisation error twice.** At the standard 0.5 IoU threshold, shifting a
+    1000 x 60 text line by 4 px leaves IoU 0.8685; the same 4 px on a
+    120 x 20 footnote leaves 0.6304, and at 8 px the footnote is 0.3889 and
+    fails the threshold while the line is 0.7540 and passes. Mean average
+    precision therefore reports whatever the large blocks do, because they
+    dominate both the count and the score. The trap is a headline mAP of 0.94
+    on a page layout model that cannot find the footnotes — the ones carrying
+    the disclaimers and the page numbers.
+
+    **Reading order is a linear extension of a partial order, and
+    top-to-bottom sorting is a different order entirely.** Measured over
+    2,000 synthetic pages with independently placed blocks: sorting by
+    (y_top, x_left) reproduces the true order on 1.0000 of single-column
+    pages and on 0.0000 of two-column and three-column pages, with a Kendall
+    tau of 0.2719 and 0.3513 — 27% and 35% of all block pairs reversed. The
+    model is not occasionally wrong; it is structurally incapable of
+    expressing "column A precedes column B", because that relation is not a
+    function of y. The trap is evaluating reading order with block-level
+    accuracy, which stays high while the order is wrong.
+
+    **The failure rate is predictable in advance: (k - 1) / (2k).** With k
+    columns whose blocks are independently placed, a cross-column pair is
+    inverted with probability one half, and cross-column pairs are (k-1)/k of
+    all pairs, so the expected Kendall tau is (k-1)/(2k) — 0.2500 at two
+    columns and 0.3333 at three. Measured: 0.2719 and 0.3513. That identity
+    matters because it is a *floor*: it does not depend on the detector, the
+    model, or the image quality, only on the fact that the method reads y and
+    ignores column membership. The trap is trying to fix it with a better
+    detector.
+
+    **Recursive XY-cut recovers most of it, and fails exactly where a page
+    stops being a partition.** Cutting at the widest empty band, alternating
+    axes and recursing, reproduces the exact order on 0.7895 of two-column
+    pages (Kendall tau 0.0318) and 0.6925 of three-column pages (0.0260) —
+    against 0.0000 for the sort. On pages with one full-width figure it
+    collapses to 0.0000 (tau 0.1405, barely better than the sort's 0.1597),
+    because a spanning element makes the layout non-hierarchical: no
+    sequence of non-overlapping cuts can isolate it. The trap is shipping
+    XY-cut, which is right on the benchmark's aligned two-column pages, and
+    meeting an annual report where every third page has a chart across the
+    gutter.
+
+    **OCR and an end-to-end VLM differ by 39.6 times in tokens, and by how
+    their errors compound.** A 3,000-character page is about 857 tokens at
+    3.5 characters per token; the same page as pixels at 300 DPI and patch 16
+    is 33,945 tokens. At 150 DPI the ratio is still 9.79. But OCR's errors
+    are per character and a field must be exactly right: at 0.5% character
+    error, a 12-character field is exact 0.9416 of the time and a 20-character
+    field 0.9046, while at 1% it is 0.8864 and 0.8179. The VLM has no
+    per-character error but cannot be pointed at a crop, cannot be audited
+    character by character, and costs the full page in context. The trap is
+    comparing word accuracy, which looks like 99%+, with field accuracy,
+    which is 90%.
+
+    **Table errors are correlated, so table accuracy falls as r to the power
+    of the number of rules.** A six-column table has five internal vertical
+    rules and is exactly right only if all five are found: at per-rule recall
+    0.99 that is 0.99^5 = 0.9510, and measured 0.9485; at 0.95 it is 0.7738
+    and measured 0.7768, with cell accuracy 0.8838. One missed rule shifts
+    every cell to its right by one column, so the damage is a contiguous
+    band, not a sprinkle. The trap is reporting cell F1 of 0.9738 on a
+    product where 5.2% of tables are structurally wrong — the customers
+    reconcile totals, and a shifted column changes the total.
+
+    **A chart is a calibration problem before it is a reading problem.**
+    Every digitised value is (y_pixel - y_origin) / pixels_per_unit, so the
+    error is one pixel divided by that scale. A plot 300 px tall spanning
+    0 to 100 gives 0.333 units per pixel; at 100 DPI the same plot is 100 px
+    tall and one pixel is 1.0 unit — three times the digitisation error from
+    the same mark detector. Axis tick labels have the same problem: a 6 pt
+    tick at 100 DPI is 8.3 px, less than one patch. The trap is blaming the
+    model for "misreading" a chart whose plot area was 100 px tall, where the
+    information was destroyed before the model saw it.
+
+
+  derivations:
+    - title: "Attention over a page is quartic in DPI and quartic in patch size"
+      latex: |
+        A page of $W \times H$ pixels at patch $p$ has
+
+        $$N = \frac{W}{p} \cdot \frac{H}{p} = \frac{WH}{p^2}$$
+
+        tokens, and the score matrix of one attention head has $N^2$ entries.
+        Since $W$ and $H$ are both proportional to the render resolution $d$
+        (dots per inch), $W = w_0 d$ and $H = h_0 d$, so
+
+        $$N = \frac{w_0 h_0\, d^2}{p^2},
+          \qquad
+          N^2 = \frac{(w_0 h_0)^2\, d^4}{p^4}.$$
+
+        Doubling the DPI multiplies the token count by 4 and the attention
+        entries by 16; halving the patch size does the same. The FLOP count per
+        layer, $4N^2 d_{\text{model}}$, follows the same $d^4/p^4$ law.
+
+        Measured on A4 at patch 16: 150 DPI gives 8,393 tokens and
+        $7.04 \times 10^7$ entries; 300 DPI gives 33,945 tokens and
+        $1.15 \times 10^9$ entries — ratios of 4.044 in tokens and 16.36 in
+        entries for a ratio of 2.000 in DPI. At 300 DPI, patch 8 gives 135,780
+        tokens and $1.84 \times 10^{10}$ entries, again 4.00 and 16.00 times the
+        patch-16 numbers at the same resolution.
+      prose: >-
+        This is why "just render at 300 DPI" is not a resolution decision but a
+        compute decision, and why the two knobs are not interchangeable: DPI
+        and patch size enter as the same ratio, so patch 16 at 300 DPI and
+        patch 8 at 150 DPI are the same 33,945 tokens and the same attention
+        matrix. Everything you buy by rendering sharper you can give back by
+        patching coarser, and the model cannot tell the difference.
+
+    - title: "A top-to-bottom sort reverses (k-1)/(2k) of all block pairs"
+      latex: |
+        Take a page with $k$ columns of $n$ blocks each, with block positions
+        independent of one another and uniformly distributed over the column
+        height. The true order is column-major: all of column 1, then all of
+        column 2, and so on.
+
+        A pair $(a, b)$ is inverted by the $(y_{\text{top}}, x_{\text{left}})$
+        sort exactly when $y_{\text{top}}(b) < y_{\text{top}}(a)$ while $b$
+        comes later in the true order. Within a column that never happens, so
+        only cross-column pairs can be inverted, and for two independently
+        placed blocks
+
+        $$P\big(y_b < y_a\big) = \tfrac{1}{2}.$$
+
+        The number of cross-column pairs is $\binom{k}{2} n^2$ and the total is
+        $\binom{kn}{2} = \tfrac{kn(kn-1)}{2} \approx \tfrac{k^2 n^2}{2}$, so
+        the expected Kendall tau distance is
+
+        $$\tau = \frac{\tfrac{1}{2}\binom{k}{2} n^2}{\binom{kn}{2}}
+               \approx \frac{k(k-1)n^2/4}{k^2 n^2/2}
+               = \frac{k-1}{2k}.$$
+
+        At $k = 2$: 0.2500. At $k = 3$: 0.3333. Measured over 2,000 synthetic
+        pages: 0.2719 and 0.3513.
+      prose: >-
+        The measured values sit slightly above the prediction because real
+        columns start at different heights and have different block counts,
+        which adds a little structure the model ignores. The important part is
+        that the formula contains no term for the detector, the model or the
+        image quality — it is a property of reading $y$ and nothing else. No
+        amount of accuracy upstream moves it, which is why reading order has to
+        be fixed structurally.
+
+    - title: "Table accuracy compounds over rules as r to the power C minus 1"
+      latex: |
+        A table with $C$ columns has $C-1$ internal vertical rules. Suppose
+        each rule is detected independently with probability $r$, and that the
+        predicted grid is correct only if every internal rule is found — one
+        missing rule merges two columns, and every cell to the right of the gap
+        is then indexed one column to the left of where it belongs.
+
+        Then
+
+        $$P(\text{grid exact}) = r^{\,C-1},$$
+
+        and the expected fraction of correctly indexed columns is
+
+        $$\mathbb{E}\left[\frac{\text{correct}}{\text{C}}\right]
+          = \frac{1}{C}\sum_{j=0}^{C-1} r^{\,j},$$
+
+        since a missed rule at position $j$ (counting from the left) leaves the
+        first $j$ columns correct. For $C = 6$ and $r = 0.99$:
+        $0.99^5 = 0.9510$ exact, and a mean of 0.9753 columns correct. Measured:
+        0.9485 table-exact and 0.9738 cell accuracy. At $r = 0.95$:
+        $0.95^5 = 0.7738$ predicted, 0.7768 measured, 0.8838 cell accuracy.
+      prose: >-
+        The exponent is the sensitivity of the whole product: a six-column table
+        raises a 1% rule error to a 5% table error, and a twelve-column table
+        raises it to 11%. It also explains the metric gap that makes table
+        extraction look solved while it is not — cell accuracy decays roughly
+        linearly in the rule error, table accuracy decays as the number of
+        columns, and the customer is checking a total that lives at the right
+        edge of the table where every missed rule lands.
+
+  implementations:
+    - language: python
+      title: "Recursive XY-cut, against the sort it replaces"
+      note: >-
+        `reading_order` is correct for pages that are a guillotine partition,
+        and it is the implementation the measured numbers come from: 0.7895 of
+        two-column pages exactly right and 0.6925 of three-column pages.
+        `naive_order` is **not** numerically
+        wrong — it sorts exactly what it is given — but it implements the wrong
+        model, and its measured cost is total: 0.0000 of two- and three-column
+        pages exactly right, Kendall tau 0.2719 and 0.3513. That distinction
+        matters when you review code: there is no bug to find in `naive_order`,
+        only a wrong claim about what reading order is. Both functions also
+        share a real limitation that no amount of testing finds, because it is
+        a property of the algorithm: neither can express a spanning element, so
+        on a page with a full-width figure `reading_order` scores 0.0000 exact
+        and tau 0.1405 — barely better than the sort it replaced.
+      code: |
+        import numpy as np
+
+
+        def _widest_gap(intervals):
+            """(gap, cut) for the largest empty band among 1-D intervals."""
+            intervals = sorted(intervals)
+            best, end = None, intervals[0][1]
+            for start, stop in intervals[1:]:
+                if start - end > 0 and (best is None or start - end > best[0]):
+                    best = (start - end, end)
+                end = max(end, stop)
+            return best
+
+
+        def reading_order(boxes):
+            """Recursive XY-cut: widest empty band first, then recurse."""
+            def rec(idxs):
+                if len(idxs) <= 1:
+                    return list(idxs)
+                gy = _widest_gap([(boxes[i][1], boxes[i][3]) for i in idxs])
+                gx = _widest_gap([(boxes[i][0], boxes[i][2]) for i in idxs])
+                if gy is None and gx is None:
+                    return sorted(idxs, key=lambda i: (boxes[i][1], boxes[i][0]))
+                if gx is None or (gy is not None and gy[0] >= gx[0]):
+                    cut = gy[1]
+                    return (rec([i for i in idxs if boxes[i][3] <= cut])
+                            + rec([i for i in idxs if boxes[i][1] >= cut]))
+                cut = gx[1]
+                return (rec([i for i in idxs if boxes[i][2] <= cut])
+                        + rec([i for i in idxs if boxes[i][0] >= cut]))
+
+            return rec(list(range(len(boxes))))
+
+
+        def naive_order(boxes):
+            """Top to bottom, then left to right. Wrong model, not wrong code."""
+            return sorted(range(len(boxes)), key=lambda i: (boxes[i][1], boxes[i][0]))
+
+
+        def inversions(order, truth):
+            pos = {b: k for k, b in enumerate(order)}
+            return sum(1 for a, b in zip(truth, truth[1:])
+                       if pos[a] > pos[b]) / (len(truth) - 1)
+
+
+        if __name__ == "__main__":
+            # two columns, input interleaved: the sort starts in the right column
+            boxes = [(500, 0, 900, 100), (0, 0, 400, 100),
+                     (0, 120, 400, 220), (500, 120, 900, 220)]
+            print(naive_order(boxes))       # [1, 0, 2, 3] -> columns interleaved
+            print(reading_order(boxes))     # [1, 2, 0, 3] -> columns finish in turn
+            # a full-width header over two columns
+            boxes = [(500, 100, 900, 200), (0, 100, 400, 200), (0, 0, 900, 60)]
+            print(reading_order(boxes))     # [2, 1, 0]
+
+    - language: python
+      title: "Page budget: tokens, cache, and the resolution a context buys"
+      note: >-
+        `page_tokens`, `kv_mib` and `context_dpi` are numerically correct.
+        `page_tokens_float` is **numerically WRONG**: it divides with true
+        division instead of flooring each axis, so it counts partial patches.
+        On a 2480 x 3508 page at patch 16 it returns 33,983 against the true
+        33,945 — 38 tokens, 0.11% — which is small enough to pass a smoke test
+        and large enough to break a context-budget assertion. `kv_mib_wrong`
+        is **numerically WRONG** by a factor of exactly two: it omits the K/V
+        factor, so a 300 DPI page at 24 layers and $d = 1024$ reports 1,591.17
+        MiB instead of 3,182.34 MiB. That is the error that lets a serving plan
+        be sized for one page per request and fail at two. The third silent
+        failure is unit confusion in `context_dpi`: the side in pixels divided
+        by the page height in *inches* gives DPI, but divided by the height in
+        *millimetres* gives a number 25.4 times too small that still looks
+        plausible as a resolution.
+      code: |
+        import numpy as np
+
+        A4_IN = (8.2677, 11.6929)
+
+
+        def page_tokens(width, height, patch):
+            """Floor each axis: partial patches carry no token."""
+            return (width // patch) * (height // patch)
+
+
+        def page_tokens_float(width, height, patch):
+            """WRONG: true division counts partial patches."""
+            return int((width / patch) * (height / patch))
+
+
+        def kv_mib(tokens, n_layers, d_model, bytes_per_value=2):
+            """Keys and values, per layer, per token: the 2 is K and V."""
+            return tokens * n_layers * 2 * d_model * bytes_per_value / 2 ** 20
+
+
+        def kv_mib_wrong(tokens, n_layers, d_model, bytes_per_value=2):
+            """WRONG: keys only, so exactly half the real cache."""
+            return tokens * n_layers * d_model * bytes_per_value / 2 ** 20
+
+
+        def context_dpi(context, patch, page_h_in=A4_IN[1]):
+            """Side in pixels a square page of `context` tokens allows, and its DPI."""
+            side = int(np.sqrt(context)) * patch
+            return side, side / page_h_in
+
+
+        if __name__ == "__main__":
+            t300 = page_tokens(2480, 3508, 16)
+            print(t300)                                   # 33945
+            print(page_tokens_float(2480, 3508, 16))      # 33983, WRONG
+            print(page_tokens(1240, 1754, 16))            # 8393
+            print("%.2f" % kv_mib(t300, 24, 1024))        # 3182.34
+            print("%.2f" % kv_mib_wrong(t300, 24, 1024))  # 1591.17, WRONG
+            for ctx in (2048, 4096, 8192):
+                side, dpi = context_dpi(ctx, 16)
+                print(ctx, side, "%.2f dpi" % dpi, "%.2f px glyph" % (6 / 72 * dpi))
+            # 2048 720 61.58 dpi 5.13 px glyph
+            # 4096 1024 87.57 dpi 7.30 px glyph
+            # 8192 1440 123.15 dpi 10.26 px glyph
+
+  checkpoints:
+    - id: cp-1
+      question: "A 300 DPI A4 page at patch 16 is 33,945 tokens and your context is 4,096. What resolution can you actually send, and what does it do to a 6 pt footnote?"
+      answerKind: short_text
+      hint: "Invert the relation: a context of C tokens at patch p allows a square page of side sqrt(C) times p pixels."
+      solution: >-
+        1,024 pixels on a side, which on A4's 11.69-inch height is 87.6 DPI. A
+        6 pt glyph is $6/72 \times 87.6 = 7.30$ px — 0.456 of one patch. So the
+        footnote is not "low resolution", it is sub-patch: the model sees a
+        fraction of a glyph mixed with its neighbours' ink. The honest options
+        are to crop the region and send it at 300 DPI (a 600 x 400 crop is 936
+        tokens), to tile and pay in token count, or to accept that footnotes and
+        page numbers are out of scope. Sending the full page at 88 DPI and
+        blaming the model is the fourth option, and it is the one that ships.
+    - id: cp-2
+      question: "Someone on the team says their layout model has mAP 0.94 so reading order should be fine. Which single measurement would you ask for instead?"
+      answerKind: short_text
+      hint: "mAP averages over boxes. Reading order is a property of the permutation, not of the boxes."
+      solution: >-
+        Kendall tau between the predicted and true block order, on a split that
+        is stratified by column count. Measured on two- and three-column pages, a
+        top-to-bottom sort is exactly correct on 0.0000 of pages with tau 0.2719
+        and 0.3513, and a highly accurate detector does not change either number
+        — the error is in the ordering relation, not in the boxes. The
+        relationship to state plainly: detection quality bounds what can be
+        ordered, and ordering quality is independent of it once the boxes are
+        right.
+    - id: cp-3
+      question: "Your XY-cut reads every two-column page correctly and produces garbage on the annual report. What is the structural difference, and what is the fix?"
+      answerKind: short_text
+      hint: "A guillotine cut partitions the page into pieces that do not overlap. What does a full-width chart do to that assumption?"
+      solution: >-
+        The annual report has a spanning element. XY-cut is a recursive
+        partition, so every cut must divide the remaining blocks into two
+        disjoint sets — a chart that spans both columns belongs to neither side,
+        and the cut that isolates it also separates the columns above it from
+        the columns below it, which then get ordered by whichever side of the
+        cut they land on. Measured: 0.0000 exact on pages with one spanning
+        figure, tau 0.1405 against 0.1597 for a plain sort. The fix is to stop
+        partitioning and build a DAG: edges for within-column precedence, edges
+        from every block above a span to the span and from the span to every
+        block below it, then topological sort with a deterministic tie-break.
+    - id: cp-4
+      question: "Your OCR reports 99.4% word accuracy and 0.5% character error, and the finance team says one invoice in ten has a wrong account number. Are they wrong?"
+      answerKind: short_text
+      hint: "An account number is one field. How long is it, and what is the probability that every character in it is right?"
+      solution: >-
+        They are right, and the arithmetic is $ (1-\epsilon)^L $. At
+        $\epsilon = 0.005$: a 12-character field is exact 0.9416 of the time and
+        a 20-character one 0.9046 — one in ten, exactly as reported. Word
+        accuracy is high because most words are short and because a wrong
+        character inside a long word rarely changes the word's identity; an
+        identifier has no redundancy at all. The reportable metric is
+        field-level exact match per field type, and the fix is routing: OCR
+        emits per-character confidence, so flag any field whose minimum
+        character confidence is below threshold rather than trusting the mean.
+    - id: cp-5
+      question: "A six-column table with per-rule recall 0.99 gives cell accuracy 0.9738 and table-exact 0.9485. Which number do you put in the contract, and what would you add?"
+      answerKind: short_text
+      hint: "What does a customer do with a table that has one column shifted? Count how many cells that damages versus how many a single character damages."
+      solution: >-
+        Table-exact, 0.9485 — because a missed rule shifts an entire column
+        band, and the customer reconciles totals that live at the right edge of
+        the table. Cell accuracy is the number that hides the failure, since
+        97% of cells are still individually correct while 5% of tables are
+        structurally wrong. Add a row-sum or column-count check as a runtime
+        signal: it is cheap, it is independent of the model, and it catches
+        precisely the correlated error that no cell-level metric surfaces. Then
+        report the two together — 0.9485 exact with a 0.99 checksum pass is a
+        different product from 0.9485 with no checksum at all.
+    - id: cp-6
+      question: "You have to choose between OCR plus an LLM and an end-to-end VLM for a 40-page contract review. Which, and what decides it?"
+      answerKind: short_text
+      hint: "Compute the token bill both ways, then ask which failure the customer will notice."
+      solution: >-
+        Compute first: 3,000 characters per page is 857 tokens of OCR text
+        against 33,945 visual tokens at 300 DPI, or 8,393 at 150 DPI — 39.6 and
+        9.79 times. Forty pages is 34,280 OCR tokens (fits a 128k context) or
+        335,720 visual tokens at 150 DPI (does not fit any single request).
+        After that the decision is about failure modes, not cost: if the answers
+        must be quotable and auditable character by character, OCR gives you
+        boxes and confidence; if the document contains stamps, handwritten
+        annotations, or tables whose structure carries meaning, the VLM is the
+        only one that sees them. The common production answer is both — OCR for
+        the text layer, a VLM for the pages the layout detector flags as
+        non-text.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A document is not an image with text in it. It is a set of regions with
+        a required reading order, rendered at a resolution you chose, and every
+        one of those three facts costs something. Regions come from a detector
+        that is scored like any detector, which means small regions are the ones
+        that fail. Order is a relation between regions, not a property of their
+        coordinates, which means a sort cannot express it and the error is
+        predictable before you run anything. Resolution is the exchange rate
+        between what the page contains and what the model can be told: tokens
+        grow with the square of DPI, attention with the fourth power, and the
+        number of characters per patch falls as DPI falls until a character is
+        smaller than the unit the model sees. Everything else in this topic is
+        one of those three statements with numbers attached.
+      blocks:
+        - kind: checklist
+          body: |
+            - A4 at 300 DPI is 8,699,840 pixels, 33,945 tokens at patch 16
+            - Attention entries scale as DPI to the fourth; tokens as DPI squared
+            - A 4,096-token context buys 1,024 px, which is 87.6 DPI on A4
+            - Layout is detection: IoU threshold 0.5, small blocks fail first
+            - Reading order is a linear extension of a partial order, not a sort key
+            - A spanning element makes the page a graph, not a partition
+            - OCR errors compound per character; VLM errors do not, but cost 40x the tokens
+            - Table accuracy compounds per rule, as r to the power of columns minus one
+      checkpoint: >-
+        Before reading on: which of those eight is a property of the page, which
+        is a property of your architecture, and which one can you change without
+        touching either?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in five quantities and every claim becomes arithmetic. Tokens per
+        page, $(W/p)(H/p)$: it prices the request. Entries per attention
+        matrix, $N^2$: it decides feasibility. DPI implied by a context,
+        $\sqrt{C}p/11.69$: it decides what the model can physically read.
+        Kendall tau of the predicted order: it is the only honest reading-order
+        metric, and you should compare it against $(k-1)/(2k)$ for the sort
+        baseline so you know whether your method beat the floor or merely beat
+        the baseline. And the exponent $C-1$ in the table formula: it is the
+        sensitivity of the product to a rule detector that is "99% accurate".
+        For the OCR-versus-VLM decision, compute the token ratio first and the
+        field-level exact-match rate second; if the ratio is under 10 the
+        decision is about failure modes, not cost.
+      blocks:
+        - kind: checklist
+          body: |
+            - Tokens: (width // patch) * (height // patch), floor each axis
+            - Feasibility: N^2 * 2 bytes * heads against GPU memory
+            - Resolution: side = int(sqrt(context)) * patch, DPI = side / page height in inches
+            - Reading order: Kendall tau against truth, not block accuracy
+            - Sort baseline: (k-1)/(2k) is the floor no detector can move
+            - Table sensitivity: table-exact ~ r^(columns-1)
+            - Field exactness: (1 - char error)^length
+      checkpoint: >-
+        Which of those seven would you compute before writing any code, and
+        which one only exists once you have a labelled evaluation set?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Four procedures cover the topic: the page budget, the ordering, the
+        table grid, and the field-level score. The one that is easy to write
+        wrongly without noticing is the ordering — every version of it looks
+        reasonable, including the one that is a sort. The one that is easy to
+        *specify* wrongly is the table grid: clustering cell centres is the
+        standard method and it invents a column for every merged cell, so the
+        specification has to say what a span is before the code can be right.
+      blocks:
+        - kind: pseudocode
+          body: |
+            def page_budget(w, h, patch, d_model, layers):
+                n = (w // patch) * (h // patch)          # floor each axis
+                return n, n*n, 4*n*n*d_model, n*layers*2*d_model*2
+
+            def dpi_for(context, patch, page_h_in):
+                return (int(sqrt(context)) * patch) / page_h_in
+
+            def reading_order(boxes):                     # recursive XY-cut
+                if len(boxes) <= 1: return boxes
+                gy = widest empty y-band; gx = widest empty x-band
+                if neither: return sort by (y0, x0)       # no structure left
+                cut on the wider axis; recurse on each side; concatenate
+
+            def table_grid(cells, tol):                   # 1-D clustering
+                rows = cluster(centres_y, tol)
+                cols = cluster(centres_x, tol)            # spans land in the gutter
+                return rows, cols
+
+            def field_exact(char_err, length):
+                return (1 - char_err) ** length
+      checkpoint: >-
+        In `reading_order`, what happens to a page that has a single block
+        spanning both columns at the top, and why does the recursion never
+        recover from it?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three results carry the topic: the quartic scaling of attention in
+        resolution, the inversion rate of a y-sort on a k-column page, and the
+        compounding of table accuracy over rules. Each is one line once the
+        objects are named, and each predicts a measured number.
+      blocks:
+        - kind: math
+          body: |
+            Tokens and attention for a page:
+
+            $$N = \frac{W}{p}\cdot\frac{H}{p} = \frac{WH}{p^2},
+              \qquad N^2 = \frac{(WH)^2}{p^4},$$
+
+            so with $W, H \propto d$ (DPI), $N \propto d^2$ and
+            $N^2 \propto d^4$.
+
+            Resolution implied by a context of $C$ tokens at patch $p$:
+
+            $$\text{side} = \sqrt{C}\,p, \qquad
+              \text{DPI} = \frac{\sqrt{C}\,p}{11.6929}.$$
+
+            Expected Kendall tau of a top-to-bottom sort with $k$ columns:
+
+            $$\tau \approx
+              \frac{\tfrac{1}{2}\binom{k}{2}n^2}{\binom{kn}{2}}
+              = \frac{k-1}{2k}.$$
+
+            Field exactness under per-character error $\epsilon$:
+
+            $$P(\text{exact}) = (1-\epsilon)^{L}.$$
+
+            Table exactness under per-rule recall $r$ with $C$ columns:
+
+            $$P(\text{table exact}) = r^{\,C-1}.$$
+      checkpoint: >-
+        Two of those four formulas predict a measured number to within 0.005
+        and one is off by 0.02. Which one is off, and what does the size of the
+        gap tell you about the model behind it?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A correct page budget, a correct ordering, and the numbers each one
+        should reproduce. Compare numbers, not code: the code below is short
+        enough that the interesting content is the constants, not the control
+        flow.
+      blocks:
+        - kind: warning
+          body: >-
+            Three failures that never raise. Counting tokens with true division
+            instead of flooring each axis gives 33,983 instead of 33,945 on a
+            full page — 0.11%, invisible in a smoke test, fatal to a budget
+            assertion. Omitting the K/V factor of two in the cache calculation
+            reports 1,591.17 MiB where the truth is 3,182.34, which is how a
+            serving plan gets sized for one page per request. And using a
+            top-to-bottom sort for reading order has no error at all in the
+            sense a test suite detects: it returns a permutation of the right
+            blocks, every block appears once, and the order is wrong on 100% of
+            multi-column pages.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def page_tokens(width, height, patch):
+                return (width // patch) * (height // patch)
+
+
+            def page_budget(width, height, patch, context=4096,
+                            d_model=1024, n_layers=24, bytes_per_value=2):
+                n = page_tokens(width, height, patch)
+                return {
+                    "tokens": n,
+                    "attention_entries": n * n,
+                    "tflops_per_layer": 4 * n * n * d_model / 1e12,
+                    "kv_mib": n * n_layers * 2 * d_model * bytes_per_value / 2 ** 20,
+                    "context_ratio": n / context,
+                }
+
+
+            def dpi_for(context, patch, page_h_in=11.6929):
+                return int(np.sqrt(context)) * patch / page_h_in
+
+
+            def kendall(order, truth):
+                pos = {b: k for k, b in enumerate(order)}
+                inv = sum(1 for i in range(len(truth))
+                          for j in range(i + 1, len(truth))
+                          if pos[truth[i]] > pos[truth[j]])
+                return inv / (len(truth) * (len(truth) - 1) / 2)
+
+
+            if __name__ == "__main__":
+                print(page_budget(2480, 3508, 16)["tokens"])      # 33945
+                print(page_budget(2480, 3508, 16)["kv_mib"])      # 3182.34375
+                print("%.2f" % dpi_for(4096, 16))                 # 87.57
+                print("%.4f" % (0.99 ** 5))                       # 0.9510
+      checkpoint: >-
+        You have a correct budget and a request for forty pages. Name the three
+        numbers you would print before believing any latency or quality claim,
+        and say which one you cannot compute without knowing the output length.
+
+  problems:
+    - id: p-page-budget
+      title: "Page budget: tokens, attention entries, cache, and context ratio"
+      difficulty: easy
+      prompt: >-
+        Implement `page_budget(width, height, patch, context=4096,
+        d_model=1024, n_layers=24, bytes_per_value=2)`. A page of `width` by
+        `height` pixels is cut into non-overlapping `patch`-pixel squares, so
+        the grid is `width // patch` by `height // patch` (floor each axis
+        independently) and the token count is their product. Return a dict with
+        five keys: `tokens` (int), `attention_entries` (int, `tokens` squared),
+        `attn_tflops_per_layer` (float, `4 * tokens**2 * d_model / 1e12`),
+        `kv_mib` (float, `tokens * n_layers * 2 * d_model * bytes_per_value /
+        2**20` — the 2 is keys and values) and `context_ratio` (float,
+        `tokens / context`).
+      starter: |
+        import numpy as np
+
+        def page_budget(width, height, patch, context=4096, d_model=1024,
+                        n_layers=24, bytes_per_value=2):
+            # your implementation here
+            pass
+      language: python
+      entry: page_budget
+      testCases:
+        - input: '{"width": 2480, "height": 3508, "patch": 16}'
+          expected: '{"tokens": 33945, "attention_entries": 1152263025, "attn_tflops_per_layer": 4.7196693504, "kv_mib": 3182.34375, "context_ratio": 8.287353515625}'
+          mode: json
+          tolerance: 1e-09
+        - input: '{"width": 2480, "height": 3508, "patch": 8}'
+          expected: '{"tokens": 135780, "attention_entries": 18436208400, "attn_tflops_per_layer": 75.5147096064, "kv_mib": 12729.375, "context_ratio": 33.1494140625}'
+          mode: json
+          tolerance: 1e-09
+        - input: '{"width": 1240, "height": 1754, "patch": 16}'
+          expected: '{"tokens": 8393, "attention_entries": 70442449, "attn_tflops_per_layer": 0.288532271104, "kv_mib": 786.84375, "context_ratio": 2.049072265625}'
+          mode: json
+          tolerance: 1e-09
+        - input: '{"width": 1240, "height": 1754, "patch": 16, "context": 2048}'
+          expected: '{"tokens": 8393, "attention_entries": 70442449, "attn_tflops_per_layer": 0.288532271104, "kv_mib": 786.84375, "context_ratio": 4.09814453125}'
+          mode: json
+          tolerance: 1e-09
+        - input: '{"width": 1024, "height": 1024, "patch": 16, "d_model": 768, "n_layers": 12}'
+          expected: '{"tokens": 4096, "attention_entries": 16777216, "attn_tflops_per_layer": 0.051539607552, "kv_mib": 144.0, "context_ratio": 1.0}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+
+        def page_budget(width, height, patch, context=4096, d_model=1024,
+                        n_layers=24, bytes_per_value=2):
+            if patch <= 0:
+                raise ValueError("patch must be positive")
+            tokens = (width // patch) * (height // patch)
+            return {
+                "tokens": int(tokens),
+                "attention_entries": int(tokens * tokens),
+                "attn_tflops_per_layer": float(
+                    4 * tokens * tokens * d_model / 1e12),
+                "kv_mib": float(
+                    tokens * n_layers * 2 * d_model * bytes_per_value / 2 ** 20),
+                "context_ratio": float(tokens / context),
+            }
+      solutionExplanation: >-
+        Test 1 is the canonical number: 2480 x 3508 at patch 16 is 155 x 219 =
+        33,945 tokens, 8.29 times a 4,096 context, 1.15 billion attention
+        entries, and 3,182.34 MiB of cache at 24 layers and $d = 1024$. Test 2
+        is the same page at patch 8 and it is exactly 4x the tokens and 16x the
+        entries — the quartic, in one test case. Test 3 is the 150 DPI version:
+        8,393 tokens, still 2.05 contexts, which is the number that makes a
+        four-page request impossible. Test 4 pins `context` as a parameter and
+        not a constant, so the ratio doubles while everything else is unchanged.
+        Test 5 is the one that catches the floor: 1024 x 1024 at patch 16 is
+        exactly 4,096 tokens, ratio 1.0, and the integer division must be exact
+        on both axes — true division would give the same answer here, which is
+        why the 2480 x 3508 cases are the ones that discriminate. Note the
+        asymmetry in the two scaling laws: doubling DPI quadruples tokens but
+        only doubles the resolution, so the page gets 4x more expensive to
+        express and 2x sharper.
+      complexity: "O(1) time and space; the content is in the two exponents, 2 for tokens and 4 for attention"
+      tags: [document-ai, token-budget, resolution, kv-cache, attention-cost]
+
+    - id: p-reading-order
+      title: "Reading order by recursive XY-cut"
+      difficulty: medium
+      prompt: >-
+        Implement `reading_order(boxes)`, where `boxes` is a list of
+        `[x0, y0, x1, y1]` integer boxes for the blocks on a page. Return a list
+        of indices in reading order, computed recursively:
+
+        (1) If a group has one box, return it.
+
+        (2) Find the largest empty horizontal band — the largest gap between
+        consecutive y-intervals of the group's boxes — and the largest empty
+        vertical band, the same on the x-axis. A band counts only if its width
+        is strictly greater than zero.
+
+        (3) If a group has no empty band on either axis, return its indices
+        sorted by `(y0, x0)`.
+
+        (4) Otherwise cut on the axis with the larger band, preferring the
+        horizontal (y) cut on a tie. The boxes entirely before the cut come
+        first, then those entirely at or after it, and each side is processed
+        recursively.
+
+        Do not sort the two sides against each other: the cut already
+        establishes their order.
+      starter: |
+        import numpy as np
+
+        def reading_order(boxes):
+            # your implementation here
+            pass
+      language: python
+      entry: reading_order
+      testCases:
+        - input: '[[[0, 300, 400, 340], [0, 0, 400, 40], [0, 150, 400, 190]]]'
+          expected: '[1, 2, 0]'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[500, 0, 900, 100], [0, 0, 400, 100], [0, 120, 400, 220], [500, 120, 900, 220]]]'
+          expected: '[1, 2, 0, 3]'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[500, 100, 900, 200], [0, 100, 400, 200], [0, 0, 900, 60]]]'
+          expected: '[2, 1, 0]'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[0, 300, 400, 400], [500, 300, 900, 400], [0, 0, 400, 200], [500, 0, 900, 200], [0, 220, 900, 280]]]'
+          expected: '[2, 3, 4, 0, 1]'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[0, 0, 100, 100], [50, 50, 150, 150]]]'
+          expected: '[0, 1]'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+
+        def _widest_gap(intervals):
+            intervals = sorted(intervals)
+            best, end = None, intervals[0][1]
+            for start, stop in intervals[1:]:
+                if start - end > 0 and (best is None or start - end > best[0]):
+                    best = (start - end, end)
+                end = max(end, stop)
+            return best
+
+
+        def reading_order(boxes):
+            boxes = [[float(v) for v in b] for b in boxes]
+
+            def rec(idxs):
+                if len(idxs) <= 1:
+                    return list(idxs)
+                gy = _widest_gap([(boxes[i][1], boxes[i][3]) for i in idxs])
+                gx = _widest_gap([(boxes[i][0], boxes[i][2]) for i in idxs])
+                if gy is None and gx is None:
+                    return sorted(idxs, key=lambda i: (boxes[i][1], boxes[i][0]))
+                if gx is None or (gy is not None and gy[0] >= gx[0]):
+                    cut = gy[1]
+                    before = [i for i in idxs if boxes[i][3] <= cut]
+                    after = [i for i in idxs if boxes[i][1] >= cut]
+                else:
+                    cut = gx[1]
+                    before = [i for i in idxs if boxes[i][2] <= cut]
+                    after = [i for i in idxs if boxes[i][0] >= cut]
+                return rec(before) + rec(after)
+
+            return rec(list(range(len(boxes))))
+      solutionExplanation: >-
+        Test 1 is a single column entered out of order: no x-gap exists, the
+        y-gaps are 110 and 110 (a tie), and the y-axis wins by construction, so
+        the answer is the y-order [1, 2, 0]. Test 2 is the case that defeats
+        sorting: two columns at the same y, so there is no y-gap at all and the
+        100 px gutter is the only cut — left column first, giving [1, 2, 0, 3]
+        where a sort by `(y0, x0)` returns [1, 0, 2, 3] and interleaves the
+        columns. Test 3 is a full-width header: the 40 px band under it is a
+        y-gap, the header has to be cut off first, and only then does the
+        gutter appear inside the remainder — [2, 1, 0]. If you cut on the
+        gutter first, the header spans it, so no gutter exists and the header
+        ends up read in the middle of a column. Test 4 is the case that shows
+        the limit: a 1,000-wide band at y 220 to 280 has no y-gap on either
+        side of it that partitions cleanly, so the recursion handles the two
+        rows above and below it as separate groups and the band is placed
+        between them — [2, 3, 4, 0, 1]. That works here because the band is
+        itself a separating cut, which is exactly the reason XY-cut fails when
+        a spanning element is not at a cut: this test passes for a page where
+        the same structure at an arbitrary y would not. Test 5 is the
+        degenerate case — two overlapping boxes with no empty band anywhere —
+        and the fallback must return a permutation, not raise.
+      complexity: "O(n log n) per level in the number of boxes, O(n^2) worst case for deeply nested cuts; the recursion depth is bounded by the number of separating bands"
+      tags: [document-ai, reading-order, xy-cut, page-segmentation]
+
+    - id: p-table-grid
+      title: "Table grid: assign cell boxes to rows and columns"
+      difficulty: medium
+      prompt: >-
+        Implement `assign_cells(boxes, tol=5.0)`. `boxes` is a list of
+        `[x0, y0, x1, y1]` cell boxes in arbitrary order. Compute each box's
+        centre on both axes, then cluster the centres with single-linkage along
+        each axis: sort the centres, and start a new cluster whenever a centre
+        exceeds the previous one by strictly more than `tol`. Cluster labels are
+        the rank of the cluster in ascending order, so row 0 is the topmost band
+        and column 0 the leftmost.
+
+        Return a dict with `rows` (int, number of row clusters), `cols` (int,
+        number of column clusters) and `assignment` (a list, in input order, of
+        `[row, col]` integer pairs).
+      starter: |
+        import numpy as np
+
+        def assign_cells(boxes, tol=5.0):
+            # your implementation here
+            pass
+      language: python
+      entry: assign_cells
+      testCases:
+        - input: '[[[0, 0, 90, 30], [100, 0, 190, 30], [0, 40, 90, 70], [100, 40, 190, 70]]]'
+          expected: '{"rows": 2, "cols": 2, "assignment": [[0, 0], [0, 1], [1, 0], [1, 1]]}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[0, 0, 90, 30], [100, 2, 190, 32], [0, 42, 90, 72], [100, 41, 190, 71], [0, 84, 90, 114], [100, 83, 190, 113]]]'
+          expected: '{"rows": 3, "cols": 2, "assignment": [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0], [2, 1]]}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[0, 0, 90, 30], [100, 0, 190, 30], [0, 40, 190, 70]]]'
+          expected: '{"rows": 2, "cols": 3, "assignment": [[0, 0], [0, 2], [1, 1]]}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[0, 0, 90, 30], [100, 8, 190, 38], [0, 42, 90, 72], [100, 40, 190, 70]]]'
+          expected: '{"rows": 3, "cols": 2, "assignment": [[0, 0], [1, 1], [2, 0], [2, 1]]}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[[0, 0, 90, 30], [100, 8, 190, 38], [0, 42, 90, 72], [100, 40, 190, 70]], 10.0]'
+          expected: '{"rows": 2, "cols": 2, "assignment": [[0, 0], [0, 1], [1, 0], [1, 1]]}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+
+        def _cluster(values, tol):
+            order = sorted(range(len(values)), key=lambda i: values[i])
+            labels = [0] * len(values)
+            k = 0
+            for pos, i in enumerate(order):
+                if pos and values[i] - values[order[pos - 1]] > tol:
+                    k += 1
+                labels[i] = k
+            return labels
+
+
+        def assign_cells(boxes, tol=5.0):
+            if not boxes:
+                return {"rows": 0, "cols": 0, "assignment": []}
+            cy = [(b[1] + b[3]) / 2.0 for b in boxes]
+            cx = [(b[0] + b[2]) / 2.0 for b in boxes]
+            rows = _cluster(cy, tol)
+            cols = _cluster(cx, tol)
+            return {
+                "rows": int(max(rows) + 1),
+                "cols": int(max(cols) + 1),
+                "assignment": [[int(rows[i]), int(cols[i])] for i in range(len(boxes))],
+            }
+      solutionExplanation: >-
+        Test 1 is a clean 2 x 2 grid and the only content is that labels follow
+        the sorted order, not the input order. Test 2 is the same grid with 2 and
+        3 px of baseline jitter; at `tol = 5` the jitter is absorbed and the grid
+        stays 3 x 2 — this is the case that sets the tolerance. Test 3 is the
+        trap this problem exists for: a merged cell spanning both columns has
+        its centre at x = 95, which lies in the gutter and is more than `tol`
+        from both header centres (45 and 145), so single-linkage gives it a
+        cluster of its own and the table is reported as 3 columns where it has
+        2. The assignment `[[0, 0], [0, 2], [1, 1]]` is *self-consistent and
+        wrong*: nothing raises, no cell is missing, and every downstream
+        row-sum check fails. A correct extractor has to resolve spans before
+        clustering, or cluster on edges rather than centres. Test 4 shows the
+        other side of the tolerance: 8 px of jitter at `tol = 5` splits the
+        first row into two, so a 2 x 2 table is reported as 3 x 2 with an empty
+        first column. Test 5 is the same boxes at `tol = 10`, where the jitter is
+        absorbed and the grid is right — the tolerance is a bet on how well the
+        detector localises, and there is no value that is right for both a
+        tightly typeset table and a scan.
+      complexity: "O(n log n) for the sorts, O(n) space; the correctness content is in the choice of centre versus edge"
+      tags: [document-ai, table-extraction, clustering, layout]
+
+  try_it: >-
+    Take one A4 page at 300 DPI: 2480×3508 = 8,699,840 pixels, which at patch 16 is 155×219 =
+    33,945 tokens. Divide by 4,096 to get 8.29 contexts, then invert the arithmetic for a
+    4,096-token budget — a 64×64 grid is 1,024×1,024 pixels, which on A4's 11.69-inch height is
+    87.6 DPI. At that resolution a 6 pt footnote glyph is 7.30 px tall, or 0.456 of one patch.
+  interview_questions:
+    - question: "Your OCR reports 99.4% word accuracy and finance says the totals are still wrong. Reconcile those two statements."
+      level: mid
+      key_points:
+        - "Word accuracy is not the metric a financial field needs: an account number is correct only if every character is, so the relevant unit is exact-match rate per field."
+        - "A 20-character field at 99.4% per character is roughly 0.994^20, about 89% exact — one field in ten wrong from an OCR number that sounds near-perfect."
+        - "Errors also compound differently between the two pipelines: OCR errs per character, an end-to-end VLM errs per region, and a missed table rule invalidates a whole block of cells."
+        - "The fix is to measure field-level exact match and cell F1, and to stop reporting word accuracy as the quality gate."
+      follow_up: "What per-character accuracy would you need for 99% of 20-character fields to be exactly right?"
+    - question: "How often is sorting blocks by (y_top, x_left) the correct reading order, and why does it fail so completely?"
+      level: senior
+      key_points:
+        - "Reading order is a linear extension of a partial order; sorting by coordinates imposes a different total order that only agrees with the true one on single-column layouts."
+        - "Measured over 2,000 synthetic pages, the sort reproduces the exact order on 1.0000 of single-column pages and 0.0000 of two-column and three-column pages."
+        - "The expected Kendall tau is (k − 1)/(2k) — 0.2500 at two columns and 0.3333 at three — because cross-column pairs are (k − 1)/k of all pairs and half of them invert; measured 0.2719."
+        - "Recursive XY-cut recovers exact order on 0.7895 of two-column pages with Kendall tau 0.0318, and fails exactly where a block spans a column boundary."
+      follow_up: "Which page feature breaks XY-cut, and what do you fall back to when it does?"
+    - question: "You can feed a page at native resolution or downscale it to fit the context. What is the real trade, in tokens and in glyphs?"
+      level: senior
+      key_points:
+        - "A4 at 300 DPI is 8.7 million pixels and 33,945 tokens at patch 16, which is 8.29 times a 4,096-token context before the question or the system prompt."
+        - "Inverting the budget gives a resolution mandate: 4,096 tokens is 1,024×1,024 px, or 87.6 DPI on A4, where a 6 pt glyph is 7.30 px — 0.456 of a patch."
+        - "A 10 pt character cell is 4.88 patches at 300 DPI, 2.17 at 200, 1.22 at 150 and 0.54 at 100; below one patch per character the model sees texture rather than glyphs."
+        - "Against OCR, an end-to-end page at 300 DPI costs 39.6 times the tokens (33,945 against about 857 for 3,000 characters), and still 9.79 times at 150 DPI."
+      follow_up: "At an 8,192-token budget, what DPI do you get, and does that make the footnote legible?"
+  common_mistakes:
+    - "Treating 99.4% word accuracy as 99.4% field accuracy — per-character errors compound to roughly 90% on a 20-character field."
+    - "Reporting cell F1 as if table errors were independent, when one missed vertical rule invalidates every cell to its right: five rules at 0.99 recall gives 0.99^5 = 0.9510."
+    - "Sorting blocks by (y_top, x_left) and calling it reading order, which is correct on 0% of multi-column pages by construction."
+  further_reading:
+    - label: "Huang et al., LayoutLMv3: Pre-training for Document AI with Unified Text and Image Masking, ACM MM 2022"
+    - label: "Kim et al., OCR-free Document Understanding Transformer (Donut), ECCV 2022"

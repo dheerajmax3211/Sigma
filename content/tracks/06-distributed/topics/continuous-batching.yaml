@@ -1,0 +1,1305 @@
+id: continuous-batching
+slug: continuous-batching
+title: "Continuous Batching and PagedAttention"
+summary: >-
+  Static batching makes every request in a group wait for the longest one, so
+  four fifths of the KV-cache slots you paid for produce nothing; continuous
+  batching reschedules every decode step and refills each slot the moment it
+  frees. This topic replays a 1,000-request trace through both schedulers,
+  prices the difference in tokens per second and in wasted cache bytes, and
+  shows why paged block tables are what make the larger running batch
+  affordable.
+kind: lesson
+difficulty: hard
+position: 6
+estMinutes: 27
+prerequisites: [kv-cache]
+phase: serving
+tags:
+  - continuous-batching
+  - iteration-level-scheduling
+  - paged-attention
+  - kv-cache
+  - serving
+  - throughput
+  - latency
+  - fragmentation
+  - prefill-chunking
+  - vllm
+
+body:
+  big_idea: >-
+    For a decoder the unit of work is the step, not the batch: re-deciding
+    membership every step keeps every KV-cache slot full and amortises weight
+    traffic over the sequences still generating.
+  problem:
+    - "GPU at 100% but tokens per second a sixth of benchmark: three quarters of each batch already emitted EOS and still hold a slot."
+    - "A one-line question waits forty seconds behind a batch admitted two seconds earlier that will not return to the queue for thirty."
+    - "You reserve maximum context per request, so an 80 GiB card holds 66 users when the arithmetic says 194 at real lengths."
+  analogy: >-
+    A shuttle bus leaves only when all thirty-two seats are sold and completes
+    the whole circuit before returning, so whoever is going the shortest
+    distance rides to the end. A taxi rank resells each seat the moment it
+    frees. The seat is the unit, not the vehicle: a seat is a KV-cache slot, a
+    trip is one request's output length.
+  concept_points:
+    - "**Static batching charges every request for the longest in its group.** Thirty-two requests run until the slowest finishes: $\\max_i L_i$ steps for $\\sum_i L_i$ tokens. On a 1,000-request lognormal trace (median 103 tokens, p99 992) at batch 32 that is **23,723 steps at 6.77 tokens per step — 21.2% slot occupancy**, so four fifths of reserved slot-steps produce no token."
+    - "**Iteration-level scheduling makes the step the unit of work.** Each step the scheduler retires sequences that emitted EOS, then admits from the queue until the running set is full. The same trace takes **5,818 steps at 27.60 tokens per step, 86.3% occupancy, 4.08x fewer steps** — same model, same kernel, only the membership question asked every step instead of every batch."
+    - "**The speedup is dispersion, not batch size.** $S = \\mathbb{E}[\\max_i L_i]/\\mathbb{E}[L]$ is exactly 1 when all outputs are equal, at any batch width. Our trace predicts **4.37x** at 32 (expected max 702.4 against mean 160.6) and realises **4.08x**; a uniform trace gives **1.00x** at batch 2 and batch 4."
+    - "**Throughput is bytes per generated token: $W/(\\text{tokens per step}) + C$.** At 693-token context ($W = 14.0$ GB, $C = 363.3$ MB) that is **2.43 GB per token static against 870 MB continuous — 1,378 against 3,848 tokens per second** at 3.35 TB/s. The ceiling as the batch widens is $C$ alone, **9,221 tokens per second**, which no scheduler changes."
+    - "**Batching touches the queueing term, not time per output token.** Each live sequence emits one token per step either way, so TPOT is step time in both; what collapses is admission delay, **10,410 to 2,236 steps mean and 22,672 to 4,913 p99**. Prefill must now share the step — 96.6 ms for 2,048 tokens against a 7.65 ms decode — so it is chunked."
+    - "**PagedAttention is orthogonal and multiplicative.** Reserving the 2,048-token maximum costs **1.00 GiB per sequence**, so 66.96 GiB holds **66** while the 693.6-token mean needs 0.339 GiB — **66.1% dead space**. Fixed 16-token blocks with a 175-byte table cut waste to **1.05%** and fit **194** sequences, **2.94x** more."
+  definitions:
+    - term: "Static batching (request-level batching)"
+      meaning: >-
+        Admitting a fixed group of requests together and running the group
+        until every member has finished. Batch duration is the maximum output
+        length in the group, so slot occupancy is
+        $\mathbb{E}[L]/\mathbb{E}[\max L]$ — 21.2% on the reference trace at
+        batch 32.
+    - term: "Continuous batching (iteration-level scheduling, in-flight batching)"
+      meaning: >-
+        Re-deciding the batch composition on every decode step: finished
+        sequences leave, queued requests take their slots, and the running set
+        stays full. Same kernel, same batch-size cap, different question asked
+        per step.
+    - term: "Slot occupancy"
+      meaning: >-
+        Tokens actually produced divided by (batch size x steps). It is the
+        fraction of the cache slots you reserved that did work. 21.2% static
+        against 86.3% continuous on the reference trace, at the same nominal
+        batch size of 32.
+    - term: "Time to first token (TTFT)"
+      meaning: >-
+        Queueing delay plus prefill. This is the term continuous batching
+        actually improves — 10,410 to 2,236 steps of mean admission wait in
+        the replay — and the term chunked prefill makes slightly worse in
+        exchange for a smoother stream.
+    - term: "Time between tokens (TBT, also TPOT)"
+      meaning: >-
+        The decode step time, which is bytes moved divided by bandwidth. Set by
+        how many sequences are live and how long their caches are, not by which
+        scheduler admitted them. 7.65 ms at 32 live sequences and a 693-token
+        context; 18.1 ms at 128.
+    - term: "Prefill chunking"
+      meaning: >-
+        Splitting one long prompt's prefill into fixed-size pieces and putting
+        one piece in each decode step, so a single 2,048-token prompt cannot
+        stall the stream for 96.6 ms. It converts a TBT spike into extra TTFT:
+        5 chunks of 473 tokens cost 38.25 ms of first-token latency to cap the
+        worst step at 30 ms.
+    - term: "Block table"
+      meaning: >-
+        A per-sequence array mapping logical block index to physical block
+        index, 4 bytes per entry. 43.8 entries for a 693-token sequence at
+        block size 16 — 175 bytes of table for 0.342 GiB of cache.
+    - term: "Logical and physical block"
+      meaning: >-
+        A logical block is a fixed window of a sequence's token positions; a
+        physical block is an 8 MiB slab of HBM holding 16 tokens' keys and
+        values. The table is what lets the two be different, which is what makes
+        non-contiguous allocation and sharing possible.
+    - term: "Internal fragmentation"
+      meaning: >-
+        Space reserved and not used inside an allocated unit: the tail of the
+        last block of a sequence. Expected at $(b-1)/2$ tokens, so waste is
+        about $(b-1)/(2\mathbb{E}[L])$ — 1.08% predicted against 1.05% measured
+        at block 16. Bounded by block size, never by the allocator.
+    - term: "External fragmentation"
+      meaning: >-
+        Free memory that exists but cannot satisfy a request because it is
+        split into unusable pieces. Contiguous per-request reservation suffers
+        from it as sequences grow at different rates; a block pool with a table
+        cannot, because any free block fits any logical position.
+    - term: "KV block pool"
+      meaning: >-
+        The pre-allocated set of physical blocks that all sequences draw from —
+        8,571 blocks of 8 MiB, 66.96 GiB, on one 80 GiB card holding a 7B model.
+        Capacity is a division over this pool, not over parameter count.
+    - term: "Copy-on-write block sharing"
+      meaning: >-
+        Two sequences pointing at the same physical block until one of them
+        writes, at which point the writer gets a private copy. This is how
+        parallel sampling and beam search avoid paying for the prompt $k$
+        times, and it exists only because the block table is an indirection.
+
+  diagrams:
+    - type: compare
+      title: "The same 1,000-request trace, two schedulers, batch 32"
+      left_label: "Static: admit 32, run until the slowest finishes"
+      left_points:
+        - "23,723 steps for 160,599 tokens"
+        - "6.77 tokens per step; 21.2% slot occupancy"
+        - "1,378 tokens per second; 2.43 GB of traffic per token"
+        - "Mean admission wait 10,410 steps, p99 22,672"
+        - "Capped at 66 resident sequences by 1.00 GiB reservations"
+        - "No prefill in the decode step, so TBT is a flat 7.65 ms"
+      right_label: "Continuous: re-fill every slot every step"
+      right_points:
+        - "5,818 steps for the same 160,599 tokens"
+        - "27.60 tokens per step; 86.3% slot occupancy"
+        - "3,848 tokens per second; 870 MB of traffic per token"
+        - "Mean admission wait 2,236 steps, p99 4,913"
+        - "194 resident sequences once the cache is paged in 16-token blocks"
+        - "Prefill competes with decode unless it is chunked"
+    - type: architecture
+      title: "Where the scheduling decision lives"
+      nodes:
+        - { id: r, x: 0, y: 1, label: "Request stream", kind: client, detail: "Arrivals are bursty and their output lengths are not known in advance; the only thing known at admission is the prompt, which is why length prediction is a research problem and not a config flag." }
+        - { id: q, x: 1, y: 1, label: "Waiting queue", kind: queue, detail: "FIFO by default. Head-of-line blocking is real: one 8,000-token generation at the front delays everything behind it, which is why production stacks use priority or shortest-job-first admission." }
+        - { id: a, x: 2, y: 0, label: "Block allocator", kind: storage, detail: "Hands out 8 MiB physical blocks from a pool of 8,571 on an 80 GiB card, and writes one 4-byte table entry per block. Frees blocks when a sequence emits EOS." }
+        - { id: s, x: 2, y: 2, label: "Step scheduler", kind: server, detail: "Runs once per step: retire finished sequences, free their blocks, admit from the queue until 32 are live, then launch. This loop is the entire difference between static and continuous batching." }
+        - { id: g, x: 3, y: 1, label: "GPU: one forward pass", kind: gpu, detail: "Reads 14.0 GB of weights plus one cache per live sequence. 25.6 GB and 7.65 ms at 32 live sequences with a 693-token context." }
+      edges:
+        - { from: r, to: q, label: "admit" }
+        - { from: q, to: s, label: "pop until full" }
+        - { from: s, to: g, label: "batch of 32 + block tables" }
+        - { from: a, to: g, label: "physical blocks" }
+        - { from: g, to: s, label: "logits, EOS", style: async }
+        - { from: s, to: a, label: "free finished blocks", style: async }
+      caption: "The scheduler is a loop, not a component, and it sits between the queue and the GPU. Static batching is the same diagram with the loop body replaced by 'wait for all 32 to finish'."
+    - type: pipeline
+      title: "One iteration of the scheduler"
+      nodes:
+        - label: "Retire"
+          note: "Drop sequences that emitted EOS last step"
+          detail: "Retirement is what frees the slot. In static batching this step is skipped until the whole group is done, which is the entire source of the waste."
+        - label: "Free blocks"
+          note: "Return physical blocks to the pool"
+          detail: "Blocks are freed the step the sequence ends, not when the batch ends. On the reference trace the mean sequence lives 581.8 steps, so a static batch holds its longest member's blocks 4x longer than necessary."
+        - label: "Admit"
+          note: "Fill free slots from the queue, up to the cap"
+          detail: "The batch-size cap is a memory and latency decision, not a scheduling one. 32 live sequences at 693 tokens is 11.6 GB of cache and 7.65 ms per step."
+        - label: "Prefill the new ones"
+          note: "Chunked if a TBT budget exists"
+          detail: "A 2,048-token prompt costs 96.6 ms of prefill; spliced whole into a 7.65 ms step it is a 104 ms TBT spike. Chunking at 473 tokens caps the step at 30 ms for 38.25 ms of extra TTFT."
+        - label: "Forward, sample, append K and V"
+          note: "One token per live sequence"
+          detail: "The kernel is unchanged from the static case. Same weights, same attention, same 512 KiB appended per token per sequence."
+        - label: "Repeat"
+          note: "The loop body is the scheduler"
+          detail: "5,818 iterations on the reference trace against 23,723 for static. The work per iteration is identical; only the number of productive slots differs."
+      caption: "Every step is the same six beats. Static batching runs beats two through six zero times until the group drains, which is why its cost is set by the maximum rather than the mean."
+    - type: plot
+      title: "Steps to finish the same trace, as the batch cap moves"
+      chart: line
+      xLabel: "batch size cap (sequences)"
+      yLabel: "steps to drain 1,000 requests"
+      series:
+        - name: "Static batching"
+          points:
+            - { x: 8, y: 57078 }
+            - { x: 16, y: 37431 }
+            - { x: 32, y: 23723 }
+            - { x: 64, y: 14165 }
+            - { x: 128, y: 7572 }
+        - name: "Continuous batching"
+          points:
+            - { x: 8, y: 20850 }
+            - { x: 16, y: 10834 }
+            - { x: 32, y: 5818 }
+            - { x: 64, y: 3322 }
+            - { x: 128, y: 2079 }
+    - type: sequence
+      title: "One 693-token sequence, block by block"
+      items:
+        - "Token 1: one physical block (16 tokens, 8 MiB) allocated, table length 1"
+        - "Tokens 2 to 16: reused; no allocation, no copy, no fragmentation"
+        - "Token 17: second block; table length 2, and the block need not be adjacent"
+        - "Token 100: seventh block; table length 7"
+        - "Token 693: 44 blocks, 0.342 GiB, 175 bytes of table"
+        - "EOS: all 44 blocks returned to the pool in one step, whatever order they were allocated in"
+        - "Six 5-token sequences: 6 blocks, 30 of 96 tokens used, 68.75% waste"
+      caption: "Growth is append-only and never requires a copy, which is the property a contiguous reservation cannot offer: it must guess the final length at admission and pay for the guess."
+
+  markdown: |
+    ## The slot you paid for and did not use
+
+    A serving stack admits a batch, runs a forward pass, samples one token per
+    sequence, and repeats. The only decision that matters is what "the batch"
+    is. Static batching — request-level batching — treats it as the unit of
+    work: thirty-two requests are admitted together, the group runs until every
+    member has emitted its end-of-sequence token, and only then is the next
+    admitted. Its duration is the maximum of the members' output lengths, and
+    every member holds a KV-cache slot for that whole window.
+
+    Replay a 1,000-request trace through that policy at batch 32 — outputs
+    lognormal, median 103 tokens, p99 992, 160,599 tokens in total — and the
+    whole trace takes 23,723 steps. A step that could carry 32 tokens carries
+    6.77. **Slot occupancy is 21.2%**: four fifths of the cache slots you
+    reserved belonged to sequences that had already stopped generating.
+
+    Continuous batching — iteration-level scheduling, or in-flight batching —
+    makes the step the unit of work. Every step the scheduler asks which
+    sequences are still alive, retires the ones that emitted EOS on the
+    previous step, and refills those slots from the queue. Nothing waits for a
+    group to drain, because there are no groups. The same trace takes 5,818
+    steps at 27.60 tokens per step, 86.3% occupancy, and the makespan falls
+    4.08x.
+
+    ## The speedup is dispersion, not batch size
+
+    This is where most explanations go wrong. The gain is not proportional to
+    the batch size — it is proportional to how unequal the output lengths are.
+    With lengths $L_1,\dots,L_B$ in a group, static costs $\max_i L_i$ steps
+    while an ideal continuous schedule costs $\mathbb{E}[L]$, so
+
+    $$S = \frac{\mathbb{E}[\max_i L_i]}{\mathbb{E}[L]}.$$
+
+    If every request generated exactly 200 tokens then $S = 1$ at every batch
+    size: there is nothing to reclaim, and the replayed speedup on a uniform
+    trace is exactly 1.00. On our trace the expectation of the maximum of 32
+    lognormal draws with $\sigma = 0.9$ is 702.4 against a mean of 160.6,
+    predicting $S = 4.37$; the replay delivers 4.08. The 7% gap is the
+    continuous schedule's own tail, where the queue empties and the last
+    thousand steps run with a thinning batch — 5,818 steps against the 5,019
+    that perfect packing would need.
+
+    The same formula predicts the wrong thing about batch size. Doubling the
+    batch doubles the expected maximum, so the theoretical gain rises with $B$:
+    4.37 at 32, 5.84 at 128. Measured, it falls — 4.08x at 32 and 3.64x at 128 —
+    because the drain tail costs $O(\max L)$ steps whatever the batch width, and
+    that tail is a larger share of a shorter run.
+
+    | batch cap | static steps | continuous steps | speedup | continuous occupancy |
+    |---|---|---|---|---|
+    | 8 | 57,078 | 20,850 | 2.74x | 96.3% |
+    | 16 | 37,431 | 10,834 | 3.45x | 92.6% |
+    | 32 | 23,723 | 5,818 | 4.08x | 86.3% |
+    | 64 | 14,165 | 3,322 | 4.26x | 75.5% |
+    | 128 | 7,572 | 2,079 | 3.64x | 60.4% |
+
+    Read the last two columns against each other. Occupancy *falls* as the batch
+    grows — a wide batch has more slots to leave empty at the tail — while wall
+    time keeps improving. Occupancy is not throughput, and a dashboard that
+    shows only occupancy will tell you to shrink the batch and go slower.
+
+    ## Throughput and latency are separate ledgers
+
+    Total HBM traffic over a replay is the weight reads plus the cache reads:
+    $W \cdot \text{steps} + C \cdot \text{tokens}$, where $W = 14.0$ GB is the
+    7B model's fp16 weights and $C = 363.3$ MB is one 693-token KV cache at
+    512 KiB per token. Bytes per generated token are therefore
+
+    $$\frac{W}{\text{tokens per step}} + C .$$
+
+    Static moves **2.43 GB per token** and continuous **870 MB**, which at
+    3.35 TB/s is **1,378 against 3,848 tokens per second** on one card. The
+    ceiling as tokens per step grows is $C$ alone — 363.3 MB, or **9,221 tokens
+    per second** — and it contains no batch size, no scheduler and no GPU
+    generation. That is the number to attack with grouped-query attention,
+    fp8 caches or shorter contexts, not with scheduling.
+
+    Latency splits the same way. Each live sequence emits one token per step in
+    both schedules, so time per output token is the step time and continuous
+    batching does not change it: 7.65 ms at 32 live sequences and a 693-token
+    context, 18.1 ms at 128. What changes is the wait before a slot exists.
+    Mean admission delay falls from 10,410 steps to 2,236 and p99 from 22,672
+    to 4,913. The published "2-4x at the same latency" is exactly this trade:
+    throughput up, per-token latency held constant, queueing latency down.
+
+    So "throughput-oriented" and "latency-oriented" are two settings of one
+    knob, the running batch. Thirty-two live sequences is 7.65 ms per token per
+    stream and 3,848 tokens per second aggregate; 128 is 18.1 ms and about
+    6,150. You buy aggregate throughput with per-stream speed, and past
+    $W/C \approx 38$ sequences the weight term is already amortised and the
+    exchange rate collapses.
+
+    ## Why the allocator is the other half
+
+    None of this matters if you cannot afford the running set. Reserving the
+    2,048-token maximum costs 1.00 GiB per sequence, so 66.96 GiB of free HBM
+    holds 66 — while the mean request occupies 693.6 tokens, or 0.339 GiB.
+    **66.1% of the pool is dead space**, and the scheduler is asked to keep 32
+    slots full out of a possible 66.
+
+    PagedAttention replaces the reservation with fixed 16-token blocks (8 MiB
+    each) drawn from a pool and indexed by a per-sequence block table. External
+    fragmentation disappears, since any free block fits any logical position.
+    Internal fragmentation remains, bounded by the block: expected waste is
+    $(b-1)/(2\mathbb{E}[L])$, so 1.08% predicted and 1.05% measured at block
+    16. Residency goes from 66 to 194 sequences, 2.94x, for 175 bytes of table
+    each.
+
+    | block size | waste | blocks per 693-token sequence | table bytes |
+    |---|---|---|---|
+    | 8 | 0.49% | 87.1 | 348 |
+    | 16 | 1.05% | 43.8 | 175 |
+    | 32 | 2.15% | 22.1 | 89 |
+    | 64 | 4.39% | 11.3 | 45 |
+
+    The block size is a real trade, but a mild one until the sequences get
+    short. Six 5-token sequences in 16-token blocks waste 68.75%, because the
+    waste is bounded by the block rather than by the allocator: paging does not
+    make short sequences cheap, it makes their cost predictable.
+
+    ## Block tables are indirection, and indirection is shareable
+
+    The table is 4 bytes per entry, so 43.8 entries cost 175 bytes to index
+    0.342 GiB — about two million to one, which is why the indirection is
+    nearly free. It is also why parallel sampling and beam search can point
+    several sequences at the same physical prompt blocks and copy only on
+    write, so $k$ samples cost one prompt plus $k$ continuations. The same
+    mechanism makes preemption possible: evicting a sequence means dropping
+    its table entries, not finding it a contiguous hole later.
+
+    ## What breaks
+
+    Continuous batching does not make a bad workload good. Uniform output
+    lengths gain nothing — 1.00x measured — and pay the scheduler's complexity
+    for free. A single long generation pins a slot for its whole life; at 8,000
+    tokens it also pins 4.0 GiB of cache, which is why production stacks
+    preempt, swap or recompute rather than wait. And prefill, which static
+    batching hid by making the batch wait, must now fit inside a decode step:
+    96.6 ms against 7.65 ms, twelve steps of stall, unless it is chunked.
+    Chunking costs TTFT — five chunks of 473 tokens to hold a 30 ms TBT budget
+    adds 38.25 ms — and a scheduler that always prefers decode will starve
+    prefill entirely under load. These are policy choices, not properties of
+    the algorithm.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    For a decoder the batch is not the unit of work — the step is, because a step costs the same whether one sequence or thirty-two are alive in it, so a scheduler that re-decides the batch every step keeps every cache slot full and amortises the weight traffic over the sequences that are actually still generating.
+
+    ### The analogy, in full
+
+    A shuttle bus versus a shared taxi rank. The bus leaves the depot only when all thirty-two seats are sold, and it completes the whole circuit before it returns — so a passenger whose stop is the first one sits on the bus while the other thirty-one are delivered and the bus comes back. The taxi rank resells each seat the moment it frees: the seat is the unit, not the vehicle. The mapping is exact about the resources. A seat is a KV-cache slot, a passenger's trip length is that request's output length, the bus's circuit is one batch's makespan, and the depot is the waiting queue. The bus is not slow because it is full; it is slow because it is full of people going different distances and it charges every one of them for the longest trip. It breaks in three places. A passenger cannot be split across two taxis — a sequence owns one slot for its entire life, which is why a single 8,000-token generation pins a slot for 8,000 steps and why preempting it costs either a swap to host memory or a recompute. Fares are not additive: the taxi's cost per kilometre is set by the road, not by how many passengers are aboard, so filling seats is nearly free until the memory system saturates. And a taxi can pick up a new passenger mid-route only if the route does not change — which is exactly the prefix constraint that makes cache reuse legal and makes prefill a separate, blocking kind of work.
+
+    ### Failure modes, in full
+
+    - Your dashboard says the GPU is at 100% and the tokens per second is a sixth of the benchmark number for the same model. Nothing is broken: three quarters of the sequences in every batch have already emitted their end-of-sequence token and are still holding a slot, because the batch cannot end until the longest member does.
+    - A user asks a one-line question and waits forty seconds. They are not behind a slow model, they are behind a batch that started two seconds before they arrived and will not return to the queue for another thirty.
+    - You reserve the maximum context length per request because it is simple and it is what the first tutorial did. Support then asks why an 80 GiB card holds 66 users when the KV-cache arithmetic says the same card holds 194 of them at the lengths you actually serve.
+    - You add continuous batching, p99 time-to-first-token improves by 4x, and a handful of users report that the output now arrives in bursts. The average got better and the worst case got worse, which is exactly what happens when prefill is allowed to share a step with decode.
+    - You copy "2-4x throughput at the same latency" into a design review and cannot reproduce it. Your workload generates near-identical output lengths, and on that workload every batching scheduler is the same scheduler.
+
+    ### The mechanisms, in full
+
+    - **Static batching charges every request for the longest one in its group.** Thirty-two requests are admitted together and the group runs until its slowest member finishes, so the batch costs $\max_i L_i$ steps while producing $\sum_i L_i$ tokens. On a 1,000-request trace with lognormal outputs (median 103 tokens, p99 992, 160,599 tokens total) at batch 32, that is **23,723 steps for 6.77 tokens per step — 21.2% slot occupancy**. Four fifths of the reserved slot-steps produced no token. The trap is reading "100% GPU utilisation" as efficiency: the SM is busy, and 25 of the 32 cache slots it is streaming belong to sequences that already stopped.
+    - **Iteration-level scheduling makes the step the unit of work.** Every step the scheduler re-derives the batch: retire sequences that emitted EOS on the previous step, then admit from the queue until the running set is full again. The same trace takes **5,818 steps, 27.60 tokens per step, 86.3% occupancy, and 4.08x fewer steps**. Nothing about the model or the kernel changed; only the question "which sequences are in this step" is asked every step instead of every batch. The trap is calling this "dynamic batching" as if it were a size knob — the size is fixed, the membership is not.
+    - **The speedup is dispersion, not batch size.** With per-batch cost $\max_i L_i$ and ideal continuous cost $\mathbb{E}[L]$, the ratio is $S = \mathbb{E}[\max_i L_i]/\mathbb{E}[L]$, which is exactly 1 when all outputs are the same length, at every batch size. Measured: a uniform trace gives **1.00x** at batch 2 and batch 4; our lognormal trace gives a predicted **4.37x** at batch 32 (expected max of 32 draws is 702.4 against a mean of 160.6) and a realised **4.08x**. The trap is predicting a speedup from batch size alone: a workload with deterministic output lengths gains nothing and should not pay for the scheduler.
+    - **The step-count speedup overstates the wall-clock speedup, because static's late steps are cheap.** A static batch of 32 that is down to 3 live sequences reads 3 KV caches and produces 3 tokens; it is wasteful of admission opportunities, not of bandwidth per token. Weighting each step by the bytes it moves, static costs **27,891 weight-reads against 9,986 — 2.79x, not 4.08x** — and at a 4k context the gap widens to **1.59x** (48,358 against 30,453), because a long context makes each drained cache expensive and therefore makes draining save more. The trap is quoting the step ratio as a throughput ratio.
+    - **Throughput is bytes per generated token, and batching only amortises the weight term.** Total traffic over a replay is $W \cdot \text{steps} + C \cdot \text{tokens}$, so bytes per token are $W/(\text{tokens per step}) + C$. At 693-token mean context ($W = 14.0$ GB, $C = 363.3$ MB) that is **2.43 GB per token for static and 870 MB for continuous: 1,378 against 3,848 tokens per second** on one 80 GiB card at 3.35 TB/s. The ceiling as tokens per step grows is $C$ alone: **363.3 MB, or 9,221 tokens per second**, which no scheduler, batch size or GPU generation changes. The trap is optimizing the scheduler when $C$ — set by KV heads, bytes per element and context length — is the term that dominates.
+    - **Continuous batching does not touch time per output token; it touches the queueing term.** Each living sequence emits exactly one token per step either way, so TPOT is the step time in both schedules. What collapses is the wait before a slot: measured mean admission delay **10,410 steps to 2,236** and p99 **22,672 to 4,913** on the same trace. The trap is promising latency improvements from the wrong term: TPOT is bought with a smaller running batch, TTFT with a shorter queue, and continuous batching only sells the second.
+    - **The latency cost of continuous batching is prefill, which now has to share a step with decode.** A 2,048-token prefill is $2 \cdot 7\text{e}9 \cdot 2048$ FLOPs $= 28.7$ TFLOP, **96.6 ms at 30% MFU**, against a 7.65 ms decode step at 32 live sequences — **12.6 steps of stall** if it is spliced in whole, so TBT spikes to 104 ms. Chunked prefill is the fix, and it is not free either: holding a 30 ms TBT budget allows a 473-token chunk, needs 5 chunks for 2,048 tokens, and adds **38.25 ms to TTFT**. The trap is benchmarking throughput with prefill disabled, which is the only configuration where the scheduler looks perfect.
+    - **PagedAttention is orthogonal to scheduling and multiplies it.** Reserving the 2,048-token maximum costs **1.00 GiB per sequence**, so 66.96 GiB of free HBM holds **66** sequences while the mean request actually uses 693.6 tokens = 0.339 GiB, i.e. **66.1% of the pool is dead space**. Fixed 16-token blocks with a per-sequence table cut that to **1.05%** and fit **194** sequences, **2.94x** more, for a 175-byte table per sequence. The two wins compose rather than overlap: continuous batching needs a deep runnable set to keep slots full, and paging is what makes that set affordable.
+    - **Block size buys waste with indirection, and only short sequences see the bill.** Measured sweep on the same 693.6-token mean: **0.49% waste at 8 tokens, 1.05% at 16, 2.15% at 32, 4.39% at 64**, against 348/175/89/45 bytes of table per sequence. Six 5-token sequences in 16-token blocks waste **68.75%** — internal fragmentation is bounded by the block, not by the allocator, so paging cannot fix a workload whose sequences are shorter than the block. The trap is assuming "paged" means "no waste": it means the waste is bounded and predictable.
+    - **A block table is indirection, and indirection is shareable.** The table is 4 bytes per entry — 43.8 entries for a 693-token sequence, **175 bytes indexing 0.342 GiB**, a ratio of about 2 million to one. Because the mapping is a level of indirection, parallel sampling and beam search can point several sequences at the same physical prompt blocks and copy only on write, so $k$ samples cost one prompt plus $k$ continuations instead of $k$ prompts. The trap is treating the table as bookkeeping overhead rather than as the mechanism that makes prefix sharing and preemption possible.
+  derivations:
+    - title: "Why the speedup is the expected maximum over the expected mean"
+      latex: |
+        Take a group of $B$ requests with output lengths $L_1,\dots,L_B$ drawn
+        i.i.d. from a distribution with mean $\mu$. Static batching charges the
+        group $\max_i L_i$ steps: the group cannot retire until its slowest
+        member does. The tokens produced are $\sum_i L_i$, so the step count per
+        token is
+
+        $$\frac{\mathbb{E}[\max_i L_i]}{\mathbb{E}\left[\sum_i L_i\right]}
+          = \frac{\mathbb{E}[\max_i L_i]}{B\mu}.$$
+
+        A continuous schedule that keeps all $B$ slots busy has step count per
+        token $1/B$, so the ratio of the two makespans is
+
+        $$S = \frac{\mathbb{E}[\max_i L_i]}{\mu}.$$
+
+        Note what is absent: $B$ cancels. For deterministic lengths
+        $\mathbb{E}[\max] = \mu$ and $S = 1$ for every batch size. For the
+        lognormal with $\sigma = 0.9$ used in the replay, $\mu = 160.6$ and
+        $\mathbb{E}[\max_{32}] = 702.4$, giving $S = 4.37$. The measured
+        replay gives $23{,}723/5{,}818 = 4.08$; the difference is the
+        continuous schedule's drain, $5{,}818$ steps against the $5{,}019$ that
+        perfect packing needs.
+
+        The same expression explains the batch sweep. At $B = 128$,
+        $\mathbb{E}[\max] = 937.2$, so $S = 5.84$ in theory while the replay
+        measures 3.64, because the drain tail is $O(\max L)$ steps and is a
+        larger fraction of a shorter run.
+      prose: >-
+        The lesson is that continuous batching converts length variance into
+        throughput. A workload with no variance has nothing to convert, no
+        matter how wide the batch. That is why the first question to ask about
+        a serving workload is not "what batch size" but "what is the
+        distribution of output lengths" — and why a chat product with a long
+        tail of essay-length answers gains far more than a classification
+        endpoint that emits a fixed number of tokens.
+
+    - title: "Internal fragmentation is half a block"
+      latex: |
+        A sequence of length $L$ with block size $b$ occupies
+        $\lceil L/b \rceil$ blocks, so the wasted space in its final block is
+
+        $$p(L) = b\left\lceil \frac{L}{b} \right\rceil - L
+          = (-L) \bmod b .$$
+
+        If $L$ is large and not aligned, the residue is approximately uniform on
+        $\{0,\dots,b-1\}$, so
+
+        $$\mathbb{E}[p] \approx \frac{b-1}{2}, \qquad
+          \text{waste} = \frac{\mathbb{E}[p]}{\mathbb{E}[L] + \mathbb{E}[p]}
+          \approx \frac{b-1}{2\mathbb{E}[L]}.$$
+
+        At $b = 16$ and $\mathbb{E}[L] = 693.6$ this predicts
+        $15/1387.2 = 1.08\%$; the replay measures 1.05%. At $b = 64$ it
+        predicts 4.54% against 4.39% measured, and the small shortfall is the
+        aligned tail of the length distribution, where the residue is zero.
+
+        The formula also predicts when paging fails. With six 5-token sequences
+        at $b = 16$, every sequence wastes 11 of its 16 tokens, so
+        $11/16 = 68.75\%$ — which is what the replay prints.
+      prose: >-
+        Waste from paging is bounded and you can price it before you deploy,
+        which is the property that makes 16-token blocks a safe default: under
+        1.1% at any realistic sequence length, and 68.75% only when the
+        sequences are shorter than a single block. Contiguous reservation has
+        no such bound — its waste is the gap between the maximum context you
+        configured and the length you actually served, which on this trace is
+        66.1%.
+
+    - title: "Bytes per generated token, and the ceiling no scheduler crosses"
+      latex: |
+        One decode step reads the weights once and one cache per live sequence,
+        producing one token per live sequence:
+
+        $$B_{\text{step}} = W + n C, \qquad \text{tokens}_{\text{step}} = n,$$
+
+        where $n$ is the number of live sequences. Traffic per generated token
+        is therefore
+
+        $$\frac{B_{\text{step}}}{\text{tokens}_{\text{step}}}
+          = \frac{W}{n} + C .$$
+
+        With $W = 14.0$ GB and $C = 693 \cdot 512\ \text{KiB} = 363.3$ MB:
+        static averages $n = 6.77$ and so moves $14.0/6.77 + 0.363 = 2.43$ GB
+        per token; continuous averages $n = 27.60$ and moves
+        $0.507 + 0.363 = 870$ MB. Dividing by 3.35 TB/s gives 1,378 and 3,848
+        tokens per second.
+
+        The weight term vanishes as $n$ grows, so the ceiling is
+
+        $$\lim_{n \to \infty} \frac{\text{BW}}{W/n + C} = \frac{\text{BW}}{C}
+          = \frac{3.35 \times 10^{12}}{363.3 \times 10^{6}} = 9{,}221
+          \ \text{tokens/s}.$$
+
+        That ceiling has no batch size, no scheduler and no GPU generation in
+        it. It is $3.35$ TB/s divided by 512 KiB times the context length.
+      prose: >-
+        This is the arithmetic that tells you which lever to pull. Scheduling
+        moves $n$ from 6.8 to 27.6 and buys 2.8x. Paging moves how many
+        sequences fit at all, which is what allows $n$ to reach 27.6 in the
+        first place. But the term that caps everything is $C$, and $C$ is
+        decided in the model architecture — KV head count, bytes per element —
+        and in the product decision about context length. A scheduler is worth
+        about 3x; grouped-query attention at 4 KV heads is worth 4x; together
+        they are worth 12x, which is why every serious stack does both.
+
+  implementations:
+    - language: python
+      title: "Replaying a trace through both schedulers, in steps and in bytes"
+      note: >-
+        Correct, and the only unit of time is one decode step — deliberately,
+        because a step at fixed running batch is memory-bound and therefore
+        near-constant, so step counts are the honest currency for a scheduler
+        comparison. `static` charges each group its maximum; `continuous`
+        retires at the end of a step and admits at the start of the next, so a
+        freed slot produces its first token one step later. `cost` weights each
+        step by the bytes it actually moves, and it is the only reason the
+        4.08x becomes 2.79x: a static group that is down to three live
+        sequences reads three caches, so its late steps are cheap. The
+        admission-delay percentile is the number people quote as "latency" and
+        it is entirely queueing — 10,410 steps of it under static. The final
+        block is the memory accounting, and it assumes the cache is the only
+        thing in HBM besides weights, which is optimistic by the size of the
+        activations and the CUDA context.
+      code: |
+        import numpy as np
+
+        GIB = 2 ** 30
+        BT = 2 * 32 * 32 * 128 * 2      # 512 KiB per token, 7B MHA fp16
+        W = 7e9 * 2                      # 14.0 GB of weights
+        BW = 3.35e12
+        READ_MS = W / BW * 1e3           # 4.18 ms per weight read
+
+
+        def trace(n=1000, seed=7):
+            rng = np.random.default_rng(seed)
+            prompt = rng.integers(16, 2 * 512, size=n)
+            out = np.clip(rng.lognormal(np.log(180) - 0.5, 0.9, n).astype(int), 1, 1024)
+            return prompt, out
+
+
+        def static(out, b):
+            steps, lat = 0, []
+            for i in range(0, len(out), b):
+                chunk = [int(x) for x in out[i:i + b]]
+                L = max(chunk)                    # the whole group waits for this
+                steps += L
+                lat += [steps] * len(chunk)
+            return steps, lat
+
+
+        def continuous(out, b):
+            q = [int(x) for x in out]
+            run, steps, lat = [], 0, []
+            while q or run:
+                while q and len(run) < b:          # refill before the step
+                    run.append(q.pop(0))
+                steps += 1
+                nxt = []
+                for left in run:
+                    if left - 1 > 0:
+                        nxt.append(left - 1)
+                    else:
+                        lat.append(steps)          # retired at end of step
+                run = nxt
+            return steps, lat
+
+
+        def cost(out, b, rho):                     # steps weighted by bytes moved
+            q = [int(x) for x in out]
+            run, c = [], 0.0
+            while q or run:
+                while q and len(run) < b:
+                    run.append(q.pop(0))
+                c += 1.0 + rho * len(run)          # one weight read + one cache each
+                run = [r - 1 for r in run if r - 1 > 0]
+            return c
+
+
+        def cost_static(out, b, rho):
+            c = 0.0
+            for i in range(0, len(out), b):
+                rem = [int(x) for x in out[i:i + b]]
+                live = len(rem)
+                while live:
+                    c += 1.0 + rho * live
+                    rem = [r - 1 for r in rem]
+                    live = sum(1 for r in rem if r > 0)
+            return c
+
+
+        p, o = trace()
+        tok = int(o.sum())
+        ctx = int((p + o).mean())
+        rho = ctx * BT / W                         # cache bytes per sequence, in weights
+        B = 32
+
+        ss, sl = static(o, B)
+        cs, cl = continuous(o, B)
+        print("trace %d requests, %d output tokens, mean context %d" % (len(o), tok, ctx))
+        print("static      %6d steps  %5.2f tok/step  %5.1f%% occupancy"
+              % (ss, tok / ss, 100 * tok / (B * ss)))
+        print("continuous  %6d steps  %5.2f tok/step  %5.1f%% occupancy"
+              % (cs, tok / cs, 100 * tok / (B * cs)))
+        print("speedup %.2fx steps, %.2fx bytes"
+              % (ss / cs, cost_static(o, B, rho) / cost(o, B, rho)))
+        print("tokens/s static %.0f  continuous %.0f"
+              % (tok / (cost_static(o, B, rho) * READ_MS / 1e3),
+                 tok / (cost(o, B, rho) * READ_MS / 1e3)))
+        print("wait p50 %d -> %d  p99 %d -> %d"
+              % (np.percentile([a - b for a, b in zip(sl, o)], 50),
+                 np.percentile([a - b for a, b in zip(cl, o)], 50),
+                 np.percentile([a - b for a, b in zip(sl, o)], 99),
+                 np.percentile([a - b for a, b in zip(cl, o)], 99)))
+
+        # reserve the max context vs page in 16-token blocks
+        print("reserve 2048: %.2f GiB/seq, %d slots; mean used %.1f tokens -> %.1f%% waste"
+              % (2048 * BT / GIB, int((80 * GIB - W) // (2048 * BT)), (p + o).mean(),
+                 100 * (1 - (p + o).mean() / 2048)))
+        for blk in (8, 16, 32, 64):
+            blocks = sum(-(-int(L) // blk) for L in (p + o))
+            print("block %3d: waste %.2f%%  %.1f blocks/seq  %.0f B table/seq"
+                  % (blk, 100 * (1 - (p + o).sum() / (blocks * blk)), blocks / len(o),
+                     4 * blocks / len(o)))
+
+        # trace 1000 requests, 160599 output tokens, mean context 693
+        # static       23723 steps   6.77 tok/step   21.2% occupancy
+        # continuous    5818 steps  27.60 tok/step   86.3% occupancy
+        # speedup 4.08x steps, 2.79x bytes
+        # tokens/s static 1378  continuous 3848
+        # wait p50 10410 -> 2236  p99 22672 -> 4913
+        # reserve 2048: 1.00 GiB/seq, 66 slots; mean used 693.6 tokens -> 66.1% waste
+        # block   8: waste 0.49%  87.1 blocks/seq  348 B table/seq
+        # block  16: waste 1.05%  43.8 blocks/seq  175 B table/seq
+        # block  32: waste 2.15%  22.1 blocks/seq   89 B table/seq
+        # block  64: waste 4.39%  11.3 blocks/seq   45 B table/seq
+
+    - language: python
+      title: "The spreadsheet model that makes static batching look fine"
+      note: >-
+        **Numerically WRONG, in the way this mistake is actually made.** The
+        only change is one line: the group is charged its *mean* output length
+        instead of its *maximum*. That is the natural thing to write when you
+        reason "32 requests, average 160 tokens, so about 160 steps per batch",
+        and it is wrong because a batch cannot retire its fast members. On the
+        reference trace the wrong model reports **5,212 steps against the true
+        23,723 — a 4.55x understatement** — and, worse, it reports static as
+        *faster* than continuous (5,212 against 5,818, i.e. 0.90x), which is the
+        opposite of the truth. Nothing raises, every number is plausible, and
+        the conclusion inverts. The same error appears in reverse in
+        `capacity`: dividing free HBM by the mean cache leaves no room for the
+        maximum, so a pool sized that way overflows the first time a long
+        generation arrives.
+      code: |
+        import numpy as np
+
+        BT = 2 * 32 * 32 * 128 * 2
+        rng = np.random.default_rng(7)
+        prompt = rng.integers(16, 2 * 512, size=1000)          # same stream as the replay
+        o = np.clip(rng.lognormal(np.log(180) - 0.5, 0.9, 1000).astype(int), 1, 1024)
+
+        def static_mean(out, b):
+            # WRONG: a group's lifetime is its longest member, not its average one
+            return sum(int(round(np.mean(out[i:i + b]))) for i in range(0, len(out), b))
+
+        def static_max(out, b):
+            return sum(int(out[i:i + b].max()) for i in range(0, len(out), b))
+
+        def continuous(out, b):
+            q = [int(x) for x in out]
+            run, steps = [], 0
+            while q or run:
+                while q and len(run) < b:
+                    run.append(q.pop(0))
+                steps += 1
+                run = [r - 1 for r in run if r - 1 > 0]
+            return steps
+
+        wrong, right, cont = static_mean(o, 32), static_max(o, 32), continuous(o, 32)
+        print("mean model %d steps, max model %d steps, continuous %d steps"
+              % (wrong, right, cont))
+        print("understatement %.2fx; mean model says static is %.2fx faster than continuous"
+              % (right / wrong, wrong / cont))
+
+        # mean model 5212 steps, max model 23723 steps, continuous 5818 steps
+        # understatement 4.55x; mean model says static is 0.90x faster than continuous
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        The GPU reports 100% utilisation under static batching, so what exactly
+        is being wasted?
+      answerKind: short_text
+      hint: >-
+        Distinguish "the SM is executing instructions" from "the memory
+        requests it issues produce tokens someone asked for".
+      solution: >-
+        Nothing in the arithmetic is idle — the step still reads all 14.0 GB of
+        weights and the kernels still run. What is wasted is slot-steps: 32
+        cache slots are reserved for the group's whole lifetime, but the group
+        only produces $\sum L_i$ tokens over $\max L_i$ steps. On the reference
+        trace that is 6.77 tokens per step out of a possible 32, so 78.8% of
+        the reserved slot-steps produce nothing. In bytes the waste is smaller
+        than that suggests, because a step with fewer live sequences reads fewer
+        caches — which is why the step ratio is 4.08x and the byte-weighted
+        ratio is 2.79x. Utilisation measures the machine; occupancy measures
+        whether the machine was asked to do useful work.
+    - id: cp-2
+      question: >-
+        Two workloads both serve 32 sequences at a time. One generates exactly
+        200 tokens per request, the other generates a lognormal spread with the
+        same mean. Which gains from continuous batching, and by how much?
+      answerKind: short_text
+      hint: >-
+        Write the speedup as a ratio of an expected maximum to an expected mean,
+        then ask what the maximum of 32 identical values is.
+      solution: >-
+        The uniform one gains nothing: $\mathbb{E}[\max] = \mathbb{E}[L] = 200$,
+        so $S = 1$ at every batch size, and the replay confirms exactly 1.00x on
+        a uniform trace. The spread one gains
+        $\mathbb{E}[\max_{32}]/\mathbb{E}[L]$; for a lognormal with
+        $\sigma = 0.9$ that is $702.4/160.6 = 4.37$ in theory and 4.08 measured.
+        The practical consequence is that the scheduler purchase should be
+        justified by the measured output-length distribution, not by a
+        benchmark — and that a workload serving fixed-length completions should
+        spend the same engineering effort on the cache and the kernel instead.
+    - id: cp-3
+      question: >-
+        You quote 4.08x in a design doc and your colleague measures 2.8x on the
+        same trace. Who is wrong?
+      answerKind: short_text
+      hint: >-
+        Ask what a "step" costs when only three of the thirty-two sequences are
+        still alive.
+      solution: >-
+        Both are right, and they are measuring different denominators. 4.08x is
+        the ratio of step *counts*; 2.79x is the ratio of byte-weighted time.
+        Static's late steps are cheap — three live sequences means three cache
+        reads and three tokens, not thirty-two — so a step-count comparison
+        overstates the wall-clock win. The gap widens with context: at 4k the
+        same trace gives 1.59x, because a long context makes each drained cache
+        expensive and therefore makes draining save proportionally more bytes.
+        The right convention is to quote bytes-per-token or measured tokens/s,
+        and to say explicitly when a number is a step ratio.
+    - id: cp-4
+      question: >-
+        Paging cuts cache waste from 66.1% to 1.05%, yet a workload of six
+        5-token requests still wastes 68.75%. Is the allocator broken?
+      answerKind: short_text
+      hint: >-
+        Which kind of fragmentation does a block size bound, and which does it
+        create?
+      solution: >-
+        Not broken — the two numbers measure different things. The 66.1% is
+        over-reservation: 2,048 tokens reserved against 693.6 used, which is
+        external fragmentation plus a bad guess about the future, and paging
+        eliminates it because blocks are allocated on demand and need not be
+        contiguous. The 68.75% is internal fragmentation inside the final block:
+        six sequences of 5 tokens each occupy one 16-token block apiece, so 11
+        of every 16 tokens are padding. That is bounded by the block size, not
+        by the allocator, and the only fixes are a smaller block (waste 0.49% at
+        block 8, at 2x the table bytes) or admitting longer sequences.
+    - id: cp-5
+      question: >-
+        After enabling continuous batching, p99 TTFT improves 4.6x but a few
+        users report the stream stutters. What is the mechanism, and what are
+        the two knobs?
+      answerKind: short_text
+      hint: >-
+        Something that used to happen while nobody was watching now happens
+        inside a step that other people are waiting on.
+      solution: >-
+        Prefill. Under static batching a prompt was prefilled while the previous
+        group drained, so no decode stream was running. Under continuous
+        batching a newly admitted request is prefilled in the same step as
+        everyone else's decode, and a 2,048-token prefill is 28.7 TFLOP —
+        96.6 ms at 30% MFU against a 7.65 ms decode step, so TBT spikes to about
+        104 ms, twelve times normal. The two knobs are the chunk size and the
+        admission policy: chunking to a 473-token budget holds the worst step at
+        30 ms and costs 38.25 ms of extra TTFT over five chunks, and a scheduler
+        that reserves one slot-step in $k$ for prefill bounds the spike without
+        letting prefill starve. Both are latency-for-throughput trades, and both
+        should be set from a TBT SLO rather than left at defaults.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A batch is a promise to keep 32 cache slots occupied. Static batching
+        makes that promise for the duration of the *slowest* member, so every
+        request that finishes early keeps paying rent on a slot it no longer
+        uses. Continuous batching keeps the same promise but re-negotiates it
+        every step: whoever is still alive stays, whoever finished leaves, and
+        whoever is waiting takes the vacancy.
+
+        Two quantities decide whether that matters. How unequal the output
+        lengths are — with equal lengths there is nothing to reclaim — and what
+        one step costs, which is the weights plus one cache per live sequence.
+        The second number is why filling a slot is nearly free once the weights
+        are already being read, and why an empty slot is pure loss.
+      blocks:
+        - kind: checklist
+          body: |
+            - A step reads every weight plus one cache per live sequence
+            - Static charges the group its maximum length, not its mean
+            - The gain is dispersion, not batch size: equal lengths gain nothing
+            - Step-count speedup overstates wall-clock speedup; late steps are cheap
+            - Bytes per token are W / (tokens per step) + C
+            - Reservation wastes the gap to the maximum; paging bounds waste to one block
+      checkpoint: >-
+        Before going on: if a step's cost is dominated by the weight read, and a
+        step already carries one token per live sequence, what does adding a
+        thirty-third sequence to that step cost — and what does leaving a slot
+        empty cost?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Model the scheduler as a loop over steps, not as a formula over batches.
+        That single change of representation makes both policies fall out: the
+        static one is the same loop with the retirement rule replaced by "wait
+        until everyone is done".
+
+        For memory, stop thinking in allocations per request and think in blocks
+        drawn from a pool with an index. Two numbers then describe any policy:
+        how many blocks a sequence occupies at its final length, and how many
+        sequences the pool can hold. Everything else — waste, residency,
+        table cost — is those two divided into each other.
+      blocks:
+        - kind: checklist
+          body: |
+            - Write the step loop first: admit, forward, sample, retire, free
+            - Static = retire only when the whole group is done
+            - Continuous = retire every step, and admit at the start of the next
+            - Weight each step by bytes moved, or you will overstate the win
+            - Blocks: ceil(L / b) per sequence, drawn from one pool
+            - Waste = 1 - used / (blocks x b), and it is bounded by b
+      checkpoint: >-
+        In that loop, a sequence that emits EOS on step $t$ frees its slot for
+        step $t+1$, not $t$. What does a scheduler that admits at the *start* of
+        step $t+1$ do to the makespan of a trace whose lengths are all exactly
+        10 — and does the answer change if the lengths are 10 and 1?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three functions, one unit of time. Steps are the currency; bytes are the
+        correction.
+      blocks:
+        - kind: pseudocode
+          body: |
+            static(lens, B):
+                steps = 0
+                for each consecutive group g of size B:
+                    steps += max(g)          # the group cannot retire early
+                return steps
+
+            continuous(lens, B):
+                queue = lens; run = []
+                steps = 0
+                while queue or run:
+                    while len(run) < B and queue:
+                        run.append(queue.pop(0))     # refill BEFORE the step
+                    steps += 1
+                    run = [r - 1 for r in run if r - 1 > 0]   # retire AFTER
+                return steps
+
+            cost(lens, B, rho):              # rho = cache bytes / weight bytes
+                steps, bytes = continuous_with_live_count(lens, B)
+                return steps + rho * sum(lens)     # weight reads + cache reads
+
+            paged(lens, b, pool_blocks):
+                blocks = sum(ceil(L / b))    # allocated in order, if it fits
+                waste  = 1 - sum(lens) / (blocks * b)
+                return blocks, waste, pool_blocks // mean_blocks_per_seq
+      checkpoint: >-
+        `cost` adds `steps` and `rho * tokens` in different units until you
+        notice what `rho` is: cache bytes divided by weight bytes, so both terms
+        are "weight-read equivalents". What is the byte count per token if you
+        divide the result by the token count — and which term survives as the
+        batch grows?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three expressions cover the topic: the speedup, the waste, and the
+        ceiling.
+      blocks:
+        - kind: math
+          body: |
+            Speedup. Static costs a group $\max_i L_i$ steps and an ideal
+            continuous schedule costs $\mathbb{E}[L]$ per group of the same
+            size, so
+
+            $$S = \frac{\mathbb{E}[\max_i L_i]}{\mathbb{E}[L]},$$
+
+            and $B$ cancels. Deterministic lengths give $S = 1$; a lognormal
+            with $\sigma = 0.9$ gives $\mathbb{E}[\max_{32}] = 702.4$ against
+            $\mu = 160.6$, so $S = 4.37$ predicted and 4.08 measured.
+
+            Waste. A sequence of length $L$ in blocks of $b$ wastes
+            $(-L) \bmod b$ tokens, which is uniform on average, so
+
+            $$\text{waste} \approx \frac{b-1}{2\mathbb{E}[L]}
+              = \frac{15}{1387.2} = 1.08\%,$$
+
+            measured at 1.05% for $b = 16$, and 68.75% for six 5-token
+            sequences where the bound is the block itself.
+
+            Ceiling. One step reads $W + nC$ bytes and produces $n$ tokens, so
+
+            $$\frac{\text{bytes}}{\text{token}} = \frac{W}{n} + C,
+              \qquad \frac{\text{tokens}}{s} \to \frac{\text{BW}}{C}
+              = \frac{3.35\text{e}12}{363.3\text{e}6} = 9{,}221.$$
+      checkpoint: >-
+        The ceiling is 9,221 tokens/s at a 693-token context. Halve the context
+        and the ceiling doubles to 18,442; halve the KV heads and it doubles
+        again. Why does halving the batch size not move it at all?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The scheduler in sixteen lines, the numbers it produces on the reference
+        trace, and the three diagnostics that tell you whether a real deployment
+        matches the model.
+      blocks:
+        - kind: warning
+          body: >-
+            Two measurements are easy to fake and both are common. Benchmarking
+            with prefill disabled makes any scheduler look perfect, because
+            prefill is the only work that cannot be overlapped with itself.
+            Quoting step-count ratios as throughput ratios overstates the win by
+            46% on this trace (4.08x against 2.79x) and by much more at long
+            context. And a "batch size" that exceeds the number of sequences the
+            cache can hold is not a batch size at all — 32 slots at 2,048 tokens
+            apiece is 32 GiB of a 66.96 GiB pool, before activations.
+        - kind: code
+          language: python
+          body: |
+            def schedule(out, b, rho):
+                """Both policies, in steps and in weight-read equivalents."""
+                lens = [int(x) for x in out]
+                tok = sum(lens)
+
+                st, sl, i = 0, [], 0
+                while i < len(lens):
+                    g = lens[i:i + b]
+                    st += max(g)
+                    sl += [st] * len(g)
+                    i += b
+
+                q, run, cs, cl = list(lens), [], 0, []
+                while q or run:
+                    while q and len(run) < b:
+                        run.append(q.pop(0))
+                    cs += 1
+                    nxt = []
+                    for left in run:
+                        if left - 1 > 0:
+                            nxt.append(left - 1)
+                        else:
+                            cl.append(cs)
+                    run = nxt
+
+                return {"tokens": tok,
+                        "static_steps": st, "continuous_steps": cs,
+                        "speedup_steps": st / cs,
+                        "static_occupancy": tok / (b * st),
+                        "continuous_occupancy": tok / (b * cs),
+                        "static_reads": st + rho * tok,
+                        "continuous_reads": cs + rho * tok,
+                        "speedup_bytes": (st + rho * tok) / (cs + rho * tok)}
+        - kind: checklist
+          body: |
+            - 23,723 static steps against 5,818 continuous: 4.08x in steps, 2.79x in bytes
+            - 6.77 tokens per step against 27.60; 21.2% occupancy against 86.3%
+            - 1,378 tokens/s against 3,848 at a 693-token context and 3.35 TB/s
+            - Admission wait p50 10,410 -> 2,236 steps, p99 22,672 -> 4,913
+            - 2,048-token reservation: 1.00 GiB/seq, 66 resident, 66.1% dead
+            - 16-token blocks: 1.05% waste, 194 resident, 175 B of table per sequence
+            - Ceiling 9,221 tokens/s = 3.35 TB/s / 363.3 MB, independent of batch
+      checkpoint: >-
+        `speedup_bytes` and `speedup_steps` differ by the term `rho * tok` in
+        both numerator and denominator. As `rho` goes to zero — a very short
+        context — what does the byte speedup converge to, and why is that the
+        case where the step ratio is finally honest?
+
+  problems:
+    - id: p-batch-replay
+      title: "Replay a trace through both schedulers"
+      difficulty: medium
+      prompt: >-
+        Implement `batch_replay(output_lens, batch_size)` returning a dict with
+        exactly the keys `tokens`, `static_steps`, `continuous_steps`,
+        `speedup`, `static_occupancy` and `continuous_occupancy`.
+
+        Static batching takes consecutive groups of `batch_size` from
+        `output_lens` in order; a group costs `max(group)` steps.
+
+        Continuous batching runs a step loop. At the start of each step, admit
+        from the front of the queue while fewer than `batch_size` sequences are
+        running; then every running sequence emits one token, and any sequence
+        that has now emitted all of its tokens is retired at the end of that
+        step. Step until the queue and the running set are both empty.
+
+        `speedup` is `static_steps / continuous_steps`. Occupancy is
+        `tokens / (batch_size * steps)` for each policy. All lengths are
+        positive integers.
+      starter: |
+        def batch_replay(output_lens, batch_size):
+            # your implementation here
+            pass
+      language: python
+      entry: batch_replay
+      testCases:
+        - input: '[[3, 1, 2], 2]'
+          expected: '{"tokens": 6, "static_steps": 5, "continuous_steps": 3, "speedup": 1.6666666666666667, "static_occupancy": 0.6, "continuous_occupancy": 1.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[5, 5, 5, 5], 2]'
+          expected: '{"tokens": 20, "static_steps": 10, "continuous_steps": 10, "speedup": 1.0, "static_occupancy": 1.0, "continuous_occupancy": 1.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[1, 1, 1, 1, 1, 1], 4]'
+          expected: '{"tokens": 6, "static_steps": 2, "continuous_steps": 2, "speedup": 1.0, "static_occupancy": 0.75, "continuous_occupancy": 0.75}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[8, 1, 1, 1, 1, 1, 1, 1], 4]'
+          expected: '{"tokens": 15, "static_steps": 9, "continuous_steps": 8, "speedup": 1.125, "static_occupancy": 0.4166666666666667, "continuous_occupancy": 0.46875}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[40, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2], 4]'
+          expected: '{"tokens": 62, "static_steps": 44, "continuous_steps": 40, "speedup": 1.1, "static_occupancy": 0.3522727272727273, "continuous_occupancy": 0.3875}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[10, 20, 30, 40, 50, 60], 3]'
+          expected: '{"tokens": 210, "static_steps": 90, "continuous_steps": 90, "speedup": 1.0, "static_occupancy": 0.7777777777777778, "continuous_occupancy": 0.7777777777777778}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def batch_replay(output_lens, batch_size):
+            lens = [int(x) for x in output_lens]
+            tokens = sum(lens)
+
+            static = 0
+            for i in range(0, len(lens), batch_size):
+                static += max(lens[i:i + batch_size])
+
+            queue = list(lens)
+            running = []
+            steps = 0
+            while queue or running:
+                while queue and len(running) < batch_size:
+                    running.append(queue.pop(0))
+                steps += 1
+                running = [r - 1 for r in running if r - 1 > 0]
+
+            return {
+                "tokens": tokens,
+                "static_steps": static,
+                "continuous_steps": steps,
+                "speedup": static / steps,
+                "static_occupancy": tokens / (batch_size * static),
+                "continuous_occupancy": tokens / (batch_size * steps),
+            }
+      solutionExplanation: >-
+        The first case is small enough to check by hand and the one that catches
+        the off-by-one in admission. Static: group [3, 1] costs 3 and group [2]
+        costs 2, so 5 steps for 6 tokens. Continuous: admit 3 and 1, step 1
+        retires the 1, step 2 admits the 2 while the 3 is on its second token,
+        step 3 finishes both — 3 steps, occupancy 1.0. If you get 4 steps you
+        admitted at the end of the step instead of the start, which leaves a
+        slot empty for one step per retirement. The second and third cases are
+        the invariant: equal lengths give speedup exactly 1.0 at any batch size,
+        which is the point of the whole topic. The fourth case is a single long
+        sequence in a batch of short ones and shows why the gain is
+        `E[max]/E[L]` rather than the batch size: 8 against seven 1s gains only
+        1.125x even though the group is 4 wide. The fifth has one 40-token
+        outlier, so the makespan is set by it and the gain is 1.1x. The sixth is
+        the no-free-lunch case: strictly increasing lengths leave the FIFO
+        continuous schedule with nothing to reclaim, and both policies take
+        exactly 90 steps.
+      complexity: "O(n) time and O(n) space"
+      tags: [scheduling, continuous-batching, simulation]
+
+    - id: p-paged-alloc
+      title: "Allocate blocks from a pool and price the waste"
+      difficulty: medium
+      prompt: >-
+        Implement `paged_alloc(lengths, block, capacity_blocks)` simulating a
+        paged KV cache. Process the sequences in order; a sequence of length `L`
+        needs `ceil(L / block)` blocks, and it is admitted only if that many
+        blocks remain in the pool (otherwise it is skipped and the next one is
+        tried). A sequence of length 0 needs 0 blocks and is always admitted.
+
+        Return a dict with exactly the keys `sequences_fit`, `blocks_used`,
+        `tokens_reserved`, `tokens_used`, `waste` and `block_table_bytes`.
+        `tokens_reserved` is `blocks_used * block`; `tokens_used` is the sum of
+        the admitted lengths; `waste` is `1 - tokens_used / tokens_reserved`,
+        and `0.0` when nothing was reserved; `block_table_bytes` is 4 bytes per
+        table entry, with one entry per allocated block.
+      starter: |
+        def paged_alloc(lengths, block, capacity_blocks):
+            # your implementation here
+            pass
+      language: python
+      entry: paged_alloc
+      testCases:
+        - input: '[[5, 5, 5, 5, 5, 5], 16, 6]'
+          expected: '{"sequences_fit": 6, "blocks_used": 6, "tokens_reserved": 96, "tokens_used": 30, "waste": 0.6875, "block_table_bytes": 24}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[16, 17, 1, 31, 32], 16, 100]'
+          expected: '{"sequences_fit": 5, "blocks_used": 8, "tokens_reserved": 128, "tokens_used": 97, "waste": 0.2421875, "block_table_bytes": 32}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[100, 200, 300], 16, 30]'
+          expected: '{"sequences_fit": 2, "blocks_used": 20, "tokens_reserved": 320, "tokens_used": 300, "waste": 0.0625, "block_table_bytes": 80}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[1, 1, 1, 1], 16, 4]'
+          expected: '{"sequences_fit": 4, "blocks_used": 4, "tokens_reserved": 64, "tokens_used": 4, "waste": 0.9375, "block_table_bytes": 16}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[12, 40, 12], 16, 2]'
+          expected: '{"sequences_fit": 2, "blocks_used": 2, "tokens_reserved": 32, "tokens_used": 24, "waste": 0.25, "block_table_bytes": 8}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[64, 64, 64], 64, 2]'
+          expected: '{"sequences_fit": 2, "blocks_used": 2, "tokens_reserved": 128, "tokens_used": 128, "waste": 0.0, "block_table_bytes": 8}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def paged_alloc(lengths, block, capacity_blocks):
+            blocks_used = 0
+            tokens_used = 0
+            fit = 0
+            for L in lengths:
+                L = int(L)
+                need = -(-L // block)
+                if blocks_used + need <= capacity_blocks:
+                    blocks_used += need
+                    tokens_used += L
+                    fit += 1
+            reserved = blocks_used * block
+            return {
+                "sequences_fit": fit,
+                "blocks_used": blocks_used,
+                "tokens_reserved": reserved,
+                "tokens_used": tokens_used,
+                "waste": (1.0 - tokens_used / reserved) if reserved else 0.0,
+                "block_table_bytes": 4 * blocks_used,
+            }
+      solutionExplanation: >-
+        The first case is the pathological one and the reason block size is a
+        real decision: six 5-token sequences each take a whole 16-token block,
+        so 30 of 96 reserved tokens are used and 68.75% is padding. Nothing
+        about that is an allocator bug — it is the block granularity, and it is
+        why short-sequence workloads want 8-token blocks even at twice the table
+        cost. The second case mixes exact multiples with near-misses (16, 17,
+        31, 32) and lands on 8 blocks for 97 tokens: 16 and 17 take one and two
+        blocks, 1 takes one, 31 and 32 take two each. The third shows the pool
+        binding: 100 takes 7 blocks, 200 takes 13 (20 total), and 300 needs 19
+        against 10 remaining, so it is skipped and `sequences_fit` is 2 —
+        capacity is a prefix, not a count. The fourth is the short-sequence
+        extreme: 4 tokens in 64 reserved, 93.75% waste. The fifth is the case
+        that catches a "stop at the first failure" implementation: 12 fits, 40
+        needs 3 blocks and cannot fit in the 1 remaining, but 12 fits again, so
+        the answer is 2 sequences and 2 blocks, not 1. The sixth is exact:
+        64-token sequences in 64-token blocks waste nothing, which is what
+        "bounded by the block" means at the boundary.
+      complexity: "O(n) time, O(1) space beyond the input"
+      tags: [paged-attention, fragmentation, kv-cache, allocator]
+
+    - id: p-chunk-prefill
+      title: "Size a prefill chunk from a TBT budget"
+      difficulty: hard
+      prompt: >-
+        Implement `chunk_size(decode_ms, prefill_ms_per_token, tbt_budget_ms,
+        n_prefill)` returning a dict with exactly the keys `max_chunk`,
+        `chunks`, `ttft_overhead_ms`, `tbt_worst_ms` and `budget_met`.
+
+        Chunked prefill puts one chunk of prompt tokens into each decode step,
+        so the worst step is the decode time plus one chunk's prefill. The
+        largest chunk that fits the budget is
+        `floor((tbt_budget_ms - decode_ms) / prefill_ms_per_token)`, clamped at
+        0 when the room is not positive. `chunks` is `ceil(n_prefill /
+        max_chunk)`, or 0 when `max_chunk` is 0 — in that case no chunking is
+        possible and the whole prefill is spliced into one step, so
+        `ttft_overhead_ms` and `tbt_worst_ms` are both
+        `n_prefill * prefill_ms_per_token`.
+
+        When chunking is possible, `ttft_overhead_ms` is `chunks * decode_ms` —
+        the interleaving delay added before the first token — and
+        `tbt_worst_ms` is `decode_ms + max_chunk * prefill_ms_per_token`.
+        `budget_met` is `True` exactly when `max_chunk > 0`.
+      starter: |
+        import math
+
+        def chunk_size(decode_ms, prefill_ms_per_token, tbt_budget_ms, n_prefill):
+            # your implementation here
+            pass
+      language: python
+      entry: chunk_size
+      testCases:
+        - input: '[7.65, 0.0472, 30.0, 2048]'
+          expected: '{"max_chunk": 473, "chunks": 5, "ttft_overhead_ms": 38.25, "tbt_worst_ms": 29.9756, "budget_met": true}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[7.65, 0.0472, 50.0, 2048]'
+          expected: '{"max_chunk": 897, "chunks": 3, "ttft_overhead_ms": 22.950000000000003, "tbt_worst_ms": 49.9884, "budget_met": true}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[4.0, 0.05, 4.5, 512]'
+          expected: '{"max_chunk": 10, "chunks": 52, "ttft_overhead_ms": 208.0, "tbt_worst_ms": 4.5, "budget_met": true}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[4.0, 0.05, 3.0, 512]'
+          expected: '{"max_chunk": 0, "chunks": 0, "ttft_overhead_ms": 25.6, "tbt_worst_ms": 25.6, "budget_met": false}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[12.5, 0.1, 200.0, 8192]'
+          expected: '{"max_chunk": 1875, "chunks": 5, "ttft_overhead_ms": 62.5, "tbt_worst_ms": 200.0, "budget_met": true}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[2.0, 0.01, 2.5, 100]'
+          expected: '{"max_chunk": 50, "chunks": 2, "ttft_overhead_ms": 4.0, "tbt_worst_ms": 2.5, "budget_met": true}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+
+        def chunk_size(decode_ms, prefill_ms_per_token, tbt_budget_ms, n_prefill):
+            room = tbt_budget_ms - decode_ms
+            max_chunk = max(0, int(math.floor(room / prefill_ms_per_token))) if room > 0 else 0
+            if max_chunk == 0:
+                chunks = 0
+                overhead = float(n_prefill) * prefill_ms_per_token
+                worst = overhead
+            else:
+                chunks = -(-int(n_prefill) // max_chunk)
+                overhead = chunks * decode_ms
+                worst = decode_ms + max_chunk * prefill_ms_per_token
+            return {
+                "max_chunk": max_chunk,
+                "chunks": chunks,
+                "ttft_overhead_ms": overhead,
+                "tbt_worst_ms": worst,
+                "budget_met": bool(max_chunk > 0),
+            }
+      solutionExplanation: >-
+        The first two cases are the same 2,048-token prefill with two different
+        budgets, and they show the whole trade. A 30 ms budget leaves 22.35 ms
+        of room, so the chunk is 473 tokens, five chunks, and 38.25 ms added to
+        TTFT; a 50 ms budget allows 897-token chunks, three of them, and only
+        22.95 ms of added latency — a looser SLO on the token stream buys a
+        faster first token, which is the opposite direction from most
+        intuitions. The third case is the one that should change your mind about
+        small TBT budgets: a 4 ms decode and a 4.5 ms budget leave 0.5 ms of
+        room, so chunks of 10 tokens and 52 of them, and 208 ms of TTFT for a
+        prompt whose prefill is only 25.6 ms — an eightfold latency blowup to
+        protect half a millisecond. The fourth is the infeasible case: the
+        budget is below the decode time, so no chunk fits, `max_chunk` is 0, and
+        the whole prefill lands in one step, 25.6 ms. The fifth is a 200 ms
+        budget on an 8,192-token prompt, where 1,875-token chunks give five
+        chunks and 62.5 ms of overhead. The sixth is the arithmetic edge: a
+        0.5 ms margin divides into exactly 50 tokens, so two chunks of 50 and a
+        worst step of exactly the budget. If your first case returns 474 you
+        used ceil instead of floor on the division and are over budget by one
+        token's prefill.
+      complexity: "O(1) time and space"
+      tags: [prefill, chunking, latency, serving]
+
+  try_it: >-
+    Take 32 requests with output lengths you choose, one of them ten times the median. Compute
+    the token-steps each schedule spends: static batching costs 32 × max(lengths) while
+    continuous costs sum(lengths) whenever the queue never empties. Then make the longest request
+    twenty times the median and watch which of the two numbers moves.
+  interview_questions:
+    - question: "The dashboard shows the GPU at 100% and tokens per second at a sixth of the benchmark. Nothing crashed. What is happening?"
+      level: mid
+      key_points:
+        - "Static batching runs the whole group until its slowest member finishes, so the batch costs max_i L_i steps while producing the sum of the lengths."
+        - "Finished sequences keep their slots until the longest one ends, so the SM is busy while most of the batch is dead work — 100% utilisation is not 100% useful work."
+        - "Iteration-level scheduling re-derives the batch every step: the same trace takes 5,818 steps at 27.60 tokens per step, 86.3% occupancy and 4.08× fewer steps."
+        - "Nothing is broken in the model or the hardware; the scheduler is the component to look at."
+      follow_up: "Why does continuous batching not improve time per output token at all?"
+    - question: "When does continuous batching give you exactly 1.0×, and why?"
+      level: senior
+      key_points:
+        - "The scheduler-level speedup is E[max_i L_i] / E[L] over a batch, which is exactly 1 when every output has the same length, at every batch size."
+        - "Measured on a uniform trace it is 1.00× at batch 2 and batch 4; on a lognormal trace with median 103 and p99 992 it is 4.08×."
+        - "The step-count ratio also overstates wall clock, because static's late steps are cheap — they read only the few surviving KV caches: 2.43 GB per token static against 870 MB continuous."
+        - "So the win is dispersion in output length rather than batch size, and a workload without dispersion should be optimised elsewhere."
+      follow_up: "Your workload has near-identical output lengths. What would you change instead?"
+    - question: "Continuous batching improves p99 time-to-first-token 4×, and some users now say output arrives in bursts. Why?"
+      level: senior
+      key_points:
+        - "Prefill has to share a step with decode; a 2,048-token prefill is 28.7 TFLOP, about 96.6 ms at 30% MFU, against a 7.65 ms decode step — 12.6 steps of stall if spliced in whole."
+        - "The average improves because admission delay collapses: mean 10,410 steps to 2,236, p99 22,672 to 4,913."
+        - "The tail worsens because one whole prefill lands inside a single step, taking time-between-tokens to about 104 ms."
+        - "The fix is prefill chunking, which caps the per-step stall at one chunk at the cost of a little TTFT."
+      follow_up: "What chunk size would you choose for a 7.65 ms decode step, and what does it cost in time to first token?"
+  common_mistakes:
+    - "Reading 100% GPU utilisation as full throughput when three quarters of the batch have already emitted end-of-sequence and still hold slots."
+    - "Reserving the maximum context per request: 1.00 GiB per sequence at 2,048 tokens fits 66 sequences where the actual mean length would allow 194."
+    - "Quoting the step-count speedup as a wall-clock speedup — 4.08× fewer steps is 2.43 GB to 870 MB per token, not 4.08× less time."
+  further_reading:
+    - label: "Yu et al., Orca: A Distributed Serving System for Transformer-Based Generative Models, OSDI 2022"
+    - label: "Kwon et al., Efficient Memory Management for Large Language Model Serving with PagedAttention (vLLM), SOSP 2023"

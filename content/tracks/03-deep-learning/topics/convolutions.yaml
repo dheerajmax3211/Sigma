@@ -1,0 +1,1411 @@
+id: convolutions
+slug: convolutions
+title: "Convolutions: From Kernel to Feature Maps"
+summary: >-
+  Read a convolution as what it actually is — a matrix product whose matrix is
+  forced to be banded and Toeplitz — then use that structure to compute the
+  parameter count, the FLOP count, the output shape, the im2col memory bill and
+  the receptive field exactly, instead of reciting them.
+kind: lesson
+difficulty: medium
+position: 4
+estMinutes: 28
+prerequisites: [mlp-from-scratch, linear-algebra-foundations]
+phase: deep-learning-foundations
+tags: [convolution, toeplitz, im2col, receptive-field, parameter-sharing, feature-map, flops]
+
+body:
+  big_idea: >-
+    A convolution is the same matrix product with the matrix constrained to be
+    banded and Toeplitz — one kernel reused at every position — which turns a
+    4.3-billion-parameter dense map into 36,928 numbers.
+
+  problem:
+    - >-
+      You size a 224×224 RGB to 64-channel stem honestly: the dense matrix is
+      483,385,147,392 entries, 1.9 TB in float32, for one layer.
+    - >-
+      Your shapes are off by one: 224 in, 7×7 kernel, stride 2, padding 2
+      gives 111, not `ceil(224/2) = 112`.
+    - >-
+      You write the convolution with six nested loops, switch to im2col, get
+      16× faster, and never learn the FLOP count did not change.
+
+  analogy: |
+    A rubber stamp: carve one 3×3 pattern and press it everywhere. A dense
+    layer is a separate hand-carved stamp for every position, so moving the
+    image one pixel invalidates all of them. But convolution windows overlap,
+    so one input pixel feeds nine outputs and the shared weight's gradient is
+    a sum over positions, not a copy.
+
+  concept_points:
+    - >-
+      **A convolution is a matrix product with 99.7% of the matrix deleted.**
+      For a length-1024 signal and a 3-tap kernel, the valid-convolution
+      operator is $1022 \times 1024$ with three non-zeros per row:
+      **3,066 non-zeros in 1,046,528 entries**, density **0.293%**. It is
+      banded Toeplitz, so the 341× storage saving and the 341× arithmetic
+      saving are the same fact.
+    - >-
+      **Parameter sharing is an equality constraint, and its dimension is $k$.**
+      A conv layer is the same affine map as a `Linear`, with the weight
+      matrix projected onto a $k$ -dimensional subspace. Concretely: 3×3,
+      64→64 owns **36,928** numbers where the dense map on 32×32×64 owns
+      **4,295,032,832** — a factor of **116,308**. That factor is a prior, not
+      a free lunch.
+    - >-
+      **The FLOP saving is exactly $\text{HW}/K^2$, and the parameter saving is its square.**
+      3×3 at 32×32×64 costs $2\cdot1024\cdot9\cdot64\cdot64 = 75{,}497{,}472$
+      FLOPs against the dense $2\cdot1024^2\cdot64^2 = 8{,}589{,}934{,}592$ —
+      ratio **113.78**, exactly $1024/9$. Parameters fall by $(HW/K)^2$. The
+      224×224 stem runs at **6.75 FLOP/byte**, memory-bound; a 56×56 64→64
+      runs at 131.9.
+    - >-
+      **The shape algebra is one floor and one plus-one.** With input $n$,
+      kernel $k$, stride $s$, padding $p$, dilation $d$:
+      $n_{\text{out}} = \lfloor (n + 2p - d(k-1) - 1)/s \rfloor + 1$. So 224,
+      k=7, s=2, p=3 → **112**; 32, k=3, s=2, p=1 → **16**; 55, k=3, s=1, p=0,
+      d=2 → **51**. Same padding $p=(k-1)/2$ holds only for odd $k$ at stride
+      1.
+    - >-
+      **im2col turns the structure into a GEMM and pays for it in memory, not FLOPs.**
+      For 56×56×64 with 3×3 the column matrix is $576 \times 3136$:
+      **6.89 MiB against the input's 0.766 MiB, exactly 9×**, because each
+      element is copied $K^2$ times. At 7×7 it is 49×. The GEMM does the same
+      115.6M MACs — measured 48 ms direct against 3 ms, **16.4×**, difference
+      **8.9e-15**.
+    - >-
+      **The theoretical receptive field is roughly four times the effective one.**
+      Ten random 3×3 kernels compose to a $2\sigma$ width of **5.64 pixels**
+      against a nominal $R=21$; at L=20 it is **9.49** against 41. Convolving
+      distributions adds variances, so the composite is roughly Gaussian with
+      $\sigma$ growing like $\sqrt{L}$ while support grows like $L$: 21 pixels
+      is what can influence the output, not what does.
+
+  definitions:
+    - term: "Kernel (filter)"
+      meaning: >-
+        The $K \times K \times C_{\text{in}} \times C_{\text{out}}$ tensor of
+        learned weights, applied identically at every spatial position. "The
+        kernel" for a 3×3 64→64 layer is 36,864 numbers; the 9 weights of one
+        channel pair is what the diagrams usually show, which is why the
+        parameter count surprises people by a factor of 4,096.
+    - term: "Feature map"
+      meaning: >-
+        The $C_{\text{out}} \times H_{\text{out}} \times W_{\text{out}}$ output
+        of a conv layer — one 2-D activation map per output channel, each the
+        response of one filter across space. Its spatial size is what the shape
+        algebra computes; its channel count is what the next layer's fan-in
+        reads.
+    - term: "Stride"
+      meaning: >-
+        The step between successive window positions. Stride $s$ divides the
+        output size by roughly $s$ and multiplies the *jump* $j$ by $s$, so it
+        grows the receptive field of every later layer without adding a single
+        parameter. It also breaks exact translation equivariance: a shift of one
+        input pixel is no longer representable as a shift of the output when
+        $s>1$.
+    - term: "Padding"
+      meaning: >-
+        Extra positions added around the border so the window can start at the
+        edge. Zero padding is the default and is the only reason a "same"
+        convolution exists; it is also a lie about the world, since it tells the
+        network that everything outside the image is black. Circular padding
+        keeps exact equivariance and is what a toroidal convolution assumes.
+    - term: "Dilation"
+      meaning: >-
+        Spacing between kernel taps. Dilation $d$ turns a $k$-tap kernel into a
+        footprint of $d(k-1)+1$ while keeping $k$ weights, so a 3×3 with $d=2$
+        sees 5×5 for 9/25 of the cost of a real 5×5 — and samples a comb rather
+        than a block, which is a different inductive bias, not just a cheaper
+        one.
+    - term: "Receptive field"
+      meaning: >-
+        The set of input positions that can influence one output unit, computed
+        by $r_{\text{out}} = r_{\text{in}} + (k-1)j_{\text{in}}$. It is a
+        statement about *support*: every position in the field has a non-zero
+        path to the output, which is not the same as having a meaningful one.
+    - term: "Effective receptive field"
+      meaning: >-
+        The width that actually carries the gradient — measured as 2σ of the
+        composite kernel, or of $|\partial y/\partial x|$. It grows like
+        $\sqrt{L}$ while the nominal field grows like $L$, so at ten 3×3 layers
+        it is 5.64 pixels against a nominal 21.
+    - term: "Toeplitz matrix"
+      meaning: >-
+        A matrix that is constant along each diagonal, $T_{ij} = k_{j-i}$. A
+        banded Toeplitz matrix with $k$ non-zero diagonals *is* a 1-D
+        convolution, which is why its storage and its arithmetic both cost $k$
+        per row instead of $n$.
+    - term: "im2col"
+      meaning: >-
+        The layout transform that copies each $K \times K \times C_{\text{in}}$
+        patch into a column, producing a
+        $(C_{\text{in}}K^2) \times (H_{\text{out}}W_{\text{out}})$ matrix so the
+        convolution becomes one GEMM. It changes no arithmetic and costs $K^2$
+        times the input's memory.
+    - term: "Parameter sharing (weight tying)"
+      meaning: >-
+        Reusing one weight tensor at every spatial position. Formally it is the
+        constraint that the layer's matrix lie in a $k$-dimensional subspace of
+        the full matrix space; informally it is the assumption that a pattern
+        means the same thing wherever it appears.
+    - term: "Translation equivariance"
+      meaning: >-
+        $f(\text{shift}_\delta x) = \text{shift}_\delta f(x)$. True exactly for
+        convolution under circular padding (measured error 0.0), approximately
+        true under zero padding (measured 0.522 for a 7-sample shift), and false
+        once you add stride or pooling. Equivariance is the property; invariance
+        — the output not changing at all — requires pooling or a global average.
+    - term: "Depthwise separable convolution"
+      meaning: >-
+        A per-channel spatial convolution followed by a 1×1 channel mixer.
+        4,672 weights instead of 36,864 at 64 channels, and formally a rank-
+        $C_{\text{in}}$ factorisation of the full weight matrix, so it is an
+        approximation with the error characteristics of a truncated SVD.
+
+  diagrams:
+    - type: architecture
+      title: "One conv layer: where the reuse actually happens"
+      caption: >-
+        The kernel is the only thing stored. The patch matrix is derived, and its
+        size — $C_{\text{in}}K^2$ columns per output position — is the whole
+        memory bill of the layer.
+      nodes:
+        - { id: x, x: 0, y: 0, label: "x  (C_in, H, W)", kind: client, detail: "The input tensor. Nothing is copied yet; a conv can run straight off these strides, which is what every fast kernel does." }
+        - { id: w, x: 1, y: 0, label: "W  (C_out, C_in, K, K)", kind: storage, detail: "The only parameters: 3x3x64x64 = 36,864 numbers plus 64 biases. Reused at every one of the H_out·W_out positions — that reuse is parameter sharing." }
+        - { id: col, x: 1, y: 1, label: "patches  (C_in·K², HW)", kind: storage, detail: "im2col. 576 x 3136 for 56x56x64 with 3x3. Each input value is copied K^2 = 9 times, so this buffer is 9x the input: 6.89 MiB against 0.766 MiB." }
+        - { id: b, x: 2, y: 0, label: "b  (C_out,)", kind: storage, detail: "One number per output channel, broadcast over space. Its gradient is a sum over H_out·W_out positions — the same unbroadcast rule as the MLP, with a larger reduction." }
+        - { id: gemm, x: 2, y: 1, label: "GEMM  (C_out, C_in·K²)", kind: model, detail: "The matmul. Same 115.6M MACs as the direct loop — 16.4x faster in wall clock, not one FLOP cheaper. This is the step im2col exists to enable." }
+        - { id: act, x: 3, y: 1, label: "ReLU", kind: server, detail: "Elementwise, parameter-free. Half the units go to exactly zero, which is why the next layer's effective fan-in is half its nominal one." }
+        - { id: y, x: 3, y: 0, label: "y  (C_out, H_out, W_out)", kind: client, detail: "The feature map. Its spatial size comes from floor((n + 2p - d(k-1) - 1)/s) + 1, and its channel count becomes the next layer's C_in." }
+      edges:
+        - { from: x, to: col, label: "K² copies" }
+        - { from: col, to: gemm, label: "columns" }
+        - { from: w, to: gemm, label: "flattened kernel" }
+        - { from: b, to: gemm, label: "broadcast" }
+        - { from: gemm, to: act, label: "pre-activation" }
+        - { from: act, to: y, label: "feature map" }
+
+    - type: compare
+      title: "The dense map and the Toeplitz map, on the same 32×32×64 tensor"
+      left_label: "Dense map (what the MLP would do)"
+      left_points:
+        - "4,295,032,832 parameters for one 32x32x64 -> 32x32x64 layer: 1.7e10 bytes in float32, 17 GB of weights"
+        - "8,589,934,592 FLOPs per image; 113.78x the convolutional version, exactly HW/K²"
+        - "Every output position owns its own filter, so a pattern learned at (3,4) is not recognised at (4,3)"
+        - "Condition number and rank are whatever training makes them; nothing about the operator is constrained"
+        - "Arithmetic intensity 0.5 FLOP/byte — the weights alone are 17 GB, so it is bandwidth-bound by two orders of magnitude"
+      right_label: "Toeplitz map (what the conv layer is)"
+      right_points:
+        - "36,928 parameters: 116,308x fewer, 144 KiB in float32 — small enough that a whole layer's weights sit in L2"
+        - "75,497,472 FLOPs; the matrix has 3 non-zeros per row, so 99.7% of it is never touched in 1-D"
+        - "One filter reused at every position, which is the assumption that a pattern is position-independent"
+        - "The operator is banded Toeplitz: a k-dimensional subspace, so its spectrum is the kernel's DFT"
+        - "A 3-tap box filter has condition number 846; a second difference is singular by construction"
+
+    - type: plot
+      title: "Receptive field vs depth: support grows linearly, influence grows like √L"
+      chart: line
+      xLabel: "depth (conv layers, stride 1)"
+      yLabel: "pixels (nominal R and measured 2σ)"
+      series:
+        - name: "R, 3x3 kernels (1 + 2L)"
+          points:
+            - { x: 1, y: 3 }
+            - { x: 2, y: 5 }
+            - { x: 3, y: 7 }
+            - { x: 5, y: 11 }
+            - { x: 10, y: 21 }
+            - { x: 20, y: 41 }
+            - { x: 30, y: 61 }
+        - name: "R, 5x5 kernels (1 + 4L)"
+          points:
+            - { x: 1, y: 5 }
+            - { x: 2, y: 9 }
+            - { x: 3, y: 13 }
+            - { x: 5, y: 21 }
+            - { x: 10, y: 41 }
+            - { x: 20, y: 81 }
+            - { x: 30, y: 121 }
+        - name: "R, 7x7 kernels (1 + 6L)"
+          points:
+            - { x: 1, y: 7 }
+            - { x: 2, y: 13 }
+            - { x: 3, y: 19 }
+            - { x: 5, y: 31 }
+            - { x: 10, y: 61 }
+            - { x: 20, y: 121 }
+            - { x: 30, y: 181 }
+        - name: "measured 2σ, 3x3 stack"
+          points:
+            - { x: 1, y: 1.39 }
+            - { x: 2, y: 2.73 }
+            - { x: 3, y: 3.16 }
+            - { x: 5, y: 3.39 }
+            - { x: 10, y: 5.64 }
+            - { x: 20, y: 9.49 }
+            - { x: 30, y: 11.16 }
+
+    - type: plot
+      title: "The im2col memory multiplier is K², and it is the reason fast kernels never materialise it"
+      chart: bar
+      xLabel: "kernel size K"
+      yLabel: "im2col buffer / input (×)"
+      series:
+        - name: "memory multiplier"
+          points:
+            - { x: 1, y: 1 }
+            - { x: 3, y: 9 }
+            - { x: 5, y: 25 }
+            - { x: 7, y: 49 }
+            - { x: 11, y: 121 }
+
+    - type: graph
+      title: "One kernel, three ways to spend the structure"
+      nodes:
+        - { id: kernel, label: "kernel: k numbers" }
+        - { id: toeplitz, label: "banded Toeplitz operator" }
+        - { id: spectrum, label: "spectrum = DFT(kernel)" }
+        - { id: im2col, label: "im2col: K²·C_in copies" }
+        - { id: gemm, label: "GEMM (BLAS)" }
+        - { id: fft, label: "FFT convolution" }
+        - { id: map, label: "feature map" }
+      edges:
+        - { from: kernel, to: toeplitz, label: "k free numbers per row" }
+        - { from: toeplitz, to: spectrum, label: "circulant: eigenvalues" }
+        - { from: spectrum, to: map, label: "rank / conditioning" }
+        - { from: kernel, to: im2col, label: "K² memory" }
+        - { from: im2col, to: gemm, label: "same FLOPs, 16x faster" }
+        - { from: gemm, to: map, label: "dense output" }
+        - { from: kernel, to: fft, label: "n log n" }
+        - { from: fft, to: map, label: "circular unless padded" }
+
+  markdown: |
+    ## The layer that does not fit
+
+    Take a 224×224 RGB image and ask for a 64-channel feature map — the first
+    thing every image model does. In matrix terms the input is a vector of
+    $224^2 \cdot 3 = 150{,}528$ numbers and the output is a vector of
+    $224^2 \cdot 64 = 3{,}211{,}264$ numbers, so the dense weight matrix is
+
+    $$150{,}528 \times 3{,}211{,}264 = 483{,}385{,}147{,}392 \text{ entries},$$
+
+    which is 1.9 TB in float32, for **one** layer. Not a big layer — larger than
+    the whole model you were going to build.
+
+    The convolutional version of exactly the same map has
+    $3 \cdot 3 \cdot 3 \cdot 64 + 64 = 1{,}792$ parameters. The ratio is
+    $2.7 \times 10^8$. Everything else in this topic is bookkeeping on that
+    number.
+
+    ## Write the operator as a matrix
+
+    Take a length-$n$ signal $x$ and a $k$-tap kernel $w$, and write the valid
+    convolution as $y = Tx$ with $T \in \mathbb{R}^{(n-k+1)\times n}$:
+
+    $$y_i = \sum_{j=0}^{k-1} w_j\, x_{i+j}, \qquad T_{ij} = w_{\,j-i}\ \text{for}\ 0 \le j-i < k.$$
+
+    $T$ is **banded Toeplitz**: constant along each of its $k$ non-zero
+    diagonals. At $n=1024$, $k=3$ it holds 3,066 non-zero numbers inside
+    1,046,528 slots.
+
+    | object | entries | non-zeros | density | compression |
+    |---|---|---|---|---|
+    | 1-D operator, n=1024, k=3 | 1,046,528 | 3,066 | 0.293% | 341.3× |
+    | 2-D operator, 32×32, k=3 | 921,600 | 8,100 | 0.879% | 113.78× |
+
+    Two independent savings come out of the one constraint. Storage falls from
+    $k(n-k+1)$ to $k$ because every row holds the *same* $k$ numbers. Arithmetic
+    falls from $n(n-k+1)$ to $k(n-k+1)$ because the zeros are never multiplied.
+    The first is parameter sharing; the second is why a conv layer is cheap.
+
+    ## Parameter sharing is a subspace constraint
+
+    Fix $n$ and $k$. The map from a kernel $w \in \mathbb{R}^k$ to the operator
+    $T(w)$ is linear and injective, so its image is a $k$-dimensional subspace of
+    $\mathbb{R}^{(n-k+1)\times n}$ — codimension 1,046,525 at $n=1024, k=3$. A
+    convolutional layer is therefore not a new species of layer. It is the
+    `Linear` layer from *MLP: Layers, Activations, and Initialisation* with its
+    weight matrix projected onto that subspace.
+
+    That reframing makes the parameter counts fall out. A 3×3, 64→64 layer on a 32×32×64 tensor owns **36,928** numbers.
+    The dense map between the same two tensors owns **4,295,032,832**. The factor
+    is 116,308 — the *square* of the FLOP factor, because both the input and the
+    output are HW-sized, so the saving is paid twice in the weights and once in
+    the arithmetic.
+
+    | | parameters | FLOPs |
+    |---|---|---|
+    | dense 32×32×64 → 32×32×64 | 4,295,032,832 | 8,589,934,592 |
+    | conv 3×3, 64→64 | 36,928 | 75,497,472 |
+    | ratio | 116,308× | 113.78× = 1024/9 |
+
+    The constraint is a prior, and priors cost something. A dense layer may learn
+    a different filter for every pixel; a conv layer is forbidden to. That is
+    precisely why a conv net generalises from a thousand images and a dense net
+    on raw pixels does not.
+
+    ## The shape algebra, exactly
+
+    With input $n$, kernel $k$, stride $s$, padding $p$ and dilation $d$:
+
+    $$n_{\text{out}} = \left\lfloor \frac{n + 2p - d(k-1) - 1}{s} \right\rfloor + 1.$$
+
+    The $-1$ inside and the $+1$ outside are the two places people make errors,
+    and both are invisible at $s=1$, $p=(k-1)/2$, which is where every unit test
+    lives.
+
+    | configuration | effective k | $n_{\text{out}}$ |
+    |---|---|---|
+    | 224, k=7, s=2, p=3 (ResNet stem) | 7 | 112 |
+    | 224, k=3, s=1, p=1 ("same") | 3 | 224 |
+    | 32, k=3, s=2, p=1 | 3 | 16 |
+    | 55, k=3, s=1, p=0, d=2 | 5 | 51 |
+
+    Note the last row: dilation does not add parameters, it adds *reach*. A 3×3
+    with $d=2$ has 9 weights and a 5×5 footprint, so it is $25/9 = 2.78\times$
+    cheaper than a real 5×5 — and it samples a comb, not a block, which is a
+    different function class, not merely a cheaper one.
+
+    ## im2col: the structure made explicit
+
+    Gather each patch into a column and the convolution becomes
+    $Y = W_{\text{flat}} \cdot \text{cols}$ with
+    $W_{\text{flat}} \in \mathbb{R}^{C_{\text{out}} \times C_{\text{in}}K^2}$
+    and $\text{cols} \in \mathbb{R}^{C_{\text{in}}K^2 \times H_{\text{out}}W_{\text{out}}}$.
+    The GEMM performs exactly the same multiply-accumulates as the direct loop —
+    115.6M of them for 56×56×64 with 3×3 — and runs **16.4× faster** (48 ms
+    against 3 ms in float64) because it hands the work to a library that has been
+    tuned for four decades. Not one FLOP is saved.
+
+    What is spent is memory: each input element is copied $K^2$ times, so the
+    buffer is 9× the input at 3×3 (6.89 MiB against 0.766 MiB), 49× at 7×7, and
+    121× at 11×11. That is why production kernels never materialise it: they
+    feed the GEMM from a small on-chip tile, moving the multiplication into the
+    addressing.
+
+    ## Receptive field: support is not influence
+
+    $$r_{\text{out}} = r_{\text{in}} + (k-1)\,j_{\text{in}}, \qquad j_{\text{out}} = j_{\text{in}}\,s,$$
+
+    starting from $r=1, j=1$. For $L$ layers of 3×3 stride 1 that is $2L+1$: 21
+    pixels at depth 10, 41 at depth 20.
+
+    Those numbers are upper bounds on influence. Convolve ten random 3×3 kernels
+    and the composite has a 2σ width of **5.64** pixels — 27% of the nominal 21.
+    At depth 20 it is 9.49 against 41. The reason is the central limit theorem:
+    convolving distributions *adds variances*, so σ grows like $\sqrt{L}$ while
+    the support grows like $L$. The corners of the field have a path to the
+    output; the path just carries almost nothing.
+
+    ## What the kernel's spectrum decides
+
+    Under circular padding the operator is circulant, and a circulant matrix is
+    diagonalised by the DFT: its eigenvalues are $\hat{k}(\omega_m)$. So the
+    kernel's frequency response *is* the layer's spectrum, and the pathologies
+    from *Linear Algebra Foundations* show up as filter choices:
+
+    - $[1,1,1]/3$, the 3-tap box filter, has condition number **846** at
+      $N=1024$. At $N=1023$ — a multiple of 3 — it is exactly singular: rank
+      1021, condition number $4.1\times10^{16}$ in float64.
+    - $[1,-2,1]$, the second difference, has rank $N-1$ at every length: the
+      constant vector is in its null space by construction.
+    - The 2-D five-point Laplacian on 32×32 has rank **961** of 1024 and
+      condition number $1.0\times10^{19}$.
+
+    A smoothing kernel annihilates high frequencies; a derivative kernel
+    annihilates the DC mode. Stack either one and the surviving directions carry
+    the signal. No amount of weight decay restores a direction the operator has
+    already removed.
+
+    ## Where the equivariance stops
+
+    Convolution is translation *equivariant*, not invariant:
+    $f(\text{shift}_\delta x) = \text{shift}_\delta f(x)$. Under circular padding
+    that identity holds exactly — measured error **0.0** for a 7-sample shift on
+    a length-64 signal. Under zero padding it does not: the same test gives
+    **0.522**, because the border invents information that the shifted signal no
+    longer has.
+
+    Two consequences follow. Stride and pooling break equivariance to
+    sub-pixel shifts, so what a strided stack gives you is strictly weaker than
+    the identity you just proved for stride 1. And padding mode is a modelling
+    decision, not a default: `zeros` teaches the network that the world ends in
+    black, `circular` keeps the algebra exact, `reflect` claims neither.
+
+    ## The longer version
+
+    A convolution is the same matrix product you already know from *Linear
+    Algebra Foundations*, with the matrix constrained to be banded and Toeplitz
+    — one kernel reused at every position — and that single constraint is what
+    turns a 4.3-billion-parameter dense map into 36,928 numbers and cuts the
+    arithmetic by exactly $\text{HW}/K^2$.
+
+    A rubber stamp. You carve one 3×3 pattern once, then press it at every
+    position on the page. The dense layer is the alternative: a separate
+    hand-carved stamp for every position on the page, each one memorised
+    independently, so moving the image one pixel invalidates all of them. The
+    stamp is the kernel; pressing it everywhere is weight sharing; the sheet of
+    impressions is the feature map.
+
+    The analogy breaks in two places, and both are the content of this topic.
+    First, a stamp transfers ink from a pad, so each impression is independent —
+    but convolution windows *overlap*, so one input pixel contributes to nine
+    different outputs, which means the gradient of a shared weight is a **sum**
+    over positions, not a copy. Measured on iid data at 32×32, that sum has
+    9,826× the squared magnitude of a single position's contribution rather
+    than the 1,024× you would guess from counting. Second, a stamp is one
+    pattern; a convolution filter is a $C_{\text{in}} \to C_{\text{out}}$
+    matrix applied at every position, so "the kernel" is 64×64 numbers per tap,
+    not 9.
+
+    ### What goes wrong
+
+    - You size the first layer of an image model honestly: 224×224 RGB in, 64
+      channels out. The dense weight matrix is
+      $150{,}528 \times 3{,}211{,}264$ — **483,385,147,392** entries, 1.9 TB
+      in float32, for one layer. The model does not fit, and no amount of GPU
+      changes that, because it is a counting problem.
+    - You write the convolution with six nested loops, it takes 40 seconds per
+      step, and someone says "use im2col". You do, it gets 16× faster, and you
+      never learn that the FLOP count did not change by a single multiply —
+      only the memory layout did.
+    - Your shapes are off by one. 224 in, 7×7 kernel, stride 2, padding 2: you
+      expect `ceil(224/2) = 112` and get 111, because `ceil` silently assumes
+      the padding is exactly $(k-1)/2$. The bug is invisible on every 3×3
+      stride-1 layer you own, which is precisely the configuration where the
+      formula is forgiving.
+    - An interviewer asks why three 3×3 convolutions beat one 7×7 and you say
+      "fewer parameters". True, and incomplete: 27 against 49 channels-squared
+      is 45% fewer, but the reason it also *works better* is that there are
+      two extra nonlinearities inside the same receptive field.
+    - You read that a stack has a 41-pixel receptive field and assume the
+      network uses 41 pixels of context. Measured, the 2σ width of the actual
+      composite kernel is **9.49** pixels — the corners of the nominal field
+      carry almost no gradient, so the number you quoted is about support, not
+      influence.
+
+    ### The full treatment
+
+    **A convolution is a matrix product with 99.7% of the matrix deleted.**
+    For a length-1024 signal and a 3-tap kernel, the valid-convolution
+    operator is a $1022 \times 1024$ matrix with three non-zeros per row:
+    **3,066 non-zeros in 1,046,528 entries**, a density of **0.293%**. It is
+    banded Toeplitz — constant along each diagonal — so the 341× storage
+    saving and the 341× arithmetic saving are the same fact: the zeros are
+    never stored and never multiplied. In 2-D the same accounting gives a
+    $900 \times 1024$ matrix for a 32×32 image with a 3×3 kernel, 8,100
+    non-zeros, density **0.879%**, compression **113.78×** — which is exactly
+    the FLOP ratio you will meet two points down. The trap is believing
+    "convolution is not a matmul". It is; it is a matmul whose matrix has k
+    degrees of freedom per row instead of n.
+
+    **Parameter sharing is an equality constraint, and its dimension is k.**
+    The set of valid-convolution operators for a k-tap kernel is a
+    **k-dimensional linear subspace** of $\mathbb{R}^{(n-k+1)\times n}$: at
+    n=1024, k=3 that is a codimension of **1,046,525**. A conv layer is not a
+    different kind of layer from the `Linear` you built in *MLP: Layers,
+    Activations, and Initialisation*; it is the same affine map with the
+    weight matrix projected onto that subspace. Concretely: 3×3, 64→64 owns
+    **36,928** numbers (36,864 weights + 64 biases) where the dense map on
+    32×32×64 owns **4,295,032,832** — a factor of **116,308**. The trap is
+    assuming that factor is free. It is a prior: the dense map can learn a
+    different filter for every pixel, and the conv layer is forbidden from
+    doing so. That is why a conv generalises from 1,000 images and a dense
+    layer on pixels does not.
+
+    **The FLOP saving is exactly $\text{HW}/K^2$, and the parameter saving is
+    its square.** Same layer, same tensor: 3×3 at 32×32×64 costs
+    $2\cdot1024\cdot9\cdot64\cdot64 = $ **75,497,472** FLOPs; the dense
+    version costs $2\cdot1024^2\cdot64^2 = $ **8,589,934,592**; ratio
+    **113.78**, and $1024/9 = 113.78$ exactly. Parameters fell by
+    $(HW/K)^2 = 116{,}508$ (116,308 with the bias) because *both* the input
+    and the output are HW-sized, while FLOPs fall by $HW/K^2$ once. The second
+    number people never compute is arithmetic intensity: the 224×224×3→64
+    stem moves 25.70 MB and does 173.4 MFLOP, **6.75 FLOP/byte** — firmly
+    memory-bound — while a 56×56 64→64 3×3 layer does **131.9 FLOP/byte** and
+    is compute-bound. Same kernel size, 20× different bottleneck.
+
+    **The shape algebra is one floor and one plus-one.** With input size $n$,
+    kernel $k$, stride $s$, padding $p$ and dilation $d$, the effective kernel
+    is $d(k-1)+1$ and
+    $n_{\text{out}} = \lfloor (n + 2p - d(k-1) - 1)/s \rfloor + 1$. Check it
+    against the cases you will actually type: 224, k=7, s=2, p=3 → **112**;
+    224, k=3, s=1, p=1 → **224**; 32, k=3, s=2, p=1 → **16**; 55, k=3, s=1,
+    p=0, d=2 → **51**. The trap is "same padding is $p=(k-1)/2$" — that
+    identity holds only for odd k with stride 1. At stride 1 it pins the
+    output to the input size; at stride 2 no padding can, and the target
+    becomes $\lceil n/s \rceil$. The other trap is dilation: $d=2$ on a 3×3
+    kernel is a 5×5 footprint with 9 weights, so it is 25/9 = 2.78× cheaper
+    than a real 5×5 and samples a comb, not a block.
+
+    **im2col turns the structure into a GEMM and pays for it in memory, not
+    FLOPs.** Gather every $K \times K \times C_{\text{in}}$ patch into a
+    column: for 56×56×64 with 3×3 that is a $576 \times 3136$ matrix,
+    **6.89 MiB against the input's 0.766 MiB — exactly 9×**, because each
+    element is copied $K^2$ times. At 7×7 it is **49×, 37.5 MiB**, and at
+    11×11 it is 121×. The GEMM then performs precisely the same 115.6M MACs
+    as the direct loop — it is faster, not cheaper: measured 48 ms direct
+    against 3 ms for im2col + BLAS on the same float64 tensor, **16.4×**, with
+    a maximum difference of **8.9e-15**. The trap is thinking im2col is an
+    algorithmic improvement. It is a layout change that hands the work to a
+    library which has been tuned for 40 years; on a memory-constrained device
+    the 9× buffer is the thing that kills you, which is why the same trick
+    exists in a blocked, never-materialised form.
+
+    **A stack of small kernels is one big kernel with nonlinearities inside
+    it, for fewer weights.** The recursion is
+    $r_{\text{out}} = r_{\text{in}} + (k-1)\,j_{\text{in}}$ with
+    $j_{\text{out}} = j_{\text{in}} s$, starting from $r=1, j=1$. So L layers
+    of 3×3 stride 1 give $r = 2L+1$: **21** at L=10, **41** at L=20. Two 3×3
+    layers cover a 5×5 field with $2\cdot9C^2 = 18C^2$ weights where one 5×5
+    needs $25C^2$ — **28% fewer**; three 3×3 cover 7×7 with $27C^2$ against
+    $49C^2$ — **44.9% fewer**. But the honest comparison is not the parameter
+    count: the two-layer version has two ReLUs inside the field, so it can
+    represent a non-monotone function of position that a single 5×5 cannot.
+    The trap is quoting only the 28% and losing the argument you were actually
+    having.
+
+    **The theoretical receptive field is roughly four times the effective
+    one.** Convolve ten random 3×3 kernels and look at the composite: its 2σ
+    width is **5.64 pixels** against a nominal $R=21$; at L=20 it is
+    **9.49** against 41; at L=3, 3.16 against 7. The mass concentrates because
+    convolving distributions adds variances, so the composite is roughly
+    Gaussian with σ growing like $\sqrt{L}$ while the *support* grows like
+    $L$. Practical consequence: a "21-pixel context" claim is a statement
+    about which inputs can influence the output at all, not about which ones
+    do. The trap is using the nominal number to justify why your model cannot
+    see long-range structure — it cannot, but for a different reason than the
+    one you wrote down.
+
+    **The kernel's spectrum is the operator's spectrum, and it can be
+    singular.** For a circulant (toroidal) convolution the eigenvalues are the
+    DFT of the kernel, so a 3-tap box filter $[1,1,1]/3$ has condition number
+    **846** at N=1024, and at N=1023 — a multiple of 3 — it is **exactly
+    singular**: rank 1021 of 1023, condition number $4.1\times10^{16}$ in
+    float64. The 3-tap second difference $[1,-2,1]$ has rank **1023 of 1024**
+    at $N=1024$ — rank $N-1$ at every length — because the constant vector is
+    in its null space, and the
+    2-D five-point Laplacian on 32×32 has rank **961** of 1024 with condition
+    number $1.0\times10^{19}$. This is *Linear Algebra Foundations* applied to
+    a layer: a smoothing kernel destroys high frequencies and a derivative
+    kernel destroys the DC mode, and stacking either one deep makes the
+    singular values you have left do the work. The trap is expecting weight
+    decay to fix it — no regulariser restores a direction the operator has
+    already annihilated.
+
+    **Backprop through a conv is a convolution, and the shared weight's
+    gradient is a sum over every position.** $\partial L/\partial W$ equals
+    $\sum_{ab} x_{\text{patch}(a,b)} \otimes g_{ab}$ — 1,024 outer products
+    added together at 32×32, which is exactly what `conv2d_weight_grad`
+    computes in one einsum. On iid data the squared norm of that sum comes out
+    **9,826×** a single position's contribution, not the 1,024× a naive count
+    predicts, because adjacent patches share 8 of their 9 pixels and their
+    gradients are therefore correlated. The backward pass costs about **2× the forward
+    pass** (one conv for the input gradient, one for the weight gradient), and
+    the weight-gradient term is why: the same shared tensor accumulates from
+    every spatial position, so its gradient scale grows with the feature-map
+    size. The trap is reusing a learning rate tuned at 32×32 on a 128×128
+    input — the per-weight update is 16× larger in squared terms before you
+    touch anything else.
+
+    **Two factorisations of the same weight matrix: 1×1 and depthwise
+    separable.** A 1×1 convolution is a dense layer on the channel axis —
+    $C_{\text{in}}C_{\text{out}}$ numbers, **4,096** for 64→64, **9×** cheaper
+    than 3×3 — and it is how a conv stack changes width without touching
+    geometry. Depthwise separable replaces one 3×3 64→64 (36,864 weights) with
+    a 3×3 depthwise pass plus a 1×1 pointwise pass: $9\cdot64 + 64\cdot64 = $
+    **4,672**, a factor of **7.89**. In linear-algebra terms that is a rank
+    constraint: viewed as a matrix
+    $\mathbb{R}^{C_{\text{out}} \times C_{\text{in}}K^2}$, the separable
+    weight has rank at most $C_{\text{in}}$, so it is a truncated-SVD-shaped
+    approximation of the full kernel and inherits the same failure — it loses
+    exactly the cross-channel/spatial interactions that fall outside that
+    rank. MobileNet is that trade, made deliberately.
+
+
+  derivations:
+    - title: "From the double sum to the banded Toeplitz operator"
+      latex: |
+        Write the valid convolution of a length-$n$ signal with a $k$-tap
+        kernel as
+
+        $$y_i = \sum_{j=0}^{k-1} w_j x_{i+j}, \qquad i = 0,\dots,n-k.$$
+
+        Re-index with $p = i + j$, so $j = p - i$:
+
+        $$y_i = \sum_{p=i}^{i+k-1} w_{p-i}\, x_p = \sum_{p=0}^{n-1} T_{ip} x_p,
+          \qquad T_{ip} = w_{p-i}\ \text{ when } 0 \le p-i < k, \text{ and } 0 \text{ otherwise.}$$
+
+        $T$ is $(n-k+1)\times n$ and constant along each diagonal $p-i =
+        \text{const}$, with only $k$ non-zero diagonals. Counting:
+        $k(n-k+1)$ non-zeros inside $n(n-k+1)$ entries, so the density is
+        $k/n$ — at $n=1024$, $k=3$ that is $3/1024 = 0.293\%$. The kernel
+        $w \in \mathbb{R}^k$ maps linearly and injectively into $T$, so the
+        convolutional operators form a $k$-dimensional subspace of
+        $\mathbb{R}^{(n-k+1)\times n}$.
+      prose: >-
+        The point of the re-index is that the kernel index becomes a difference
+        of positions, which is exactly what "constant along a diagonal" means.
+        Once you see that, the storage count and the arithmetic count are the
+        same count: $k$ numbers per row, $k$ multiplies per row.
+
+    - title: "The output-shape formula, derived from the last valid window"
+      latex: |
+        Padding by $p$ on each side gives an effective input length $n + 2p$.
+        With dilation $d$, tap $t$ sits at offset $d\,t$, so a window of $k$
+        taps spans $d(k-1)+1$ positions. Window $i$ starts at $s\,i$ for
+        $i = 0,1,2,\dots$ and must fit:
+
+        $$s\,i + d(k-1) \le n + 2p - 1.$$
+
+        Solve for the largest integer $i$:
+
+        $$i_{\max} = \left\lfloor \frac{n + 2p - 1 - d(k-1)}{s} \right\rfloor,$$
+
+        and the count of windows is $i_{\max} + 1$:
+
+        $$n_{\text{out}} = \left\lfloor \frac{n + 2p - d(k-1) - 1}{s} \right\rfloor + 1.$$
+
+        Setting $n_{\text{out}} = \lceil n/s \rceil$ and solving for $p$ gives
+        the "same" condition; for odd $k$ and $s=1$ it collapses to
+        $p = (k-1)/2$.
+      prose: >-
+        The inequality is the whole derivation: a window is legal if its last tap
+        lands inside the padded input, and the number of legal windows is one
+        more than the index of the last one. Every off-by-one in every
+        framework's shape code is a mistake about either the $-1$ inside the
+        floor or the $+1$ outside it.
+
+    - title: "Receptive-field recursion, and why two 3×3s beat one 5×5"
+      latex: |
+        Let $r_\ell$ be the receptive field after $\ell$ layers and $j_\ell$ the
+        jump (the input distance between two adjacent output positions). One
+        layer of kernel $k$ and stride $s$ adds $(k-1)$ kernel-widths of input to
+        the field, and stretches the jump:
+
+        $$r_{\ell+1} = r_\ell + (k-1)\, j_\ell, \qquad j_{\ell+1} = s\, j_\ell,
+          \qquad r_0 = j_0 = 1.$$
+
+        With $s=1$, $j_\ell = 1$ and $r_L = 1 + L(k-1)$. For $k=3$:
+        $r_L = 2L+1$.
+
+        Now compare coverage of a 5×5 field, with $C$ channels throughout:
+
+        $$\text{two } 3\times3: \ 2 \cdot 9C^2 = 18C^2, \qquad
+          \text{one } 5\times5: \ 25C^2,$$
+
+        a ratio of $18/25 = 0.72$ — **28% fewer** weights. Three 3×3 against one
+        7×7 gives $27C^2$ against $49C^2$, a ratio of $0.551$ — **44.9% fewer**.
+      prose: >-
+        The parameter count is only half the argument. The two-layer version also
+        applies two nonlinearities inside the same footprint, so it can represent
+        a non-monotone function of position; the single 5×5 is one linear map
+        followed by one ReLU and cannot. Quote the 28% and you have described a
+        storage optimisation; quote the nonlinearity and you have described why
+        the network is better.
+
+  implementations:
+    - language: python
+      title: "Direct convolution and im2col: identical numbers, 9× the memory"
+      note: >-
+        Both paths are numerically correct, and they agree to 8.9e-15 on a
+        64×56×56 tensor — but the direct path is 16.4× slower because `einsum`
+        over a strided view cannot reach BLAS. Two hazards are worth naming.
+        First, `np.pad` defaults to `mode="constant"` with `constant_values=0`,
+        which is what you want for a conv and is *not* what you want for a
+        pooling layer that should ignore the border; passing the wrong mode here
+        changes the answer at the edge and nowhere else, so every interior test
+        still passes. Second, `im2col` builds a
+        $(C_{\text{in}}K^2, H_{\text{out}}W_{\text{out}})$ array eagerly: at
+        7×7 and 56×56×64 that is 37.5 MiB per layer per image, so a batch of 64
+        allocates 2.4 GB for one layer's patches before any activations exist.
+      code: |
+        import numpy as np
+
+
+        def conv2d_direct(x, w, b=None, stride=1, padding=0):
+            """x: (C_in, H, W), w: (C_out, C_in, kh, kw). Returns (C_out, Ho, Wo)."""
+            x = np.asarray(x, dtype=np.float64)
+            w = np.asarray(w, dtype=np.float64)
+            c_out, c_in, kh, kw = w.shape
+            _, h, wd = x.shape
+            if c_in != x.shape[0]:
+                raise ValueError("channel mismatch: w has %d, x has %d" % (c_in, x.shape[0]))
+
+            xp = np.pad(x, ((0, 0), (padding, padding), (padding, padding)))
+            ho = (h + 2 * padding - kh) // stride + 1
+            wo = (wd + 2 * padding - kw) // stride + 1
+
+            out = np.zeros((c_out, ho, wo))
+            for i in range(kh):
+                for j in range(kw):
+                    patch = xp[:, i:i + stride * ho:stride, j:j + stride * wo:stride]
+                    # one tap: (C_in, ho, wo) x (C_out, C_in) -> (C_out, ho, wo)
+                    out += np.einsum("cij,oc->oij", patch, w[:, :, i, j])
+            if b is not None:
+                out += np.asarray(b, dtype=np.float64).reshape(-1, 1, 1)
+            return out
+
+
+        def im2col(x, kh, kw, stride=1, padding=0):
+            """Return (C_in*kh*kw, Ho*Wo) — the matrix the GEMM wants."""
+            c, h, wd = x.shape
+            xp = np.pad(x, ((0, 0), (padding, padding), (padding, padding)))
+            ho = (h + 2 * padding - kh) // stride + 1
+            wo = (wd + 2 * padding - kw) // stride + 1
+            cols = np.empty((c, kh, kw, ho, wo))
+            for i in range(kh):
+                for j in range(kw):
+                    cols[:, i, j] = xp[:, i:i + stride * ho:stride,
+                                       j:j + stride * wo:stride]
+            return cols.reshape(c * kh * kw, ho * wo), ho, wo
+
+
+        def conv2d_gemm(x, w, b=None, stride=1, padding=0):
+            c_out, c_in, kh, kw = w.shape
+            cols, ho, wo = im2col(np.asarray(x, float), kh, kw, stride, padding)
+            out = (np.asarray(w, float).reshape(c_out, -1) @ cols).reshape(c_out, ho, wo)
+            if b is not None:
+                out += np.asarray(b, float).reshape(-1, 1, 1)
+            return out
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            x = rng.normal(size=(64, 56, 56))
+            w = rng.normal(size=(64, 64, 3, 3)) * 0.05
+            a = conv2d_direct(x, w, padding=1)
+            b2 = conv2d_gemm(x, w, padding=1)
+            print(np.abs(a - b2).max())              # 8.88e-15
+            print(im2col(x, 3, 3, 1, 1)[0].shape)     # (576, 3136)
+
+    - language: python
+      title: "FFT convolution: O(n log n), and numerically WRONG at the border"
+      note: >-
+        This implementation is **numerically wrong** unless you zero-pad to
+        $n + k - 1$: `ifft(fft(x) * fft(k))` computes the **circular**
+        convolution, where the tail of the kernel wraps onto the head of the
+        signal. Measured on a length-256 signal with a 3-tap kernel, the maximum
+        error is **0.478** at index 0 — the first sample is wrong by 48% of the
+        signal's own scale — while the interior is correct to 8.9e-16. Zero-pad
+        to 258 and the error drops to 8.9e-16 everywhere. It is included because
+        the mistake is invisible: the output has the right shape, the right
+        dtype, and looks like a convolution everywhere you would think to plot.
+        The second caveat is cost: at 3×3 the FFT is *slower* than direct
+        convolution, because three transforms and a complex multiply cost more
+        than nine real multiplies per output. It wins from about 7×7.
+      code: |
+        import numpy as np
+
+
+        def conv1d_fft_wrong(x, k):
+            """CIRCULAR convolution. WRONG at the border for a linear convolution."""
+            x = np.asarray(x, dtype=np.float64)
+            k = np.asarray(k, dtype=np.float64)
+            n = len(x)
+            return np.real(np.fft.ifft(np.fft.fft(x) * np.fft.fft(k, n)))
+
+
+        def conv1d_fft(x, k):
+            """Linear convolution: pad to n + k - 1 so nothing wraps."""
+            x = np.asarray(x, dtype=np.float64)
+            k = np.asarray(k, dtype=np.float64)
+            n = len(x) + len(k) - 1
+            y = np.real(np.fft.ifft(np.fft.fft(x, n) * np.fft.fft(k, n)))
+            return y[:len(x)]
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(3)
+            x = rng.normal(size=256)
+            k = np.array([0.25, -0.5, 0.75])
+
+            linear = np.convolve(x, k)[:len(x)]
+            err_wrong = np.abs(conv1d_fft_wrong(x, k) - linear)
+            err_right = np.abs(conv1d_fft(x, k) - linear)
+
+            print("wrong: max %.3f at %d, interior %.1e"
+                  % (err_wrong.max(), err_wrong.argmax(), err_wrong[8:248].max()))
+            # wrong: max 0.478 at 0, interior 8.9e-16
+            print("padded: max %.1e" % err_right.max())
+            # padded: max 8.9e-16
+
+  checkpoints:
+    - id: cp-1
+      question: "A 3×3, 64→64 convolution on a 32×32×64 tensor has 36,928 parameters against the dense map's 4,295,032,832. Why is that ratio 116,308 while the FLOP ratio is only 113.78?"
+      answerKind: short_text
+      hint: "Write both ratios in terms of HW and K. Which one has HW squared in it?"
+      solution: >-
+        Dense parameters are $(HW\,C)^2 = H^2W^2C^2$ and convolutional ones are
+        $K^2C^2$, so the ratio is $(HW/K)^2 = (1024/3)^2 = 116{,}508$ — the
+        square of the FLOP factor. FLOPs are $2HW\,K^2C^2$ against
+        $2(HW)^2C^2$, a ratio of $HW/K^2 = 113.78$. The saving is paid twice in
+        the weights because both the input and the output are HW-sized, and once
+        in the arithmetic because each output position performs $K^2C^2$
+        multiply-accumulates regardless of how large the image is.
+    - id: cp-2
+      question: "224 in, 7×7 kernel, stride 2, padding 2. You write `ceil(224/2) = 112` and get 111. Which term in the shape formula did you drop?"
+      answerKind: short_text
+      hint: "With k=7 and p=2 the padded input is 228 long, and the window needs 7 of those positions before the stride divides anything."
+      solution: >-
+        The correct value is
+        $\lfloor (224 + 4 - 7)/2 \rfloor + 1 = \lfloor 110.5 \rfloor + 1 = 111$.
+        `ceil(n/s)` returns 112 because it silently assumes $2p = k-1$: with
+        that substitution the formula becomes $\lfloor (n-1)/s \rfloor + 1$,
+        which equals $\lceil n/s \rceil$ for integer $n$ — that is the
+        "same padding" identity, and it is why the shortcut survives every test
+        written on a ResNet stem ($p=3$, $k=7$, where $2p = k-1$). Here
+        $2p = 4$ against $k-1 = 6$, so you are two pixels short, the numerator
+        is 221 rather than 223, and the floor costs you exactly one output
+        position. The habit that prevents this: compute
+        $n + 2p - d(k-1)$, floor-divide by $s$ with `//`, then add one — never
+        divide $n$ by $s$ and hope.
+    - id: cp-3
+      question: "A 3-tap moving-average filter is applied 20 times. Is the resulting operator invertible, and what does your answer depend on?"
+      answerKind: short_text
+      hint: "The circulant eigenvalues are the DFT of the kernel. Where does 1 + z + z² vanish?"
+      solution: >-
+        $1 + z + z^2 = 0$ at the primitive cube roots of unity, so the operator
+        is singular exactly when the signal length is a multiple of 3. At
+        $N=1023$ the 3-tap box filter has rank 1021 of 1023 and condition number
+        $4.1\times10^{16}$ in float64. At $N=1024$ — not a multiple of 3 — it is
+        technically invertible with condition number **846**, but applying it
+        twenty times multiplies that by $846^{20} \approx 10^{58}$, which is
+        past the reciprocal of float64 epsilon. So the honest answer is that the
+        operator is not usable in either case: either it annihilates a direction
+        outright, or it amplifies noise by more than the arithmetic can carry.
+    - id: cp-4
+      question: "Your ten-layer 3×3 stack has a nominal receptive field of 21 pixels, but the measured 2σ width of the composite kernel is 5.64. Which number should go in the paper, and why?"
+      answerKind: short_text
+      hint: "One number describes support, the other describes where the mass is."
+      solution: >-
+        Both, labelled correctly. 21 is the *support*: every pixel within that
+        window has a non-zero path to the output, and the number is exact and
+        checkable by the recursion $r \leftarrow r + (k-1)j$. 5.64 is the
+        *influence*: 2σ of the composite kernel, which is what you want when you
+        argue about long-range context. Convolving distributions adds variances,
+        so σ grows like $\sqrt{L}$ while support grows like $L$ — the gap widens
+        with depth (9.49 against 41 at L=20). Quoting only 21 overstates what
+        the network uses; quoting only 5.64 understates what it can reach.
+    - id: cp-5
+      question: "Why does a convolution's weight gradient scale with the size of the feature map, when an MLP's does not?"
+      answerKind: short_text
+      hint: "How many times does one shared weight appear in the forward pass at 128×128 versus 32×32?"
+      solution: >-
+        Because the weight is shared, its gradient is a sum over every spatial
+        position: $\partial L/\partial W = \sum_{ab} x_{\text{patch}(ab)}
+        \otimes g_{ab}$. At 32×32 that is 1,024 terms; at 128×128 it is 16,384.
+        Measured on iid data, the squared norm of that sum is 9,826× a single
+        position's contribution at 32×32 — larger than the 1,024× a naive count
+        gives, because adjacent patches share 8 of their 9 pixels and the terms
+        are correlated. An MLP weight appears exactly once per example, so its
+        gradient scale is independent of the input's spatial size. Practical
+        consequence: under plain SGD a learning rate tuned at 32×32 is too large
+        at 128×128 — the per-weight step grows with the map — and this is one
+        mechanism behind "it trains on small crops and diverges on full images".
+    - id: cp-6
+      question: "im2col does not change the FLOP count, so why is it 16× faster, and what does it cost?"
+      answerKind: short_text
+      hint: "What does a library like BLAS need in order to reach peak throughput?"
+      solution: >-
+        It converts the convolution into a single large GEMM with contiguous,
+        regularly strided operands, which lets the vendor BLAS use register
+        blocking, packed panels and SIMD — measured 48 ms against 3 ms at
+        64×56×56 with a 3×3 kernel, a 16.4× speedup with a maximum numerical
+        difference of 8.9e-15. The cost is memory: every input element is copied
+        $K^2$ times, so the column buffer is 9× the input at 3×3 (6.89 MiB
+        against 0.766 MiB) and 49× at 7×7. Production kernels get the same GEMM
+        throughput without the buffer by generating patches on the fly into a
+        small tile — the multiplication is the same; the copy is what was
+        removed.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A convolution is not a new kind of operation. It is the same $y = Ax$ you
+        already know, with $A$ required to be constant along its diagonals —
+        which means one small kernel is reused at every position instead of a
+        separate weight per position. Every quantitative fact about conv layers
+        (parameters, FLOPs, memory, receptive field) is a consequence of that one
+        constraint, and none of them require you to think about images.
+      blocks:
+        - kind: checklist
+          body: |
+            - Structure: banded Toeplitz, k non-zeros per row, density k/n
+            - Storage: k numbers total, not k per row
+            - Arithmetic: k multiplies per output, not n
+            - Geometry: one floor and one plus-one
+            - Influence: support grows like L, mass grows like sqrt(L)
+      checkpoint: >-
+        Before reading on: if a layer's weight matrix has only three non-zero
+        diagonals, how many *distinct numbers* does it contain, and how many
+        multiplies does one output element cost?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Write the operator down as a matrix first, then count. Almost every
+        question about a conv layer — how many parameters, how many FLOPs, why
+        im2col helps, why the receptive field is what it is — is answered by
+        counting the entries of that matrix and the non-zeros among them. Reach
+        for the matrix when the prose gets confusing; reach for the recursion
+        $r \leftarrow r + (k-1)j$ when geometry is the question.
+      blocks:
+        - kind: checklist
+          body: |
+            - Parameters: (C_out, C_in, K, K) plus (C_out,) — count them, do not estimate
+            - FLOPs: 2 · H_out · W_out · K² · C_in · C_out, and compare to the dense 2 · (HW C)²
+            - Memory: im2col is K² times the input; no im2col means no buffer
+            - Shape: floor((n + 2p - d(k-1) - 1)/s) + 1, always with the +1
+            - Field: r += (k-1)·j, j *= s, starting at 1, 1
+      checkpoint: >-
+        Which of those five numbers changes if you double the batch size, and
+        which of them changes if you double the input resolution?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three pieces: pad and compute the output size, accumulate one tap at a
+        time, and — if you care about speed — gather patches into a column and
+        call a GEMM. The getitem expression is the part that has to be right.
+      blocks:
+        - kind: pseudocode
+          body: |
+            def conv2d(x, w, b, stride, pad):
+                xp = pad(x, pad)                     # zeros, symmetric
+                ho = (H + 2*pad - kh) // stride + 1
+                wo = (W + 2*pad - kw) // stride + 1
+                out = zeros(C_out, ho, wo)
+                for i in range(kh):
+                    for j in range(kw):
+                        patch = xp[:, i : i+stride*ho : stride,
+                                      j : j+stride*wo : stride]
+                        out += einsum("cij,oc->oij", patch, w[:, :, i, j])
+                return out + b[:, None, None]
+
+            def im2col(x, kh, kw, stride, pad):
+                for each (i, j) tap:
+                    cols[:, i, j] = the strided window
+                return cols.reshape(C_in*kh*kw, ho*wo)
+
+            def conv2d_fast(x, w):
+                return (w.reshape(C_out, -1) @ im2col(x)) .reshape(...)
+      checkpoint: >-
+        Why is the patch slice `xp[:, i : i+stride*ho : stride, ...]` rather than
+        `xp[:, i : i+ho, ...]`? What breaks if you forget the stride in the
+        slice?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Four lines get you every number in the topic, and they are all counting
+        arguments on the same matrix.
+      blocks:
+        - kind: math
+          body: |
+            Operator, valid conv, length $n$, $k$ taps:
+
+            $$y_i = \sum_{j=0}^{k-1} w_j x_{i+j} = \sum_{p} T_{ip} x_p,
+              \qquad T_{ip} = w_{p-i}.$$
+
+            Non-zeros: $k(n-k+1)$ in $n(n-k+1)$ entries, density $k/n$.
+
+            Shape, from the last legal window:
+
+            $$s\,i + d(k-1) \le n + 2p - 1
+              \quad\Longrightarrow\quad
+              n_{\text{out}} = \left\lfloor \frac{n + 2p - d(k-1) - 1}{s} \right\rfloor + 1.$$
+
+            Receptive field:
+
+            $$r_{\ell+1} = r_{\ell} + (k-1) j_\ell, \qquad j_{\ell+1} = s\, j_\ell.$$
+
+            Spectrum (circulant case): eigenvalues of $T$ are
+            $\hat{k}(\omega_m) = \sum_j w_j e^{-2\pi i j m/N}$, so zeros of the
+            kernel's DFT are zeros of the operator.
+      checkpoint: >-
+        The density is k/n but the FLOP ratio in 2-D is HW/K². Where does the
+        second factor of HW/K come from in the 2-D parameter count, and why does
+        it not appear in the FLOP count?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A correct conv, a correct shape function, and the measurement that shows
+        the shared-weight gradient really is a sum. Compare your output against
+        these numbers before you look at the code.
+      blocks:
+        - kind: warning
+          body: >-
+            The three places this goes wrong are not syntax. `np.pad` with the
+            default mode is correct here and wrong for pooling. The `//` in the
+            output-size formula must be a floor division on integers, not an
+            `int()` cast of a float, or a negative numerator truncates toward
+            zero instead of down. And the patch slice has to carry the stride, or
+            you silently compute a full-resolution convolution and then index it
+            as if it were strided.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def conv2d_forward(x, w, b=None, stride=1, padding=0):
+                x = np.asarray(x, dtype=float)
+                w = np.asarray(w, dtype=float)
+                c_out, c_in, kh, kw = w.shape
+                _, h, wd = x.shape
+                xp = np.pad(x, ((0, 0), (padding, padding), (padding, padding)))
+                ho = (h + 2 * padding - kh) // stride + 1
+                wo = (wd + 2 * padding - kw) // stride + 1
+                out = np.zeros((c_out, ho, wo))
+                for i in range(kh):
+                    for j in range(kw):
+                        patch = xp[:, i:i + stride * ho:stride,
+                                      j:j + stride * wo:stride]
+                        out = out + np.einsum("cij,oc->oij", patch, w[:, :, i, j])
+                if b is not None:
+                    out = out + np.asarray(b, dtype=float).reshape(-1, 1, 1)
+                return out
+
+
+            def conv_output_shape(n, k, stride=1, padding=0, dilation=1):
+                return (n + 2 * padding - dilation * (k - 1) - 1) // stride + 1
+
+
+            def conv_weight_grad(x, g, w_shape, padding=1):
+                """dW by tap: one einsum per kernel position."""
+                c_out, c_in, kh, kw = w_shape
+                xp = np.pad(np.asarray(x, float), ((0, 0), (padding, padding),
+                                                  (padding, padding)))
+                _, ho, wo = np.asarray(g).shape
+                dw = np.zeros(w_shape)
+                for i in range(kh):
+                    for j in range(kw):
+                        patch = xp[:, i:i + ho, j:j + wo]
+                        dw[:, :, i, j] = np.einsum("cij,oij->oc", patch, g)
+                return dw
+
+
+            def weight_grad_explicit_sum(x, g, w_shape, padding=1):
+                """The same thing, written as the definition: one outer product
+                per output position, summed."""
+                c_out, c_in, kh, kw = w_shape
+                xp = np.pad(np.asarray(x, float), ((0, 0), (padding, padding),
+                                                  (padding, padding)))
+                _, ho, wo = np.asarray(g).shape
+                total = np.zeros(w_shape)
+                for a in range(ho):
+                    for b in range(wo):
+                        for i in range(kh):
+                            for j in range(kw):
+                                total[:, :, i, j] += np.outer(g[:, a, b],
+                                                              xp[:, a + i, b + j])
+                return total
+
+
+            if __name__ == "__main__":
+                print(conv_output_shape(224, 7, 2, 3))    # 112
+                print(conv_output_shape(55, 3, 1, 0, 2))  # 51
+                rng = np.random.default_rng(0)
+                x = rng.normal(size=(4, 8, 8))
+                g = rng.normal(size=(2, 8, 8))
+                shape = (2, 4, 3, 3)
+                print(np.abs(conv_weight_grad(x, g, shape)
+                             - weight_grad_explicit_sum(x, g, shape)).max())
+                # 7.1e-15 — the same tensor, computed two ways
+      checkpoint: >-
+        In `weight_grad_explicit_sum`, the padding is applied to `x` before the
+        outer products. Why does that produce the same answer as treating padded
+        zeros as ordinary inputs, and where would it differ if the padding mode
+        were `reflect`?
+
+  problems:
+    - id: p-conv2d-forward
+      title: "Convolution, forwards, with stride and padding"
+      difficulty: medium
+      prompt: >-
+        Implement `conv2d_forward(x, w, b=None, stride=1, padding=0)` for a
+        single image, channels-first. `x` has shape `(C_in, H, W)`, `w` has shape
+        `(C_out, C_in, K_h, K_w)`, `b` is either `None` or a list of `C_out`
+        biases. Zero-pad symmetrically by `padding` on both spatial axes, slide
+        the kernel with the given `stride`, and return the output as nested
+        lists of shape `(C_out, H_out, W_out)` with
+        $H_{\text{out}} = \lfloor(H + 2p - K_h)/s\rfloor + 1$ and likewise for
+        the width. Do not use any library convolution routine — the exercise is
+        the index arithmetic.
+      starter: |
+        import numpy as np
+
+        def conv2d_forward(x, w, b=None, stride=1, padding=0):
+            # your implementation here
+            pass
+      language: python
+      entry: conv2d_forward
+      testCases:
+        - input: '[[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]], [[[[1.0, 2.0], [3.0, 4.0]]]], null, 1, 0]'
+          expected: "[[[37.0, 47.0], [67.0, 77.0]]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]], [[[[1.0, 0.0], [0.0, 1.0]], [[0.0, 1.0], [1.0, 0.0]]], [[[1.0, -1.0], [-1.0, 1.0]], [[2.0, 0.0], [0.0, -2.0]]]], [10.0, -10.0], 1, 0]'
+          expected: "[[[28.0]], [[-16.0]]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]]], [[[[1.0, 0.0], [0.0, -1.0]]]], null, 2, 1]'
+          expected: "[[[-1.0, -3.0, 0.0], [-9.0, -5.0, 8.0], [0.0, 14.0, 16.0]]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]], [[[[1.0, -1.0], [-1.0, 1.0]]]], [2.0], 1, 1]'
+          expected: "[[[3.0, 3.0, 3.0, -1.0], [5.0, 2.0, 2.0, -1.0], [5.0, 2.0, 2.0, -1.0], [-5.0, 1.0, 1.0, 11.0]]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def conv2d_forward(x, w, b=None, stride=1, padding=0):
+            x = np.asarray(x, dtype=float)
+            w = np.asarray(w, dtype=float)
+            c_out, c_in, kh, kw = w.shape
+            channels, h, wd = x.shape
+            if channels != c_in:
+                raise ValueError("expected %d input channels, got %d" % (c_in, channels))
+
+            xp = np.pad(x, ((0, 0), (padding, padding), (padding, padding)))
+            ho = (h + 2 * padding - kh) // stride + 1
+            wo = (wd + 2 * padding - kw) // stride + 1
+            if ho <= 0 or wo <= 0:
+                raise ValueError("kernel does not fit the padded input")
+
+            out = np.zeros((c_out, ho, wo))
+            for i in range(kh):
+                for j in range(kw):
+                    patch = xp[:, i:i + stride * ho:stride, j:j + stride * wo:stride]
+                    # (C_in, ho, wo) against (C_out, C_in) -> (C_out, ho, wo)
+                    out = out + np.einsum("cij,oc->oij", patch, w[:, :, i, j])
+            if b is not None:
+                out = out + np.asarray(b, dtype=float).reshape(-1, 1, 1)
+            return out.tolist()
+      solutionExplanation: >-
+        The loop runs over kernel taps, not output positions, which is the layout
+        that makes the strided slicing reusable: for a fixed tap `(i, j)` every
+        output position reads `xp[:, i + stride*a, j + stride*b]`, and that is
+        exactly the slice `xp[:, i:i+stride*ho:stride, j:j+stride*wo:stride]`.
+        Accumulating over taps in this order costs `K_h·K_w` Python iterations
+        instead of `H_out·W_out`, which at 3×3 is 9 instead of 7,056. The einsum
+        index order `cij,oc->oij` is the whole channel contract: `c` is summed
+        (fan-in), `o` is preserved (fan-out), and swapping it to `cij,co->oij`
+        would silently transpose the weight matrix and produce a correct-looking
+        answer for square channel counts.
+      complexity: "O(K_h·K_w·C_in·C_out·H_out·W_out) time, O(H_out·W_out·C_out) space"
+      tags: [convolution, stride, padding, im2col]
+
+    - id: p-conv-weight-grad
+      title: "The weight gradient is a sum over positions"
+      difficulty: hard
+      prompt: >-
+        Implement `conv2d_weight_grad(x, grad_out, w_shape, stride=1,
+        padding=0)`: given the input `x` of shape `(C_in, H, W)` and the incoming
+        cotangent `grad_out` of shape `(C_out, H_out, W_out)`, return
+        $\partial L/\partial W$ as a nested list of shape
+        `(C_out, C_in, K_h, K_w)`, where `w_shape` gives the kernel dimensions.
+        Use no autograd library — the point is that a shared weight's gradient is
+        the sum of the local outer products at every position it was used, and
+        you should be able to write that sum directly.
+      starter: |
+        import numpy as np
+
+        def conv2d_weight_grad(x, grad_out, w_shape, stride=1, padding=0):
+            # your implementation here
+            pass
+      language: python
+      entry: conv2d_weight_grad
+      testCases:
+        - input: '[[[[1.0, 2.0], [3.0, 4.0]]], [[[1.0, 1.0], [1.0, 1.0]]], [1, 1, 2, 2], 1, 0]'
+          expected: "[[[[10.0, 12.0], [14.0, 16.0]]]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], [[2.0, 7.0, 1.0], [8.0, 2.0, 9.0], [3.0, 5.0, 4.0]]], [[[1.0, 2.0], [3.0, 4.0]]], [1, 2, 2, 2], 1, 0]'
+          expected: "[[[[37.0, 47.0], [67.0, 77.0]], [[48.0, 51.0], [41.0, 51.0]]]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 5.0, 2.0, 4.0], [7.0, 3.0, 9.0, 1.0], [2.0, 8.0, 4.0, 6.0], [5.0, 1.0, 7.0, 3.0]]], [[[1.0, -1.0], [2.0, -3.0]], [[1.0, 1.0], [1.0, 1.0]]], [2, 1, 2, 2], 2, 0]'
+          expected: "[[[[-9.0, -1.0], [-13.0, -5.0]]], [[[9.0, 23.0], [28.0, 8.0]]]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]], [[[1.0, -2.0], [-3.0, 4.0]]], [1, 1, 2, 2], 1, 1]'
+          expected: "[[[[4.0, 5.0], [14.0, 5.0]]]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def conv2d_weight_grad(x, grad_out, w_shape, stride=1, padding=0):
+            x = np.asarray(x, dtype=float)
+            g = np.asarray(grad_out, dtype=float)
+            c_out, c_in, kh, kw = w_shape
+            channels, h, wd = x.shape
+            go, ho, wo = g.shape
+            if go != c_out:
+                raise ValueError("grad_out has %d channels, w_shape says %d" % (go, c_out))
+            if channels != c_in:
+                raise ValueError("x has %d channels, w_shape says %d" % (channels, c_in))
+
+            xp = np.pad(x, ((0, 0), (padding, padding), (padding, padding)))
+            dw = np.zeros((c_out, c_in, kh, kw))
+            for i in range(kh):
+                for j in range(kw):
+                    patch = xp[:, i:i + stride * ho:stride, j:j + stride * wo:stride]
+                    # sum over every position: (C_in, ho, wo) x (C_out, ho, wo)
+                    dw[:, :, i, j] = np.einsum("cij,oij->oc", patch, g)
+            return dw.tolist()
+      solutionExplanation: >-
+        For a single position the weight gradient would be the outer product
+        `g[:, a, b] ⊗ x_patch`; because the weight is shared across all
+        `H_out·W_out` positions, the gradient is that outer product summed over
+        all of them — which is why the einsum contracts `i` and `j` while keeping
+        `o` and `c`. This is the same "sum over the broadcast axis" rule the MLP
+        used for its bias, applied to two spatial axes instead of one batch axis.
+        The padding is applied to the input, not to the cotangent, because the
+        forward pass consumed padded zeros; a padded position contributes zero to
+        the sum, so applying the pad to `x` and reading `grad_out` unshifted is
+        exactly right. Test case 3 is the one that catches a missing stride in
+        the slice: without it you would read overlapping 2×2 windows and get a
+        gradient roughly 4× too large while every shape still checks out.
+      complexity: "O(K_h·K_w·C_in·C_out·H_out·W_out) time, O(C_in·C_out·K_h·K_w) space"
+      tags: [convolution, backpropagation, parameter-sharing, gradient]
+
+    - id: p-toeplitz
+      title: "The Toeplitz matrix a convolution actually is"
+      difficulty: easy
+      prompt: >-
+        Implement `toeplitz_matrix(kernel, n)` returning the
+        $(n - k + 1) \times n$ matrix $T$ of the valid 1-D convolution, so that
+        `T @ x` equals convolving `kernel` with `x` and keeping only the fully
+        overlapping positions. Element `T[r][c]` must be `kernel[c - r]` when
+        `0 <= c - r < len(kernel)` and `0.0` otherwise. Return nested lists of
+        floats.
+      starter: |
+        import numpy as np
+
+        def toeplitz_matrix(kernel, n):
+            # your implementation here
+            pass
+      language: python
+      entry: toeplitz_matrix
+      testCases:
+        - input: '[[1.0, 2.0, 3.0], 5]'
+          expected: "[[1.0, 2.0, 3.0, 0.0, 0.0], [0.0, 1.0, 2.0, 3.0, 0.0], [0.0, 0.0, 1.0, 2.0, 3.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1.0, -2.0, 1.0], 4]'
+          expected: "[[1.0, -2.0, 1.0, 0.0], [0.0, 1.0, -2.0, 1.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[2.0], 3]'
+          expected: "[[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1.0, 0.0, -1.0], 6]'
+          expected: "[[1.0, 0.0, -1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, 1.0, 0.0, -1.0]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def toeplitz_matrix(kernel, n):
+            k = np.asarray(kernel, dtype=float).ravel()
+            if len(k) == 0:
+                raise ValueError("empty kernel")
+            if len(k) > n:
+                raise ValueError("kernel longer than the signal")
+            rows = n - len(k) + 1
+            t = np.zeros((rows, n))
+            for r in range(rows):
+                t[r, r:r + len(k)] = k
+            return t.tolist()
+      solutionExplanation: >-
+        Each row shifts the kernel one position to the right, which is why the
+        matrix is constant along its diagonals: entry `(r, c)` depends only on
+        `c - r`. The three numbers of the kernel appear `n - k + 1` times each,
+        so the matrix stores `k(n-k+1)` non-zeros in `n(n-k+1)` slots — density
+        `k/n`, which is 0.293% for a 3-tap kernel on a 1024-length signal. That
+        is the whole reason convolutional layers are cheap, expressed as a
+        property of a matrix rather than as a story about images, and it is why
+        the same operator can be applied as a loop over taps in `O(kn)` instead
+        of as a matvec in `O(n²)`.
+      complexity: "O(n·k) time and space to build, O(n·k) time per application"
+      tags: [toeplitz, structure, linear-algebra, convolution]
+
+  visualizers:
+    - id: vs-conv-shapes
+      kind: shape_flow
+      title: "Shape algebra: watch the map shrink, hold, or die"
+      description: >-
+        Feed a tensor through a stack and watch
+        $n \leftarrow \lfloor (n + 2p - d(k-1) - 1)/s \rfloor + 1$ at every step.
+        With $k=3, s=1, p=1$ the size is unchanged at every layer — which is why
+        "same" padding is the default and why a shape bug can hide for twenty
+        layers. Set $s=2, p=1$ and it halves; set $p=0$ and it loses two pixels
+        per layer until the kernel no longer fits.
+      params:
+        input: [3, 224, 224]
+        stages:
+          - { k: 7, stride: 2, padding: 3 }
+          - { k: 3, stride: 1, padding: 1 }
+          - { k: 3, stride: 2, padding: 1 }
+          - { k: 3, stride: 1, padding: 1 }
+    - id: vs-conv-cost
+      kind: computation_graph
+      title: "One tap, multiplied by every position"
+      description: >-
+        Follow a single 3×3 kernel from the parameter tensor through the 1,024
+        output positions of a 32×32 map. FLOPs scale with
+        $H_{\text{out}}W_{\text{out}}$, parameters do not — 36,928 against
+        4,295,032,832 for the dense map. Then toggle to the backward pass and
+        watch the same shared tensor accumulate 1,024 contributions into one
+        gradient.
+      params:
+        channels: 64
+        spatial: [32, 32]
+        kernel: 3
+        mode: forward
+
+  try_it: >-
+    Build the 1022-by-1024 valid-convolution matrix for a 3-tap kernel in NumPy, count its
+    non-zeros, and check the density against 0.293%. Multiply it by a random length-1024 signal
+    and compare the result with np.convolve on the same inputs — they must agree to machine
+    precision.
+  interview_questions:
+    - question: 'A convolution and a dense layer both compute an affine map. What exactly separates them, and what does the constraint cost?'
+      level: mid
+      key_points:
+        - 'The convolution matrix is banded and Toeplitz: constant along each diagonal, so each row has k degrees of freedom instead of n.'
+        - 'For a length-1024 signal and a 3-tap kernel that is 3,066 non-zeros in 1,046,528 entries, a density of 0.293%.'
+        - 'The set of valid-convolution operators is a k-dimensional subspace of R^{(n-k+1) x n}, a codimension of 1,046,525 at n = 1024, k = 3.'
+        - 'The constraint is a prior, not a free lunch: a dense map can learn a different filter per position and a conv layer is forbidden from doing so, which is why it generalises from 1,000 images.'
+    - question: 'Your ten-layer 3x3 stack has a nominal receptive field of 21 pixels. Why is that not what the network uses, and what would you measure instead?'
+      level: senior
+      key_points:
+        - 'Receptive field is support, not influence: the composite kernel of ten random 3x3 filters has a 2-sigma width of 5.64 pixels against a nominal 21, and 9.49 against 41 at twenty layers.'
+        - 'Mass concentrates because convolving distributions multiplies their characteristic functions and repeatedly smooths the profile.'
+        - 'The corners of the nominal field therefore carry almost no gradient, so quoting the support number overstates the context the model sees.'
+        - 'Measure influence directly: perturb a pixel at distance d and record the change in the output, or differentiate and look at the gradient profile.'
+      follow_up: 'If the effective field is a quarter of the nominal one, does stacking more layers buy context efficiently, or is there a cheaper way to spend the same arithmetic?'
+    - question: 'Give the output-shape formula and show why ceil(n/s) fails for a 7x7 stride-2 stem with padding 2 on 224.'
+      level: mid
+      key_points:
+        - 'The formula is n_out = floor((n + 2p - d(k-1) - 1)/s) + 1, with effective kernel d(k-1)+1 under dilation d.'
+        - 'ceil(n/s) is a theorem about same padding: with p = (k-1)/2 and odd k it collapses to floor((n-1)/s) + 1.'
+        - 'At 224, k = 7, s = 2, p = 3 the answer is 112; with p = 2 it is 111, which is the off-by-one that no 3x3 stride-1 test catches.'
+        - 'The bug is invisible on the forgiving configuration, which is exactly the one every unit test uses.'
+  common_mistakes:
+    - 'Believing convolution is not a matmul. It is one whose matrix is banded Toeplitz with 3,066 non-zeros in 1,046,528 entries, and that structure is the whole storage and arithmetic saving.'
+    - 'Reporting the nominal receptive field as the context the network uses: 41 pixels of support against 9.49 pixels of 2-sigma influence at twenty layers.'
+    - 'Assuming im2col accelerates the arithmetic. It expands a 56x56x64 input from 0.766 MiB to 6.89 MiB, exactly 9x, and leaves the multiply count identical.'
+  further_reading:
+    - label: "Dumoulin & Visin, A guide to convolution arithmetic for deep learning (2016)"
+    - label: "Goodfellow, Bengio & Courville, Deep Learning, Chapter 9 (MIT Press 2016)"

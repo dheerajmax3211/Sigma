@@ -1,0 +1,1426 @@
+id: rnn-lstm-gru
+slug: rnn-lstm-gru
+title: "RNNs, LSTMs, and GRUs"
+summary: >-
+  Model a sequence by applying one cell over and over, read the backward pass as
+  a power of a single Jacobian rather than a product of different ones, and
+  replace that power with an additive cell state whose decay is a gate you
+  control — so the gradient survives a hundred steps instead of dying at thirty.
+kind: lesson
+difficulty: hard
+position: 8
+estMinutes: 27
+prerequisites: [autograd-engine, time-series]
+phase: deep-learning-foundations
+tags: [rnn, lstm, gru, bptt, vanishing-gradient, sequence-modelling, gates, truncation]
+
+body:
+  big_idea: >-
+    A recurrent net applies one cell $T$ times, so its gradient is a power of
+    one Jacobian, not $T$ different ones; the LSTM's fix is structural: memory
+    on an additive, gated path.
+
+  problem:
+    - >-
+      Your RNN nails ten-step patterns, but on sixty-step sequences the loss
+      parks at the target's variance: it predicts the mean, with gradient
+      around $10^{-9}$.
+    - >-
+      You add gradient clipping, the NaNs stop, and you conclude the gradient
+      problem is solved — clipping does nothing when the norm is too small.
+    - >-
+      You truncate backpropagation at 32 steps to fit the activations;
+      training loss keeps falling while 200-step evaluation gets worse.
+
+  analogy: |
+    A factory with one night-shift worker and a written log. If the copying
+    rule is "keep seventy percent", then after fifty shifts only
+    $0.7^{50} = 1.6\times10^{-7}$ of the first night survives: uniform
+    forgetting, not selective. The LSTM changes the rule, not the diligence —
+    a vector log with a per-line volume knob, so one line can be copied at
+    0.999 for a thousand shifts while its neighbours are wiped.
+
+  concept_points:
+    - >-
+      **One cell, $T$ applications: the parameters do not grow with the sequence, the gradient exponent does.**
+      An RNN over 100 steps with 256 hidden units owns
+      $256\cdot(128+256+1) = \mathbf{98{,}560}$ parameters, identical at
+      $T=10$ and $T=10{,}000$. The backward pass is a product of $T-1$ copies
+      of the same matrix: $\|W_{hh}^{50}\|_2$ measures $6.376\times10^{8}$ at
+      $\rho=1.5$, $117.4$ at $\rho=1.1$, $5.154\times10^{-3}$ at $\rho=0.9$ —
+      exactly $\rho^{50}$.
+    - >-
+      **The per-step Jacobian norm lies about the horizon; only the product tells the truth.**
+      At $\rho=1.0$, tanh, the mean per-step $\|J_t\|_2$ measured **0.9955** —
+      a naive reading says no vanishing. The product: **0.213** at $k=5$,
+      **0.0327** at $k=10$, **$8.78\times10^{-4}$** at 20,
+      **$2.61\times10^{-10}$** at 50, crossing $10^{-6}$ at $k=34$. The
+      effective per-step gain is 0.66, not 0.9955, because each factor rotates
+      the top singular direction.
+    - >-
+      **The LSTM's cell state is additive, so the gradient path contains no weight matrix.**
+      $c_t = f_t\odot c_{t-1} + i_t\odot g_t$ gives
+      $\partial c_t/\partial c_{t-1} = \operatorname{diag}(f_t)$, so over $T$
+      steps the path is $\operatorname{diag}(\prod_s f_s)$ — a product of
+      *scalars*. That is the residual argument in its cheapest form, and it
+      buys selectivity: one unit can hold $f=1$ for a thousand steps while its
+      neighbour decays in ten.
+    - >-
+      **The forget-gate bias is 1 because the gate multiplies your only gradient path.**
+      $\sigma(1)=0.7311$ against $\sigma(0)=0.5$: over 50 steps
+      $0.7311^{50}=1.58\times10^{-7}$ versus $0.5^{50}=8.88\times10^{-16}$ —
+      **8.25 decades** — and the half-life goes from 1.00 to 2.21 steps. The
+      price is small: the gate's own derivative falls from 0.250 to 0.1966. At
+      $b_f=0$ the instruction is "forget in one step".
+    - >-
+      **GRU: the leak is exactly $(1-z)$, and that preserves the highway.**
+      With $h_t = (1-z)\odot h_{t-1} + z\odot\tilde h$ the coefficient on
+      $h_{t-1}$ is $(1-z)$, so the path survives by construction and the cell
+      state merges into the hidden state; what is lost is the output gate. The
+      sign trap: an LSTM retains with $f\to1$ ($b_f>0$), a GRU with $z\to0$
+      ($b_z<0$).
+    - >-
+      **Measured horizon on the adding problem: the vanilla RNN is done by 20 steps, the LSTM is unchanged at 100.**
+      Held-out MSE, $h=32$, 2000 Adam steps: RNN **0.0023** at $T=10$, 0.0292
+      at 20, 0.1593 at 50, **0.1797** at 100; LSTM 0.000197, 0.000187,
+      0.000683, **0.000526**. In variance-explained terms the RNN falls from
+      99.3% to **46.1%** while the LSTM stays above 99.7% — a 342x gap in MSE
+      at $T=100$.
+
+  definitions:
+    - term: "Hidden state"
+      meaning: >-
+        The vector $h_t$ that carries everything the network remembers about
+        steps $1..t$. It is the only thing passed between time steps; the
+        parameters are shared, so the state is the entire interface.
+    - term: "Unrolling (BPTT)"
+      meaning: >-
+        Writing the recurrence out as $T$ copies of the same cell, one per time
+        step, so the ordinary reverse-mode autograd from *Building an Autograd
+        Engine* applies unchanged. The graph has $T$ cells and one set of
+        parameter nodes with $T$ incoming gradient edges, which is why the
+        parameter gradient is a sum over time.
+    - term: "Truncated BPTT"
+      meaning: >-
+        Running the backward pass only $k$ steps into the past. It bounds
+        activation memory at $O(kBH)$ and gives a gradient that is not the
+        gradient of any single objective — a biased estimator, so it converges
+        to a different point rather than to a noisier version of the same one.
+    - term: "Spectral radius"
+      meaning: >-
+        $\rho(W)=\max_i|\lambda_i|$, the largest eigenvalue magnitude. For a
+        normal matrix $\|W^T\|_2=\rho^T$ exactly; for a non-normal one the power
+        can be far larger at finite $T$ before the asymptotic rate wins. It is
+        the single number that sets an RNN's memory horizon.
+    - term: "Vanishing gradient (temporal)"
+      meaning: >-
+        $\|P_k\|_2$ falling below the precision of the gradient you need, so the
+        parameters that wrote an early step receive no useful signal. Measured
+        on a $\rho=1$ tanh RNN, it crosses $10^{-6}$ at $k=34$.
+    - term: "Exploding gradient"
+      meaning: >-
+        The same product growing instead of shrinking: $\rho=1.5$ over 50 steps
+        is $6.4\times10^{8}$, which is a NaN within a few steps in fp32. Fixed by
+        clipping, which is a no-op for the vanishing case.
+    - term: "Cell state"
+      meaning: >-
+        The LSTM's $c_t$, updated additively as $f_t\odot c_{t-1}+i_t\odot g_t$.
+        Its Jacobian with respect to $c_{t-1}$ is diagonal and contains no weight
+        matrix, which is the entire reason the gradient survives.
+    - term: "Forget gate"
+      meaning: >-
+        $f_t=\sigma(W_{if}x_t+W_{hf}h_{t-1}+b_f)$, the per-unit coefficient on
+        the previous cell state. Initialised with $b_f=1$ so $f\approx0.731$ at
+        step zero rather than $0.5$.
+    - term: "Input and output gates"
+      meaning: >-
+        $i_t$ scales what is written into the cell this step; $o_t$ scales what
+        the cell exposes as $h_t=o_t\tanh(c_t)$. Keeping them separate is what
+        lets a unit hold a value internally without publishing it.
+    - term: "Identity path (highway)"
+      meaning: >-
+        A term in $\partial c_T/\partial c_t$ (or $\partial h_L/\partial h_l$ in
+        a ResNet) that multiplies by a diagonal near 1 instead of by a weight
+        matrix, so it cannot vanish through multiplication. In the LSTM it is
+        $\prod f_s$; in a residual net it is the $I$ in $\prod(I+J_l)$.
+    - term: "Update gate (GRU)"
+      meaning: >-
+        $z_t$ in $h_t=(1-z)\odot h_{t-1}+z\odot\tilde h$. The retention
+        coefficient is $(1-z)$, so the bias sign for remembering is opposite to
+        the LSTM's: $b_z<0$ to hold, $b_f>0$ to hold.
+    - term: "Memory horizon"
+      meaning: >-
+        The number of steps over which a dependency can actually be learned,
+        not merely represented. Measured on the adding problem: about 10-20 for
+        a vanilla RNN, above 100 for an LSTM at the same hidden size.
+
+  diagrams:
+    - type: architecture
+      title: "One cell, one parameter set, T copies in the graph"
+      nodes:
+        - { id: x, x: 0, y: 1, label: "x_t  (d,)", kind: client, detail: "One step of the input. Split into windows of length T; nothing about the cell depends on T except the number of copies in the graph." }
+        - { id: wih, x: 1, y: 0, label: "W_ih  (h, d)", kind: storage, detail: "Input-to-hidden. Only this path sees the current input, so it is the only place new information can enter." }
+        - { id: whh, x: 1, y: 2, label: "W_hh  (h, h), reused every step", kind: storage, detail: "The recurrent matrix. The gradient with respect to it is a sum of T terms, each containing a product of up to T Jacobians - which is why one bad spectral radius poisons every step at once." }
+        - { id: cell, x: 1, y: 1, label: "tanh(W_ih x_t + W_hh h) ", kind: model, detail: "The only nonlinearity in the recurrence. Its derivative 1 - h squared is the per-step contraction factor, and it is bounded by 1, so the recurrence can never amplify through the activation." }
+        - { id: h, x: 2, y: 1, label: "h_t  (h,)", kind: client, detail: "The whole memory. Everything the model knows about steps 1..t has to be inside this vector; if it is not linearly decodable from h_t, the model cannot use it." }
+        - { id: y, x: 3, y: 1, label: "y_t = W_hy h_t", kind: model, detail: "The read-out, applied at whichever steps the task needs a prediction. For sequence labelling it runs at every step; for forecasting, only at the last." }
+      edges:
+        - { from: x, to: cell, label: "new information" }
+        - { from: wih, to: cell, label: "input path" }
+        - { from: whh, to: cell, label: "memory path" }
+        - { from: cell, to: h, label: "state" }
+        - { from: h, to: y, label: "read-out" }
+        - { from: h, to: cell, label: "t+1, same matrix", style: async }
+
+    - type: compare
+      title: "Where the gradient actually travels in each cell"
+      left_label: "Vanilla RNN: one matrix, T times"
+      left_points:
+        - "Path: product of diag(1 - h squared) times W_hh, T times"
+        - "Measured per-step norm 0.9955 at rho=1, but the product crosses 1e-6 at k=34"
+        - "Every direction is coupled: you cannot keep one feature and drop another"
+        - "Controls only the total: rho below 1 kills long range, rho above 1 explodes"
+      right_label: "LSTM: a diagonal gate on an additive path"
+      right_points:
+        - "Path: product of diag(f_t) - no weight matrix anywhere in it"
+        - "One unit can hold f=1 while its neighbour decays in ten steps"
+        - "Measured product at init: 2.48e-14 over 100 steps with b_f=1, 7.89e-31 with b_f=0"
+        - "Controls decay per unit, and the gate is learned from the gradient it passes"
+
+    - type: plot
+      title: "Adding problem, h=32, 2 seeds: the RNN stops learning the dependency at about 20 steps"
+      chart: line
+      xLabel: "sequence length T"
+      yLabel: "log10 held-out MSE (lower is better)"
+      series:
+        - name: "vanilla RNN"
+          points:
+            - { x: 10, y: -2.638 }
+            - { x: 20, y: -1.535 }
+            - { x: 50, y: -0.798 }
+            - { x: 100, y: -0.745 }
+        - name: "LSTM (forget bias 1)"
+          points:
+            - { x: 10, y: -3.706 }
+            - { x: 20, y: -3.728 }
+            - { x: 50, y: -3.166 }
+            - { x: 100, y: -3.279 }
+        - name: "baseline: predict the mean"
+          points:
+            - { x: 10, y: -0.477 }
+            - { x: 100, y: -0.477 }
+
+    - type: plot
+      title: "The forget-gate bias as a decade budget: retention per step, log scale"
+      chart: line
+      xLabel: "steps back"
+      yLabel: "log10 of the cell-state gradient kept"
+      series:
+        - name: "forget bias 0 (sigma = 0.5)"
+          points:
+            - { x: 0, y: 0.0 }
+            - { x: 5, y: -1.5051 }
+            - { x: 10, y: -3.0103 }
+            - { x: 15, y: -4.5154 }
+            - { x: 20, y: -6.0206 }
+            - { x: 25, y: -7.5257 }
+            - { x: 30, y: -9.0309 }
+            - { x: 35, y: -10.536 }
+            - { x: 40, y: -12.0412 }
+            - { x: 45, y: -13.5463 }
+            - { x: 50, y: -15.0515 }
+            - { x: 55, y: -16.5566 }
+            - { x: 60, y: -18.0618 }
+        - name: "forget bias 1 (sigma = 0.7311)"
+          points:
+            - { x: 0, y: 0.0 }
+            - { x: 5, y: -0.6802 }
+            - { x: 10, y: -1.3605 }
+            - { x: 15, y: -2.0407 }
+            - { x: 20, y: -2.721 }
+            - { x: 25, y: -3.4012 }
+            - { x: 30, y: -4.0814 }
+            - { x: 35, y: -4.7617 }
+            - { x: 40, y: -5.4419 }
+            - { x: 45, y: -6.1221 }
+            - { x: 50, y: -6.8024 }
+            - { x: 55, y: -7.4826 }
+            - { x: 60, y: -8.1629 }
+
+    - type: pipeline
+      title: "Choosing the truncation window, in the order that decides it"
+      nodes:
+        - label: "Measure the per-step gain of the recurrent Jacobian"
+          note: "rho times mean tanh derivative; < 1 means decay"
+          detail: "Do this before picking k. If the gain is 0.9 the gradient is already 1e-9 after 90 steps and truncation at 20 is numerically free; if the gain is 1.0 the same truncation throws away 64% of the mass."
+        - label: "Set k from the longest dependency you must learn"
+          note: "k >= that length, not smaller"
+          detail: "A dependency of length L cannot be learned with k < L, because no gradient from beyond k steps ever reaches the parameters that wrote the early step. k is a hard ceiling on the horizon of the objective."
+        - label: "Check activation memory at that k"
+          note: "B times H times k times 4 bytes"
+          detail: "B=32, H=256, k=50 is 1.64 MB per layer; the same at k=1000 is 32.8 MB. If k is unaffordable, that is a reason to change the architecture, not to shrink k below the dependency length."
+        - label: "Use overlapping windows with carried state"
+          note: "stateful=False is a silent bug"
+          detail: "If you split a long series into k-length windows, carry h across the boundary or the model sees a reset every k steps and learns a horizon of k regardless of what you intended."
+        - label: "Compare truncated and full gradient on one batch"
+          note: "relative error and cosine, not the loss"
+          detail: "The loss looks fine in both cases. The check is ||g_trunc - g_full|| / ||g_full|| on a batch small enough to run untruncated."
+
+  markdown: |
+    ## One cell, T copies
+
+    Write the cell once:
+
+    $$h_t = \tanh(W_{ih}x_t + W_{hh}h_{t-1} + b)$$
+
+    and the graph for a 100-step sequence is that cell copied 100 times, with a
+    single `W_hh` node feeding all of them. From *Building an Autograd Engine*,
+    that is unremarkable: the reverse walk visits each copy and accumulates into
+    the shared node. The consequence is the whole topic.
+
+    $$\frac{\partial h_T}{\partial h_t} = \prod_{s=t+1}^{T}
+      \operatorname{diag}(1-h_s^2)\,W_{hh}$$
+
+    One matrix, raised to a power. In a 50-layer MLP the factors are fifty
+    *different* matrices and their product is governed by the average of their
+    log-norms. Here there is one matrix, and its powers are governed by its
+    spectrum.
+
+    | quantity | 50-layer MLP | 100-step RNN |
+    |---|---|---|
+    | factors in the product | 50 different | 100 copies of one |
+    | governing quantity | mean log gain | spectral radius |
+    | exponent controlled by | architecture | sequence length |
+    | parameters | grows with depth | fixed at 98,560 |
+
+    ## The number that decides it
+
+    For a normal matrix, $\|W^T\|_2 = \rho^T$ exactly. Measured on a $32\times32$
+    orthogonal $W_{hh}$ scaled to three radii:
+
+    | $\rho$ | $\|W^{50}\|_2$ | $\rho^{50}$ |
+    |---|---|---|
+    | 0.9 | 5.154e-03 | 5.154e-03 |
+    | 1.1 | 117.4 | 117.4 |
+    | 1.5 | 6.376e+08 | 6.376e+08 |
+
+    That is the entire design tension of a vanilla RNN. Below 1 the network
+    forgets; above 1 it explodes. There is a knife edge at 1 and no way to be
+    selective about which information sits on it.
+
+    The per-step picture is misleading, and it is worth seeing how misleading.
+    At $\rho=1$ the measured mean $\|J_t\|_2$ was **0.9955** — indistinguishable
+    from 1. The actual product crossed $10^{-6}$ at $k=34$:
+
+    | $k$ (steps back) | 1 | 5 | 10 | 20 | 50 |
+    |---|---|---|---|---|---|
+    | $\|P_k\|_2$ | 1.00 | 0.213 | 0.0327 | 8.78e-04 | 2.61e-10 |
+
+    The effective gain is 0.66, not 0.9955. Each factor rotates the top singular
+    direction, so the product of norms is a bound that is loose by orders of
+    magnitude. If you measure $\|J\|$ and conclude "gain near 1, no problem", you
+    have measured the wrong object.
+
+    ## The additive path
+
+    The LSTM changes the *shape* of the recursion rather than the scale of a
+    matrix:
+
+    $$c_t = f_t\odot c_{t-1} + i_t\odot g_t, \qquad h_t = o_t\odot\tanh(c_t)$$
+
+    with
+
+    $$f_t=\sigma(W_{if}x_t+W_{hf}h_{t-1}+b_f),\quad
+      i_t=\sigma(W_{ii}x_t+W_{hi}h_{t-1}+b_i),$$
+    $$o_t=\sigma(W_{io}x_t+W_{ho}h_{t-1}+b_o),\quad
+      g_t=\tanh(W_{ig}x_t+W_{hg}h_{t-1}+b_g).$$
+
+    Differentiate the cell update with respect to the previous cell state:
+
+    $$\frac{\partial c_t}{\partial c_{t-1}} = \operatorname{diag}(f_t)$$
+
+    No matrix. Over $T-t$ steps the composite is
+    $\operatorname{diag}(\prod_s f_s)$ — a product of scalars, one per unit, and
+    each scalar is a number you can set independently. This is the residual
+    connection's argument in a cheaper form: in a ResNet the path
+    $\partial h_L/\partial h_l = \prod(I+J_l)$ contains an identity term, so it
+    cannot vanish by multiplication; in the LSTM the path is a diagonal matrix
+    you learn, and a single unit can hold $f\approx1$ forever while its
+    neighbours decay.
+
+    Four gate blocks instead of one means four times the parameters: at
+    $d=128$, $h=256$, the RNN has 98,560 and the LSTM 394,240. The GRU sits
+    between them at 295,680 by merging the cell state into $h$ and dropping the
+    output gate:
+
+    $$h_t = (1-z_t)\odot h_{t-1} + z_t\odot\tilde h_t,\qquad
+      \tilde h_t = \tanh(W_{xh}x_t + W_{hh}(r_t\odot h_{t-1})).$$
+
+    The leak on $h_{t-1}$ is exactly $1-z$, which keeps the additive path
+    intact — but it also means the sign convention for the bias is reversed.
+    An LSTM remembers when $b_f>0$; a GRU remembers when $b_z<0$.
+
+    ## The decade budget of the forget bias
+
+    $$\sigma(1)=0.7311, \qquad \sigma(0)=0.5$$
+
+    | steps | $0.5^{T}$ | $0.7311^{T}$ | gap |
+    |---|---|---|---|
+    | 20 | 9.54e-07 | 1.90e-03 | 3.30 decades |
+    | 50 | 8.88e-16 | 1.58e-07 | 8.25 decades |
+    | 100 | 7.89e-31 | 2.48e-14 | 16.50 decades |
+
+    The half-life of a memorised value goes from 1.00 step to 2.21 steps. The
+    cost is that the gate's derivative drops from 0.250 to 0.1966 — 21% less
+    gradient through the gate itself, which is a one-time reduction rather than
+    a compounding one, while the retention gain compounds at
+    $1.4622^{T}$. On real inputs with random weights the measured mean forget
+    activation is 0.5009 at $b_f=0$ and 0.6979 at $b_f=1$.
+
+    ## What the measurements say about the horizon
+
+    The adding problem, $h=32$, 2000 Adam steps, two seeds, held-out MSE against
+    a mean-predictor baseline of 0.3333:
+
+    | T | RNN MSE | RNN variance explained | LSTM MSE | LSTM variance explained |
+    |---|---|---|---|---|
+    | 10 | 0.0023 | 99.3% | 0.000197 | 99.94% |
+    | 20 | 0.0292 | 91.2% | 0.000187 | 99.94% |
+    | 50 | 0.1593 | 52.2% | 0.000683 | 99.80% |
+    | 100 | 0.1797 | 46.1% | 0.000526 | 99.84% |
+
+    The RNN is not broken at $T=20$; it is *degrading*, and by $T=50$ it has
+    fallen back to slightly better than the marginal. The LSTM is flat. Note
+    what did not happen: no NaN, no divergence, no warning. A model that has
+    stopped learning a dependency looks exactly like a model that has learned
+    the dependency is absent.
+
+    ## Truncation is a ceiling, not a speed-up
+
+    Truncating the backward pass at $k$ preserves
+    $(1-g^k)/(1-g^T)$ of the gradient mass. The table looks reassuring at
+    $g=0.9$ and is not:
+
+    | $g$ | $k=20$, $T=200$ retained |
+    |---|---|
+    | 0.90 | 87.8% |
+    | 0.99 | 21.0% |
+    | 1.00 | 10.0% |
+    | 1.01 | 3.5% |
+
+    Measured directly on two RNNs at $T=100$, truncating at $k=20$:
+
+    | regime | relative gradient error at $k=20$ |
+    |---|---|
+    | decaying ($\rho=1$, tanh) | 1.38e-04 |
+    | slow mode ($W_{hh}=I$, gain 1) | 0.643 |
+
+    The regime where truncation costs nothing is the regime where you did not
+    need the memory. The regime where you need it is the one where truncation
+    throws away two thirds of the signal. If your task needs a 60-step
+    dependency, $k$ must be at least 60 — shrinking it is not a memory
+    optimisation, it is a different model.
+
+    ## The longer version
+
+    A recurrent network is one cell applied $T$ times, so its gradient is a
+    *power* of one Jacobian instead of a product of $T$ different ones — which
+    makes the vanishing-gradient problem worse, not better — and the LSTM's fix
+    is structural rather than numerical: put the memory on an additive path
+    where the only thing between $c_T$ and $c_t$ is a product of scalars you
+    gate, not a product of matrices you do not.
+
+    A factory with one night-shift worker and a written log. Each shift the
+    worker reads yesterday's log, copies some of it forward, adds today's event,
+    and signs it. If the copying rule is "keep seventy percent of what is
+    written", then after fifty shifts only $0.7^{50} = 1.6\times10^{-7}$ of the
+    first night survives — the worker is not forgetting selectively, they are
+    forgetting uniformly, and nothing they write today can change what was lost.
+
+    The LSTM changes the copying rule, not the worker's diligence. The log
+    becomes a vector of independent lines, and beside each line there is a
+    volume knob that says how much of *that line* to carry forward. One line can
+    be copied at 0.999 for a thousand shifts while its neighbours are wiped
+    every shift, because the knobs are per-line and nothing mixes the lines
+    together on the way through. A vanilla RNN cannot express "keep this line
+    intact", because its copy step is a matrix: every line is mixed into every
+    other line before anything is scaled.
+
+    Two things break the analogy, and they are the actual content. First, the
+    knob is *learned from the log itself* — so a signal that has already faded
+    cannot teach the knob to stop fading it. That is why the knob starts high
+    rather than being discovered high. Second, the worker also has to decide
+    what to *show* the reader each shift, and that is a separate decision from
+    what to keep; the LSTM gives it a third knob (the output gate) and the GRU
+    does not, which is the whole of their difference.
+
+    ### What goes wrong
+
+    - Your demand model needs a promotion from three weeks ago. With the
+      lagged design matrix from *Time Series* that is twenty-one extra columns
+      per row, and the linear model still cannot express "the effect decays
+      after the promotion ends" without you hand-coding the decay shape.
+    - So you build an RNN. It nails the ten-step pattern, and on sixty-step
+      sequences the loss parks itself at the variance of the target — it is
+      predicting the mean. Nothing raised, nothing NaN'd. The gradient
+      reaching the first step is around $10^{-9}$ and the only symptom is a
+      model that has learned to ignore its input.
+    - You add gradient clipping, the NaNs stop, and you conclude the gradient
+      problem is solved. Clipping rescales the norm; it does nothing at all
+      when the norm is too *small*, which is the failure you actually have.
+    - You truncate backpropagation at 32 steps because the activations will
+      not fit otherwise. Training loss keeps falling, evaluation on 200-step
+      sequences gets worse, and you spend a week tuning the learning rate for
+      what is a mismatch between the objective you optimise and the one you
+      report.
+    - The interview question is "why does the LSTM have four weight matrices
+      and why is the forget-gate bias initialised to one?" You have called
+      `nn.LSTM(...)` for two years and cannot answer either half.
+
+    ### The full treatment
+
+    **One cell, $T$ applications: the parameters do not grow with the sequence,
+    the gradient exponent does.** An RNN over 100 steps of 128-dimensional
+    input with 256 hidden units owns $256\cdot(128+256+1) = \mathbf{98{,}560}$
+    parameters, and that number is identical at $T=10$ and $T=10{,}000$. What
+    grows is the backward pass:
+    $\partial h_T/\partial h_1 = \prod_t \operatorname{diag}(1-h_t^2)W_{hh}$,
+    a product of $T-1$ copies of *the same* matrix. Measured on a $32\times32$
+    orthogonal $W_{hh}$: $\|W_{hh}^{50}\|_2$ is $6.376\times10^{8}$ at
+    $\rho=1.5$, $117.4$ at $\rho=1.1$, $5.154\times10^{-3}$ at $\rho=0.9$ —
+    exactly $\rho^{50}$ to four digits, because an orthogonal matrix is normal
+    and its powers have norm exactly $\rho^T$. The trap is the flip side of
+    weight sharing: you cannot have a well-conditioned early step and a bad
+    late one. Every step has the same conditioning, so one bad spectral radius
+    is fatal rather than merely unhelpful.
+
+    **The per-step Jacobian norm lies about the horizon; only the product
+    tells the truth.** At $\rho=1.0$, $h=32$, tanh, on a real trajectory the
+    mean per-step 2-norm $\|J_t\|_2$ measured **0.9955** — essentially 1, and
+    a naive reading says "the gain is fine, no vanishing". The product:
+    $\|P_k\|_2 = 1.00$ at $k=1$, $0.213$ at $k=5$, $0.0327$ at $k=10$,
+    $8.78\times10^{-4}$ at $k=20$, $2.61\times10^{-10}$ at $k=50$, crossing
+    $10^{-6}$ at $k=34$. The effective per-step gain is $0.66$, not $0.9955$.
+    The reason is that each factor rotates the top singular direction, so you
+    are multiplying *different* directions of a matrix whose singular values
+    are spread over two decades — the product of norms is an upper bound that
+    is not close to tight. The trap is quoting $\|J\|$ as the gain: it is the
+    single most common wrong answer in this topic, and it is wrong by eight
+    orders of magnitude after fifty steps.
+
+    **It is the gradient-stability argument with $T$ in place of depth, and $T$
+    is a property of your data.**
+    $\log_{10}\|g\| = \log_{10}\|g_T\| + \sum_t \log_{10}\text{gain}_t$ — the
+    same bookkeeping as *Numerical Stability*, applied to a product indexed by
+    time instead of by layer. At a per-step gain of $0.9$, one hundred steps
+    is $-4.58$ decades; at $1.1$ it is $+4.14$; at $1.25$ it is $+9.69$, i.e.
+    $4.9\times10^{9}$. The difference from the deep-MLP case is that you chose
+    the depth of an MLP and you inherit the length of a sequence: the identical
+    model trains on 20-step windows and fails on 200-step ones, with no code
+    change. That is why "it works on short sequences" is so often misdiagnosed
+    as an optimiser problem.
+
+    **Truncated BPTT buys memory and pays in a biased objective.**
+    Truncating the backward pass at $k$ keeps $\sum_{i<k}g^i$ of the
+    $\sum_{i<T}g^i$ the full gradient contains, a fraction
+    $(1-g^k)/(1-g^T)$: at $g=0.9$, $T=200$, $k=20$ that is **87.8%**; at
+    $g=0.99$ it is **21.0%**; at $g=1.01$ it is **3.5%**. The cost side is
+    concrete: activations fall from $O(TBH)$ to $O(kBH)$, which at $B=32$,
+    $H=256$, $T=1000$, $k=50$, fp32 is **32.8 MB down to 1.64 MB**, a 20x
+    saving. But the measured bias is stranger than the fraction suggests. On a
+    decaying RNN ($\rho=1$, tanh, $h=32$, $T=100$) truncating at $k=20$ has
+    relative gradient error **$1.38\times10^{-4}$** — numerically invisible. On
+    a *slow* mode ($W_{hh}=I$ so the gain is exactly 1, the regime you need for
+    long memory) the same truncation has relative error **$0.643$**, and even
+    $k=50$ leaves **$0.256$**. So truncation is nearly free exactly where it
+    is unnecessary and expensive exactly where the memory lives: $k$ is a hard
+    ceiling on the dependencies you can *learn*, independent of what the cell
+    can *represent*.
+
+    **The LSTM's cell state is additive, so the gradient path contains no
+    weight matrix.**
+    $c_t = f_t\odot c_{t-1} + i_t\odot g_t$ gives
+    $\partial c_t/\partial c_{t-1} = \operatorname{diag}(f_t)$ — a diagonal
+    matrix of numbers in $(0,1)$ with no $W$ in it, so over $T$ steps
+    $\partial c_T/\partial c_t = \operatorname{diag}(\prod_s f_s)$: a product
+    of *scalars*, one per unit, not a product of matrices. This is the residual
+    argument in its cheapest form — the gradient path contains an identity term
+    instead of only products — except that here the identity is *scaled by a
+    gate you learn* rather than added to a branch. The structural consequence
+    is selectivity: one unit can hold $f=1$ for a thousand steps while its
+    neighbour decays to zero in ten, because nothing couples the directions. In
+    a matrix product you cannot protect one direction without changing all of
+    them. Measured at initialisation: $\prod f$ over 100 steps is
+    $2.48\times10^{-14}$ at $b_f=1$; with the gate learned to $0.99$ the
+    half-life is **69 steps** and the $10^{-6}$ crossing is at $k=1375$.
+
+    **The forget-gate bias is 1 because the gate multiplies your only gradient
+    path.** $\sigma(1)=0.7311$ against $\sigma(0)=0.5$. Over 50 steps
+    $0.7311^{50}=1.58\times10^{-7}$ versus $0.5^{50}=8.88\times10^{-16}$ —
+    **8.25 decades**; over 100 steps the gap is **16.5 decades**. The half-life
+    goes from 1.00 step to 2.21 steps. The price is real and small: the gate's
+    own derivative falls from $0.250$ to $0.1966$, a 21% reduction that does
+    not compound, and the gate keeps receiving gradient so it can move once
+    training starts. On a real input with random weights the measured mean
+    forget activation is **0.5009** at $b_f=0$ and **0.6979** at $b_f=1$. The
+    trap is treating $b_f=0$ as neutral: it is not a default, it is the
+    instruction "forget in one step". On the adding problem at $T=100$ the
+    difference was only $1.71$x in final error (0.00090 against 0.00053),
+    because 2000 Adam steps is long enough for the gates to recover — the
+    decade budget buys you the gradient to *start* from, and it decides the
+    outcome precisely when the task is hard enough that the gate never gets a
+    useful signal otherwise.
+
+    **Four gates, four times the parameters, and the arithmetic is exact.**
+    At $d=128$, $h=256$: RNN $=256\cdot385=\mathbf{98{,}560}$; LSTM
+    $=4\cdot256\cdot385=\mathbf{394{,}240}$, exactly $4.00$x; GRU
+    $=3\cdot256\cdot385=\mathbf{295{,}680}$, which is $0.75$x the LSTM. The
+    four blocks are $i,f,o,g$, each with its own $W_{ih}$ rows, $W_{hh}$ rows
+    and bias. The trap is thinking the parameter count is the cost: at
+    inference the binding constraint is that a 100-step LSTM performs 100
+    *dependent* matrix products, so it cannot use a GPU's parallelism over
+    time at all, while a 100-step convolution or an attention layer does the
+    same work in one batched product.
+
+    **GRU: the leak is exactly $(1-z)$, and that is what preserves the
+    highway.** $z=\sigma(\cdot)$, $r=\sigma(\cdot)$,
+    $\tilde h=\tanh(W_{xh}x_t + W_{hh}(r\odot h_{t-1}))$,
+    $h_t = (1-z)\odot h_{t-1} + z\odot\tilde h$. The coefficient on $h_{t-1}$
+    is $(1-z)$, not an independent gate, so the additive path survives by
+    construction and the cell state is merged into the hidden state. What is
+    lost is the output gate: the hidden state cannot be shielded from what the
+    read-out needs, so a value you are holding is always also being published.
+    The sign trap is worth memorising: to retain, an LSTM wants $f\to1$, which
+    means $b_f>0$; a GRU wants $z\to0$ because its retention is $(1-z)$, which
+    means $b_z<0$. Copying the LSTM's $+1$ into a GRU asks it to overwrite
+    everything at every step. At $\sigma(0)=0.5$ a GRU retains exactly half per
+    step — the same as an LSTM with $b_f=0$.
+
+    **Measured horizon on the adding problem: the vanilla RNN is done by 20
+    steps, the LSTM is unchanged at 100.** Two input channels per step (a value
+    in $[0,1]$ and a mask with exactly two ones), target is the sum of the two
+    masked values, so a model that ignores the input scores MSE
+    $\operatorname{Var}(\text{target}) = 0.3333$. $h=32$, 2000 Adam steps, two
+    seeds, held-out MSE: RNN $0.0023$ at $T=10$, $0.0292$ at $T=20$, $0.1593$
+    at $T=50$, $0.1797$ at $T=100$; LSTM $0.000197$, $0.000187$, $0.000683$,
+    $0.000526$ at the same four lengths. In variance-explained terms the RNN
+    goes from **99.3%** at $T=10$ to **91.2%** at $T=20$ to **46.1%** at
+    $T=100$, while the LSTM stays above **99.7%** throughout — a 342x gap in
+    MSE at $T=100$. The honest reading is that the RNN's horizon is roughly
+    ten steps, and that between 20 and 50 it stops learning the dependency and
+    starts fitting the marginal.
+
+    **Clipping is the exploding half, and it is blind to the vanishing half.**
+    Global-norm clipping rescales the entire gradient by
+    $c/\|g\|$ when $\|g\|>c$, so it changes the step *size* and not its
+    direction: the cosine between $g$ and $\text{clip}(g)$ is exactly 1. At
+    $\rho=1.5$ the 50-step Jacobian has norm $6.376\times10^{8}$ and the update
+    would be eight orders too large; clipping at 1.0 turns it into a unit step
+    and the NaN disappears. At $\rho=0.9$ the same 50 steps leave
+    $5.15\times10^{-3}$ and clipping never fires, because the norm never
+    exceeds the threshold — the gradient is small, not large, and no threshold
+    on the norm can detect a direction that has stopped carrying signal. The
+    trap is that clipping is the only gradient knob most codebases expose, so
+    "we clip" gets read as "we handled it".
+
+
+  derivations:
+    - title: "BPTT: one matrix raised to a power"
+      latex: |
+        With $h_t=\tanh(a_t)$, $a_t=W_{ih}x_t+W_{hh}h_{t-1}+b$, the one-step
+        Jacobian is
+
+        $$J_t=\frac{\partial h_t}{\partial h_{t-1}}
+          =\operatorname{diag}\!\left(1-h_t^{2}\right)W_{hh}.$$
+
+        Composing from $t$ to $T$:
+
+        $$\frac{\partial h_T}{\partial h_t}=\prod_{s=t+1}^{T}J_s
+          =\prod_{s=t+1}^{T}\operatorname{diag}\!\left(1-h_s^{2}\right)W_{hh}.$$
+
+        For an orthogonal $W_{hh}$ scaled to spectral radius $\rho$ — which is a
+        normal matrix, so its singular values are all $\rho$ — every factor has
+
+        $$\left\|J_s\right\|_2\le\rho\cdot\max_i\left(1-h_{s,i}^{2}\right)\le\rho,$$
+
+        and therefore $\|P_k\|_2\le\rho^{k}$. The bound is an equality only if
+        the activation derivative is 1 in the direction that matters, which is
+        why a network with $\rho=1$ still decays: the measured effective gain at
+        $\rho=1$ was $0.66$ per step against a per-step bound of $1.00$.
+
+        The parameter gradient sums one such product per time step:
+
+        $$\frac{\partial L}{\partial W_{hh}}=\sum_{t=1}^{T}\delta_t h_{t-1}^{\top},
+          \qquad \delta_t=W_{hh}^{\top}\delta_{t+1}\odot\left(1-h_t^{2}\right),$$
+
+        so the early terms $\delta_1,\delta_2,\dots$ are exactly the ones with
+        the most factors between them and the loss. That is why the *first*
+        layers of the sequence stop learning first, and why the parameter count
+        can stay constant while the gradient disappears.
+      prose: >-
+        The exponent is the sequence length, which is a property of the data and
+        not of the architecture — the one structural difference from the
+        deep-MLP case in Numerical Stability, where you chose the depth. Weight
+        sharing also removes the option of a lucky layer: every factor in the
+        product has the same spectrum, so a bad spectral radius is uniformly bad
+        rather than locally bad.
+
+    - title: "Why the LSTM cell-state Jacobian is diagonal"
+      latex: |
+        $$c_t=f_t\odot c_{t-1}+i_t\odot g_t$$
+
+        Differentiating with respect to $c_{t-1}$, holding the gates fixed
+        (their dependence on $h_{t-1}$ is a separate path through $W_{hf}$ etc.):
+
+        $$\frac{\partial c_t}{\partial c_{t-1}}
+          =\operatorname{diag}(f_t).$$
+
+        Composing over $T-t$ steps,
+
+        $$\frac{\partial c_T}{\partial c_t}
+          =\prod_{s=t+1}^{T}\operatorname{diag}(f_s)
+          =\operatorname{diag}\!\left(\prod_{s=t+1}^{T}f_s\right).$$
+
+        Compare the two objects:
+
+        $$\text{RNN: } \prod_s \operatorname{diag}(1-h_s^2)W_{hh}
+          \qquad\text{vs}\qquad
+          \text{LSTM: } \operatorname{diag}\!\left(\prod_s f_s\right).$$
+
+        A product of matrices cannot be inverted by a per-coordinate decision.
+        A product of scalars can: unit $j$ decays at rate $f_{s,j}$,
+        independently of unit $k$. Setting $f_{s,j}=1$ for one coordinate holds
+        that coordinate for arbitrarily many steps, at no cost to the others.
+      prose: >-
+        This is the same move a residual connection makes — put an identity in
+        the gradient path so that no product of weight matrices stands between
+        the loss and the early step. The difference is that the LSTM's identity
+        is multiplied by a learned number in (0,1) rather than added to a branch,
+        so it can forget on purpose instead of only failing to.
+
+    - title: "The forget bias as a decade budget"
+      latex: |
+        With the gate at its initial value and no input contribution,
+        $f=\sigma(b_f)$ constant, so retention over $T$ steps is $\sigma(b_f)^T$.
+        The ratio between two choices of $b_f$ is
+
+        $$\frac{\sigma(b_1)^T}{\sigma(b_0)^T}
+          =\left(\frac{\sigma(b_1)}{\sigma(b_0)}\right)^{T}
+          =1.4622^{T}\quad\text{for } b_1=1,\ b_0=0,$$
+
+        and in decades,
+
+        $$T\log_{10}1.4622 = 0.16513\,T .$$
+
+        At $T=50$ that is $8.25$ decades, at $T=100$ it is $16.50$. The
+        half-life is
+
+        $$t_{1/2}=\frac{\log 0.5}{\log\sigma(b_f)}
+          =1.000\ \ (b_f=0),\quad 2.213\ \ (b_f=1),\quad
+          68.97\ \ (\sigma(b_f)=0.99).$$
+
+        The price is the gate's own derivative: $\sigma'(1)=0.1966$ against
+        $\sigma'(0)=0.2500$, a factor of $0.786$ on the *gate's* gradient, which
+        does not compound because it is applied once per step to a term that is
+        not itself a product.
+      prose: >-
+        The bias is not a hyperparameter in any meaningful sense; it is the
+        initial value of a decay rate, and 0 is the value that means "forget in
+        one step". Setting it to 1 costs 21% of the gate's derivative and buys
+        8.25 decades of retention at fifty steps, which is the gradient the rest
+        of the network needs in order to learn what is worth keeping.
+
+  implementations:
+    - language: python
+      title: "A vanilla RNN with a truncation window, and what truncation costs"
+      note: >-
+        Forward and backward are correct; the *truncated* gradient is deliberately
+        numerically wrong and is included so you can measure by how much. It is
+        biased rather than noisy: it is not the gradient of any objective, so
+        optimising with it converges somewhere else. The size of the bias depends
+        entirely on the regime, which is the point of the demo — on the decaying
+        network, truncating at 20 of 100 steps changes the gradient by
+        $1.4\times10^{-4}$; on a network whose recurrence is the identity (gain
+        exactly 1, the regime long memory requires) the same truncation drops
+        64% of the signal. Two smaller traps: `1 - h**2` computed from a float32
+        `h` returns exactly 0.0 for any $|h|>0.9999$, because tanh saturates to
+        1.0f at $|z|>9.01$ — a saturated unit reads as a dead one; and the
+        gradient norm is dominated by the last few steps, so watching the norm
+        will never show you a lost long-range term.
+      code: |
+        import numpy as np
+
+        class VanillaRNN:
+            """One cell, applied T times. The only reused parameter is Whh."""
+
+            def __init__(self, d, h, rng, rho=1.0):
+                q, _ = np.linalg.qr(rng.normal(size=(h, h)))   # orthogonal
+                self.Whh = rho * q                             # ||Whh^k|| = rho^k
+                self.Wih = rng.normal(0.0, 1.0 / np.sqrt(d), (h, d))
+                self.b = np.zeros(h)
+                self.h, self.d = h, d
+
+            def forward(self, xs, h0=None):
+                T = xs.shape[0]
+                hs = np.zeros((T + 1, self.h))
+                hs[0] = np.zeros(self.h) if h0 is None else h0
+                for t in range(T):
+                    hs[t + 1] = np.tanh(
+                        xs[t] @ self.Wih.T + hs[t] @ self.Whh.T + self.b)
+                return hs
+
+            def bptt(self, xs, hs, dh_last, k=None):
+                """dL/dWhh, dL/dWih, dL/db. k truncates the window (biased)."""
+                T = xs.shape[0]
+                dWhh = np.zeros_like(self.Whh)
+                dWih = np.zeros_like(self.Wih)
+                db = np.zeros_like(self.b)
+                dh = dh_last.copy()
+                stop = 0 if k is None else max(0, T - k)
+                for t in range(T - 1, stop - 1, -1):
+                    da = dh * (1.0 - hs[t + 1] ** 2)      # tanh' at h_t
+                    dWhh += np.outer(da, hs[t])
+                    dWih += np.outer(da, xs[t])
+                    db += da
+                    dh = da @ self.Whh
+                return dWhh, dWih, db
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            net = VanillaRNN(d=8, h=32, rng=rng, rho=1.0)
+            print(f"rho {np.abs(np.linalg.eigvals(net.Whh)).max():.4f}"
+                  f"  params {net.h * (net.d + net.h + 1)}")   # 1.0000  1312
+            xs = rng.normal(size=(100, 8))
+            hs = net.forward(xs)
+            dh = np.ones(net.h)                                # L = sum(h_T)
+            full = net.bptt(xs, hs, dh)[0]
+            for k in (20, 50):
+                tr = net.bptt(xs, hs, dh, k=k)[0]
+                err = np.linalg.norm(tr - full) / np.linalg.norm(full)
+                print(f"k={k}: relative error {err:.3e}")      # k=20: 1.383e-04
+            # in float32, tanh saturates and the mask is exactly 0:
+            h32 = np.float32(1.0) - np.float32(1e-8)
+            print(float(1 - h32 * h32))                        # 0.0
+
+    - language: python
+      title: "The LSTM cell, and the one line that is numerically wrong when it is zero"
+      note: >-
+        `b_f=0` is numerically wrong in the specific sense that it sets the
+        cell's only gradient path to a decay of 0.5 per step: 8.88e-16 over 50
+        steps against 1.58e-07 at `b_f=1`, a gap of 8.25 decades that compounds
+        to 16.5 by 100 steps. It will still train on an easy task — measured on
+        the adding problem at T=100, `b_f=0` reached MSE 0.00090 against 0.00053
+        for `b_f=1`, only 1.71x worse, because 2000 Adam steps is enough for the
+        gate to walk itself up. What it cannot do is train when the task is hard
+        enough that the gate never receives a usable signal in the first place,
+        which is exactly the long-sequence case you bought the LSTM for. The
+        demo makes the two regimes visible: the retention table is computed
+        analytically from `sigmoid(b_f)`, and the activation statistics come from
+        running the real cell on random input.
+      code: |
+        import numpy as np
+
+        def sigmoid(z):
+            return 1.0 / (1.0 + np.exp(-z))
+
+        def lstm_step(x, h, c, Wih, Whh, b):
+            """One step. Gates stacked in the order i, f, o, g."""
+            H = h.shape[0]
+            a = Wih @ x + Whh @ h + b
+            i = sigmoid(a[:H])
+            f = sigmoid(a[H:2 * H])
+            o = sigmoid(a[2 * H:3 * H])
+            g = np.tanh(a[3 * H:])
+            c = f * c + i * g          # additive: no matrix touches c
+            h = o * np.tanh(c)         # publication is a separate decision
+            return h, c, (i, f, o, g)
+
+        def retention(forget_bias, T):
+            return float(sigmoid(forget_bias) ** T)
+
+        if __name__ == "__main__":
+            for bf in (0.0, 1.0):
+                print(f"b_f={bf}: f={sigmoid(bf):.4f} "
+                      f"20:{retention(bf, 20):.4g} "
+                      f"50:{retention(bf, 50):.4g} "
+                      f"100:{retention(bf, 100):.4g}")
+            # b_f=0.0: f=0.5000 20:9.537e-07 50:8.882e-16 100:7.889e-31
+            # b_f=1.0: f=0.7311 20:0.001901 50:1.576e-07 100:2.484e-14
+
+            rng = np.random.default_rng(0)
+            H, d = 8, 4
+            Wih = rng.normal(0, 1 / np.sqrt(d), (4 * H, d))
+            Whh = rng.normal(0, 1 / np.sqrt(H), (4 * H, H))
+            xs = rng.normal(size=(100, d))
+            for bf in (0.0, 1.0):
+                b = np.zeros(4 * H)
+                b[H:2 * H] = bf
+                h = np.zeros(H); c = np.zeros(H); fs = []
+                for t in range(100):
+                    h, c, (i, f, o, g) = lstm_step(xs[t], h, c, Wih, Whh, b)
+                    fs.append(f)
+                print(f"b_f={bf}: mean f {np.mean(fs):.4f}")   # 0.5009 / 0.6979
+
+  checkpoints:
+    - id: cp-1
+      question: "A 200-step sequence through a 64-hidden-unit RNN has how many parameters, and how does the backward pass differ from a 200-layer MLP with the same width?"
+      answerKind: short_text
+      hint: "Count the shapes, then count the distinct matrices in the gradient product."
+      solution: >-
+        For $d=64$, $h=64$: $h(d+h+1)=64\cdot129=\mathbf{8{,}256}$ parameters,
+        independent of the 200 steps. A 200-layer MLP of width 64 would have
+        $200\cdot(64\cdot64+64)=832{,}000$ — about 100x more — and its backward
+        pass is a product of 200 *different* matrices, averaged in log-space. The
+        RNN's is 200 copies of one matrix, so the product is governed by its
+        spectral radius alone: at $\rho=1.5$, $\|W^{50}\|_2=6.376\times10^{8}$
+        and the gradient overflows long before step 200. Cheaper to parameterise
+        and much harder to train, for the same structural reason.
+    - id: cp-2
+      question: "Your RNN's per-step Jacobian has 2-norm 0.995 at every step. Is the gradient stable, and what number would settle it?"
+      answerKind: short_text
+      hint: "Multiplying 0.995 by itself 50 times gives 0.78 — but that is not what the product of these matrices does."
+      solution: >-
+        No, and it is the classic misreading. $0.995^{50}=0.78$ would suggest a
+        mild decay, but measured on a $\rho=1$, $h=32$ tanh RNN the product
+        crossed $10^{-6}$ at $k=34$ and was $2.61\times10^{-10}$ at $k=50$: an
+        effective per-step gain of 0.66, not 0.995. The per-step norm bounds the
+        product from above but is not tight, because each factor rotates the top
+        singular direction and you end up multiplying different directions of a
+        matrix with a two-decade spread of singular values. The number that
+        settles it is $\|P_k\|_2$ for the $k$ you care about — computed by
+        propagating an identity matrix backwards through the stored trajectory,
+        not by raising the per-step norm to a power.
+    - id: cp-3
+      question: "Why is the forget-gate bias 1 and not 0, given that 0 is the standard for every other bias in the network?"
+      answerKind: short_text
+      hint: "What does the forget gate multiply, and what does its initial value do to that product over 50 steps?"
+      solution: >-
+        Every other bias shifts a pre-activation and the network can compensate
+        at the next layer. The forget bias sets an exponent: it multiplies the
+        *only* path by which gradient reaches anything written in an earlier
+        step. $\sigma(0)=0.5$ gives $0.5^{50}=8.88\times10^{-16}$; $\sigma(1)=0.7311$
+        gives $1.58\times10^{-7}$ — 8.25 decades, and 16.5 by 100 steps. The cost
+        is 21% of the gate's own derivative ($0.1966$ against $0.2500$), applied
+        once per step and not compounded. So the trade is a compounding gain
+        against a one-time loss, and the default of 0 is an instruction to forget
+        in one step rather than a neutral choice.
+    - id: cp-4
+      question: "You truncate BPTT at k=20 on a 200-step sequence. The training loss is falling normally. Name two things that can still be wrong and the measurement that detects each."
+      answerKind: short_text
+      hint: "One is about which dependencies can be learned at all; the other is about the window boundary."
+      solution: >-
+        First, $k$ is a hard ceiling on learnable dependency length: no gradient
+        from beyond 20 steps ever reaches the parameters that wrote step 1, so a
+        60-step dependency cannot be learned regardless of capacity, and the loss
+        will fall happily on whatever 20-step surrogate it found. Detect it by
+        evaluating on the full length and comparing per-position error at the
+        steps beyond $k$ — the error should jump at $k$ if this is happening.
+        Second, if the series is split into 20-step windows without carrying $h$
+        across the boundary, the model gets a hard reset every 20 steps and
+        learns a horizon of 20 no matter what $k$ is. Detect it by
+        concatenating two consecutive windows and checking that the state at the
+        join matches the state after the first window; if it is zero, the carry
+        is missing.
+    - id: cp-5
+      question: "An LSTM and a GRU both have d=256, h=512. Give both parameter counts and state the one structural guarantee the LSTM has that the GRU does not."
+      answerKind: short_text
+      hint: "4 gates against 3, each with fan_in = d+h and one bias per unit. Then think about what the GRU does not gate."
+      solution: >-
+        LSTM: $4\cdot512\cdot(256+512+1)=4\cdot512\cdot769=\mathbf{1{,}574{,}912}$.
+        GRU: $3\cdot512\cdot769=\mathbf{1{,}181{,}184}$, exactly $0.75$x. The
+        structural guarantee is the output gate: an LSTM can hold a value in $c$
+        and expose almost none of it through $h=o\tanh(c)$, so retention and
+        read-out are separate decisions. A GRU's hidden state *is* its cell
+        state, so anything it holds is published, and the read-out cannot be
+        decoupled from the memory. That is why an LSTM can count or hold a flag
+        over long spans more reliably, and why the GRU's leak $(1-z)$ alone is
+        enough for most sequence-labelling work.
+    - id: cp-6
+      question: "Gradient clipping at norm 1.0 stopped your NaNs. Does it address the vanishing case at all, and what is the cosine between the gradient and its clipped version?"
+      answerKind: short_text
+      hint: "What does the rescale factor depend on, and when is it not applied?"
+      solution: >-
+        Not at all. Clipping applies only when $\|g\|>c$; when the gradient has
+        vanished, the norm is far below the threshold and the operation is the
+        identity — no rescale, no effect, no warning. When it does fire, the
+        output is $g\cdot c/\|g\|$, a positive multiple of $g$, so the cosine is
+        exactly 1: clipping changes the step *length* and never the *direction*.
+        At $\rho=1.5$ over 50 steps the norm is $6.376\times10^{8}$ and clipping
+        is doing real work; at $\rho=0.9$ it is $5.15\times10^{-3}$ and clipping
+        is provably a no-op. The fix for the vanishing half is architectural —
+        a gate on an additive path — not a threshold.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A recurrent network does not have T layers. It has one layer, called T
+        times, and that difference is the whole topic. When a layer is called
+        once, its gradient is one factor. When it is called a hundred times, its
+        gradient is that factor raised to the hundredth power — and a number
+        slightly less than 1, raised to the hundredth power, is indistinguishable
+        from zero.
+
+        The LSTM does not make that number closer to 1. It removes the
+        multiplication from the memory path altogether: the cell state is updated
+        by adding a gated copy of its old self, so the "remember" operation is a
+        scale factor per unit rather than a matrix applied to a vector.
+      blocks:
+        - kind: checklist
+          body: |-
+            - Parameters are shared across time, so the gradient is a power
+            - A power is governed by one number (the spectral radius), not by an average
+            - Gates are elementwise scales, so they act per unit and independently
+            - An additive update means no weight matrix sits in the gradient path
+            - Truncation is a ceiling on the dependencies you can learn, not a speed knob
+            - Clipping fixes the growing case and is a no-op for the shrinking one
+      checkpoint: >-
+        Before reading on: if every step multiplies the state by the same matrix,
+        and that matrix has one eigenvalue slightly greater than 1 and one
+        slightly less, what happens to the two directions over 100 steps — and
+        what happens to a gradient that has to travel through both?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in logarithms and per unit, not in norms and in aggregate. The
+        diagnostic is three measurements, in this order: the spectral radius of
+        the recurrent matrix; the norm of the *composed* Jacobian over the
+        horizon you care about (propagate an identity backwards, do not raise the
+        per-step norm to a power); and the per-unit product of forget gates. If
+        the composed norm falls faster than the radius suggests, the cause is
+        rotation, not scale. If the forget-gate product falls, the cause is the
+        bias initialisation.
+      blocks:
+        - kind: checklist
+          body: |-
+            - Compute the spectral radius of the recurrent matrix first
+            - Propagate an identity matrix backwards to get the real composed Jacobian norm
+            - For the LSTM, record the per-unit product of forget gates, not their mean
+            - Compare truncation to the full gradient on one batch: relative error and cosine
+            - Only after those three, touch the learning rate
+      checkpoint: >-
+        If the per-step norm is 1.0 and the ten-step composed norm is 0.03, which
+        of the two is the honest measure of the model's memory — and why is the
+        other one not merely imprecise but wrong?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Build the cell once, with the gate order written down and asserted. Then
+        measure the backward pass before you train anything.
+      blocks:
+        - kind: pseudocode
+          body: |-
+            # the cell, gates in a fixed order: i, f, o, g
+            def step(x, h, c, Wih, Whh, b):
+                a = Wih @ x + Whh @ h + b          # (4H,)
+                i, f, o = sigmoid(a[0:H]), sigmoid(a[H:2H]), sigmoid(a[2H:3H])
+                g = tanh(a[3H:4H])
+                c = f * c + i * g                  # additive: no matrix on c
+                h = o * tanh(c)
+                return h, c, (i, f, o, g)
+
+            # the measurement that decides whether it will train
+            P = identity(H)
+            for t in reverse(range(T)):
+                P = P @ (diag(1 - h[t]**2) @ Whh)
+                record norm(P)                     # this is the real horizon
+
+            # the truncation trade
+            g_full  = bptt(..., k=None)
+            g_trunc = bptt(..., k=20)
+            record norm(g_trunc - g_full) / norm(g_full)
+      checkpoint: >-
+        In the measurement loop, why must `P` be multiplied on the right by each
+        Jacobian rather than on the left — what changes if you get the order
+        wrong, and would the norms tell you?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Everything reduces to two products: one of matrices, one of scalars.
+      blocks:
+        - kind: math
+          body: |-
+            RNN, one step:
+
+            $$J_t=\operatorname{diag}(1-h_t^2)W_{hh},
+              \qquad \frac{\partial h_T}{\partial h_t}=\prod_{s>t}J_s .$$
+
+            With $W_{hh}$ orthogonal scaled to $\rho$, $\|J_s\|_2\le\rho$, hence
+            $\|P_k\|_2\le\rho^k$ — but the measured exponent is smaller, because
+            the top singular direction rotates at every step.
+
+            LSTM, one step:
+
+            $$c_t=f_t\odot c_{t-1}+i_t\odot g_t
+              \quad\Longrightarrow\quad
+              \frac{\partial c_t}{\partial c_{t-1}}=\operatorname{diag}(f_t),$$
+
+            $$\frac{\partial c_T}{\partial c_t}
+              =\operatorname{diag}\!\left(\prod_{s>t}f_s\right).$$
+
+            Forget bias, at initialisation with $f=\sigma(b_f)$ constant:
+
+            $$\text{retention}(T)=\sigma(b_f)^T,\qquad
+              \frac{\sigma(1)^T}{\sigma(0)^T}=1.4622^T
+              =10^{0.16513\,T}.$$
+
+            Truncation, geometric gain $g$:
+
+            $$\text{retained}(k)=\frac{1-g^{k}}{1-g^{T}}
+              \xrightarrow[g\to1]{}\frac{k}{T}.$$
+      checkpoint: >-
+        The truncated fraction is 87.8% at g=0.9 and 21.0% at g=0.99. Which of
+        those two regimes is the one where you needed long memory — and what does
+        that imply about when truncation is a safe optimisation?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete cell with the diagnostics attached, and the numbers the
+        reference run produces so you can check yours.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the printed diagnostics before the code. If your composed
+            Jacobian norm at k=34 is around 1e-6 and your forget-gate product at
+            100 steps is around 1e-14, you have reproduced the reference and do
+            not need the listing. If the composed norm is still near 1 at k=100,
+            your recurrent matrix is not what you think it is — check the
+            spectral radius before anything else.
+        - kind: code
+          language: python
+          body: |-
+            import numpy as np
+            sig = lambda z: 1.0 / (1.0 + np.exp(-z))
+
+            class Cell:
+                """LSTM cell with the forget bias exposed, because it is a
+                decay rate and not a hyperparameter."""
+
+                def __init__(self, d, h, rng, forget_bias=1.0):
+                    k = 1.0 / np.sqrt(h)
+                    self.Wih = rng.normal(0, 1 / np.sqrt(d), (4*h, d))
+                    self.Whh = rng.normal(0, k, (4*h, h))
+                    self.b = np.zeros(4*h)
+                    self.b[h:2*h] = forget_bias
+                    self.h = h
+
+                def run(self, xs, h=None, c=None):
+                    H = self.h
+                    h = np.zeros(H) if h is None else h
+                    c = np.zeros(H) if c is None else c
+                    fs = []
+                    for x in xs:
+                        a = self.Wih @ x + self.Whh @ h + self.b
+                        i, f, o = sig(a[:H]), sig(a[H:2*H]), sig(a[2*H:3*H])
+                        g = np.tanh(a[3*H:])
+                        c = f * c + i * g
+                        h = o * np.tanh(c)
+                        fs.append(f)
+                    return h, c, np.array(fs)
+
+            def horizon(Whh, hs, threshold=1e-6):
+                """First k where the composed Jacobian norm drops below threshold."""
+                P = np.eye(Whh.shape[0])
+                for k in range(1, len(hs)):
+                    P = P @ (np.diag(1 - hs[-k]**2) @ Whh)
+                    if np.linalg.norm(P, 2) < threshold:
+                        return k
+                return None
+
+            if __name__ == "__main__":
+                # 1. the RNN horizon at rho = 1, on a real trajectory
+                rng = np.random.default_rng(0)
+                q, _ = np.linalg.qr(rng.normal(size=(32, 32)))
+                Wih = rng.normal(0, 1/np.sqrt(8), (32, 8))
+                hs = [rng.normal(0, 0.5, 32)]
+                for _ in range(200):
+                    hs.append(np.tanh(Wih @ rng.normal(size=8) + q @ hs[-1]))
+                print("RNN horizon at rho=1:", horizon(q, np.array(hs)))  # 34
+
+                # 2. retention at the two biases: same weights, same input
+                for bf in (0.0, 1.0):
+                    r = np.random.default_rng(0)
+                    cell = Cell(4, 8, r, bf)
+                    xs = r.normal(size=(100, 4))
+                    _, _, fs = cell.run(xs)
+                    prod = np.exp(np.log(fs).sum(axis=0))   # per unit, over T
+                    print(f"b_f={bf}: mean f {fs.mean():.4f} "
+                          f"mean per-unit product {prod.mean():.3e}")
+                # b_f=0.0: mean f 0.5009  mean per-unit product 3.252e-31
+                # b_f=1.0: mean f 0.6979  mean per-unit product 6.355e-15
+      checkpoint: >-
+        The reference prints a mean forget activation of 0.6979 where the
+        analytic value at initialisation is 0.7311. Explain the gap, and say
+        whether it makes the decade argument stronger or weaker.
+
+  problems:
+    - id: p-lstm-step
+      title: "One LSTM step, with the gate order fixed"
+      difficulty: medium
+      prompt: >-
+        Implement `lstm_step(x, h, c, Wih, Whh, b)` returning `[h_new, c_new]`
+        as lists of floats. Gates are stacked in the fixed order `i, f, o, g`,
+        so with hidden size `H = len(b) // 4`: `i = sigmoid(a[:H])`,
+        `f = sigmoid(a[H:2H])`, `o = sigmoid(a[2H:3H])`, `g = tanh(a[3H:])`,
+        where `a = Wih @ x + Whh @ h + b`. Then
+        `c_new = f * c + i * g` and `h_new = o * tanh(c_new)`. Shapes:
+        `x` is `(d,)`, `h` and `c` are `(H,)`, `Wih` is `(4H, d)`, `Whh` is
+        `(4H, H)`, `b` is `(4H,)`. Accept plain Python lists; return plain
+        Python lists, `[h_new, c_new]`.
+      starter: |
+        import numpy as np
+
+        def lstm_step(x, h, c, Wih, Whh, b):
+            # your implementation here
+            pass
+      language: python
+      entry: lstm_step
+      testCases:
+        - input: '[[1.0, -1.0], [0.0], [0.0], [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]], [[0.5], [0.5], [0.0], [0.0]], [0.0, 0.0, 0.0, 0.0]]'
+          expected: "[[0.1359705785714023], [0.5567699411459397]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.5, 0.25], [0.3], [0.7], [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]], [[0.5], [0.5], [0.0], [0.0]], [0.0, 0.0, 0.0, 0.0]]'
+          expected: "[[0.09535940763618041], [0.25816723837548095]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.0], [0.0], [2.0], [[0.0], [1.0], [0.0], [0.0]], [[0.0], [0.0], [0.0], [0.0]], [0.0, 1.0, 0.0, 0.0]]'
+          expected: "[[0.44903150573044787], [1.4621171572600098]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[1.2, -0.7], [0.4, 0.9], [-0.3, 0.6], [[0.8, -0.5], [0.3, 0.9], [-0.6, 0.2], [1.1, -0.4], [0.2, 0.7], [-0.9, 0.4], [0.5, -0.1], [0.3, 0.6]], [[0.2, 0.1], [-0.3, 0.4], [0.5, -0.5], [0.1, 0.6], [0.4, -0.2], [-0.6, 0.3], [0.2, 0.2], [-0.1, 0.5]], [0.1, -0.2, 0.05, 0.3, 0.0, 0.15, -0.25, 0.1]]'
+          expected: "[[0.16938318861182383, 0.1479434791060945], [0.4132977187542616, 0.7404333684351803]]"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def lstm_step(x, h, c, Wih, Whh, b):
+            x = np.asarray(x, dtype=float)
+            h = np.asarray(h, dtype=float)
+            c = np.asarray(c, dtype=float)
+            Wih = np.atleast_2d(np.asarray(Wih, dtype=float))
+            Whh = np.atleast_2d(np.asarray(Whh, dtype=float))
+            b = np.asarray(b, dtype=float)
+            H = b.shape[0] // 4
+            a = Wih @ x + Whh @ h + b
+            i = 1.0 / (1.0 + np.exp(-a[:H]))
+            f = 1.0 / (1.0 + np.exp(-a[H:2 * H]))
+            o = 1.0 / (1.0 + np.exp(-a[2 * H:3 * H]))
+            g = np.tanh(a[3 * H:])
+            c_new = f * c + i * g
+            h_new = o * np.tanh(c_new)
+            return [h_new.tolist(), c_new.tolist()]
+      solutionExplanation: >-
+        The gate order is a convention, not a fact, and every framework picks a
+        different one — PyTorch uses `i, f, g, o`, which is why copying a
+        reference implementation line for line and testing it against PyTorch
+        fails in a way that looks like a maths error. The only ordering fact that
+        matters here is that the four blocks are contiguous, each of length `H`,
+        and that you take `H` from `len(b) // 4` rather than from `len(h)` so the
+        function still works when `h` and `c` arrive as Python lists. The second
+        thing: `c_new` is computed *before* `h_new` and `h_new` reads `c_new`,
+        not `c`. That ordering is the output gate's entire meaning — the hidden
+        state is a squashed view of the *current* cell state, so a unit can hold
+        a large `c` while publishing almost nothing. Test case 3 isolates it: the
+        input is zero, the forget bias is 1, so `c_new = sigmoid(1) * 2 =
+        1.4621` and `h_new = sigmoid(0) * tanh(1.4621) = 0.4490`. Half of the
+        cell state survives four steps' worth of decay and almost none of it is
+        visible at the output, which is exactly the behaviour the output gate
+        exists to provide.
+      complexity: "O(H·d + H²) time, O(H) space"
+      tags: [lstm, gates, cell-state, shapes]
+
+    - id: p-truncation-fraction
+      title: "How much of the gradient a truncation window keeps"
+      difficulty: medium
+      prompt: >-
+        Implement `truncated_bptt_fraction(gain, k, T)` returning the fraction of
+        the total backward signal that survives truncating the pass at `k` steps
+        out of `T`, under a constant per-step gain `gain`. If the per-step
+        contribution is `gain**i` for `i = 0..T-1`, the kept sum over
+        `i = 0..k-1` divided by the full sum is
+        `(1 - gain**k) / (1 - gain**T)` when `gain != 1`, and `k / T` when
+        `gain == 1` (the removable singularity). If `k >= T` the answer is `1.0`.
+        Return a float. Use an absolute test `abs(gain - 1.0) < 1e-12` for the
+        singular case.
+      starter: |
+        def truncated_bptt_fraction(gain, k, T):
+            # your implementation here
+            pass
+      language: python
+      entry: truncated_bptt_fraction
+      testCases:
+        - input: '[0.9, 20, 200]'
+          expected: "0.8784233460291653"
+          mode: json
+          tolerance: 1e-9
+        - input: '[0.99, 20, 200]'
+          expected: "0.210264190246232"
+          mode: json
+          tolerance: 1e-9
+        - input: '[1.0, 20, 200]'
+          expected: "0.1"
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.5, 10, 50]'
+          expected: "0.9990234375000009"
+          mode: json
+          tolerance: 1e-9
+        - input: '[1.01, 50, 200]'
+          expected: "0.10206301453962992"
+          mode: json
+          tolerance: 1e-9
+        - input: '[0.9, 200, 200]'
+          expected: "1.0"
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.98, 25, 100]'
+          expected: "0.4571641808574003"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def truncated_bptt_fraction(gain, k, T):
+            if k >= T:
+                return 1.0
+            if abs(gain - 1.0) < 1e-12:
+                return float(k) / float(T)
+            return (1.0 - gain ** k) / (1.0 - gain ** T)
+      solutionExplanation: >-
+        The geometric sum is the whole content, and the two edge cases are where
+        it is usually got wrong. At `gain == 1` the numerator and denominator are
+        both zero, so the ratio is a removable singularity whose limit is `k/T`:
+        every step contributes equally and truncation keeps the fraction of steps
+        you kept. That is not a corner case — it is the regime a perfectly
+        preserved memory lives in, and it is the one where truncation is most
+        expensive: at `T=200`, `k=20` it keeps 10%. At `gain == 0.9` the same
+        truncation keeps 87.8%, because the terms it dropped were already ten
+        orders of magnitude below the ones it kept. The practical reading is
+        inverted from the intuition: truncation looks harmless precisely when
+        the gradient has already decayed to nothing, so a low truncation error is
+        evidence that you are not learning long dependencies — not evidence that
+        the shortcut is safe.
+      complexity: "O(1) time, O(1) space"
+      tags: [bptt, truncation, geometric-series, bias]
+
+    - id: p-cell-params
+      title: "Parameter counts for the three cells"
+      difficulty: easy
+      prompt: >-
+        Implement `cell_params(d, h, cell)` returning the number of trainable
+        parameters (weights and biases, no output layer) for a recurrent cell
+        with input width `d` and hidden width `h`. `cell` is one of `"rnn"`,
+        `"lstm"`, `"gru"`: `"rnn"` has one gate block, `"lstm"` has four
+        (`i, f, o, g`), `"gru"` has three (`z, r, h_tilde`). Each block owns a
+        `(h, d)` input matrix, an `(h, h)` recurrent matrix, and `h` biases, so
+        one block is `h * (d + h + 1)`. Any other `cell` value raises
+        `ValueError`. Return an `int`.
+      starter: |
+        def cell_params(d, h, cell):
+            # your implementation here
+            pass
+      language: python
+      entry: cell_params
+      testCases:
+        - input: '[128, 256, "lstm"]'
+          expected: "394240"
+          mode: json
+          tolerance: 1e-9
+        - input: '[128, 256, "gru"]'
+          expected: "295680"
+          mode: json
+          tolerance: 1e-9
+        - input: '[128, 256, "rnn"]'
+          expected: "98560"
+          mode: json
+          tolerance: 1e-9
+        - input: '[64, 128, "lstm"]'
+          expected: "98816"
+          mode: json
+          tolerance: 1e-9
+        - input: '[32, 32, "gru"]'
+          expected: "6240"
+          mode: json
+          tolerance: 1e-9
+        - input: '[8, 4, "rnn"]'
+          expected: "52"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def cell_params(d, h, cell):
+            blocks = {"rnn": 1, "lstm": 4, "gru": 3}
+            if cell not in blocks:
+                raise ValueError("unknown cell: %r" % (cell,))
+            return int(blocks[cell] * h * (d + h + 1))
+      solutionExplanation: >-
+        The `+1` is the bias and it is per gate block, not per cell: a third of
+        the memory of this formula is the fact that each block's bias is a
+        vector of length `h`, so an LSTM at `d=128, h=256` has `4*256 = 1024`
+        bias parameters and 393,216 weights. The ratio is exact and worth
+        carrying around: GRU is `3/4` of LSTM at every size, LSTM is exactly `4x`
+        RNN. Getting `h*(d+h)` instead of `h*(d+h+1)` is a 0.26% error at
+        `d=128, h=256` — small enough to pass a sanity check and wrong enough to
+        break a parameter-count budget reconciliation against a framework, which
+        is the situation where anyone actually computes this number by hand.
+      complexity: "O(1) time, O(1) space"
+      tags: [parameter-count, lstm, gru, shapes]
+
+  visualizers:
+    - id: vs-sequence-memory
+      kind: shape_flow
+      title: "Watch the backward signal die with T, and stop dying with a gate"
+      description: >-
+        Push one hidden state through $T$ steps of the recurrence and record the
+        norm of the composed Jacobian at every step. At $\rho=1$ and $h=32$ it
+        crosses $10^{-6}$ at $k=34$ even though every single step has norm 0.9955;
+        with a forget gate held at 0.999 the same path loses less than a factor of
+        2 over 100 steps. Switch the forget bias to 0 and the gate path collapses
+        to $10^{-30}$ before $T=100$.
+      params:
+        steps: 200
+        hidden: 32
+        spectral_radii: [0.9, 1.0, 1.1, 1.5]
+        forget_biases: [0.0, 1.0, 2.0, 3.0]
+
+
+  try_it: >-
+    Initialise one LSTM with the forget-gate bias at 0 and another at 1, then measure
+    $\|\partial c_{50}/\partial c_0\|$ in each. The gap is about 8.25 decades —
+    $0.7311^{50} = 1.58\times10^{-7}$ against $0.5^{50} = 8.88\times10^{-16}$ — and it costs one
+    line of initialisation.
+  interview_questions:
+    - question: 'Why does an RNN parameter count not grow with sequence length, and what does grow?'
+      level: mid
+      key_points:
+        - 'One cell is applied T times, so parameters are fixed: 256 * (128 + 256 + 1) = 98,560 at d = 128, h = 256, identical at T = 10 and T = 10,000.'
+        - 'What grows is the gradient exponent, because the backward pass is a power of one Jacobian rather than a product of different ones.'
+        - 'The graph also grows with T, so memory scales with the sequence unless you truncate.'
+        - 'That asymmetry — constant parameters, multiplicative gradient — is why the vanishing problem is structural rather than a tuning issue.'
+    - question: 'The LSTM cell state has no weight matrix on its gradient path. Why does that matter, and what is the forget-gate bias for?'
+      level: senior
+      key_points:
+        - 'c_t = f_t * c_{t-1} + i_t * g_t gives d c_t / d c_{t-1} = diag(f_t), a diagonal of numbers in (0,1) with no W in it.'
+        - 'Over T steps the path is a product of scalars you gate, not a product of matrices you do not, which is the structural fix rather than a numerical one.'
+        - 'The bias of 1 gives sigma(1) = 0.7311 against sigma(0) = 0.5: over 50 steps that is 1.58e-7 against 8.88e-16, a gap of 8.25 decades, and 16.5 decades over 100 steps.'
+        - 'It is a statement about the only gradient path the cell has: the gate multiplies it, so its initial value is a horizon setting.'
+      follow_up: 'If the forget gate is the horizon, what breaks when you initialise it to something much larger than 1?'
+    - question: 'Truncated BPTT at k = 20 on a T = 200 sequence: how much of the gradient do you keep, and is the loss the same one?'
+      level: mid
+      key_points:
+        - 'You keep the fraction (1 - g^k)/(1 - g^T): 87.8% at g = 0.9, 21.0% at g = 0.99, 3% at g = 1.01.'
+        - 'It is a biased objective rather than a speed-up, because you are optimising a truncated sum of the same terms.'
+        - 'Memory falls to O(k) instead of O(T), which is the reason to do it at all.'
+        - 'The bias is largest exactly when the horizon matters, which is why the truncation length is a modelling decision and not a memory setting.'
+      follow_up: 'Clipping has cosine exactly 1 with the raw gradient. Which half of the exploding/vanishing pair does that leave untouched?'
+  common_mistakes:
+    - 'Reading a per-step Jacobian norm of 0.9955 as proof that the long-range gradient is healthy, when the product over 50 or 100 steps is the number that decides it.'
+    - 'Initialising the forget-gate bias to 0, which halves the gate and costs 8.25 decades of gradient over 50 steps.'
+    - 'Expecting gradient clipping to fix vanishing gradients: it rescales the step size and leaves the direction, and the cosine with the raw gradient is exactly 1.'
+  further_reading:
+    - label: "Hochreiter & Schmidhuber, Long Short-Term Memory (Neural Computation, 1997)"
+    - label: "Cho, van Merriënboer, Gulcehre, Bahdanau, Bougares, Schwenk & Bengio, Learning Phrase Representations using RNN Encoder-Decoder for Statistical Machine Translation (EMNLP 2014)"

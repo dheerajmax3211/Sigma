@@ -1,0 +1,398 @@
+id: sora-wan-video
+title: "Sora and Wan: turning a video into patches, and paying for it in attention"
+summary: >-
+  Sora's contribution was not a better image model. It was a representation
+  decision: compress video into a spatio-temporal latent, cut that latent into
+  spatio-temporal patches, and let a diffusion transformer denoise the patches as
+  a sequence. Wan is the open replication of that idea, with a 3D causal VAE that
+  compresses 4x in time and 8x8 in space. The engineering consequence is brutal:
+  a five-second 1080p clip becomes roughly 122,000 tokens, and at that length the
+  attention term equals the parameter term, so video generation is an attention
+  and memory problem long before it is a modelling problem.
+kind: case_study
+date: "2025-02-25"
+actors: [OpenAI, Alibaba Wan]
+key_facts:
+  - "Sora was announced on 15 February 2024 and demonstrated clips up to a minute long, with variable resolution, duration and aspect ratio."
+  - "The architecture is a diffusion transformer over spatio-temporal latent patches: video is compressed by a VAE, the latent is cut into cubes, and the transformer denoises the sequence."
+  - "Wan 2.1 was released open-source in February 2025 with Wan-VAE at 4x temporal and 8x8 spatial compression, supporting 1080p, and a 14B text-to-video model alongside a 1.3B variant."
+  - "A 3D causal VAE makes frame t depend only on frames up to t, which is what allows long video to be generated in chunks without temporal seams."
+  - "A five-second 1080p clip at 24 fps is 120 frames, which compress to 30 latent frames, and patchify to roughly 122,000 tokens at a 2x2x2 patch."
+  - "Wan 2.2 moved the denoiser to a mixture-of-experts shape, trading total parameters for per-token compute in the same way language MoE does."
+timeline:
+  - when: Dec 2022
+    what: "The DiT paper shows a transformer can replace the U-Net in a diffusion model and scale predictably."
+  - when: 15 Feb 2024
+    what: "Sora preview: spatio-temporal patches, variable duration, up to a minute of video."
+  - when: 2024
+    what: "Open video models follow: Latte, CogVideoX and others test the DiT-plus-3D-VAE recipe in public."
+  - when: Feb 2025
+    what: "Wan 2.1 released: Wan-VAE with 4x8x8 compression, 1080p support, 14B and 1.3B models, open weights."
+  - when: Jul 2025
+    what: "Wan 2.2 introduces a mixture-of-experts denoiser and stronger cinematic control."
+  - when: 2025
+    what: "Distillation to 4 to 8 sampling steps turns video generation from a research demo into a priced API."
+decisions:
+  - choice: "Compress video into a latent before diffusion"
+    why: "Diffusing pixels directly is computationally impossible at 1080p: a five-second clip is 120 x 1920 x 1080 x 3 = 746 million values. A VAE with 4x temporal and 8x8 spatial compression reduces that to about 15.6 million latents, a 48x reduction in the quantity the transformer has to model."
+    cost: "The VAE becomes a quality ceiling. If it loses fine texture or motion detail, no amount of denoising steps recovers it, and the failure is visible as softness rather than as an error."
+  - choice: "Spatio-temporal patches instead of frame-by-frame generation"
+    why: "Patching across time lets one attention operation see motion directly. A model that generates frames independently has to infer velocity from nothing, which is why early video models flickered. A patch that spans two frames carries the motion inside the token."
+    cost: "Token count multiplies: a patch that spans time reduces the temporal resolution of the token grid, so fast motion needs smaller temporal patches and therefore more tokens."
+  - choice: "A causal 3D VAE rather than a symmetric one"
+    why: "Causality in time means frame t is reconstructed only from frames up to t. That allows autoregressive generation in chunks, which is the only way to make a two-minute video without holding the whole latent in memory."
+    cost: "A causal VAE cannot use future frames to denoise the past, so reconstruction quality at a given compression ratio is worse than a bidirectional VAE, and the first frames are the hardest."
+  - choice: "Diffusion transformer rather than a U-Net"
+    why: "Transformers scale predictably with parameters and data, and they handle variable sequence lengths without architectural surgery. That is what makes variable resolution and variable duration possible in one model."
+    cost: "Attention is quadratic in token count, and video token counts are two orders of magnitude larger than image token counts. The U-Net's inductive bias was doing real work that the transformer now has to learn."
+  - choice: "Distil the sampler to a handful of steps"
+    why: "A 50-step sampler at 122,000 tokens costs minutes per clip. A 4-step distilled sampler cuts the bill by more than 10x, which is the difference between a demo and a priced product."
+    cost: "Distillation narrows diversity and can soften motion; the 4-step model is measurably worse than the 50-step one on prompt adherence, and the gap shows up on unusual prompts."
+lessons:
+  - "Video generation is a tokenisation problem first. The compression ratio decides the token count, and the token count decides everything else."
+  - "At 100,000 tokens attention stops being a detail and becomes the dominant term. Every architecture choice after that is an attention-cost decision."
+  - "Causality in the VAE is what makes long video possible. It buys streaming at the cost of reconstruction quality."
+  - "The VAE is the quality ceiling. Distillation and better samplers cannot recover detail the latent never encoded."
+  - "Step count is the price. Distillation is not an optimisation, it is the business model."
+mistakes:
+  - "Comparing video models on clip length without comparing token count. A minute at 480p and a minute at 1080p are different products."
+  - "Assuming a bigger denoiser fixes motion. Most motion artefacts come from the temporal compression ratio and the patch shape, not from parameter count."
+  - "Ignoring the VAE. A 4x temporal compression cannot represent fast motion, and no sampler recovers it."
+  - "Pricing a video API on denoiser FLOPs alone. The VAE decode is a separate and often dominant cost, and it does not shrink with distillation."
+problem_statement: >-
+  Generating video means modelling a distribution over hundreds of millions of
+  pixel values per clip, which is intractable directly. The field's answer is to
+  compress first: a VAE maps the clip into a latent volume, and a diffusion model
+  learns the distribution of latents instead. That transforms the problem into a
+  sequence-modelling problem, which is exactly what transformers are good at, but
+  it also imports the transformer's worst property: quadratic attention. A
+  five-second 1080p clip becomes about 122,000 tokens after patching, and at that
+  length attention costs as much as the entire parameter set. The design problem
+  is therefore to choose compression ratios, patch shapes and attention
+  factorisation such that the token count stays inside a memory budget, while
+  keeping enough temporal resolution that motion is representable. Every
+  practical video model is a different answer to that trade.
+requirements:
+  functional:
+    - "Generate a coherent clip from a text prompt, with motion that matches the described action rather than a slow zoom."
+    - "Support 1080p output at durations from 5 to 10 seconds, with variable aspect ratios from square to widescreen."
+    - "Maintain temporal consistency: no flicker, no identity drift across frames, no object that changes shape between cuts."
+    - "Accept an image or a video as conditioning, so the same model does text-to-video, image-to-video and video extension."
+    - "Allow long-form generation by extending a clip in chunks without a visible seam at the join."
+  non_functional:
+    - "Generate a 5-second 1080p clip in under two minutes on a single 8-GPU node, which sets the denoiser size and the step count."
+    - "Fit the latent for a 5-second clip in under 40 MB so that a training batch of 64 is feasible on a node."
+    - "Keep denoiser FLOPs per clip under 3e17 so that a 30-step sampler stays inside the latency budget."
+    - "Reduce the sampler to 4 to 8 steps via distillation without losing prompt adherence on the long tail."
+    - "Keep the VAE decode from dominating wall clock, which is a separate bottleneck from the denoiser."
+clarifying_questions:
+  - question: "What resolution and duration is the product actually selling?"
+    why_it_matters: "Token count scales with width times height times duration divided by the compression ratio, and attention scales with the square of that. A 720p five-second clip is 4x cheaper than 1080p and a ten-second clip is 2x again, so the product definition is a capacity decision."
+  - question: "Is the output consumed as a file or as a stream?"
+    why_it_matters: "Streaming requires a causal VAE and chunked generation, which constrains the architecture. A file can use a bidirectional VAE, which reconstructs better at the same compression."
+  - question: "How important is motion fidelity versus visual fidelity?"
+    why_it_matters: "Temporal compression ratio trades directly against motion. A 4x temporal compression cannot represent a fast pan, so a sports product needs a different VAE from a product that generates slow cinematic shots."
+  - question: "What is the acceptable latency for a single clip?"
+    why_it_matters: "At 30 steps and 122k tokens a clip is minutes; at 4 distilled steps it is seconds. The step count is chosen by the latency target, and it determines whether you need one node or eight."
+  - question: "Is audio generated with the video?"
+    why_it_matters: "Joint audio-video generation adds a second modality to the token stream and a synchronisation requirement. It roughly doubles the token budget and introduces a failure mode where the audio is plausible and the lip sync is not."
+capacity_estimation:
+  assumptions:
+    - "Output is 1080p at 24 fps, five seconds, so 120 frames of 1920 x 1080."
+    - "The VAE compresses 8x spatially in each dimension and 4x temporally, with 16 latent channels, following the Wan-VAE design."
+    - "The denoiser is a 14B-parameter DiT with hidden dimension 1,536 and 40 blocks, which is the Wan 2.1 14B scale."
+    - "An H100 has 80 GB of HBM and about 400 TFLOPS of effective BF16 throughput at 40% MFU in this workload."
+    - "A 30-step sampler is the baseline and a 4-step distilled sampler is the optimised case."
+  arithmetic:
+    - label: "Raw pixel count for one clip"
+      calculation: "120 frames x 1920 x 1080 x 3 channels = 746,496,000 values"
+      conclusion: "Diffusing pixels directly is not a question of efficiency; it is 746 million values per clip. Compression is mandatory, not an optimisation."
+    - label: "Latent volume after VAE compression"
+      calculation: "1920/8 = 240; 1080/8 = 135; 120/4 = 30 frames; 240 x 135 x 30 = 972,000 positions; x 16 channels = 15.6e6 latent values"
+      conclusion: "The VAE reduces 746M values to 15.6M, a 48x reduction. That ratio is the single most important number in the system, because everything downstream scales with it."
+    - label: "Token count at a 2x2x2 patch"
+      calculation: "(240/2) x (135/2) x (30/2) = 120 x 68 x 15 = 122,400 tokens"
+      conclusion: "One five-second clip is 122,400 tokens, which is longer than most language-model contexts. This is why video models are memory-bound in a way image models never were."
+    - label: "Token count at a 2x2x1 patch"
+      calculation: "120 x 68 x 30 = 244,800 tokens"
+      conclusion: "Dropping the temporal dimension from the patch doubles the token count. The patch shape is the main lever on cost, and it trades directly against motion fidelity."
+    - label: "Attention FLOPs per denoise step"
+      calculation: "4 x S^2 x d x layers = 4 x (122,400)^2 x 1,536 x 40 = 3.68e15 FLOPs"
+      conclusion: "Attention alone is 3.7e15 FLOPs per step at 122k tokens, the same order as the parameter term. Above roughly 130k tokens attention dominates and grows quadratically."
+    - label: "Parameter FLOPs per denoise step"
+      calculation: "2 x 14e9 params x 122,400 tokens = 3.43e15 FLOPs"
+      conclusion: "Attention and parameters are almost exactly balanced at this token count, which is why video DiTs are designed around attention factorisation rather than around parameter efficiency."
+    - label: "Total inference cost for one clip"
+      calculation: "(3.68e15 + 3.43e15) x 30 steps = 2.13e17 FLOPs; at 8 H100 x 4e14 effective = 3.2e15 FLOP/s that is 67 s"
+      conclusion: "A five-second 1080p clip is about 67 seconds on an 8-GPU node, or roughly 0.15 GPU-hours. At $2.50 per GPU-hour that is $0.37 of compute per clip at 30 steps."
+    - label: "Cost with a 4-step distilled sampler"
+      calculation: "2.13e17 x (4/30) = 2.84e16 FLOPs; 2.84e16 / 3.2e15 = 8.9 s per clip; 0.02 GPU-hours = $0.05"
+      conclusion: "Distillation is a 7.5x cost reduction on the denoiser and turns a $0.37 clip into a $0.05 clip. That ratio is why every video API advertises a fast tier."
+    - label: "Latent storage for the training set"
+      calculation: "15.6e6 values x 2 bytes = 31 MB per 5-second latent; 10e6 clips x 31 MB = 310 TB"
+      conclusion: "Pre-computed latents for a 10M-clip dataset are 310 TB, which is a storage system, not a directory. Most pipelines compute latents on the fly and cache a hot subset."
+    - label: "Training compute for one epoch"
+      calculation: "10e6 clips x 2.13e17 FLOPs = 2.13e24 FLOPs; 4,096 H100 x 9.89e14 x 0.4 MFU = 1.62e18 FLOP/s; 2.13e24 / 1.62e18 = 1.31e6 s = 15.2 days"
+      conclusion: "One epoch at this resolution is about two weeks on 4,096 GPUs. Real video training runs multiple epochs at mixed resolutions, which is why the budget is measured in tens of millions of GPU-hours."
+    - label: "VAE decode cost"
+      calculation: "972,000 latent positions x 200 GFLOP per position = 1.94e14 FLOPs per clip; / 2.13e17 total = 0.09% of the denoiser"
+      conclusion: "Decode FLOPs are small but memory-bound: the operation is a series of upsampling convolutions over a large volume, and it often takes longer than its FLOP count suggests."
+architecture_summary: >-
+  The system has three stages. First, a 3D causal VAE compresses the clip: 8x
+  spatially in each dimension and 4x temporally, into 16 latent channels, with
+  causal convolutions along the time axis so that the latent at frame t depends
+  only on frames up to t. Second, the latent volume is patchified into
+  spatio-temporal cubes, typically 2x2x2, and each cube is projected to the
+  denoiser's hidden dimension with a linear embedding plus a positional
+  encoding that carries both space and time. Third, a diffusion transformer
+  denoises the token sequence, conditioned on a text embedding injected through
+  adaptive layer norm and on the diffusion timestep through the same pathway.
+  Attention is factorised: spatial attention within each latent frame, temporal
+  attention across frames at the same spatial position, and occasionally a full
+  3D attention at low resolution. The factorisation is what keeps the token
+  count tractable, because full 3D attention over 122,000 tokens is 1.5e10 pairs
+  per head per layer. At inference the sampler iterates the denoiser 30 times,
+  then the VAE decodes the final latent back to pixels, and the decode is a
+  separate memory-bound stage that runs on the same node with a different
+  utilisation profile.
+deep_dives:
+  - topic: "The 3D causal VAE is the quality ceiling"
+    explanation: >-
+      The VAE is usually described as a preprocessing step and it is actually the
+      most consequential component in the system. It decides how much of the
+      original signal survives, and nothing downstream can recover what it drops.
+      At 8x8 spatial and 4x temporal compression, a 1080p clip becomes a
+      240 x 135 x 30 volume with 16 channels, which is 15.6 million values
+      against 746 million pixels. The spatial compression is standard practice
+      from image models; the temporal compression is where video differs. Four
+      to one means every latent frame represents four consecutive frames at
+      24 fps, so the latent has to encode motion over a sixth of a second. Fast
+      motion becomes ambiguous: a hand moving across the frame in three frames is
+      a blur in one latent frame, and the denoiser has no way to know which
+      direction it was going. Causality adds a second constraint. A causal
+      convolution at time t sees only t and earlier, so the model cannot use
+      future frames to disambiguate the past. That is what enables chunked
+      generation, and it costs reconstruction quality relative to a
+      bidirectional VAE at the same ratio. The practical implication is that a
+      model trained with a 4x causal VAE will always produce soft fast motion,
+      and the fix is a different VAE rather than a bigger denoiser.
+    tradeoffs:
+      - option: "4x temporal, 8x8 spatial, causal"
+        pros: "48x compression, streaming-capable, long video in chunks, and a token count that fits a single node at 1080p."
+        cons: "Fast motion is under-resolved; the first frames are hardest; reconstruction quality is below a bidirectional VAE at the same ratio."
+      - option: "2x temporal, 8x8 spatial"
+        pros: "Better motion fidelity; less ambiguity for the denoiser; visibly sharper action."
+        cons: "Doubles the token count and therefore quadruples attention cost; a five-second clip no longer fits the same memory budget."
+      - option: "Bidirectional VAE with the same ratios"
+        pros: "Better reconstruction because future frames inform the past; fewer temporal artefacts at chunk boundaries within a clip."
+        cons: "Cannot stream or extend, because the whole clip must be available before decoding; rules out long-form generation."
+  - topic: "Spatio-temporal patches: the token count is the architecture"
+    explanation: >-
+      Patchification is where a video becomes a sequence. A 2x2x2 patch over the
+      latent grid turns 972,000 positions into 121,500 tokens, and each token
+      carries eight latent values times 16 channels. The patch shape is a direct
+      trade: a patch that spans more time reduces the token count but limits the
+      temporal resolution of what the model can represent, so fast motion has to
+      be inferred across tokens rather than encoded within one. A 2x2x1 patch
+      keeps full temporal resolution and doubles the token count, which
+      quadruples attention. This is why every video model has a resolution and
+      duration limit that looks arbitrary: it is the point at which the token
+      count crosses a memory threshold. Variable resolution makes the problem
+      worse, because a sequence length that varies per sample defeats static
+      kernel shapes and forces padding or bucketing. The practical solution is
+      to bucket by aspect ratio and resolution, run each bucket as a separate
+      batch shape, and accept the utilisation loss.
+    tradeoffs:
+      - option: "2x2x2 patches"
+        pros: "Halves the token count versus 2x2x1; fits 1080p five seconds in about 122k tokens; attention stays affordable."
+        cons: "Temporal resolution drops to 6 latent frames per second at the token level, so fast action is smoothed."
+      - option: "2x2x1 patches"
+        pros: "Full temporal resolution in the token grid; better for action and camera motion."
+        cons: "244k tokens for the same clip; attention cost quadruples and the clip no longer fits a single node."
+      - option: "Variable patch size by content"
+        pros: "Spend tokens where motion is, which is the ideal allocation."
+        cons: "Breaks static shapes and batching; requires a variable-length kernel and a scheduler that can pack irregular sequences."
+  - topic: "Factorised attention: spatial then temporal"
+    explanation: >-
+      Full 3D attention over 122,000 tokens is 1.5e10 query-key pairs per head per
+      layer. At 40 layers and 16 heads that is 9.6e12 pairs, and even at one FLOP
+      per pair it is more than the entire parameter budget. The standard fix is
+      to factorise: spatial attention within each latent frame, so tokens
+      attend to other tokens at the same time step, then temporal attention
+      across frames at the same spatial position, so each location attends to its
+      own history. The cost becomes 4 x S_frame^2 x d for the spatial pass plus
+      4 x T^2 x d for the temporal pass, where S_frame is 8,160 tokens and T is
+      30 frames. That is 4 x 6.7e7 x 1,536 = 4.1e11 per layer for spatial and
+      4 x 900 x 1,536 = 5.5e6 for temporal, which is four orders of magnitude
+      less than full 3D attention. The price is that a token can never attend
+      jointly to a distant space and a distant time in one operation. It has to
+      compose the two, which works well for objects that move coherently and
+      badly for events that require correlating two distant regions across time.
+    tradeoffs:
+      - option: "Factorised spatial then temporal attention"
+        pros: "Four orders of magnitude cheaper than full 3D; fits 1080p in memory; trains stably."
+        cons: "Cannot jointly attend over space and time; struggles with long-range interactions such as a reflection that should match an object across the frame."
+      - option: "Full 3D attention at low resolution"
+        pros: "Best quality per token; models joint space-time interactions directly."
+        cons: "Infeasible above roughly 30k tokens; only usable for a preview pass or a low-resolution base stage."
+      - option: "Hierarchical coarse-to-fine"
+        pros: "Full attention at low resolution to establish structure, then factorised attention at high resolution to add detail."
+        cons: "Two-stage pipeline doubles the engineering and the latency, and errors in the coarse pass propagate."
+  - topic: "Why the denoiser is a transformer and not a U-Net"
+    explanation: >-
+      The DiT result was that a transformer with adaptive layer-norm
+      conditioning matches or beats a U-Net at equal compute, and scales more
+      predictably. For images that was a useful simplification. For video it is
+      the enabling decision, because a U-Net's inductive bias is spatial
+      locality: convolutions see a neighbourhood, and hierarchy is built by
+      downsampling. That is exactly wrong for motion, which is a relationship
+      between distant pixels across time. A transformer can attend from a token
+      in frame 1 to a token in frame 30 directly, and factorised attention makes
+      that cheap in the temporal direction. The second reason is variable
+      sequence length: a transformer does not care whether the input is 30 frames
+      or 300, while a U-Net's downsampling path assumes a fixed spatial grid. The
+      cost is that the transformer has no locality prior, so it needs more data
+      to learn that neighbouring patches are related, and it needs positional
+      encodings that generalise across durations. That is why video DiTs are
+      trained on mixed resolutions and durations: the model has to learn that
+      time is a dimension, not a fixed-size tensor.
+    tradeoffs:
+      - option: "Diffusion transformer"
+        pros: "Scales predictably with parameters and data; handles variable duration and resolution; attention models motion directly."
+        cons: "No locality prior, so data-hungry; quadratic attention; positional encodings must generalise across lengths."
+      - option: "3D U-Net"
+        pros: "Strong locality prior, so it learns from less data; convolutional kernels are efficient at high resolution."
+        cons: "Fixed spatial grid; motion modelling is limited to the receptive field; scaling is less predictable."
+      - option: "Hybrid convolutional stem plus transformer trunk"
+        pros: "Local detail from convolutions, long-range motion from attention; often the best quality per FLOP at high resolution."
+        cons: "Two architectures to tune, and the interface between them is a design surface with no principled default."
+  - topic: "Paying for a clip: steps, resolution and the distillation trade"
+    explanation: >-
+      The bill for one clip is the denoiser FLOPs times the number of steps, plus
+      the VAE decode. At 122,400 tokens and a 14B model, one step is about
+      7.1e15 FLOPs, so a 30-step sampler is 2.13e17 FLOPs, which is 67 seconds
+      on an 8-GPU node. That is $0.37 at $2.50 per GPU-hour, before margin. A
+      4-step distilled sampler is 2.84e16 FLOPs, or 8.9 seconds and $0.05. The
+      7.5x gap is the entire consumer market for video generation: at 30 steps
+      you sell to studios, at 4 steps you sell to social apps. Distillation works
+      by training a student to match the teacher's trajectory in fewer steps, and
+      it is not free: the student's diversity collapses toward the modes the
+      teacher visits most, so unusual prompts produce generic output. The second
+      lever is resolution, and it is stronger than step count because attention
+      is quadratic. Halving width and height quarters the token count and
+      quarters the attention per token, so the total attention cost falls by
+      16x for a 4x reduction in pixels. That is why 720p generation is not
+      merely cheaper than 1080p, it is a different product.
+    tradeoffs:
+      - option: "30-step sampler at 1080p"
+        pros: "Best prompt adherence and diversity; the quality ceiling of the model."
+        cons: "67 seconds and $0.37 per clip at cost; unusable for interactive products."
+      - option: "4-step distilled sampler at 1080p"
+        pros: "8.9 seconds and $0.05 per clip; interactive enough for a consumer product."
+        cons: "Narrower diversity, softer motion, worse on unusual prompts; the teacher is still needed to generate training data."
+      - option: "30 steps at 720p"
+        pros: "Cheaper than 1080p at the same quality per pixel; keeps the full sampler and its diversity."
+        cons: "Resolution is visibly lower, and upscaling afterwards adds a second model and its own artefacts."
+bottlenecks:
+  - failure: "Temporal flicker and identity drift"
+    symptom: "Frame-to-frame brightness or texture oscillates; a character's face changes slightly every few frames even though the prompt is unchanged."
+    mitigation: "Temporal compression in the VAE rather than independent frame encoding, factorised temporal attention with a receptive field long enough to cover the drift period, and a fixed noise schedule shared across frames."
+  - failure: "Attention memory blow-up at high resolution"
+    symptom: "The job runs out of memory when the resolution is increased, and the failure is abrupt rather than gradual; gradient checkpointing helps training but not inference."
+    mitigation: "Factorised attention, chunked spatial attention with a halo, sequence parallelism across the frame dimension, and bucketing by resolution so no batch contains the largest and smallest shape together."
+  - failure: "VAE decode dominating wall clock"
+    symptom: "Denoiser finishes in seconds and the request takes a minute; GPU utilisation drops during decode because the operation is memory-bound rather than compute-bound."
+    mitigation: "Decode in tiles with overlap, run the decode on a separate pool from the denoiser, and overlap the decode of clip N with the denoising of clip N+1 in a pipelined service."
+  - failure: "Motion collapse under distillation"
+    symptom: "The 4-step model produces clips that are visually clean but almost static; camera moves described in the prompt are ignored."
+    mitigation: "Include motion-heavy clips in the distillation set, add an explicit motion objective rather than pure trajectory matching, and keep the 30-step teacher available for prompts the student fails."
+  - failure: "Prompt adherence on compositional scenes"
+    symptom: "Two objects swap attributes, a colour applies to the wrong noun, a count is wrong. The clip looks good and is wrong."
+    mitigation: "Better text encoders and longer text conditioning, spatial conditioning from a layout or a reference image, and evaluation that scores attribute binding separately from aesthetic quality."
+interview_questions:
+  - question: "A five-second 1080p clip becomes 122,000 tokens. Show me the arithmetic and tell me what it implies."
+    level: senior
+    key_points:
+      - "120 frames at 1920x1080 compress 8x8 spatially and 4x temporally to 240x135x30 latent positions."
+      - "A 2x2x2 patch gives 120x68x15 = 122,400 tokens."
+      - "At that length attention is 4 x S^2 x d per layer, about 3.7e15 FLOPs, the same order as the parameter term."
+      - "Implication: the architecture is chosen by attention cost, and the token count is the real product specification."
+    follow_up: "What would you change to halve the token count without visibly hurting motion?"
+  - question: "Why is the VAE a quality ceiling rather than a preprocessing detail?"
+    level: staff
+    key_points:
+      - "The VAE decides what survives compression; the denoiser can only model what the latent contains."
+      - "A 4x temporal compression means one latent frame represents four frames, so fast motion becomes ambiguous."
+      - "Causality forbids using future frames to disambiguate the past, which costs reconstruction quality."
+      - "The symptom is softness and smoothed motion, which looks like a model failure and is not."
+    follow_up: "How would you measure VAE quality separately from denoiser quality?"
+  - question: "Full 3D attention is infeasible at 122k tokens. What do you do instead, and what do you lose?"
+    level: senior
+    key_points:
+      - "Factorise into spatial attention within a frame and temporal attention across frames at a fixed position."
+      - "Cost falls from 1.5e10 pairs per head per layer to 6.7e7 for spatial and 900 for temporal, four orders of magnitude."
+      - "You lose the ability to jointly attend over distant space and distant time in one operation."
+      - "Composition works for coherent motion and fails for long-range correlations such as reflections or shadows."
+    follow_up: "Which failure case would you test to detect that the factorisation is hurting you?"
+  - question: "Estimate the cost of one generated clip and tell me how distillation changes it."
+    level: mid
+    key_points:
+      - "One denoise step is about 7.1e15 FLOPs at 122k tokens and a 14B model."
+      - "Thirty steps is 2.13e17 FLOPs, 67 seconds on an 8-GPU node at 3.2e15 FLOP/s, or about $0.37 at cost."
+      - "Four distilled steps is 2.84e16 FLOPs, 8.9 seconds, about $0.05."
+      - "The VAE decode is additional and memory-bound; it does not shrink with distillation."
+    follow_up: "How would you price a 10-second 720p tier against a 5-second 1080p tier?"
+  - question: "Why did video generation move from U-Nets to transformers?"
+    level: senior
+    key_points:
+      - "A transformer scales predictably and handles variable sequence length, which is what makes variable duration and resolution possible."
+      - "Attention can relate a token in frame 1 to a token in frame 30 directly, where a convolution only sees its receptive field."
+      - "The U-Net's locality prior is an advantage for images and a limitation for motion."
+      - "The cost is data hunger and quadratic attention, so the transformer only wins once you have both data and factorised attention."
+    follow_up: "Where would a hybrid convolutional stem still beat a pure transformer?"
+  - question: "Your model produces a clip that looks beautiful and completely ignores the prompt. Where do you look?"
+    level: staff
+    key_points:
+      - "Text conditioning path first: encoder capacity, prompt length, and how the embedding is injected."
+      - "Then attribute binding: check whether colours, counts and object pairs are swapped, which is a compositional failure rather than a conditioning failure."
+      - "Then distillation: a 4-step student often collapses to the teacher's most common modes regardless of prompt."
+      - "Then data: prompts in the training set may be short and simple, so the model never learned to follow compositional text."
+    follow_up: "How would you build an evaluation that separates aesthetics from prompt adherence?"
+  - question: "Would you choose a causal or a bidirectional VAE for a product that must generate two-minute videos?"
+    level: staff
+    key_points:
+      - "Causal allows chunked autoregressive generation, which is the only way to hold a two-minute latent in memory."
+      - "Causal also enables streaming output, which changes the product from a file to a feed."
+      - "The cost is reconstruction quality, because the past cannot be refined using the future."
+      - "A bidirectional VAE would need the whole clip resident, so two minutes at 1080p is roughly 24 times the latent of a five-second clip."
+    follow_up: "How would you hide the seam between chunks in a causal pipeline?"
+what_to_steal:
+  - "Pick the compression ratio before the model. Tokens per clip decides cost, latency and the architecture."
+  - "Make the VAE causal if you ever want long video. It is the difference between a clip and a stream."
+  - "Factorise attention and measure what it costs in quality. Full 3D attention is a research setting, not a product."
+  - "Distil the sampler. The step count is the price, and the price is the product."
+  - "Bucket by resolution and duration. Variable sequence length is a batching problem, not a kernel problem."
+  - "Separate the VAE decode into its own pool. It has a different bottleneck from the denoiser and will otherwise set your tail latency."
+further_reading:
+  - label: "Scalable Diffusion Models with Transformers (DiT)"
+    url: "https://arxiv.org/abs/2212.09748"
+  - label: "Sora — video generation models as world simulators"
+    url: "https://openai.com/index/video-generation-models-as-world-simulators/"
+  - label: "Wan 2.1 — open and advanced large-scale video generative models"
+    url: "https://arxiv.org/abs/2503.20314"
+  - label: "Wan technical report — Wan-VAE compression and the 4x8x8 design"
+    url: "https://github.com/Wan-Video/Wan2.1"
+  - label: "Latte — latent diffusion transformer for video generation"
+    url: "https://arxiv.org/abs/2401.03048"
+  - label: "High-Resolution Image Synthesis with Latent Diffusion Models"
+    url: "https://arxiv.org/abs/2112.10752"
+sources:
+  - label: "OpenAI — Sora, video generation models as world simulators (15 Feb 2024)"
+    url: "https://openai.com/index/video-generation-models-as-world-simulators/"
+  - label: "Wan 2.1 technical report (arXiv 2503.20314)"
+    url: "https://arxiv.org/abs/2503.20314"
+  - label: "DiT paper (arXiv 2212.09748)"
+    url: "https://arxiv.org/abs/2212.09748"
+  - label: "Wan 2.1 repository — VAE compression ratios"
+    url: "https://github.com/Wan-Video/Wan2.1"
+tags: [video, diffusion, dit, vae, attention, inference-cost]

@@ -1,0 +1,1479 @@
+id: batchnorm-layernorm
+slug: batchnorm-layernorm
+title: "Batch Normalisation and Layer Normalisation"
+summary: >-
+  Replace the initialisation constant with a measurement: normalise each
+  layer's input by its own statistics, derive why that makes the loss blind to
+  the weight scale, compute what it does to the effective learning rate, and
+  pick the axis — batch or feature — that matches how you will actually run
+  inference.
+kind: lesson
+difficulty: medium
+position: 6
+estMinutes: 30
+prerequisites: [mlp-from-scratch, gradient-stability]
+phase: deep-learning-foundations
+tags: [batchnorm, layernorm, normalisation, scale-invariance, effective-learning-rate, internal-covariate-shift, rmsnorm]
+
+body:
+  big_idea: >-
+    Normalisation does not keep the variance near 1: it measures the variance
+    and divides by it, which makes the loss invariant to weight scale and
+    moves the real step size to $\eta/\|W\|^2$.
+
+  problem:
+    - >-
+      You deploy BatchNorm without `.eval()` and the same image scores 0.91 or
+      0.62 depending on which images share its batch.
+    - >-
+      You train a transformer with BatchNorm: at batch 8 the loss is noise, at
+      batch 1 it is `nan`, and padding contaminates every sequence's
+      statistics.
+    - >-
+      Asked why BN allows a 10x learning rate,"it stabilises training" is not
+      the answer: the step that matters is $\eta/\|W\|^2$.
+
+  analogy: |
+    A camera with auto-exposure. Batch norm meters the whole burst and applies
+    one correction per channel to every frame, so one bright frame darkens the
+    rest. Layer norm auto-levels each photograph from its own histogram. The
+    burst coupling is why a batch of two throws away magnitude; the meter is
+    why inference needs statistics baked in from training.
+
+  concept_points:
+    - >-
+      **Normalisation is a projection plus a learned gain, not a loss of information.**
+      BN computes $\hat x = (x - \mu_B)/\sqrt{\sigma_B^2 + \varepsilon}$ and
+      returns $\gamma\hat x + \beta$. It removes two degrees of freedom per
+      feature and $\gamma,\beta$ put two back: a centred $32\times1024$ batch
+      has numerical rank **31**, and any bias before a BN layer has gradient
+      summing to $6.7\times10^{-16}$ — dead weight.
+    - >-
+      **Batch norm makes the loss exactly invariant to the weight scale.**
+      $\operatorname{BN}(\alpha W x + \alpha b) = \operatorname{BN}(Wx + b)$,
+      so $\langle \nabla_W L, W\rangle = 0$ (measured $-3.9\times10^{-17}$)
+      and rescaling a layer by 100x changes the loss by **0.0**, against
+      **1.73** without normalisation. Scale stops mattering; direction does
+      not.
+    - >-
+      **The effective learning rate is $\eta/\|W\|^2$, so BN turns weight decay into a schedule.**
+      The gradient is orthogonal to $W$, so $\|W\|$ only grows while the
+      angular step shrinks. Measured at $\eta = 0.1$: after 1,000 steps
+      $\|W\|$ goes from 1 to **1.871** and the effective rate is **0.286** of
+      its start; add $\lambda = 0.5$ and it is **39x**.
+    - >-
+      **A batch statistic is a random variable with relative noise $1/\sqrt{2(n-1)}$.**
+      That is **0.267** at $n = 8$, **0.127** at 32, **0.0443** at 256. The
+      same example therefore gets a different output depending on its
+      batch-mates; at $n = 2$ it is degenerate — $\hat x$ is exactly $\pm1$
+      and the input gradient is zero.
+    - >-
+      **Train mode and eval mode are two different functions, and the gap is measurable.**
+      Measured over 20 seeds, the worst-case difference is **0.935** at
+      $n = 8$ and **0.254** at 256, in units where a normalised activation has
+      standard deviation 1. The per-example noise averages out; the frozen
+      scale error( `running_std/true_std` **0.929** at 8) does not.
+    - >-
+      **LayerNorm normalises the other axis, and every advantage follows from that.**
+      It standardises each example across features, so it has $d$ samples and
+      carries no state: train and eval are bit-identical (difference exactly
+      **0.0**), a batch of one works, and padding cannot leak between
+      sequences. At $d = 768$ its estimate has **96x** the sample size of BN's
+      at batch 8.
+
+  definitions:
+    - term: "Batch statistics"
+      meaning: >-
+        The per-feature mean and variance computed over the examples currently
+        in the batch. They are a *function of the batch*, so they change when
+        the batch changes and they do not exist at inference time.
+    - term: "Running statistics"
+      meaning: >-
+        The exponential moving average of the batch statistics that BN stores as
+        model state and uses at eval time. Updated as
+        $r \leftarrow (1-m)r + m\,\text{batch stat}$; with momentum $m$ the
+        effective window is about $2/m - 1$ batches, so $m = 0.1$ means roughly
+        19 batches. They must be checkpointed, or inference silently uses the
+        initial values.
+    - term: "Affine parameters (gamma, beta)"
+      meaning: >-
+        The two learnable vectors per feature that follow normalisation:
+        $y = \gamma\hat x + \beta$. They are the layer's only parameters, 2 per
+        channel — 1536 for a 768-wide layer, which is 0.26% of that layer's
+        weight matrix. They let the network undo the normalisation, which a
+        trained model partly does.
+    - term: "Epsilon"
+      meaning: >-
+        A constant added to the variance before the square root, default
+        $10^{-5}$ in PyTorch. It keeps the division finite for a constant
+        feature and, less obviously, caps the layer's input gain at
+        $1/\sqrt{\varepsilon} = 316$ and stops normalising once
+        $\sigma \lesssim \sqrt{\varepsilon}$.
+    - term: "Internal covariate shift"
+      meaning: >-
+        The 2015 explanation of BN's benefit: each layer's input distribution
+        keeps moving as the layers below it change, so every layer is
+        perpetually chasing a moving target. It is measurable, it is real, and
+        experiments that re-inject it show it is not what makes BN work.
+    - term: "Scale invariance (of a loss)"
+      meaning: >-
+        $L(\alpha W) = L(W)$ for all $\alpha > 0$. For a differentiable loss it
+        is equivalent to $\langle\nabla_W L, W\rangle = 0$: the gradient is
+        orthogonal to the weights, so no gradient step can change the norm in
+        first order, and the norm only grows through the $\eta^2\|g\|^2$ term.
+    - term: "Effective learning rate"
+      meaning: >-
+        The size of the step measured in the directions the loss can actually
+        see. For a scale-invariant loss it is $\eta/\|W\|^2$: the same nominal
+        $\eta$ is a different step after the weights have grown, which is why
+        BN training has a learning-rate schedule whether you wrote one or not.
+    - term: "Unbiased vs biased variance"
+      meaning: >-
+        $1/(n-1)$ versus $1/n$ in the denominator. The normalisation must use
+        the biased form so the output has exactly unit variance; PyTorch stores
+        the *unbiased* form in `running_var`. At $n = 2$ they differ by a factor
+        of 2, so mixing them up scales every eval-mode activation by
+        $\sqrt{2}$.
+    - term: "LayerNorm"
+      meaning: >-
+        Normalisation over the feature axis for each example independently,
+        followed by a per-feature affine. No batch statistics, no running state,
+        identical in train and eval, defined at batch size 1, and invariant to
+        any per-example shift and positive rescaling.
+    - term: "RMSNorm"
+      meaning: >-
+        LayerNorm without the mean subtraction: divide by
+        $\sqrt{\operatorname{mean}(x^2) + \varepsilon}$ and keep the gain, drop
+        the bias. Cheaper by one reduction and one subtraction, and it cannot
+        remove a per-token offset. On a 6-dimensional token with mean 0.35 it
+        differs from LayerNorm by up to 0.417 in the output.
+    - term: "Pre-norm / post-norm"
+      meaning: >-
+        Where the normalisation sits relative to a residual addition. Post-norm
+        normalises after $x + f(x)$, which destroys the identity path; pre-norm
+        normalises inside $f$, leaving $x$ untouched. The distinction is
+        architectural and decides whether depth 50 has an identity term at all.
+    - term: "Covariate shift (as distinct from internal)"
+      meaning: >-
+        A change in the input distribution between training and deployment. BN
+        does nothing about it — a per-feature shift in the *data* is subtracted
+        like any other, so the model becomes blind to it rather than robust to
+        it. This is a common misreading of what normalisation buys.
+
+  diagrams:
+    - type: architecture
+      title: "One formula, two reduction axes — and the axis is the design decision"
+      nodes:
+        - { id: x, x: 0, y: 1, label: "x  (n, d)", kind: client, detail: "A batch of n examples with d features. Batch norm reduces over the n rows; layer norm reduces over the d columns. Everything else about the two layers is identical, including the gamma and beta that follow." }
+        - { id: bn, x: 1, y: 0, label: "BN: reduce over batch", kind: model, detail: "Per feature, over n examples. Statistics have n samples, so their noise is 1/sqrt(2(n-1)): 12.7% at n=32. Requires n > 1 to be defined at all, and n=2 gives exactly +-1 and a zero input gradient." }
+        - { id: ln, x: 1, y: 2, label: "LN: reduce over features", kind: model, detail: "Per example, over d features. Statistics have d samples, so their noise is 1/sqrt(2(d-1)): 2.55% at d=768. Defined at n=1, no state, identical in train and eval." }
+        - { id: affine, x: 2, y: 1, label: "gamma, beta", kind: storage, detail: "2d parameters, the only learnable part of the layer: y = gamma*xhat + beta. For a 768-wide layer that is 1536 parameters against 589,824 in the weight matrix — 0.26%. They exist so the network can undo the normalisation, and in a trained model it partly does." }
+        - { id: out, x: 3, y: 1, label: "y  (n, d)", kind: client, detail: "Zero mean and unit variance along the axis that was reduced, before the affine. After the affine, neither is guaranteed — which is why 'BN removes the mean' is a statement about the input, not the output." }
+      edges:
+        - { from: x, to: bn, label: "d statistics" }
+        - { from: x, to: ln, label: "n statistics" }
+        - { from: bn, to: affine, label: "standardised" }
+        - { from: ln, to: affine, label: "standardised" }
+        - { from: affine, to: out, label: "learned scale" }
+      caption: >-
+        The two layers are the same three lines of code with `axis=0` and
+        `axis=1` swapped. Every practical difference between them — batch-size
+        dependence, the train/eval gap, padding contamination, whether depth 50
+        keeps an identity path — comes from which of those two numbers the
+        reduction sees.
+
+    - type: compare
+      title: "Batch norm vs layer norm: what each one buys and what it charges"
+      left_label: "BatchNorm — statistics over the batch"
+      left_points:
+        - "Invariant to any per-feature affine drift, including the weight scale: 100x rescale changes the loss by a factor of 1.0000026"
+        - "Couples examples: the same input's output has std 0.194 across resampled batches at n=32, 0.906 at n=2"
+        - "Train and eval are different functions: worst-case gap 0.935 at n=8, 0.254 at n=256, and it never reaches 0"
+        - "Undefined at n=1: output is exactly beta and the gradient is exactly 0. At n=2 the input gradient is 0 too"
+        - "Needs running statistics in the checkpoint; a wrong momentum is a silent 30% scale error in production"
+        - "Right for CNNs, where n*H*W gives hundreds of thousands of samples per channel"
+      right_label: "LayerNorm — statistics over the features"
+      right_points:
+        - "No state: train-mode and eval-mode outputs are bit-identical (difference exactly 0.0)"
+        - "Defined at batch size 1, so it works for online inference and for variable-length sequences"
+        - "Statistics have d samples: 2.55% noise at d=768, but 26.7% at d=8 — it needs width, not batch"
+        - "Invariant to a per-token affine: max|y(4x-7) - y(x)| = 4.4e-16"
+        - "Cannot remove a per-token offset from the meaning of the token; it subtracts it with the mean"
+        - "Right for transformers and RNNs, where the batch is small, ragged, and padded"
+
+    - type: plot
+      title: "Two components of the BN train/eval gap, separated by batch size"
+      chart: line
+      xLabel: "batch size n"
+      yLabel: "difference in units of one standard deviation"
+      series:
+        - name: "worst case |train - eval| (mean of 20 seeds)"
+          points:
+            - { x: 2, y: 1.956 }
+            - { x: 8, y: 0.935 }
+            - { x: 32, y: 0.538 }
+            - { x: 256, y: 0.254 }
+        - name: "per-example train-mode noise, sqrt(1.5/n)"
+          points:
+            - { x: 2, y: 0.866 }
+            - { x: 8, y: 0.433 }
+            - { x: 32, y: 0.217 }
+            - { x: 256, y: 0.0765 }
+      caption: >-
+        The gap is the sum of two things that do not scale the same way: noise
+        in the *train-mode* output, which falls as $1/\sqrt{n}$ and averages out
+        over predictions, and the error *frozen into the running statistics*,
+        which does not fall with the inference batch size at all. At n=256 the
+        train-side noise is 0.077 and the measured gap is still 0.254 — that
+        residual is the checkpoint, not the batch.
+
+    - type: plot
+      title: "Epsilon is a gain ceiling: input gain vs feature scale (log axis)"
+      chart: line
+      xLabel: "log10(sigma of the feature)"
+      yLabel: "gain = 1/sqrt(sigma^2 + eps)"
+      series:
+        - name: "measured gain, eps = 1e-5"
+          points:
+            - { x: -4, y: 316.07 }
+            - { x: -3, y: 301.51 }
+            - { x: -2, y: 95.35 }
+            - { x: -1, y: 9.995 }
+            - { x: 0, y: 0.99999 }
+            - { x: 1, y: 0.1 }
+        - name: "ceiling 1/sqrt(eps) = 316.23"
+          points:
+            - { x: -4, y: 316.23 }
+            - { x: 1, y: 316.23 }
+      caption: >-
+        Gain is 1 at unit scale and rises as $1/\sigma$ until it hits the
+        ceiling at $\sigma \approx \sqrt{\varepsilon}$. Below that point the
+        output standard deviation is $\sigma/\sqrt{\sigma^2+\varepsilon}$: 0.30
+        at $\sigma = 10^{-3}$ and 0.032 at $\sigma = 10^{-4}$. The layer is no
+        longer normalising and nothing in the API says so.
+
+    - type: pipeline
+      title: "Choosing a normalisation layer, in five questions"
+      nodes:
+        - label: "Is the batch large and homogeneous?"
+          note: "n >= 32 per step, and every example exchangeable"
+          detail: >-
+            If yes, batch statistics are a good estimator (12.7% noise at n=32)
+            and BN's coupling is a feature. If the batch is 8, ragged, or
+            padded, the statistic is noise at best and contamination at worst.
+        - label: "Will inference see one example at a time?"
+          note: "any serving path, any streaming model"
+          detail: >-
+            BN needs running statistics and therefore needs them in the
+            checkpoint, correct. LN needs nothing. A model that scores 0.94 in a
+            notebook and 0.71 in a service is usually this question, answered
+            wrong.
+        - label: "Is the axis the reduction sees big enough?"
+          note: "n for BN, d for LN"
+          detail: >-
+            Compare 2(n-1) with 2(d-1). A 768-wide transformer with batch 8
+            wants LN by a factor of 96 in sample size; a conv channel is
+            normalised over N*H*W = 32*56*56 = 100,352 activations and LN over
+            one position would have d = 1, so BN wins by five orders of
+            magnitude.
+        - label: "Where does it sit relative to the residual addition?"
+          note: "inside the branch, not on the identity path"
+          detail: >-
+            Post-norm destroys the identity: with a zero branch the block
+            changes its input by 3.17 instead of 0.0. Pre-norm keeps it. This is
+            independent of which statistic you chose and is the mistake that
+            survives longest, because the model still trains.
+        - label: "Check epsilon against your activation scale"
+          note: "default 1e-5 assumes O(1) features"
+          detail: >-
+            Embeddings, one-hot inputs and dead channels sit below the floor.
+            Print the per-channel standard deviation entering each norm layer;
+            anything under 3e-3 is being amplified by more than 300x and is not
+            being normalised at all.
+
+  markdown: |
+    ## One formula, two axes
+
+    $$\hat x = \frac{x - \mu}{\sqrt{\sigma^2 + \varepsilon}}, \qquad y = \gamma \hat x + \beta$$
+
+    | | reduce over | samples in the statistic | state | train = eval |
+    |---|---|---|---|---|
+    | BatchNorm | the batch, per feature | $n$ | running mean and var | no |
+    | LayerNorm | the features, per example | $d$ | none | yes |
+
+    Batch norm answers "how does this feature compare to the same feature in
+    other examples?" Layer norm answers "how does this feature compare to the
+    other features in this example?" Those are different questions, and a model
+    trained on one is not trained on the other.
+
+    ## Batch norm is a projection
+
+    Write the batch as $X \in \mathbb{R}^{n\times d}$ and let
+    $\mathbf{1}$ be the all-ones vector. Then
+
+    $$\hat X = \frac{(I - \frac{1}{n}\mathbf{1}\mathbf{1}^\top)X}{\sigma_B}$$
+
+    so BN deletes exactly the component of each column along $\mathbf{1}$ and
+    rescales what is left. Two things follow immediately, and both are
+    measurable rather than metaphorical. The centred matrix has rank at most
+    $n-1$: a $32\times1024$ batch has numerical rank **31**. And a bias applied
+    before BN contributes only to that deleted direction, so its gradient is
+    exactly zero — measured at $6.7\times10^{-16}$. A bias in front of a BN
+    layer is not a small waste; it is a parameter with no gradient at all.
+
+    ## Why the loss stops seeing the weight scale
+
+    For $\alpha > 0$, scaling the whole affine map scales $\mu$ by $\alpha$ and
+    $\sigma$ by $|\alpha|$, so the ratio is unchanged:
+
+    $$\operatorname{BN}(\alpha W x + \alpha b) = \operatorname{BN}(Wx + b)
+      \quad\Longrightarrow\quad L(\alpha W) = L(W).$$
+
+    Differentiate at $\alpha = 1$ and you get the identity that matters:
+
+    $$\langle \nabla_W L, W \rangle = 0.$$
+
+    The gradient is orthogonal to the weights. Measured on a 3-layer MLP with
+    $\varepsilon = 0$: $\cos(\nabla_{W_1}L, W_1) = -3.9\times10^{-17}$, and
+    rescaling $W_1$ by 0.01, 0.1 or 10 changes the loss by exactly 0.0. The same
+    network without normalisation multiplies its loss by **1.73** when one hidden
+    layer is scaled by 100.
+
+    The symmetry is broken only by $\varepsilon$:
+
+    | rescale $W_1$ by | BN, $\varepsilon = 0$ | BN, $\varepsilon = 10^{-5}$ | no norm |
+    |---|---|---|---|
+    | 0.01 | 0.0 | $2.55\times10^{-4}$ (relative) | — |
+    | 0.1 | 0.0 | $5.3\times10^{-6}$ | — |
+    | 100 | $1.6\times10^{-16}$ | $5.4\times10^{-8}$ | 1.73x the loss |
+
+    The breaking term is $\varepsilon/\sigma^2$: invisible for $O(1)$
+    activations, dominant when the weights are small.
+
+    ## What that does to the learning rate
+
+    Because $\langle g, W\rangle = 0$, one SGD step changes the norm only
+    through the step's own length:
+
+    $$\|W_{t+1}\|^2 = \|W_t\|^2 + \eta^2\|g\|^2.$$
+
+    The norm only grows. And the step that matters is angular,
+    $\|\Delta W\|/\|W\| = \eta\|g\|/\|W\|$; combined with
+    $\nabla L(\alpha W) = \nabla L(W)/\alpha$, the effective step is
+    $\eta/\|W\|^2$. Measured by iterating the recursion at $\eta = 0.1$ and
+    $\|g\| = 0.5$:
+
+    | weight decay | $\|W\|$ after 1000 steps | effective LR |
+    |---|---|---|
+    | 0 | 1.871 | 0.286x |
+    | 0.01 | 1.103 | 0.822x |
+    | 0.5 | 0.160 | 39.0x |
+
+    With no weight decay the effective learning rate has fallen to 29% of its
+    initial value and nothing in the config says so. With strong weight decay it
+    has risen 39x. That is the honest answer to "why does BN let me use a larger
+    learning rate": the nominal $\eta$ is not the step size, and BN is what makes
+    the difference between the two large.
+
+    ## What batch statistics cost
+
+    The statistic is an estimator. For Gaussian data,
+    $\operatorname{Var}(s_B^2) = 2\sigma^4/(n-1)$, so the relative noise in the
+    scale is $1/\sqrt{2(n-1)}$:
+
+    | $n$ | predicted | measured CV of $s_B$ | per-example output noise |
+    |---|---|---|---|
+    | 2 | 0.707 | — | 0.906 |
+    | 8 | 0.267 | 0.271 | 0.434 |
+    | 32 | 0.127 | 0.128 | 0.194 |
+    | 256 | 0.0443 | 0.0440 | 0.0685 |
+
+    At $n = 2$ the noise is not the interesting part; the degeneracy is.
+    $\hat x$ is exactly $\pm 1$ for any two distinct inputs and the input
+    gradient is exactly zero, so a batch-size-2 BN layer passes only signs
+    forward and nothing backward.
+
+    Then there is the deployment problem. Train mode and eval mode are different
+    functions, and the difference is not a rounding error: measured over 20 seeds
+    the worst-case gap on identical data is 1.96 at $n=2$, 0.935 at $n=8$, 0.538
+    at $n=32$, 0.254 at $n=256$. Half of that shrinks with the batch and half of
+    it does not — the frozen error in `running_var` (measured
+    `running_std/true_std` of 0.70 to 0.999) is applied to every request forever.
+    Two practical consequences: `.eval()` is not optional, and the running
+    statistics are model state that must be checkpointed.
+
+    ## Why sequence models use layer norm
+
+    Layer norm reduces over $d$ instead of $n$, and that single change removes
+    three problems at once:
+
+    - **No batch dependence.** The output for a token is the same whether it
+      arrives alone or in a batch of 512. Measured train/eval difference:
+      exactly 0.0.
+    - **No padding contamination.** With BN, a padded sequence shifts the
+      statistics of every other sequence in the batch. With LN, padding changes
+      only the token's own normalisation, and masking handles that.
+    - **A statistic with a usable sample size.** At $d = 768$ the relative noise
+      is 2.55%; at a batch of 8 sequences BN would be at 26.7% and would also be
+      averaging over $8 \times 512$ positions whose distribution depends on
+      sequence length.
+
+    The price is that LN cannot use the batch to reduce noise, which is why a
+    convnet channel with $d = 1$ is a bad fit: there is nothing to reduce over.
+    RMSNorm drops the mean subtraction and keeps the gain, which is one reduction
+    cheaper and cannot remove a per-token offset; on a 6-dimensional token with
+    mean 0.35 the two differ by up to 0.417.
+
+    ## Where it sits matters as much as which one
+
+    A residual block's value is that $x + f(x)$ is the identity when $f$ is
+    zero. Put the norm after the addition and that stops being true: measured,
+    the block changes its input by 3.17 instead of 0.0, and layer norm's backward
+    annihilates the mean direction of the gradient exactly. The block still
+    trains, which is why this survives review; it just no longer has the $+1$
+    term that *Gradient Stability* showed is the reason a 50-block product does
+    not decay.
+
+    ## The honest caveat
+
+    The original paper's explanation — internal covariate shift — is the one
+    everybody quotes and the one that has been hardest to defend. Santurkar et
+    al. (2018) injected the shift back in after every BN layer and the speedup
+    survived; what tracked the speedup was the smoothness of the loss and its
+    gradient. What you can verify yourself is weaker and more useful: BN does not
+    stop the weights from drifting, it makes the loss invariant to a whole class
+    of drift. That tells you what BN will not fix — a bad direction, a bad
+    schedule, or a batch too small to estimate a variance.
+
+    ## The longer version
+
+    Normalisation does not keep the variance near 1, it *measures* the variance
+    and divides by it — which makes the loss exactly invariant to the weight
+    scale, moves the quantity you are really tuning from the learning rate to
+    $\eta/\|W\|^2$, and buys that invariance with a statistic computed over
+    whichever axis you chose: the batch, or the features.
+
+    A camera with auto-exposure. Batch norm is a studio photographer metering
+    the whole burst at once and applying one exposure correction per colour
+    channel to every frame: each frame is re-leveled against the *average of the
+    frames shot with it*, so a single very bright frame in the burst darkens all
+    the others. Layer norm is auto-levels applied to each photograph
+    individually, using that photograph's own histogram — no dependence on what
+    else is in the folder.
+
+    That mapping explains all three behaviours. The burst coupling is why a
+    batch of two throws away all magnitude information: with two frames the
+    meter can only say "this one is above the average, that one below", so every
+    output is exactly plus or minus one. The metering problem is why inference
+    differs from training: at home there is no burst to meter, so the camera must
+    bake in the average exposure it saw in the studio, and if that average was
+    taken on a bright day every dark photo comes out underexposed. And per-photo
+    auto-levels cannot represent "this whole frame is darker" — that is a real
+    signal, and subtracting the frame mean deletes it, which is exactly why you
+    do not put layer norm on the output of a model whose output scale carries
+    meaning.
+
+    Where it breaks: the camera's meter produces one gain, and the network's
+    $\gamma$ and $\beta$ are *learned*, so normalisation is the initialisation of
+    an affine map rather than the final transform. A network can un-normalise
+    itself completely — and in a trained model it partly does, which is why "BN
+    removes the mean" is true of the layer's input and false of its output.
+
+    ### What goes wrong
+
+    - You add `BatchNorm1d` to a 20-layer MLP, the loss curve improves, and
+      you cannot say why. Then you deploy it, forget `.eval()`, and the same
+      image scores 0.91 or 0.62 depending on which other images happen to be
+      in the inference batch — a bug that is invisible on any single-example
+      test.
+    - You train a transformer with BatchNorm because BN worked on your CNN. At
+      batch size 8 the loss is noise, at batch size 1 it is `nan`, and the
+      padding tokens have contaminated every sequence's statistics. The fix is
+      not a hyperparameter; it is the axis.
+    - An interviewer asks why BatchNorm lets you raise the learning rate by
+      10x, and the honest answer is not "it stabilises training" — it is that
+      BN makes the loss invariant to $\|W\|$, so the gradient shrinks as
+      $1/\|W\|$ and the step measured in the direction that matters is
+      $\eta/\|W\|^2$. Doubling the weights quarters your effective step size.
+    - You scale your first layer's weights down by 100 to "start gently", the
+      network trains worse, and no amount of tuning recovers it — because
+      $\varepsilon$ in the denominator is a fixed constant, and below
+      $\sigma \approx \sqrt{\varepsilon}$ normalisation stops normalising. At
+      $\sigma = 10^{-3}$ the layer's input gain is 301 and its output standard
+      deviation is 0.30, not 1.
+    - You inherit a from-scratch BN implementation that uses the unbiased
+      variance everywhere. At batch size 2 its running variance is twice the
+      value PyTorch stores, so every eval-mode activation is 41% too large,
+      and the model that scored 0.94 in the notebook scores 0.71 in the
+      service.
+
+    ### The full treatment
+
+    **Normalisation is a projection plus a learned gain, not a loss of
+    information.** Batch norm computes
+    $\hat x = (x - \mu_B)/\sqrt{\sigma_B^2 + \varepsilon}$ and returns
+    $\gamma\hat x + \beta$, where $\mu_B, \sigma_B^2$ are the per-feature mean
+    and variance over the batch. It removes exactly two degrees of freedom per
+    feature and $\gamma,\beta$ put two back, so the layer is a
+    reparameterisation: measured, the output has mean $3.7\times10^{-16}$ and
+    variance 0.9999965 per feature. The removed direction is the all-ones
+    vector, which has a consequence you can see in the shapes: a centred
+    $32\times1024$ batch has numerical rank **31**, not 32, and any bias
+    applied *before* a BN layer is dead weight — its gradient is exactly the
+    sum of the input gradient over the batch, measured at
+    $6.7\times10^{-16}$. The trap is believing the two extra parameters per
+    channel are decoration; they are the only reason the layer can represent
+    anything other than a standardised input.
+
+    **Batch norm makes the loss exactly invariant to the weight scale.**
+    For $\alpha > 0$, $\operatorname{BN}(\alpha W x + \alpha b) =
+    \operatorname{BN}(Wx + b)$: the mean scales by $\alpha$, the standard
+    deviation by $|\alpha|$, and the ratio is unchanged. Differentiating
+    $L(\alpha W) = L(W)$ at $\alpha = 1$ gives
+    $\langle \nabla_W L, W\rangle = 0$ — the gradient has no component along
+    the weights. Measured on a 3-layer MLP with $\varepsilon = 0$:
+    $\cos(\nabla_{W_1}L, W_1) = -3.9\times10^{-17}$ and rescaling $W_1$ by
+    0.01, 0.1 or 10 changes the loss by exactly **0.0**. In the same network
+    without normalisation, a 100x rescale of one hidden layer multiplies the
+    loss by **1.73**. The trap is reading this as "BN makes initialisation
+    irrelevant": it makes the *scale* irrelevant and leaves the *direction*
+    entirely your problem, which is why a badly rotated $W$ still fails. The
+    invariance is also exact only at $\varepsilon = 0$, where it breaks as
+    $\varepsilon/\sigma^2$: measured, shrinking $W_1$ by 100 changes the loss
+    by a relative $2.55\times10^{-4}$ while growing it by 100 changes it by
+    $5.4\times10^{-8}$ — negligible for $O(1)$ activations, dominant once
+    $\sigma \lesssim \sqrt{\varepsilon} = 3.2\times10^{-3}$. That is the
+    precise limit of "you can use any initialisation with BN".
+
+    **The effective learning rate is $\eta/\|W\|^2$, so BN turns weight decay
+    into a schedule.** Because the gradient is orthogonal to $W$, one SGD step
+    gives $\|W_{t+1}\|^2 = \|W_t\|^2 + \eta^2\|g\|^2$: the norm only grows, and
+    the angular step $\|\Delta W\|/\|W\| = \eta\|g\|/\|W\|$ shrinks. Since a
+    scale-invariant loss also has $\nabla L(\alpha W) = \nabla L(W)/\alpha$,
+    the step scales as $\eta/\|W\|^2$ in total. Measured by iterating the
+    recursion at $\eta = 0.1$, $\|g\| = 0.5$: after 1000 steps
+    $\|W\|$ has gone from 1 to **1.871** and the effective rate is **0.286** of
+    its initial value, with no learning-rate schedule anywhere in the code.
+    Add weight decay $\lambda = 0.5$ and the norm is pinned at 0.160, so the
+    effective rate is **39x** its starting value. This is why BN + weight
+    decay behaves like a warmup-then-decay schedule, and why "BN lets you use
+    a 10x larger LR" is only half the sentence: the optimizer's $\eta$ is not
+    the step size.
+
+    **A batch statistic is a random variable, and its noise is
+    $1/\sqrt{2(n-1)}$.** For Gaussian data
+    $\operatorname{Var}(s_B^2) = 2\sigma^4/(n-1)$, so the *scale* the layer
+    divides by fluctuates with relative standard deviation
+    $1/\sqrt{2(n-1)}$ — **0.267** at $n = 8$, **0.127** at $n = 32$,
+    **0.0443** at $n = 256$. Measured over 4000 draws: 0.2707, 0.1281, 0.0440.
+    The consequence is that the same example gets a different output depending
+    on its batch-mates: holding one example fixed and resampling its batch 400
+    times, its normalised value has standard deviation **0.906** at $n=2$,
+    **0.434** at $n=8$, **0.194** at $n=32$, **0.0685** at $n=256$, tracking
+    $\sqrt{1.5/n}$. At $n = 2$ the situation is degenerate rather than noisy:
+    $\hat x$ is exactly $\pm 1$ for any two distinct inputs, and the input
+    gradient is exactly zero, so nothing upstream of a batch-size-2 BN layer
+    trains at all.
+
+    **Train mode and eval mode are two different functions, and the gap is
+    measurable.** Train mode divides by the current batch's statistics; eval
+    mode divides by a running estimate stored in the checkpoint. Measured over
+    20 seeds, 500 warmup batches, momentum 0.1: the mean worst-case
+    difference between the two modes on the same data is **1.96** at
+    $n = 2$, **0.935** at $n = 8$, **0.538** at $n = 32$, **0.254** at
+    $n = 256$ — in units where a correctly normalised activation has standard
+    deviation 1. The gap has two parts that behave differently: the
+    per-example train-mode noise ($\propto 1/\sqrt{n}$, which averages out if
+    you average predictions) and the error frozen into the running statistics
+    (measured `running_std/true_std` of **0.701, 0.929, 0.987, 0.9988**),
+    which does *not* average out, because it is a fixed scale error applied to
+    every request. The trap is treating the gap as a bug to be fixed: it is a
+    property of the estimator, and the only real fixes are a bigger batch, a
+    better momentum, or an axis that does not depend on the batch.
+
+    **$\varepsilon$ is a floor on the gain as well as on the division.**
+    The layer's gain from input to output is
+    $\gamma/\sqrt{\sigma^2 + \varepsilon}$, which is capped at
+    $1/\sqrt{\varepsilon} = 316.2$. Measured: $\sigma = 1$ gives gain 1.0000
+    and output std 1.0000; $\sigma = 10^{-2}$ gives gain **95.35** and output
+    std 0.9535; $\sigma = 10^{-3}$ gives gain **301.5** and output std
+    **0.3015**; $\sigma = 10^{-4}$ gives gain 316.07 and output std
+    **0.0316**. So two things happen at once below the floor: a
+    low-variance feature is amplified by up to 316x (and its gradient with
+    it), and the layer stops producing unit-variance output while continuing
+    to look like it does. The trap is that this is silent — no NaN, no warning,
+    just a channel that is 300x louder than its neighbours in the backward pass.
+
+    **The backward pass is three terms, two of which are projections, and
+    dropping them is a bug that still trains.** With
+    $\hat x$ as above and cotangent $g$,
+    $\partial L/\partial x = \frac{\gamma}{n\sigma}\left(n g - \mathbf{1}\sum_i g_i - \hat x \sum_i g_i \hat x_i\right)$.
+    The two subtracted terms enforce $\sum_i dx_i = 0$ and
+    $\sum_i dx_i \hat x_i = 0$ — measured at $6.7\times10^{-16}$ and
+    $1.1\times10^{-16}$ — so the layer cannot change the batch mean or the
+    batch scale, which is the backward statement of the same invariance. The
+    consequences are concrete: a constant cotangent must give $dx = 0$
+    exactly, and the naive $g/\sigma$ gives 0.447 instead; for a random
+    cotangent the naive form is wrong by **21.7%** in relative Frobenius norm.
+    The trap is that omitting the projections optimises a slightly different
+    function and still converges, so a smoke test passes and the bug shows up
+    as "BN helped less than the paper said".
+
+    **LayerNorm normalises the other axis, and every one of its advantages
+    follows from that.** LN standardises each *example* across its features,
+    so its statistics have $d$ samples instead of $n$ and it carries no state.
+    Measured: train and eval outputs are bit-identical (difference exactly
+    **0.0**, versus 0.935 at $n=8$ for BN), a batch of one works (row mean
+    $2.2\times10^{-16}$, variance 1.0) while BN at batch one returns exactly
+    $\beta$ with zero gradient, and the layer is invariant to a per-token
+    affine map ($\max|y(4x - 7) - y(x)| = 4.4\times10^{-16}$). Its statistic
+    is noisier in absolute terms only if $d$ is small: relative standard
+    deviation $1/\sqrt{2(d-1)}$ is **8.9%** at $d = 64$ and **2.55%** at
+    $d = 768$ (measured 0.0891 and 0.0251). That ratio is the argument for
+    transformers: at $d = 768$ and a batch of 8 sequences, LN's estimate has
+    96x the sample size of BN's, and it never mixes padding from one sequence
+    into another's statistics.
+
+    **Where you put the norm decides whether the identity path is still an
+    identity.** Set a residual branch's output projection to zero and a plain
+    block is exactly the identity — measured $\max|out - in| = 0.0$ — which is
+    the $+1$ term that *Gradient Stability* showed is the only reason a
+    50-block product does not decay. Put batch norm *after* the addition and
+    the same block changes its input by **3.17** and pins its standard
+    deviation to 1.0: the identity path now runs through a projection, and
+    layer norm's backward annihilates the mean direction exactly (measured
+    $2.2\times10^{-16}$ for a constant cotangent). This is why
+    pre-activation ResNet and pre-LN transformers put the norm inside the
+    branch. The trap is architectural rather than numerical: the block still
+    trains, it just loses the property you added residuals for, and the loss
+    curve looks fine until depth 30.
+
+    **What BN is actually doing is still argued about, and "internal
+    covariate shift" is the part that did not survive.** The 2015 paper
+    explained the speedup as reduced drift in each layer's input
+    distribution; Santurkar et al. (2018) deliberately re-injected that drift
+    after every BN layer and the speedup remained, and located the effect in
+    the smoothness of the loss and its gradient instead. What you can verify
+    yourself is the invariance, and it is stronger than drift reduction: BN
+    does not *prevent* the weights from growing, it makes the loss blind to
+    them growing. Our measurement of that blindness is the pair
+    $\cos(\nabla_W L, W) = -3.9\times10^{-17}$ and a 100x layer rescale
+    changing the loss by a factor of 1.0000026 (against 1.73 without
+    normalisation). The trap for practice: "reduce internal covariate shift"
+    is a fine sentence in an interview and a bad design principle, because it
+    predicts that re-injecting the shift should undo the benefit, and it does
+    not.
+
+
+  derivations:
+    - title: "Batch norm is a projection, and the projection forces the gradient orthogonality"
+      latex: |
+        Let $X \in \mathbb{R}^{n \times d}$, $P = \frac{1}{n}\mathbf{1}\mathbf{1}^\top$,
+        and $\mu = P X$. The centred batch is $(I-P)X$, whose columns sum to zero,
+        so $\operatorname{rank}((I-P)X) \le n-1$ — a $32 \times 1024$ batch has
+        rank 31 (measured).
+
+        With $\hat X = (I-P)X/\sigma_B$ and $Y = \gamma \odot \hat X + \beta$:
+
+        $$L(\alpha W) = L(W) \;\forall \alpha>0
+          \quad\Longrightarrow\quad
+          \frac{d}{d\alpha}\Big|_{\alpha=1} L(\alpha W)
+          = \langle \nabla_W L, W\rangle = 0.$$
+
+        The same argument applied to the bias gives
+        $\langle \nabla_b L, b\rangle = 0$, and since $b$ enters only through the
+        deleted direction, $\nabla_b L = 0$ exactly (measured $6.7\times10^{-16}$).
+
+        With $\varepsilon > 0$ the homogeneity fails:
+        $\hat x(\alpha) = \alpha(x-\mu)/\sqrt{\alpha^2\sigma^2+\varepsilon}$, so
+        $\langle\nabla_W L, W\rangle$ is of order
+        $\varepsilon/(\alpha^2\sigma^2+\varepsilon)$ rather than zero — measured
+        $\cos = 3.4\times10^{-6}$ at $\varepsilon = 10^{-5}$ and
+        $\sigma^2 \approx 2$.
+      prose: >-
+        The projection is the whole mechanism: normalisation deletes one
+        direction of the batch and rescales the rest, and a loss that cannot see
+        the scale cannot produce a gradient along it. The rank statement is the
+        same fact in linear-algebra clothes — you cannot have $n$ independent
+        directions after removing the mean — and it is why a bias before BN is a
+        parameter with no gradient. Note that the orthogonality is what makes the
+        norm grow monotonically, which is the next derivation.
+    - title: "The backward pass: three terms, two of them projections"
+      latex: |
+        With $\hat x_i = (x_i - \mu)/\sigma$, $\sigma = \sqrt{\sigma_B^2+\varepsilon}$,
+        and cotangent $g_i = \partial L/\partial y_i$:
+
+        $$\frac{\partial L}{\partial \hat x_i} = \gamma g_i, \qquad
+          \frac{\partial L}{\partial x_i}
+          = \frac{\gamma}{n\sigma}\left(n g_i - \sum_j g_j
+            - \hat x_i \sum_j g_j \hat x_j\right).$$
+
+        The two subtracted terms are projections onto $\mathbf{1}$ and onto
+        $\hat x$, so
+
+        $$\sum_i \frac{\partial L}{\partial x_i} = 0, \qquad
+          \sum_i \frac{\partial L}{\partial x_i}\hat x_i = 0,$$
+
+        measured at $6.7\times10^{-16}$ and $1.1\times10^{-16}$. For a constant
+        cotangent $g_i = c$ the bracket is $nc - nc - \hat x_i c\sum_j \hat x_j
+        = 0$, so $dx = 0$ exactly, where the naive $g/\sigma$ gives $c/\sigma$
+        (0.447 in the worked example).
+      prose: >-
+        Two of the three terms exist to enforce the two identities the forward
+        pass created, which is why the layer cannot change the batch mean or the
+        batch scale: any gradient direction that would do so is projected out.
+        The practical consequence is that a hand-written backward pass which
+        drops them is not obviously broken — it optimises a slightly different
+        function, converges, and is wrong by 21.7% for a random cotangent. Write
+        the identities as assertions in the test; they are exact and they catch
+        the omission immediately.
+    - title: "Effective learning rate: the norm only grows, so the step only shrinks"
+      latex: |
+        From $\langle g, W\rangle = 0$, one SGD step gives
+
+        $$\|W_{t+1}\|^2 = \|W_t\|^2 - 2\eta\langle g, W_t\rangle + \eta^2\|g\|^2
+          = \|W_t\|^2 + \eta^2\|g\|^2,$$
+
+        hence $\|W_t\|^2 = \|W_0\|^2 + t\eta^2\|g\|^2$. The angular step is
+
+        $$\frac{\|\Delta W\|}{\|W\|} = \frac{\eta\|g\|}{\|W\|},
+          \qquad \text{and} \qquad \nabla L(\alpha W) = \frac{\nabla L(W)}{\alpha},$$
+
+        so under a rescale $W \to \alpha W$ the angular step goes as
+        $1/\alpha^2$: the effective rate is $\eta/\|W\|^2$. With weight decay
+        $\lambda$ the recursion becomes
+        $\|W_{t+1}\|^2 = (1-\eta\lambda)^2\|W_t\|^2 + \eta^2\|g\|^2$, with fixed
+        point $\|W\|^2 \approx \eta\|g\|^2/(2\lambda)$.
+      prose: >-
+        Two conclusions, both counter-intuitive until you write the recursion
+        down. First, a scale-invariant loss with plain SGD has a learning rate
+        that decays on its own: at $\eta = 0.1$ and $\|g\| = 0.5$ the norm goes
+        from 1 to 1.871 in a thousand steps and the effective rate falls to 29%
+        of its start. Second, weight decay is not a regulariser in the usual
+        sense here — it is the control that sets the norm and therefore the step
+        size, which is why $\lambda = 0.5$ raises the effective rate by 39x.
+        "BN lets you use a bigger learning rate" is true and incomplete: what
+        changed is the map from $\eta$ to the size of the step.
+
+  implementations:
+    - language: python
+      title: "BatchNorm with running statistics — and the three places it is numerically wrong"
+      note: >-
+        Numerically WRONG in three specific ways, each of which is a real bug
+        people ship. (1) It updates `running_var` with the **biased** estimate.
+        PyTorch normalises with the biased variance but stores the **unbiased**
+        one, because the running estimate is meant to be an estimate of the
+        population variance. At $n = 2$ the two differ by a factor of exactly 2,
+        so this version's running standard deviation is $1/\sqrt{2}$ of
+        PyTorch's and every eval-mode activation comes out 41% too large; at
+        $n = 32$ the error is only 1.6%, which is why nobody notices until they
+        use a small batch. (2) `self.cache` is a single slot overwritten by every
+        forward call, so `forward(a)` then `forward(b)` then `backward()` uses
+        batch b's statistics for batch a's gradient — the bug appears the moment
+        you add gradient accumulation. (3) There is no guard for $n = 1$: the
+        layer silently returns exactly $\beta$ with an exactly-zero gradient, so
+        a batch of one does not raise, it just stops the network upstream of the
+        layer from training. Each of the three is measured at the bottom of the
+        block.
+      code: |
+        import numpy as np
+
+        class BatchNorm:
+            """y = gamma * (x - mu_B) / sqrt(var_B + eps) + beta, with running stats."""
+
+            def __init__(self, d, momentum=0.1, eps=1e-5):
+                self.gamma = np.ones(d)
+                self.beta = np.zeros(d)
+                self.running_mean = np.zeros(d)
+                self.running_var = np.ones(d)      # NOT zeros: var 0 divides by eps
+                self.momentum, self.eps = momentum, eps
+                self.params = [self.gamma, self.beta]
+
+            def forward(self, x, training=True):
+                if training:
+                    mu = x.mean(axis=0)
+                    var = x.var(axis=0)                 # biased: output has var 1
+                    inv = 1.0 / np.sqrt(var + self.eps)
+                    xhat = (x - mu) * inv
+                    # BUG 1: PyTorch stores var * n/(n-1) here. At n=2 that is 2x.
+                    self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mu
+                    self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var
+                    self.cache = (xhat, inv, x.shape[0])
+                else:
+                    # BUG 2: self.cache still holds the last *training* batch, so a
+                    # backward() after this silently differentiates that batch.
+                    xhat = (x - self.running_mean) / np.sqrt(self.running_var + self.eps)
+                return self.gamma * xhat + self.beta
+
+            def backward(self, gy):
+                xhat, inv, n = self.cache
+                self.dgamma = (gy * xhat).sum(axis=0)
+                self.dbeta = gy.sum(axis=0)
+                dxhat = gy * self.gamma
+                # The two projections. Drop them and you train a different function.
+                dx = (inv / n) * (n * dxhat - dxhat.sum(axis=0)
+                                  - xhat * (dxhat * xhat).sum(axis=0))
+                return dx
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            bn = BatchNorm(4)
+            x = rng.normal(3.0, 2.0, size=(32, 4))
+            y = bn.forward(x)
+            print(y.mean(0).round(15), y.var(0).round(6))   # ~0 and ~0.999997
+            print(bn.backward(np.ones_like(y)).max())       # 6.6e-16: zero, up to rounding
+            one = BatchNorm(4).forward(rng.normal(size=(1, 4)))
+            print(one)                                      # all zeros: batch of one
+    - language: python
+      title: "LayerNorm, and the train/eval gap harness that makes BN's cost visible"
+      note: >-
+        Numerically WRONG in three ways that all pass a shape check. (1) It takes
+        the statistics over `axis=0` in the second function — the batch — which
+        for a square input returns the right shape and the wrong function, and
+        for a non-square input it raises. Square inputs are exactly what a unit
+        test uses. (2) The `ddof=1` variant normalises with the unbiased
+        variance, so the output has standard deviation $\sqrt{(n-1)/n}$ instead
+        of 1: 0.707 at $n=2$, and 0.99975 at $n=2000$ — invisible at the sizes
+        people test with, wrong at the sizes that matter. (3) `gap()` fits the
+        running statistics on the *same* batch it then compares against, so the
+        two agree by construction and the reported gap is a floor, not an
+        estimate — the warmup has to resample. A fourth trap is in the reporting
+        rather than the code: the gap is a max over `n*d` numbers, so it grows
+        with `d` even when the underlying estimator is unchanged (measured 1.83
+        at $d=64$ against 0.54 at $d=4$, same $n$). Quote the per-example
+        standard deviation when comparing across widths.
+      code: |
+        import numpy as np
+
+        def layernorm(x, gamma, beta, eps=1e-5):
+            """Per-example normalisation over the feature axis."""
+            mu = x.mean(axis=1, keepdims=True)
+            var = x.var(axis=1, keepdims=True)      # biased: output std is 1
+            return gamma * (x - mu) / np.sqrt(var + eps) + beta
+
+        def layernorm_wrong_axis(x, gamma, beta, eps=1e-5):
+            # BUG 1: reduces over the batch. Correct for a 2x2 input's shape,
+            # wrong for its values, and it is the square case people test.
+            mu = x.mean(axis=0, keepdims=True)
+            var = x.var(axis=0, keepdims=True)
+            return gamma * (x - mu) / np.sqrt(var + eps) + beta
+
+        def gap(n, d, batch_std=2.0, momentum=0.1, eps=1e-5, warmup=500, seed=0):
+            """Worst-case |train - eval| for BN, which LN does not have."""
+            rng = np.random.default_rng(seed)
+            rm, rv = np.zeros(d), np.ones(d)
+            for _ in range(warmup):
+                xb = rng.normal(0.0, batch_std, size=(n, d))   # MUST resample
+                rm = (1 - momentum) * rm + momentum * xb.mean(0)
+                rv = (1 - momentum) * rv + momentum * xb.var(0)
+            xb = rng.normal(0.0, batch_std, size=(n, d))
+            train = (xb - xb.mean(0)) / np.sqrt(xb.var(0) + eps)
+            evl = (xb - rm) / np.sqrt(rv + eps)
+            return float(np.abs(train - evl).max())
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(1)
+            x = rng.normal(0.0, 2.0, size=(8, 768))
+            g, b = np.ones(768), np.zeros(768)
+            print(np.abs(layernorm(x, g, b).mean(1)).max())      # 3.4e-17
+            print(layernorm(x, g, b).var(1).min())               # 0.999997
+            # exact only at eps=0; at eps=1e-5 the residual is 4.5e-6
+            print(np.abs(layernorm(x * 4 - 7, g, b) - layernorm(x, g, b)).max())
+            print(layernorm_wrong_axis(np.array([[1.0, 2.0], [3.0, 4.0]]),
+                                       g[:2], b[:2]))
+            for k in (2, 8, 32, 256):
+                print(k, gap(k, 64))          # 2.90, 1.83, 0.787, 0.390 for d=64
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        What does a BatchNorm layer output at batch size 1, and what is the
+        gradient with respect to its input?
+      answerKind: short_text
+      hint: >-
+        Write the forward pass with $n = 1$: what are the mean and the variance
+        of a single example, per feature?
+      solution: >-
+        The mean is the value itself and the variance is exactly 0, so
+        $\hat x = (x - x)/\sqrt{0 + \varepsilon} = 0$. The layer returns
+        $\beta$ exactly — measured 0.0 for every feature — and every gradient is
+        zero, both with respect to the input and with respect to $\gamma$. No
+        NaN appears only because $\varepsilon$ is in the denominator. The same
+        degeneracy appears at $n = 2$ in a subtler form: $\hat x$ is exactly
+        $\pm 1$ and the input gradient is exactly 0, so a BN layer at batch size
+        2 passes signs forward and nothing backward.
+    - id: cp-2
+      question: >-
+        You put `b = nn.Parameter(torch.zeros(d))` before a BatchNorm layer.
+        What is the gradient of the loss with respect to `b`, and why?
+      answerKind: short_text
+      hint: >-
+        BN subtracts the batch mean. What does adding a constant to every
+        example do to that mean?
+      solution: >-
+        It is exactly zero. Adding $b$ to every example shifts the batch mean by
+        $b$, so BN subtracts it back out: the layer's output does not depend on
+        $b$ at all. Formally, $\partial L/\partial b = \sum_i \partial L/\partial x_i$,
+        and BN's backward pass enforces $\sum_i dx_i = 0$ by construction —
+        measured at $6.7\times10^{-16}$. The parameter sits in the optimiser
+        forever, consuming weight-decay updates and momentum state, doing
+        nothing. The same argument says $\beta$ is *not* redundant: it is added
+        after the normalisation, where nothing subtracts it.
+    - id: cp-3
+      question: >-
+        Your model uses BatchNorm. Training loss is 0.31, and the loss on the
+        validation set — evaluated with batches of 8 — is 0.62. Name the two
+        candidate causes and the measurement that separates them.
+      answerKind: short_text
+      hint: >-
+        There are two ways to get a different number from the same weights: use
+        a different function, or use the same function on a different estimator.
+      solution: >-
+        Either the model is in train mode (batch statistics, so each validation
+        example is normalised against its seven neighbours) or it is in eval
+        mode with running statistics that were estimated from a different
+        distribution — too few warmup steps, momentum too high, or a training
+        batch size that differs from the eval one. Separate them by evaluating
+        the same checkpoint three ways: train mode, eval mode, and eval mode
+        with the batch repeated 32 times. If the first differs from the second
+        and the second is stable under repetition, it is the mode. If the second
+        moves when you change the batch composition, the running statistics are
+        stale. The size of the effect is not small: measured worst-case
+        train/eval gaps are 0.935 at $n=8$ and 0.254 even at $n=256$.
+    - id: cp-4
+      question: >-
+        A transformer has $d = 768$ and you train with 8 sequences of 512 tokens
+        per step. Would you use BatchNorm or LayerNorm, and what are the two
+        numbers that decide it?
+      answerKind: short_text
+      hint: >-
+        Compare $2(n-1)$ with $2(d-1)$ — and then think about what a padding
+        token contributes to a batch mean.
+      solution: >-
+        LayerNorm, for two reasons that are both quantitative. Sample size: LN's
+        statistic has 768 samples (2.55% relative noise), while BN's has 8 (26.7%
+        noise) — a factor of 96, and the noise lands directly in the output.
+        Padding: BN's batch mean is taken over every position in every sequence,
+        so a batch containing one long sequence and one short one normalises the
+        short one's real tokens against the long one's padding, and the effect
+        changes with the batch composition. If you flatten to $8 \times 512 =
+        4096$ positions per feature, the sample size looks fine and the
+        contamination gets worse, because most of those positions are padding.
+    - id: cp-5
+      question: >-
+        A feature entering a BN layer has standard deviation $10^{-3}$. What gain
+        does the layer apply to it, what is its output standard deviation, and
+        what does that do to its gradient?
+      answerKind: short_text
+      hint: >-
+        The gain is $\gamma/\sqrt{\sigma^2+\varepsilon}$ with $\varepsilon =
+        10^{-5}$; compare $\sigma^2$ with $\varepsilon$.
+      solution: >-
+        Gain $= 1/\sqrt{10^{-6} + 10^{-5}} = 301.5$, and the output standard
+        deviation is $\sigma/\sqrt{\sigma^2+\varepsilon} = 0.3015$, not 1. So
+        the feature is amplified 300-fold on the way in and is not normalised on
+        the way out. Its gradient is amplified by the same factor, which means
+        this one channel dominates the update to the layer below it — a learning
+        rate that is fine for the other channels is 300x too large for this one.
+        The ceiling is $1/\sqrt{\varepsilon} = 316.2$, reached by
+        $\sigma = 10^{-4}$ (measured gain 316.07, output std 0.0316).
+    - id: cp-6
+      question: >-
+        Why does adding BatchNorm let you raise the learning rate by 10x, and
+        what else does that same mechanism do to your training run?
+      answerKind: short_text
+      hint: >-
+        The gradient is orthogonal to the weights. What does that imply about
+        how the norm of the weights evolves, and what is the step size once you
+        measure it in the direction the loss can see?
+      solution: >-
+        BN makes the loss invariant to $\|W\|$, so $\nabla L(\alpha W) =
+        \nabla L(W)/\alpha$ and the effective step is $\eta/\|W\|^2$ rather than
+        $\eta$. A nominal rate that would explode an unnormalised net is a
+        modest step here because the gradient shrinks as the weights grow. The
+        same mechanism means the effective rate is *not* constant: with no weight
+        decay, $\|W\|^2$ grows by $\eta^2\|g\|^2$ every step, so the effective
+        rate decays — measured, 0.286x after 1000 steps at $\eta = 0.1$. And
+        weight decay becomes the control that sets it: $\lambda = 0.5$ pins the
+        norm at 0.160 and raises the effective rate 39x. So BN does not remove
+        the need for a schedule; it hides one inside the weight norm.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Initialisation chooses a scale once, from a variance argument, and hopes
+        the signal stays in range for the whole run. Normalisation stops hoping:
+        at every layer it measures the mean and the spread of what actually
+        arrived and divides them out. The interesting questions are then not
+        "does it help" but "measured over which set of numbers", "what does the
+        network become blind to as a result", and "what is different at
+        inference time, when the set of numbers is one".
+      blocks:
+        - kind: checklist
+          body: |
+            Three questions to hold in mind, in this order:
+            - What set of numbers is the mean taken over — the batch, or the features of one example?
+            - What does the layer become invariant to, as a consequence?
+            - What has to be stored, or recomputed, when that set changes size?
+        - kind: warning
+          body: >-
+            Tier 1 contains no formulas on purpose. Before reading on, commit to
+            an answer for this: if you multiply every weight in a layer by 100
+            and that layer is followed by batch norm, does the loss change? By
+            how much? Write your number down; the rest of the ladder is a test of
+            it.
+      checkpoint: >-
+        If the answer to the question above is "not at all", what does that imply
+        about the gradient with respect to those weights — and about how the norm
+        of the weights behaves during training?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in two steps. First derive what the layer is invariant to, because
+        invariance is what makes the loss well behaved and it is a one-line
+        calculation. Then treat the statistic as an estimator and compute its
+        variance, because that is where every practical failure lives: batch-size
+        sensitivity, the train/eval gap, and the choice between the two axes.
+        Do not start from the implementation — the code is three lines and it
+        will not tell you which axis to use.
+      blocks:
+        - kind: checklist
+          body: |
+            - Invariance: what happens to the output when the input is scaled and shifted?
+            - Estimator: how many samples does the statistic have, and what is its relative noise?
+            - State: what must be stored to reproduce the function later?
+            - Placement: is the normalised quantity on the residual path or inside the branch?
+        - kind: warning
+          body: >-
+            The most expensive wrong turn is treating the two layers as
+            interchangeable because the formula is the same. They differ in the
+            axis, and the axis determines the sample size, the state, and
+            whether the layer is defined at all when the batch is one example.
+      checkpoint: >-
+        For a convnet channel with 256 channels and a 56x56 feature map at batch
+        32, how many samples does BN's statistic have? How many would LN's have
+        if you applied it per position?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three functions and one assertion. The assertion is the part that
+        distinguishes an implementation that works from one that happens to
+        converge.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # forward
+            mu  = mean(x, axis=AXIS)          # AXIS=0 for BN, AXIS=1 for LN
+            var = mean((x - mu)**2, axis=AXIS)   # biased: 1/n, not 1/(n-1)
+            xhat = (x - mu) / sqrt(var + eps)
+            y = gamma * xhat + beta
+            if training and AXIS == 0:
+                running_mean = (1-m)*running_mean + m*mu
+                running_var  = (1-m)*running_var  + m*var * n/(n-1)   # unbiased!
+            if not training and AXIS == 0:
+                use running_mean, running_var instead of mu, var
+
+            # backward
+            dgamma = sum(g * xhat, axis=AXIS)
+            dbeta  = sum(g, axis=AXIS)
+            dx = (1/(n*sigma)) * (n*g*gamma - sum(g*gamma) - xhat*sum(g*gamma*xhat))
+
+            # the assertions that catch the two classic bugs
+            assert abs(sum(dx, axis=AXIS)).max() < 1e-12
+            assert abs(sum(dx*xhat, axis=AXIS)).max() < 1e-12
+        - kind: math
+          body: |
+            The noise of the statistic, with the right count substituted:
+
+            $$\frac{\operatorname{std}(s)}{\mathbb{E}[s]} \approx \frac{1}{\sqrt{2(k-1)}}$$
+
+            with $k = n$ for batch norm and $k = d$ for layer norm.
+      checkpoint: >-
+        Why is the biased variance the right choice for the normalisation but the
+        unbiased one the right choice for the running estimate? Answer in one
+        sentence about what each number is trying to be.
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Everything follows from the homogeneity of the layer and from one
+        chi-square variance.
+      blocks:
+        - kind: math
+          body: |
+            Batch norm, with $P = \frac{1}{n}\mathbf{1}\mathbf{1}^\top$:
+
+            $$\hat X = \frac{(I-P)X}{\sigma_B}, \qquad \operatorname{rank}((I-P)X) \le n-1$$
+
+            Homogeneity for $\alpha > 0$, and its derivative at $\alpha = 1$:
+
+            $$\operatorname{BN}(\alpha W x + \alpha b) = \operatorname{BN}(Wx + b)
+              \;\Longrightarrow\; \langle \nabla_W L, W \rangle = 0$$
+
+            One SGD step, using that orthogonality:
+
+            $$\|W_{t+1}\|^2 = \|W_t\|^2 + \eta^2\|g\|^2
+              \;\Longrightarrow\; \|W_t\|^2 = \|W_0\|^2 + t\eta^2\|g\|^2$$
+
+            $$\text{effective step} = \frac{\eta\|g\|}{\|W\|}
+              \;\;\text{and}\;\; \nabla L(\alpha W) = \frac{\nabla L(W)}{\alpha}
+              \;\Longrightarrow\; \text{rate} \propto \frac{\eta}{\|W\|^2}$$
+
+            Backward pass, with $\sigma = \sqrt{\sigma_B^2+\varepsilon}$:
+
+            $$\frac{\partial L}{\partial x_i} = \frac{\gamma}{n\sigma}
+              \Big(n g_i - \sum_j g_j - \hat x_i \sum_j g_j \hat x_j\Big)$$
+
+            Estimator noise, from $(n-1)s^2/\sigma^2 \sim \chi^2_{n-1}$:
+
+            $$\operatorname{Var}(s^2) = \frac{2\sigma^4}{n-1}
+              \;\Longrightarrow\; \frac{\operatorname{std}(s)}{\mathbb{E}[s]}
+              \approx \frac{1}{\sqrt{2(n-1)}}$$
+      checkpoint: >-
+        The effective-rate result used $\langle g, W\rangle = 0$, which is exact
+        only when $\varepsilon = 0$. What happens to the norm's growth when
+        $\varepsilon > 0$ and the weights are small — does it still grow
+        monotonically?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A BN layer you can trust, and the measurement harness that decides
+        between BN and LN for a given model.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the assertions before the code. They are the two identities the
+            layer must satisfy, they are exact to machine precision, and they are
+            the only tests here that will catch a dropped projection term.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def bn_forward(x, gamma, beta, eps=1e-5):
+                mu = x.mean(0)
+                var = x.var(0)
+                inv = 1.0 / np.sqrt(var + eps)
+                xhat = (x - mu) * inv
+                return gamma * xhat + beta, (xhat, inv, gamma, x.shape[0], var)
+
+            def bn_backward(gy, cache):
+                xhat, inv, gamma, n, var = cache
+                dxhat = gy * gamma
+                dx = (inv / n) * (n * dxhat - dxhat.sum(0)
+                                  - xhat * (dxhat * xhat).sum(0))
+                # The identities that prove the two projections are present.
+                assert np.abs(dx.sum(0)).max() < 1e-9
+                assert np.abs((dx * xhat).sum(0)).max() < 1e-9
+                return dx, (gy * xhat).sum(0), gy.sum(0)
+
+            def running_update(rm, rv, batch_mean, batch_var, n, m=0.1):
+                """Normalise with the BIASED variance; store the UNBIASED one."""
+                var_unbiased = batch_var * n / (n - 1) if n > 1 else batch_var
+                rm = (1 - m) * rm + m * batch_mean
+                rv = (1 - m) * rv + m * var_unbiased
+                return rm, rv
+
+            def layernorm(x, gamma, beta, eps=1e-5):
+                mu = x.mean(1, keepdims=True)
+                var = x.var(1, keepdims=True)
+                return gamma * (x - mu) / np.sqrt(var + eps) + beta
+
+            def decide(n, d):
+                """Which layer, from the sample size of the two candidate statistics."""
+                def noise(k):
+                    return 1.0 / np.sqrt(2.0 * (k - 1)) if k > 1 else float("inf")
+                bn_noise, ln_noise = noise(n), noise(d)
+                return ("LN" if ln_noise < bn_noise else "BN",
+                        {"bn_noise": bn_noise, "ln_noise": ln_noise})
+
+            if __name__ == "__main__":
+                rng = np.random.default_rng(0)
+                x = rng.normal(3.0, 2.0, (32, 8))
+                g, b = np.ones(8), np.zeros(8)
+                y, c = bn_forward(x, g, b)
+                print(y.mean(0).max(), y.var(0).min())     # 3.7e-16, 0.9999965
+                print(bn_backward(np.ones_like(y), c)[0].max())   # 5.4e-16: zero, up to rounding
+                print(decide(8, 768))                      # LN, 96x quieter
+                print(decide(256, 1))                      # BN, for a conv channel
+      checkpoint: >-
+        `decide(8, 768)` returns LN. What would it return for a conv layer at
+        batch 32 with 56x56 spatial positions, and why is the comparison not
+        really $n$ against $d$ in that case?
+
+  problems:
+    - id: p-bn-forward
+      title: "Batch norm forward: the two statistics and the affine"
+      difficulty: easy
+      prompt: >-
+        Implement `bn_forward(x, gamma, beta, eps)` for a 2-D batch
+        $x$ of shape `(n, d)`, with `gamma` and `beta` of length `d`. Return a
+        dict with exactly three keys: `out` (the normalised and re-scaled batch,
+        same shape as `x`), `mean` (the per-feature mean used, a list of length
+        `d`), and `var` (the per-feature variance used, a list of length `d`).
+        Use the **biased** variance, i.e. divide by `n`, not `n-1` — the output
+        is supposed to have exactly unit variance, and the unbiased form makes it
+        $\sqrt{(n-1)/n}$ instead. When the variance is zero and `eps` is zero,
+        numpy will produce `nan`; every test case here either has non-zero
+        variance or a positive `eps`.
+      starter: |
+        import numpy as np
+
+        def bn_forward(x, gamma, beta, eps):
+            # your implementation here
+            pass
+      language: python
+      entry: bn_forward
+      testCases:
+        - input: '[[[1.0, 2.0], [3.0, 4.0]], [1.0, 1.0], [0.0, 0.0], 0.0]'
+          expected: '{"out": [[-1.0, -1.0], [1.0, 1.0]], "mean": [2.0, 3.0], "var": [1.0, 1.0]}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[1.0, 2.0], [3.0, 4.0]], [2.0, 0.5], [1.0, -1.0], 0.0]'
+          expected: '{"out": [[-1.0, -1.5], [3.0, -0.5]], "mean": [2.0, 3.0], "var": [1.0, 1.0]}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[1.0, 1.0], [1.0, 1.0]], [1.0, 1.0], [0.0, 0.0], 1e-05]'
+          expected: '{"out": [[0.0, 0.0], [0.0, 0.0]], "mean": [1.0, 1.0], "var": [0.0, 0.0]}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 10.0]], [1.0, -1.0, 2.0], [0.0, 0.5, -1.0], 1e-05]'
+          expected: '{"out": [[-1.2247438507721387, 1.7247438507721387, -3.324951361055042], [0.0, 0.5, -1.2324951361055039], [1.2247438507721387, -0.7247438507721387, 1.5574464971605462]], "mean": [4.0, 5.0, 6.333333333333333], "var": [6.0, 6.0, 8.222222222222221]}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[2.0], [4.0], [6.0], [8.0]], [3.0], [0.0], 1e-05]'
+          expected: '{"out": [[-4.024918334583299], [-1.3416394448610998], [1.3416394448610998], [4.024918334583299]], "mean": [5.0], "var": [5.0]}'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+
+        def bn_forward(x, gamma, beta, eps):
+            x = np.asarray(x, dtype=float)
+            gamma = np.asarray(gamma, dtype=float)
+            beta = np.asarray(beta, dtype=float)
+            mean = x.mean(axis=0)
+            var = x.var(axis=0)                      # biased: divide by n
+            out = (x - mean) / np.sqrt(var + eps) * gamma + beta
+            return {"out": out.tolist(), "mean": mean.tolist(), "var": var.tolist()}
+      solutionExplanation: >-
+        The reduction is over `axis=0` — the batch — and the affine is applied
+        per feature afterwards, which is the whole content of "batch norm". The
+        variance must be the biased one. Use `ddof=1` by mistake and you divide
+        by $\sqrt{\sigma^2 \cdot n/(n-1)}$ instead of $\sigma$, so the output
+        standard deviation is $\sqrt{(n-1)/n}$ — 0.707 at $n=2$, and 0.9995 at
+        $n=1000$, which is why the bug survives every test written at a realistic
+        batch size. The zero-variance
+        case is the one to look at: with `eps = 1e-5` the layer returns exactly
+        $\beta$ (here 0.0) rather than NaN, and that is the only thing `eps` is
+        doing. The fifth case is the same arithmetic with a single feature, where
+        the per-feature statistics are the whole tensor.
+      complexity: "O(n·d) time, O(n·d) space for the output"
+      tags: [batchnorm, normalisation, statistics, numpy]
+
+    - id: p-bn-backward
+      title: "Batch norm backward: three terms and two identities"
+      difficulty: hard
+      prompt: >-
+        Implement `bn_backward(x, grad_out, gamma, eps)`, the backward pass of a
+        batch norm layer with no bias, returning a dict with keys `dx` (gradient
+        with respect to the input, same shape as `x`), `dgamma` (length `d`) and
+        `dbeta` (length `d`). The cotangent `grad_out` is
+        $\partial L/\partial y$ where $y = \gamma\hat x + \beta$ and
+        $\hat x = (x-\mu_B)/\sqrt{\sigma_B^2+\varepsilon}$, with $\mu_B$ and
+        $\sigma_B^2$ the biased batch statistics. The result must satisfy
+        $\sum_i dx_i = 0$ and $\sum_i dx_i\hat x_i = 0$ per feature, both to
+        machine precision. A constant cotangent must therefore produce exactly
+        zero `dx`, not $g/\sigma$ — check that case first, because it is the one
+        that a missing projection term fails by the largest margin.
+      starter: |
+        import numpy as np
+
+        def bn_backward(x, grad_out, gamma, eps):
+            # your implementation here
+            pass
+      language: python
+      entry: bn_backward
+      testCases:
+        - input: '[[[1.0, 2.0, 3.0], [3.0, 4.0, 9.0], [5.0, 1.0, 2.0], [7.0, 6.0, 5.0]], [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], [1.0, 1.0, 1.0], 0.0]'
+          expected: '{"dx": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], "dgamma": [0.0, 0.0, 0.0], "dbeta": [4.0, 4.0, 4.0]}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[1.0, 2.0, 4.0], [3.0, 1.0, 0.0], [0.0, 5.0, 2.0]], [[1.0, 0.0, 2.0], [0.0, 1.0, -1.0], [2.0, 0.0, 0.0]], [1.0, 1.0, 1.0], 0.0]'
+          expected: '{"dx": [[-0.171810798372273, -0.271545417883639, 0.102062072615966], [0.057270266124091, 0.20365906341273, 0.102062072615966], [0.114540532248182, 0.06788635447091, -0.204124145231931]], "dgamma": [-2.40535117721182, -0.98058067569092, 3.674234614174767], "dbeta": [3.0, 1.0, 1.0]}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[1.0, 2.0], [3.0, 4.0]], [[1.0, -1.0], [2.0, 0.5]], [1.0, 1.0], 0.0]'
+          expected: '{"dx": [[0.0, 0.0], [0.0, 0.0]], "dgamma": [1.0, 1.5], "dbeta": [3.0, -0.5]}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[1.0, 2.0], [3.0, 5.0]], [[0.5, -1.0], [2.0, 0.25]], [2.0, 3.0], 1e-05]'
+          expected: '{"dx": [[-1.4999775002730609e-05, -5.555518518796922e-06], [1.4999775002730609e-05, 5.555518518796922e-06]], "dgamma": [1.4999925000562495, 1.2499972222314815], "dbeta": [2.5, -0.75]}'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+
+        def bn_backward(x, grad_out, gamma, eps):
+            x = np.asarray(x, dtype=float)
+            g = np.asarray(grad_out, dtype=float)
+            gam = np.asarray(gamma, dtype=float)
+            n = x.shape[0]
+            mean = x.mean(axis=0)
+            var = x.var(axis=0)
+            inv = 1.0 / np.sqrt(var + eps)
+            xhat = (x - mean) * inv
+            dgamma = (g * xhat).sum(axis=0)
+            dbeta = g.sum(axis=0)
+            dxhat = g * gam
+            dx = (inv / n) * (n * dxhat - dxhat.sum(axis=0)
+                              - xhat * (dxhat * xhat).sum(axis=0))
+            return {"dx": dx.tolist(), "dgamma": dgamma.tolist(), "dbeta": dbeta.tolist()}
+      solutionExplanation: >-
+        Three terms, and the middle two are projections: the layer subtracts
+        whatever part of the gradient would change the batch mean or the batch
+        scale, because the forward pass made both of those unobservable. Two
+        consequences make this the most testable function in the topic. A
+        constant cotangent gives exactly zero — cases 1, 3 and 4 all check that,
+        at 4, 2 and 2 examples respectively — whereas the naive `g/sigma`
+        returns $1/\sigma$ per element and is never zero: 0.447 on the first
+        case's first column. And cases 3 and 4 are batch size 2, where `dx` is
+        zero for *any* cotangent in the $\varepsilon \to 0$ limit: with two
+        examples $\hat x$ is exactly
+        $\pm 1$, so the two identities $\sum dx = 0$ and $\sum dx\,\hat x = 0$
+        force $dx_1 = dx_2 = 0$. If your implementation returns non-zero values
+        there it is because the projection terms are missing, and the diagnostic
+        is one line: `sum(dx)` should be zero and is not. The last case is the
+        same batch size with `eps = 1e-5` deliberately left in: `dx` is
+        $1.5\times10^{-5}$ rather than 0, because $\varepsilon$ makes the second
+        identity approximate ($\sum dx\,\hat x = 3.0\times10^{-5}$, not 0). A
+        solution that hard-codes `eps = 0` inside the backward pass returns
+        exactly zero here and fails — which is the point of including it.
+      complexity: "O(n·d) time, O(n·d) space"
+      tags: [batchnorm, backpropagation, chain-rule, projections]
+
+    - id: p-layernorm-forward
+      title: "Layer norm forward: the same formula on the other axis"
+      difficulty: medium
+      prompt: >-
+        Implement `layernorm_forward(x, gamma, beta, eps)` for a 2-D batch of
+        shape `(n, d)`. Return a dict with `out`, `mean` and `var`, where this
+        time `mean` and `var` are lists of length `n` — one pair per example,
+        computed over that example's `d` features with the biased variance. The
+        affine `gamma` and `beta` are still per feature (length `d`). A 1x1 input
+        must return `out = [[0.0]]` rather than NaN. If your implementation
+        reduces over `axis=0` it will produce the right *shape* for every square
+        test case and the wrong values for all of them; check the 2x2 case by
+        hand, where the correct answer has both rows equal to `[-1.0, 1.0]` and
+        the batch-axis answer has both columns equal to `[-1.0, -1.0]`.
+      starter: |
+        import numpy as np
+
+        def layernorm_forward(x, gamma, beta, eps):
+            # your implementation here
+            pass
+      language: python
+      entry: layernorm_forward
+      testCases:
+        - input: '[[[1.0, 2.0], [3.0, 4.0]], [1.0, 1.0], [0.0, 0.0], 0.0]'
+          expected: '{"out": [[-1.0, 1.0], [-1.0, 1.0]], "mean": [1.5, 3.5], "var": [0.25, 0.25]}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[1.0, 2.0, 3.0, 4.0]], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 0.0]'
+          expected: '{"out": [[-1.3416407864998738, -0.4472135954999579, 0.4472135954999579, 1.3416407864998738]], "mean": [2.5], "var": [1.25]}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[1.0, 2.0, 4.0], [0.0, 0.0, 0.0], [5.0, -1.0, 2.0]], [1.0, 2.0, 0.5], [0.0, 1.0, -1.0], 1e-05]'
+          expected: '{"out": [[-1.0690415314502977, 0.46547923427485094, -0.3318490428435641], [0.0, 1.0, -1.0], [1.2247438507721387, -1.4494877015442773, -1.0]], "mean": [2.3333333333333335, 0.0, 2.0], "var": [1.5555555555555554, 0.0, 6.0]}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '[[[3.0]], [1.0], [0.0], 1e-05]'
+          expected: '{"out": [[0.0]], "mean": [3.0], "var": [0.0]}'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+
+        def layernorm_forward(x, gamma, beta, eps):
+            x = np.asarray(x, dtype=float)
+            gamma = np.asarray(gamma, dtype=float)
+            beta = np.asarray(beta, dtype=float)
+            mean = x.mean(axis=1)
+            var = x.var(axis=1)
+            out = (x - mean[:, None]) / np.sqrt(var[:, None] + eps) * gamma + beta
+            return {"out": out.tolist(), "mean": mean.tolist(), "var": var.tolist()}
+      solutionExplanation: >-
+        One word changes: `axis=1`. Everything downstream is different. The
+        statistic now has `d` samples instead of `n`, so it exists at batch size
+        one (case 2), needs no running state, and gives the same answer in train
+        and eval. The second case is the one to check by hand: mean 2.5, variance
+        1.25, $\sigma = 1.118$, and $(1-2.5)/1.118 = -1.3416$. The third case
+        contains a constant row, whose variance is zero, so `out` is exactly
+        `beta` for that row — `[0.0, 1.0, -1.0]` — which is the same degeneracy
+        BN has at batch size one, arriving through a different door. The 1x1 case
+        is the minimax version: every input is constant across a single feature,
+        so the layer's only honest output is 0.
+      complexity: "O(n·d) time, O(n·d) space"
+      tags: [layernorm, normalisation, axis, numpy]
+
+  visualizers:
+    - id: vs-norm-axes
+      kind: tensor
+      title: "Drag the batch size and watch which statistic survives"
+      description: >-
+        A fixed example's normalised value is recomputed as the batch size goes
+        from 2 to 256 and the axis switches between batch and feature. At $n=2$
+        the batch-axis value is pinned to $\pm 1$; at $n=8$ it wanders by 0.43
+        standard deviations between batches; by $n=256$ it is stable to 0.07.
+        Switch the axis to features and the noise depends on $d$ instead — 0.089
+        at $d=64$, 0.025 at $d=768$ — and the train/eval gap goes to exactly zero.
+      params:
+        minBatch: 2
+        maxBatch: 256
+        featureDims: [8, 64, 768]
+        axes: ["batch", "feature"]
+
+  try_it: >-
+    Take a 4-by-3 batch and normalise it twice by hand: column-wise (BatchNorm) and row-wise
+    (LayerNorm). Add a fifth row and confirm the first four BatchNorm outputs move while the
+    LayerNorm outputs are bit-identical, then scale the incoming weight matrix by 100 and check
+    that the BatchNorm output does not change at all.
+  interview_questions:
+    - question: 'Why is a BatchNorm loss exactly invariant to the scale of the preceding weight matrix, and what does that do to the effective learning rate?'
+      level: mid
+      key_points:
+        - 'For alpha > 0, BN(alpha W x + alpha b) = BN(W x + b): the mean scales by alpha, the standard deviation by |alpha|, and the ratio is unchanged.'
+        - 'Differentiating L(alpha W) = L(W) at alpha = 1 forces the gradient to be orthogonal to W.'
+        - 'One SGD step then gives ||W_{t+1}||^2 = ||W_t||^2 + eta^2 ||g||^2, so the norm only grows and the angular step ||dW||/||W|| = eta||g||/||W|| shrinks.'
+        - 'What you are really tuning is eta/||W||^2, not eta, which is why BatchNorm turns weight decay into an implicit schedule.'
+    - question: 'A model scores 0.94 offline and 0.71 in the service with the same weights. What is your first hypothesis and how do you prove it?'
+      level: senior
+      key_points:
+        - 'Train mode divides by the current batch statistics; eval mode divides by a running estimate stored in the checkpoint, so the two are different functions.'
+        - 'A missing .eval() makes a prediction depend on which other examples share the batch, which is invisible on any single-example test.'
+        - 'A from-scratch implementation using unbiased variance doubles the running variance at batch size 2, making every eval activation about 41% too large.'
+        - 'The proof is to score the same example at batch size 1 and batch size 32 with the model in eval mode; a gap isolates the statistics, not the weights.'
+      follow_up: 'What else in the checkpoint besides the running statistics does .eval() change, and which of those can also move your offline number?'
+    - question: 'Why do transformer stacks use LayerNorm rather than BatchNorm?'
+      level: mid
+      key_points:
+        - 'LayerNorm standardises each example across its features, so its statistic has d samples instead of n and nothing crosses the batch or the sequence.'
+        - 'Padding then cannot contaminate: pad sequences of length 12, 7 and 4 to 12 and the 12-token sequence shifts by 1.2643 under BatchNorm and by exactly 0.0 under LayerNorm.'
+        - 'It carries no running state, so train and eval are the same function and the layer works at batch size 1.'
+        - 'The cost is that its Jacobian annihilates the all-ones direction, and that mean-centring is the part RMSNorm later drops.'
+  common_mistakes:
+    - 'Leaving the model in train mode at inference, so a prediction depends on which other examples happen to share the batch.'
+    - 'Using the unbiased variance in a from-scratch BatchNorm: at batch size 2 the running variance is twice the stored value and every eval activation is about 41% too large.'
+    - 'Putting epsilon outside the square root, which changes the function: at sigma = 1e-2 the gain is 0.9990 instead of 0.9535, and at 1e-3 it is 0.3015.'
+  further_reading:
+    - label: "Ioffe & Szegedy, Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift (ICML 2015)"
+    - label: "Santurkar, Tsipras, Ilyas & Madry, How Does Batch Normalization Help Optimization? (NeurIPS 2018)"

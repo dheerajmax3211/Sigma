@@ -1,0 +1,563 @@
+id: build-lora-engine
+slug: build-lora-engine
+title: "Build a LoRA Engine: Low-Rank Adapters, Merge, and the 1% Budget"
+summary: >-
+  Implement the adapter as the factorisation it is — A, B, one scale — then
+  prove the two properties that make it useful: the merged weight reproduces the
+  adapter's forward pass to 1e-6, and the adapter costs under 1% of the base
+  parameters. Finish by measuring what a rank-r adapter provably cannot learn.
+kind: lesson
+difficulty: medium
+position: 2
+estMinutes: 23
+prerequisites: []
+phase: build-systems
+tags: [lora, peft, low-rank, fine-tuning, merge, quantisation, serving]
+
+body:
+  big_idea: >-
+    LoRA is not a smaller fine-tune but a rank constraint made explicit: $W +
+    \tfrac{\alpha}{r}BA$ trains $r(d+k)$ parameters instead of $dk$, merges
+    exactly, and represents only updates of rank at most $r$.
+  problem:
+    - "You save a 40 MB adapter against a 14 GB base and cannot explain what $r = 8$ would change against $r = 64$."
+    - "You merge the adapter and outputs shift: the algebra is exact, the cause is numerical — a rank-16 update rounded away at bf16's 8-bit mantissa."
+    - "You serve one base behind three products: the naive path loads three copies, the right one keeps one base and switches 262 KB of adapter."
+  analogy: >-
+    A hardcover book with a thin paper insert. The book is the pretrained
+    weight: expensive, shared, never rewritten. The insert is two thin sheets
+    — one mapping the page into $r$ lines, one mapping those lines back — and
+    merging is printing the insert into the book, which is free at inference
+    and why you must keep the insert to undo it.
+  concept_points:
+    - "**The parameter budget is $r(d+k)$, and 1% is a rank threshold, not a vibe.** For a square $d\\times d$ weight the ratio is $2r/d$, so under 1% needs $r < d/200$ — $r \\le 20$ at $d = 4096$. At $r = 16$ the adapter has 131,072 parameters against 16,777,216, **0.78125%**, and the checkpoint is 262 KB in fp16 against 33.5 MB. At $r = 64$ it is 3.125%."
+    - "**$B = 0$ at initialisation is what makes the adapter a no-op.** With $B = 0$ the update is exactly the zero matrix, so step 0 produces the base model's logits rather than a perturbed value you must recover from. Initialise both factors randomly and $BA$ has standard deviation $\\sigma_B$: at $\\sigma_B = 0.02$ the update's Frobenius norm is **2.1x the base weight's**, measured."
+    - "**Merge is exact algebra and inexact arithmetic.** $x(W + \\tfrac{\\alpha}{r}BA)^\\top = xW^\\top + \\tfrac{\\alpha}{r}(xA^\\top)B^\\top$, so a float64 merge matches the adapter path to $3.1\\times10^{-15}$. In float32 the gap is $1.15\\times10^{-6}$; in bf16 it is **$1.2\\times10^{-2}$**, because 8 mantissa bits give 0.2% resolution and a smaller update is rounded away. Merge into fp32 or fp16."
+    - "**The optimizer state is where the memory actually goes.** Adam keeps two moments per trainable parameter, so fine-tuning a 4096x4096 weight needs $16{,}777{,}216 \\times 12$ B = **201 MB**; LoRA at $r = 16$ needs $131{,}072 \\times 12$ B = **1.57 MB**, **128x less**, and the frozen base needs no gradient buffer. What does not fit is usually the optimizer, not the weights."
+    - "**Rank is a hard ceiling, and it is testable.** A product $BA$ with $B \\in \\mathbb{R}^{d\\times r}$ has rank at most $r$, so an update is representable only if $\\operatorname{rank}(\\Delta W) \\le r$. Eckart–Young gives relative error $\\sqrt{\\sum_{i>r}\\sigma_i^2}/\\sqrt{\\sum_i\\sigma_i^2}$: for a rank-8 target with $r = 4$ that is 0.707, and **0.665 measured**. Training longer cannot close it."
+    - "**The scale is $\\alpha/r$, and conventions differ by a factor of $r$.** Original LoRA divides by $r$; many libraries use $\\alpha/\\sqrt{r}$ or set $\\alpha = r$ so the scale is 1. At $r = 16$, $\\alpha = 16$ the update is multiplied by 1 and at $\\alpha = 32$ by 2. Changing $r$ without changing $\\alpha$ silently changes the adapter's learning rate."
+  definitions:
+    - { term: "LoRA (low-rank adaptation)", meaning: "A fine-tuning method that freezes W and learns a low-rank update ΔW = (α/r)BA, with A mapping d_in → r and B mapping r → d_out. Only A and B receive gradients or optimizer state." }
+    - { term: "Rank r", meaning: "The inner dimension of the factorisation, and a hard cap on the rank of any update the adapter can represent. It sets the parameter count r(d_in + d_out)." }
+    - { term: "Merge", meaning: "Folding the adapter into the base weight, W ← W + (α/r)BA, so inference has no extra matmul and no adapter bookkeeping. Exact in algebra, lossy in low precision." }
+    - { term: "α (lora_alpha)", meaning: "A scalar that sets the update's effective scale, α/r. It is redundant with the learning rate unless r changes, which is exactly when people forget it." }
+    - { term: "Eckart–Young theorem", meaning: "The best rank-r approximation of a matrix in Frobenius norm is its truncated SVD, with error equal to the root sum of squares of the discarded singular values. It is why a rank-r adapter cannot fit a rank-(r+1) update." }
+    - { term: "QLoRA", meaning: "LoRA on top of a 4-bit quantised base. The base is stored in NF4 and dequantised per tile during the forward pass; adapters stay in fp16, so gradients never touch the quantised weights." }
+
+  diagrams:
+    - type: architecture
+      title: "One linear layer with an adapter branch, and the merge that removes it"
+      nodes:
+        - { id: x, x: 0, y: 1, label: "x (B, d_in)", kind: client, detail: "The same activation feeds both paths. The base path is frozen: no gradient buffer, no optimizer state." }
+        - { id: w, x: 1, y: 0, label: "W (d_out, d_in)", kind: storage, detail: "16,777,216 parameters at 4096². Frozen in fp32 or quantised to NF4 at 0.5 byte per parameter." }
+        - { id: a, x: 1, y: 1, label: "A (r, d_in)", kind: storage, detail: "Initialised N(0, 1/r). Maps the 4096-wide input down to r = 16; 65,536 parameters." }
+        - { id: b, x: 2, y: 1, label: "B (d_out, r)", kind: storage, detail: "Initialised to exactly zero, which is what makes step 0 a no-op. 65,536 parameters." }
+        - { id: scale, x: 2, y: 2, label: "× α/r", kind: worker, detail: "With α = r the scale is 1. With α = 2r it is 2, and the effective learning rate doubles without a schedule change." }
+        - { id: add, x: 3, y: 1, label: "+ → y", kind: model, detail: "y = xWᵀ + (α/r)(xAᵀ)Bᵀ. Merge replaces the whole diagram with y = x(W + (α/r)BA)ᵀ." }
+      edges:
+        - { from: x, to: w, label: "base" }
+        - { from: x, to: a, label: "down" }
+        - { from: a, to: b, label: "r = 16" }
+        - { from: b, to: scale, label: "" }
+        - { from: w, to: add, label: "xWᵀ" }
+        - { from: scale, to: add, label: "Δ" }
+      caption: "The adapter is a detour through a 16-dimensional bottleneck. Merge computes B @ A once — 4096×16×4096 = 268M multiply-adds, 0.54 GFLOP, about 5 µs at 100 TFLOP/s — and the detour disappears."
+
+    - type: compare
+      title: "Full fine-tuning vs LoRA on one 4096×4096 weight"
+      left_label: "Full fine-tuning"
+      left_points:
+        - "16,777,216 trainable parameters per weight; 201 MB of weights plus Adam moments in fp32"
+        - "Gradient buffer for the weight, plus activation memory for its input"
+        - "One artifact per task, each a full 14 GB checkpoint for a 7B model"
+        - "Can represent any update, including a full-rank one; that freedom is also why it forgets"
+      right_label: "LoRA, r = 16"
+      right_points:
+        - "131,072 trainable parameters — 0.78125% — and 1.57 MB of optimizer state, 128× less"
+        - "The base weight has requires_grad=False, so no gradient and no moment buffers"
+        - "A 262 KB adapter per task, and 50 of them fit in 13 MB next to one shared base"
+        - "Can represent exactly the rank-16 updates; a rank-32 target has an irreducible 0.707 relative residual"
+
+  markdown: |
+    ## What you are building
+
+    You are building a LoRA engine in NumPy: about sixty lines, six functions. It initialises an adapter and runs its forward pass. It backpropagates into the adapter, merges it into the base weight, undoes the merge, and measures the one thing the adapter cannot learn. The base weight is 4096 by 4096 — 16,777,216 numbers you never train. The adapter attached to it is 131,072 numbers you do.
+
+    ## Why this exists
+
+    Fine-tuning every weight of a 7B model means one full checkpoint per task, plus two more copies for Adam's running averages. That is 12 bytes per parameter where the fp16 weights are 2 bytes. On a single 4096 × 4096 layer the optimizer state alone is 201 MB, against 33.5 MB of weights. LoRA freezes the base and trains two thin matrices whose product is added to it. That adapter needs 1.57 MB of optimizer state — 128× less — and it folds back into the base, so serving costs nothing extra.
+
+    ## Step 1 — Count the parameters before you write code
+
+    An adapter is two matrices, not one. The first, A, maps the 4096-wide input down to r numbers; the second, B, maps those r numbers back out to 4096. The rank r — the width of that bottleneck — is the one number you choose, and everything else follows from it.
+
+    $$P = r(d_{\text{in}} + d_{\text{out}})$$
+
+    > **Say it aloud:** "P equals r times, open bracket, d sub in plus d sub out, close bracket."
+
+    P is the parameter count, and d_in and d_out are the input and output widths of the adapted weight. The formula is the two matrices added up. A holds r × d_in numbers and B holds d_out × r, so the total is r(d_in + d_out). At r = 16 that is 16 × 8192 = 131,072 parameters, against 16,777,216 in the base: 0.78125%, and 262 KB as an fp16 file. For a square weight the ratio collapses to 2r/d, so 1% means r < 20.48. r = 20 costs 0.9766% and fits; r = 21 costs 1.0254% and does not. You are trading one d_in × d_out rectangle for a tall skinny pair. At r = d/2 the pair is exactly as large as the rectangle.
+
+    ```python
+    def adapter_params(d_in, d_out, r):
+        return r * (d_in + d_out)
+
+    p = adapter_params(4096, 4096, 16)          # 131_072
+    assert p / 4096**2 == 0.0078125
+    assert adapter_params(4096, 4096, 20) / 4096**2 < 0.01
+    assert adapter_params(4096, 4096, 21) / 4096**2 > 0.01
+    ```
+
+    > **Check:** At d = 4096, what is the largest rank that keeps a square weight under 1%?
+
+    ## Step 2 — Make the adapter a no-op at step zero
+
+    The adapter does not replace W; it adds a rank-r correction to it. Before training starts that correction must be exactly zero. Otherwise step 0 is a perturbation of the base model, and the first hundred updates are spent undoing it. Two matrices and one scalar define the correction.
+
+    $$\Delta W = \frac{\alpha}{r} B A$$
+
+    > **Say it aloud:** "delta W equals alpha over r, times B times A."
+
+    Delta W is the change added to the weight, and alpha is a scaling constant the paper calls lora_alpha. A holds small random numbers of spread 1/√r; B holds exact zeros. Because B is zero, the product is exactly the zero matrix in any float format. Step 0 reproduces the base logits bit for bit, not to within 1e-17. Initialise B randomly instead and the update's size is about 2.1× the base weight's at these settings, which is the loss spike you have seen. Zeroing A instead works equally well. The asymmetry is worth knowing, though: at step 0 the gradient for A is zero and B's is not, so B moves first.
+
+    ```python
+    def init_lora(d_in, d_out, r, alpha=None, seed=0):
+        alpha = r if alpha is None else alpha
+        g = np.random.default_rng(seed)
+        A = g.normal(0.0, 1 / np.sqrt(r), (r, d_in))
+        B = np.zeros((d_out, r))
+        return {"A": A, "B": B, "scale": alpha / r}
+    ```
+
+    > **Check:** Why does B = 0 give exactly zero rather than a very small number?
+
+    ## Step 3 — Run the forward pass through the bottleneck
+
+    A forward pass now has two paths that meet at the end. The base path is the ordinary matmul with W; the adapter path pushes x through A, then B, then scales. Never form B @ A here — that would build a full 4096 × 4096 matrix on every call, the cost the adapter exists to avoid.
+
+    $$y = xW^{\top} + \frac{\alpha}{r}\,(xA^{\top})B^{\top}$$
+
+    > **Say it aloud:** "y equals x times W transpose, plus alpha over r, times, open bracket, x times A transpose, close bracket, times B transpose."
+
+    Here x is a batch: 16 rows, each holding 4096 numbers. Transpose swaps rows and columns, so x A transpose is those 16 rows by r columns. The adapter path costs 2 × 16 × 16 × 4096 ≈ 2.1M multiply-adds. The base path costs 16 × 4096 × 4096 = 268M, so the detour is 0.78% of the arithmetic. Both terms must have shape (16, 4096); if yours do not, one of your matrices is transposed the wrong way.
+
+    Forget the alpha/r scale in both this step and the merge, and the merge test still passes, because both paths are wrong identically. The damage shows up later as an effective learning rate off by a factor of r.
+
+    ```python
+    def lora_forward(x, W, lora):
+        base = x @ W.T
+        delta = lora["scale"] * (x @ lora["A"].T) @ lora["B"].T
+        return base + delta
+    ```
+
+    > **Check:** What shape is (x A transpose) B transpose for a batch of 16, and why must it match x W transpose?
+
+    ## Step 4 — Backpropagate into A and B only
+
+    The base weight is frozen, so it has no gradient and no optimizer state. Only two gradients exist, and both carry the alpha/r scale, because the scale multiplies the whole branch rather than one factor. The gradient for the earlier factor is always weighted by the later one, which is why A's gradient contains B.
+
+    $$\frac{\partial L}{\partial B} = \frac{\alpha}{r}\, g^{\top}(xA^{\top}), \qquad \frac{\partial L}{\partial A} = \frac{\alpha}{r}\,(gB)^{\top} x$$
+
+    > **Say it aloud:** "the partial of L with respect to B equals alpha over r, times g transpose, times, open bracket, x times A transpose, close bracket; and the partial of L with respect to A equals alpha over r, times, open bracket, g times B, close bracket, transpose, times x."
+
+    L is the loss being minimised, and g is the gradient arriving from the layer above, with shape (16, 4096). Partial means the slope holding everything else fixed. The shapes are checkable without any calculus: dB must be (4096, 16) to match B, and dA must be (16, 4096) to match A. A (4096, 4096) array anywhere means you have written full fine-tuning by accident. Both products reuse h = x A transpose from the forward pass, so this pass costs about as much as the forward one. And because W never appears in either gradient, the adapter drops into any linear layer, including one inside a model you did not write.
+
+    ```python
+    def lora_backward(g, x, lora):
+        h = x @ lora["A"].T                          # (16, r)
+        dB = lora["scale"] * g.T @ h                 # (d_out, r)
+        dA = lora["scale"] * (g @ lora["B"]).T @ x   # (r, d_in)
+        return dA, dB
+    ```
+
+    > **Check:** Why does the gradient for A contain B, while the gradient for B contains A?
+
+    ## Step 5 — Merge the adapter and verify it against the forward pass
+
+    Merging computes B @ A once and adds it to W. After that, inference is a single matmul and the adapter is gone: same outputs, no extra memory traffic. The identity is ordinary matrix algebra — adding the correction before the matmul equals adding it after.
+
+    $$W_{\text{merged}} = W + \frac{\alpha}{r} B A$$
+
+    > **Say it aloud:** "W merged equals W, plus alpha over r, times B times A."
+
+    Exact in algebra, not in floating point. In float64 the two paths agree to about 3e-15; in float32 the gap is about 1e-6. In bf16 it is 0.2%, because bf16 keeps 8 mantissa bits and cannot resolve an update that small inside a weight that size. Merge into fp32 or fp16 and never bf16. Undoing the merge is W minus the same product, so keep A and B on disk. The merged weight no longer records which part of itself came from the adapter.
+
+    ```python
+    def merge(W, lora):
+        return W + lora["scale"] * lora["B"] @ lora["A"]
+
+    g = np.random.default_rng(0)
+    W, x = g.normal(0, 0.02, (128, 256)), g.normal(size=(16, 256))
+    lora = init_lora(256, 128, 8, alpha=16)            # from step 2
+    lora["B"] = g.normal(0, 0.02, (128, 8))            # non-zero, or the test is trivial
+    gap = np.abs(x @ merge(W, lora).T - lora_forward(x, W, lora)).max()
+    assert gap < 1e-12                                  # 3e-15 in float64
+    ```
+
+    > **Check:** Why does that assertion pass for the wrong reason while B is still zero?
+
+    ## Step 6 — Measure the ceiling on what the adapter can learn
+
+    A product of a (4096, r) matrix and an (r, 4096) matrix has rank at most r. So the adapter represents a target update exactly only when the target's rank is at most r. The best possible rank-r approximation is the truncated SVD, and its error is the energy left in the singular values you discarded.
+
+    $$\frac{\lVert \Delta W - BA \rVert_F}{\lVert \Delta W \rVert_F} = \sqrt{\frac{\sum_{i>r}\sigma_i^2}{\sum_i \sigma_i^2}}$$
+
+    > **Say it aloud:** "the norm of delta W minus B times A, over the norm of delta W, equals the square root of, the sum over i greater than r of sigma sub i squared, over the sum over i of sigma sub i squared."
+
+    That is the Eckart–Young theorem, and the bars with a subscript F are the Frobenius norm: the square root of the sum of squared entries. Sigma sub i is the i-th singular value, the summation sign means add up, and i greater than r selects the values you threw away. Cut a random 64 × 64 matrix to rank 8, then fit rank 4. The discarded half of the spectrum holds half the energy, so the ratio is the square root of 4/8, which is 0.707. Measured across seeds: 0.653 to 0.672, about 0.66.
+
+    More training cannot close it, because the limit is the parameterisation, not the optimiser. Run the same test per layer and you get the r each one needs. A layer whose update is nearly rank-1 does not want r = 16.
+
+    ```python
+    def best_rank_r(delta, r):
+        U, S, Vt = np.linalg.svd(delta, full_matrices=False)
+        root = np.diag(np.sqrt(S[:r]))
+        return U[:, :r] @ root, root @ Vt[:r]        # B (d_out, r), A (r, d_in)
+
+    B, A = best_rank_r(rank8_target, 4)
+    resid = np.linalg.norm(B @ A - rank8_target) / np.linalg.norm(rank8_target)
+    print(resid)                                     # 0.66
+    ```
+
+    > **Check:** A rank-4 adapter plateaus at 0.66 relative error on a rank-8 target. What do you change?
+
+    ## Step 7 — Price the memory you are saving
+
+    Adam keeps two running averages per trainable parameter, so each parameter costs 12 bytes. That is 4 for the weight, 4 for the first moment, 4 for the second. The frozen base weight pays none of that. The saving is the parameter ratio applied to the same 12 bytes, so the two ratios come out identical.
+
+    $$M = 12P, \qquad \frac{M_{\text{LoRA}}}{M_{\text{full}}} = \frac{r(d_{\text{in}}+d_{\text{out}})}{d_{\text{in}}d_{\text{out}}}$$
+
+    > **Say it aloud:** "M equals twelve times P; and the ratio of M LoRA to M full equals r times, open bracket, d sub in plus d sub out, close bracket, over d sub in times d sub out."
+
+    P is the parameter count and M is the memory those parameters need. At 4096 squared, full fine-tuning pays 16,777,216 × 12 bytes = 201 MB; LoRA pays 131,072 × 12 bytes = 1.57 MB. That is 128×, and the same 128× fits 50 adapters into 13 MB next to one shared base, at 262 KB each in fp16. This is why a 7B LoRA run fits on one 24 GB card. The 14 GB of fp16 weights are read-only, and the trainable state is tens of megabytes. Optimizer state is not the whole of training memory, since activations usually dominate, but it is the part LoRA removes outright.
+
+    ```python
+    full = 4096**2 * 12          # 201_326_592 bytes
+    lora = 131072 * 12           # 1_572_864 bytes
+    assert full / lora == 128.0
+    print(50 * 131072 * 2 / 1024, "KiB for 50 fp16 adapters")   # 12800.0
+    ```
+
+    > **Check:** Why is the memory ratio exactly the parameter ratio, and when would it stop being?
+
+    ## Putting it together
+
+    Assemble in the order the steps came. Step 1 fixes r and proves the budget. Step 2 gives an adapter that changes nothing yet. Steps 3 and 4 are the training path: forward, loss, backward, one Adam step on A and B, with the base never entering the optimiser. Step 5 turns a trained adapter into a plain weight for serving. Step 6 says whether a larger r can help at all, and step 7 says what it costs before you rent the GPU.
+
+    ```python
+    lora = init_lora(4096, 4096, 16, alpha=16)          # step 2
+    for step in range(n_steps):
+        y = lora_forward(x, W, lora)                     # step 3
+        g = loss_grad(y, y_true)                         # dL/dy, (16, 4096); your loss
+        dA, dB = lora_backward(g, x, lora)               # step 4
+        lora["A"] -= lr * dA
+        lora["B"] -= lr * dB
+    W_serve = W + lora["scale"] * lora["B"] @ lora["A"]  # step 5
+    ```
+
+    Serving three products from one base is three adapters of 262 KB and one weight. The hard part is batching, not storage: a mixed batch needs a different B @ A applied to each row.
+
+    ## What breaks
+
+    **Merged outputs drift after a correct merge** -> bf16 rounded the tiny update away -> merge into fp32, then diff a fixed batch.
+
+    **Loss spikes for the first hundred steps** -> B was initialised with noise, so the adapter was never a no-op -> set B to exact zeros.
+
+    **r = 64 trains worse than r = 8** -> alpha stayed fixed, so the effective scale alpha/r halved -> scale alpha with r.
+
+    **A rank-4 adapter plateaus at 0.66** -> the target needs rank 8 and the adapter cannot express it -> raise r; more steps will not help.
+
+  try_it: >-
+    Build the adapter for a single $4096\times4096$ weight, then measure three
+    things: the merge gap in float64 and in bf16, the optimizer-state ratio
+    between full fine-tuning and $r = 16$, and the rank-4 residual on a rank-8
+    target. Then set $B$ to random noise at initialisation and record the loss
+    on the first batch — the spike is the cost of the zero-init you did not
+    appreciate.
+  interview_questions:
+    - question: "Explain LoRA in linear-algebra terms. Why is B initialised to zero?"
+      level: mid
+      key_points:
+        - "Freeze W and learn ΔW = (α/r)BA with B ∈ R^(d_out×r) and A ∈ R^(r×d_in), so the update has rank at most r and costs r(d_in+d_out) parameters."
+        - "B = 0 makes ΔW exactly zero at step 0, so the adapted model starts at the base model's loss instead of a perturbed one."
+        - "The scale α/r is what makes the adapter's effective learning rate independent of r, up to the convention the library chose."
+        - "Only A and B get gradients and optimizer state: at r=16 on a 4096² weight that is 1.57 MB against 201 MB."
+      follow_up: "Why does initialising both factors with the usual 1/√fan_in scheme break that property, and how big is the initial update?"
+    - question: "You merge a LoRA adapter into a bf16 checkpoint and quality drops. What happened, and what do you do?"
+      level: senior
+      key_points:
+        - "The merge is exact in real arithmetic but bf16 has 8 mantissa bits, a relative resolution of about 0.2%."
+        - "A typical LoRA update is a fraction of a percent of the base weight's norm, so adding it in bf16 rounds most of it away."
+        - "Merge in fp32, then cast; verify by comparing the merged model's logits against the adapter path on a fixed batch before and after the cast."
+        - "Keep A and B if you need to unmerge, because the merged bf16 weight does not contain enough information to subtract them back."
+      follow_up: "Would fp16 be safe for a 7B model, and what constrains the answer besides mantissa bits?"
+    - question: "You need to serve one base model with 50 customer-specific adapters. What is the design, and what breaks first?"
+      level: senior
+      key_points:
+        - "One copy of the base weights, 50 adapters of about 262 KB each in fp16 — 13 MB total, versus 50 × 14 GB for full checkpoints."
+        - "A batch that mixes adapters cannot use one GEMM for the adapter path; you need a batched or segmented GEMM over rows that share an adapter."
+        - "The adapter FLOPs are 0.78% of the base layer's, so the bottleneck is kernel launches, padding and memory traffic, not arithmetic."
+        - "Caching and eviction matter: adapters are small enough to keep in HBM, but a per-token switch forces a gather and defeats the GEMM's contiguity."
+      follow_up: "What changes if the adapters must be applied to a 4-bit quantised base, as in QLoRA serving?"
+    - question: "How do you choose the rank, and what experiment tells you the rank was too small?"
+      level: mid
+      key_points:
+        - "Rank sets the ceiling on the update's rank, not its magnitude: r(d+k) parameters and a hard cap at r."
+        - "Start at r=16 with α=r, which is 0.78% of a 4096² weight; raise it only if the task's update is genuinely higher-rank."
+        - "The diagnostic is a training loss that plateaus above the full fine-tune's while training loss and eval loss move together — underfitting, not overfitting."
+        - "The clean test is to fit a known ΔW: if a rank-2r target cannot be fitted by a rank-r adapter, the residual follows Eckart–Young and will not shrink with more steps."
+      follow_up: "What would a rank-1 adapter be good for, and why is it not always the right answer even when it fits the budget?"
+  common_mistakes:
+    - "Forgetting the α/r factor in `merge`, so the merged model is under-adapted by exactly the scale you chose."
+    - "Merging into bf16, where the update's relative magnitude is below the format's resolution and most of it rounds away."
+    - "Initialising B with noise instead of zeros, producing a large update at step 0 and a loss spike the optimizer has to undo."
+    - "Applying the adapter after merging, which double-counts the update."
+    - "Changing r while holding α fixed and attributing the resulting change in convergence to capacity rather than to the effective scale."
+  further_reading:
+    - label: "Hu et al., LoRA: Low-Rank Adaptation of Large Language Models (ICLR 2022)"
+    - label: "Dettmers et al., QLoRA: Efficient Finetuning of Quantized LLMs (NeurIPS 2023)"
+    - label: "Sheng et al., S-LoRA: Serving Thousands of Concurrent LoRA Adapters (MLSys 2024)"
+
+  implementations:
+    - language: python
+      title: "Reference solution"
+      note: >-
+        Correct, and deliberately narrow: the backward pass computes gradients
+        for A and B only, because the base weight is frozen by construction —
+        add a `dW` term and you have written full fine-tuning with extra steps.
+        `best_rank_r` uses the SVD rather than gradient descent, which is the
+        right call for a *representability* test (Eckart–Young gives the exact
+        best answer) and the wrong call for training, where the SVD of a
+        4096×4096 delta costs $O(d^3)$ and the adapter costs $O(rd^2)$ per step.
+        The floating-point claims in the milestones are float64; re-run M2 in
+        bf16 and the gap moves from 3.1e-15 to about 1e-2, which is the point of
+        the exercise rather than a bug in the code.
+      code: |
+        import numpy as np
+
+
+        def init_lora(d_in, d_out, r, alpha=None, seed=0):
+            """A ~ N(0, 1/r), B = 0: the update is exactly zero at step 0."""
+            alpha = r if alpha is None else alpha
+            g = np.random.default_rng(seed)
+            A = g.normal(0.0, 1.0 / np.sqrt(r), (r, d_in))
+            B = np.zeros((d_out, r))
+            return {"A": A, "B": B, "scale": alpha / r}
+
+
+        def lora_forward(x, W, lora):
+            """xW^T + scale * (xA^T)B^T, without ever forming B @ A."""
+            return x @ W.T + lora["scale"] * (x @ lora["A"].T) @ lora["B"].T
+
+
+        def lora_backward(dy, x, lora):
+            """dA, dB with the base frozen. dy is dL/dy, shape (n, d_out)."""
+            h = x @ lora["A"].T
+            dB = lora["scale"] * dy.T @ h
+            dA = lora["scale"] * (dy @ lora["B"]).T @ x
+            return dA, dB
+
+
+        def merge(W, lora):
+            """W + scale * B @ A: one d_out x r x d_in product, done once."""
+            return W + lora["scale"] * lora["B"] @ lora["A"]
+
+
+        def unmerge(W_merged, lora):
+            return W_merged - lora["scale"] * lora["B"] @ lora["A"]
+
+
+        def adapter_params(d_in, d_out, r):
+            return r * (d_in + d_out)
+
+
+        def best_rank_r(delta, r):
+            """Exact best rank-r factorisation of a target update (Eckart-Young)."""
+            U, S, Vt = np.linalg.svd(delta, full_matrices=False)
+            root = np.diag(np.sqrt(S[:r]))
+            return U[:, :r] @ root, root @ Vt[:r]      # B (d_out, r), A (r, d_in)
+
+
+        def rel_residual(target, B, A):
+            return float(np.linalg.norm(B @ A - target) / np.linalg.norm(target))
+
+
+        if __name__ == "__main__":
+            g = np.random.default_rng(0)
+            d_in, d_out, r = 256, 128, 8
+            W, x = g.normal(0, 0.02, (d_out, d_in)), g.normal(size=(16, d_in))
+            lo = init_lora(d_in, d_out, r, alpha=16)
+            assert np.abs(lora_forward(x, W, lo) - x @ W.T).max() == 0.0       # M1
+            lo["B"] = g.normal(0, 0.02, (d_out, r))
+            gap = np.abs(x @ merge(W, lo).T - lora_forward(x, W, lo)).max()    # M2
+            ratio = adapter_params(4096, 4096, 16) / 4096 ** 2                 # M3
+            U, S, Vt = np.linalg.svd(g.normal(size=(64, 64)), full_matrices=False)
+            t4 = (U[:, :4] * S[:4]) @ Vt[:4]
+            t8 = (U[:, :8] * S[:8]) @ Vt[:8]
+            r4 = rel_residual(t4, *best_rank_r(t4, 4))                         # M4
+            r8 = rel_residual(t8, *best_rank_r(t8, 4))
+            print(f"merge gap {gap:.2e}  ratio {ratio:.5f}  rank4 {r4:.1e}  rank8 {r8:.3f}")
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Two thin matrices replace one thick one. The first maps the input down
+        to r numbers, the second maps those r numbers back out. Their product
+        has rank at most r, which is the whole trick and the whole limitation.
+        The base weight never moves; you only ever add the product to its output.
+      blocks:
+        - kind: checklist
+          body: |
+            - Which matrix is (d_out, r) and which is (r, d_in)?
+            - Where does the α/r scale apply — once, or to each factor?
+            - Why does zeroing B make the adapter a no-op, and why does zeroing A work equally well?
+        - kind: warning
+          body: >-
+            "Low rank" is not a compression of W. W is untouched and stays
+            exactly as large; the adapter is an additional, small object.
+      checkpoint: >-
+        If both A and B were initialised to the same random matrix, would the
+        adapter still be a no-op? What would its initial update rank be?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Write the forward first and check it against the base path at
+        initialisation. Then write `merge` and check it against the adapter path.
+        Those two checks catch almost every bug, and neither needs a training
+        loop. Add the backward pass last, with `dy` as the only input.
+      blocks:
+        - kind: checklist
+          body: |
+            - forward: base matmul plus scale times the two-step detour.
+            - merge: one matmul B @ A, added to W, with the same scale.
+            - backward: dB contracts over the batch, dA contracts over the output.
+            - rank test: truncated SVD, then compare the residual for a target of rank r and rank 2r.
+        - kind: warning
+          body: >-
+            Test the merge with a non-zero B. With B = 0 both paths are exactly
+            the base path and a missing scale passes.
+      checkpoint: >-
+        Which of the two milestone checks would a forgotten α/r pass, and which
+        would catch it?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Four lines of algebra and two of bookkeeping. The shapes do the work:
+        the detour is (n, d_in) → (n, r) → (n, d_out).
+      blocks:
+        - kind: pseudocode
+          body: |
+            A: (r, d_in) ~ N(0, 1/r)
+            B: (d_out, r) = 0
+            scale = alpha / r
+
+            forward(x, W):  x @ W.T + scale * ((x @ A.T) @ B.T)
+            merge(W):       W + scale * (B @ A)
+            backward(dy):   dB = scale * dy.T @ (x @ A.T)
+                            dA = scale * (dy @ B).T @ x
+      checkpoint: >-
+        Why is `dA = scale * (dy @ B).T @ x` and not `scale * dy.T @ (x @ A.T)`
+        — what shape does each produce, and which one is (r, d_in)?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The merge identity is one line; the rank ceiling is Eckart–Young; the
+        budget is arithmetic you should be able to do in your head.
+      blocks:
+        - kind: math
+          body: |
+            With $h = xA^\top \in \mathbb{R}^{n\times r}$,
+
+            $$y = xW^\top + \tfrac{\alpha}{r}hB^\top = x\left(W + \tfrac{\alpha}{r}BA\right)^\top.$$
+
+            Parameter ratio for a square weight: $\dfrac{r(d+d)}{d^2} = \dfrac{2r}{d}$,
+            so $2r/d < 0.01$ means $r < d/200 = 20.48$ at $d = 4096$.
+
+            For any target $\Delta$, $\min_{\operatorname{rank}(M)\le r}\|\Delta - M\|_F^2
+            = \sum_{i>r}\sigma_i^2$, attained by the truncated SVD. Hence an
+            adapter with $r = 4$ fitted to a rank-8 target with equal singular
+            values has relative error $\sqrt{4/8} = 0.707$.
+      checkpoint: >-
+        Does the rank ceiling depend on the training data at all? What does that
+        imply about diagnosing an underfitting adapter?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The implementation below is the whole engine: init, forward, backward,
+        merge, unmerge, the parameter count, and the truncated-SVD fit that makes
+        the rank ceiling measurable.
+      blocks:
+        - kind: warning
+          body: >-
+            The single most common bug is not in the algebra. It is calling
+            `lora_forward` on a weight that has already been merged, which
+            applies the update twice.
+      checkpoint: >-
+        If you merge, evaluate, then unmerge and evaluate again, the two
+        evaluations should agree to floating-point noise. Why is that a better
+        test than checking the merged weights directly?
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A 4096×4096 weight is adapted at r = 16 with α = 32. What is the scale,
+        the parameter count, and the optimizer-state saving against full
+        fine-tuning?
+      answerKind: short_text
+      hint: "Scale is α/r; params are r(d+k); Adam keeps two fp32 moments per trainable parameter."
+      solution: >-
+        Scale $= 32/16 = 2$. Parameters $= 16 \times 8192 = 131{,}072$, which is
+        0.78125% of 16,777,216. Optimizer state: LoRA $131{,}072 \times 8\ \text{B}
+        = 1.05$ MB for $m$ and $v$; full fine-tuning $16{,}777{,}216 \times 8\ \text{B}
+        = 134$ MB, or 201 MB once the fp32 weight is counted. The saving is 128×
+        on the full state and the adapter still fits in 262 KB in fp16.
+    - id: cp-2
+      question: >-
+        Your adapter trains to a loss 0.3 above the full fine-tune and both
+        training and eval curves plateau. Is that overfitting or underfitting,
+        and what do you change?
+      answerKind: short_text
+      hint: "Which gap is open — train vs eval, or adapter vs full fine-tune?"
+      solution: >-
+        Underfitting: the training loss itself is above the full fine-tune's, so
+        the parameterisation cannot express the update, not the data. Raise $r$
+        (doubling it doubles the parameter count and the rank ceiling), or move
+        the adapter to more modules. If training loss were *below* and eval above,
+        it would be overfitting and the answer would be the opposite.
+    - id: cp-3
+      question: >-
+        Why does merging into bf16 lose a LoRA update that merging into fp16
+        keeps?
+      answerKind: short_text
+      hint: "Count mantissa bits and convert to a relative resolution."
+      solution: >-
+        bf16 keeps 8 explicit mantissa bits, so its relative resolution is
+        $2^{-9} \approx 0.2\%$; fp16 keeps 10, giving $2^{-11} \approx 0.05\%$.
+        A LoRA update whose norm is 0.1% of the base weight's is at or below
+        bf16's resolution, so adding it rounds to the nearest representable
+        weight and most of the update disappears. fp16 has four times the
+        resolution, and fp32 has 65,536 times.
+    - id: cp-4
+      question: >-
+        You have 50 adapters and one base model. Where does the memory go, and
+        what is the first thing that stops scaling?
+      answerKind: short_text
+      hint: "Adapters are small; batching across them is not."
+      solution: >-
+        Weights: 50 × 262 KB = 13 MB, negligible against a 14 GB base. The first
+        limit is batching: requests for different adapters in one batch cannot
+        share a single adapter GEMM, so you either segment the batch and launch a
+        batched GEMM per adapter, or pad and waste. The second is cache
+        residency and kernel launch overhead, not FLOPs — the adapter adds
+        0.78% of the base layer's arithmetic.
+
+  visualizers: []

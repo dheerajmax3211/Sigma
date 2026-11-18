@@ -1,0 +1,1003 @@
+id: randomness-and-reproducibility
+slug: randomness-and-reproducibility
+title: "A Seed Buys Repeatability, Not Correctness (One Run Proves Nothing)"
+summary: >-
+  Own every random stream in a pipeline — derive independent seeds from one
+  root, log the generator state, and report variation across seeds — so a
+  result is repeatable, and so you can tell a real improvement from a lucky
+  draw.
+kind: lesson
+difficulty: medium
+position: 13
+estMinutes: 23
+prerequisites: [probability-distributions]
+phase: mathematical-foundations
+tags: [randomness, reproducibility, seeding, rng, numpy, experiments]
+
+body:
+  big_idea: >-
+    A seed makes a run repeatable but never correct, because reproducibility belongs to
+    the whole stream-consumption path — and one run is a single draw from a distribution
+    whose width you can compute first.
+
+  problem:
+    - "You rerun last week's experiment with the same seed and get 0.4% different accuracy: a library added one more draw from the global RNG."
+    - "Your report says the new model beats the baseline by 0.6%, but on a 2,000-example validation set the split alone moves accuracy by 0.67%."
+    - "You seed each cross-validation fold with `seed + i` and quietly evaluate on overlapping data, because nothing makes those streams independent."
+
+  analogy: |
+    A seed is a starting page number in an extremely long book. Two readers who
+    open at page 4,096 read exactly the same words in the same order — that is
+    all the seed guarantees. If one skips a paragraph, the pages stop lining up
+    and every following sentence differs; that skipped paragraph is the extra
+    `random()` call you added for logging.
+
+  concept_points:
+    - "**A PRNG is a deterministic finite-state machine, and the seed sets the state.** NumPy's `default_rng` is PCG64: 128 bits of state, period $2^{128} \\approx 3.4\\times10^{38}$; legacy `RandomState` is MT19937 with period $2^{19937}-1$. Both are pure functions from (state, call) to (value, next state), so `np.random.default_rng(0).random()` is exactly 0.6369616873214543 everywhere — the *stream* is specified, not just the distribution."
+    - "**Reproducibility is a property of the consumption path, not the seed value.** Insert one `rng.random()` call anywhere upstream and every downstream draw changes, with no error and no warning. A single dropout mask shifts every subsequent sample, so two runs sharing a seed but not a call sequence are unrelated. Any refactor that changes how many draws happen is a behavioural change."
+    - "**Global RNG state is shared mutable state, and the largest single source of unreproducibility.** `np.random.seed` and `np.random.rand` operate on one module-global `RandomState`, and scikit-learn with `random_state=None`, `pandas.DataFrame.sample` and most augmentation libraries draw from it too. A pipeline with 6 components on the global RNG has an implicit ordering dependency across all 6; six explicitly passed `Generator` objects have none."
+    - "**Seeds must be independent, not merely distinct — spawn them, do not add.** `SeedSequence(0).spawn(3)` yields children with distinct `spawn_key`s `(0,)`, `(1,)`, `(2)`, so the derivation is collision-free by construction; `seed + i` gives no such guarantee. Hash-derived seeds need a stable hash: Python salts `str.__hash__` per process, so use `hashlib.sha256(name.encode()).digest()[:16]` instead."
+    - "**Same seed does not mean same result across the stack.** Four sources survive seeding: cuDNN benchmark mode picking a different kernel per GPU; floating-point non-associativity (accumulating $2\\times10^6$ uniforms in float32 gives 1,000,274.1 against a true 1,000,263.9); hash randomisation changing iteration order; and thread count changing the reduction tree. `torch.use_deterministic_algorithms(True)` closes some, costs throughput, and cannot close all."
+    - "**The seed is an untuned hyperparameter that flatters you.** 2,000 seeds of 10,000 uniform draws produced sample means from 0.490942 to 0.509710 around a true 0.5 — a $\\pm1.9\\%$ spread on an estimator that never changed. The correction is $\\operatorname{SE} = \\sigma_{\\text{seed}}/\\sqrt{k}$: with per-seed sd 0.8%, one seed gives 0.80%, five give 0.36%, ten give 0.25%."
+
+  definitions:
+    - term: "PRNG"
+      meaning: >-
+        Pseudorandom number generator — a deterministic finite-state machine
+        mapping (state, call) to (value, next state). Its output is
+        statistically indistinguishable from random and perfectly predictable
+        given the state.
+    - term: "Seed"
+      meaning: >-
+        The value that initialises the generator's state. It selects a stream;
+        it does not make the stream correct, and it does not by itself make two
+        runs comparable.
+    - term: "Generator (NumPy)"
+      meaning: >-
+        The modern `np.random.Generator` object, backed by PCG64. Independent
+        and explicitly passed, unlike the module-global `RandomState` behind
+        `np.random.seed` and `np.random.rand`.
+    - term: "SeedSequence"
+      meaning: >-
+        NumPy's seed-derivation object. Mixes an entropy value into a
+        guaranteed-unique child seed per `spawn_key`, so a single root seed can
+        produce an arbitrary tree of independent streams.
+    - term: "Spawn key"
+      meaning: >-
+        The tuple identifying a child stream inside a `SeedSequence` tree, e.g.
+        `(0,)` or `(2, 1)`. Two children with different spawn keys never
+        collide, even when their entropy values are identical.
+    - term: "Consumption path"
+      meaning: >-
+        The exact ordered sequence of calls into a generator. Two runs with the
+        same seed but different consumption paths produce unrelated samples —
+        this is the actual invariant behind reproducibility.
+    - term: "Bit-exact reproducibility"
+      meaning: >-
+        Identical output bytes for identical inputs, on the same hardware and
+        library versions. Requires deterministic kernels and a fixed reduction
+        order, and is expensive.
+    - term: "Statistical reproducibility"
+      meaning: >-
+        The same distribution of outcomes across seeds, not the same draws.
+        Verified by reporting mean and standard error over $k$ runs.
+    - term: "Global RNG state"
+      meaning: >-
+        The process-wide generator behind `np.random.*` and `random.*`. Shared
+        mutable state: any library call can advance it, which makes run order
+        observable in your results.
+    - term: "RNG state snapshot"
+      meaning: >-
+        `gen.bit_generator.state` — a picklable dict holding the generator's
+        full position. Saving it is the difference between resuming a run and
+        starting a new one at the same weights.
+    - term: "Deterministic algorithms"
+      meaning: >-
+        The flag `torch.use_deterministic_algorithms(True)` that replaces
+        atomics and autotuned kernels with fixed-order equivalents. Necessary
+        but not sufficient for bit-exactness, and it costs throughput.
+
+  diagrams:
+    - type: compare
+      title: "Two different promises — pick the one your decision needs"
+      left_label: "Bit-exact"
+      left_points:
+        - "Same seed, same box, same library versions, same thread count"
+        - "Output bytes are identical; a diff of the loss curve is empty"
+        - "Needs deterministic kernels and a fixed reduction order"
+        - "Costs 10–30% throughput, and some ops have no deterministic path"
+        - "Right target: bisecting a numerical divergence, regression tests"
+      right_label: "Conclusion-reproducible"
+      right_points:
+        - "Different seeds, same distribution of outcomes"
+        - "Reported as mean ± standard error over k runs, with k stated"
+        - "Needs no determinism at all — only enough seeds"
+        - "Costs compute proportional to k, not throughput"
+        - "Right target: a paper, a model comparison, a launch review"
+    - type: plot
+      title: "Standard error of the mean metric across k seeds (per-seed sd = 0.8%)"
+      chart: "line"
+      xLabel: "number of seeds k"
+      yLabel: "percentage points"
+      series:
+        - name: "standard error, 0.8/√k"
+          points:
+            - { x: 1, y: 0.8000 }
+            - { x: 2, y: 0.5657 }
+            - { x: 3, y: 0.4619 }
+            - { x: 5, y: 0.3578 }
+            - { x: 10, y: 0.2530 }
+            - { x: 20, y: 0.1789 }
+            - { x: 28, y: 0.1512 }
+            - { x: 50, y: 0.1131 }
+        - name: "95% half-width, 1.96·SE"
+          points:
+            - { x: 1, y: 1.5680 }
+            - { x: 2, y: 1.1088 }
+            - { x: 3, y: 0.9053 }
+            - { x: 5, y: 0.7013 }
+            - { x: 10, y: 0.4959 }
+            - { x: 20, y: 0.3506 }
+            - { x: 28, y: 0.2964 }
+            - { x: 50, y: 0.2217 }
+        - name: "claimed improvement 0.6%"
+          points:
+            - { x: 1, y: 0.6000 }
+            - { x: 5, y: 0.6000 }
+            - { x: 10, y: 0.6000 }
+            - { x: 20, y: 0.6000 }
+            - { x: 28, y: 0.6000 }
+            - { x: 50, y: 0.6000 }
+    - type: architecture
+      title: "Where RNG state lives in a training stack"
+      nodes:
+        - { id: root, x: 0, y: 2, label: "Root seed", kind: client, detail: "One integer in the config, checked into version control alongside the commit hash. Everything downstream is derived from it, so this single value reproduces the whole run." }
+        - { id: spawn, x: 1, y: 2, label: "SeedSequence.spawn", kind: model, detail: "Splits the root into one child per component. Children carry the same entropy but distinct spawn keys, so two components can never share a stream — which is the failure `seed + i` does not prevent." }
+        - { id: init, x: 2, y: 0, label: "Weight init", kind: worker, detail: "Consumes exactly one stream. Adding a layer changes how many draws it takes, which is why init must be isolated from every other consumer." }
+        - { id: dropout, x: 2, y: 1, label: "Dropout masks", kind: worker, detail: "Consumes one draw per element per forward pass — by far the heaviest consumer. Sharing a stream with data loading makes the data order depend on the model architecture." }
+        - { id: augment, x: 2, y: 2, label: "Augmentation", kind: worker, detail: "Usually runs in DataLoader workers, which are separate processes. Each worker needs its own seeded generator, or the workers inherit identical state and produce identical 'random' crops." }
+        - { id: shuffle, x: 2, y: 3, label: "Shuffle / sampler", kind: queue, detail: "Determines which examples land in the final partial batch. Changing this changes the gradient, so it is a behavioural change even when the maths is untouched." }
+        - { id: val, x: 2, y: 4, label: "Val / test split", kind: database, detail: "Must be derived from a different child than training. Reusing the training stream is how a 'held-out' set silently overlaps the training data." }
+        - { id: train, x: 3, y: 1, label: "Training step", kind: "gpu", detail: "The only place the streams meet. Also where non-RNG nondeterminism enters: atomics in the reduction and autotuned kernels." }
+        - { id: eval, x: 3, y: 4, label: "Evaluation", kind: server, detail: "Fixed split, fixed seed, run once per checkpoint. Report the metric with its binomial standard error, not as a bare number." }
+      edges:
+        - { from: root, to: spawn, label: "one value" }
+        - { from: spawn, to: init, label: "child 0" }
+        - { from: spawn, to: dropout, label: "child 1" }
+        - { from: spawn, to: augment, label: "child 2" }
+        - { from: spawn, to: shuffle, label: "child 3" }
+        - { from: spawn, to: val, label: "child 4" }
+        - { from: init, to: train, label: "" }
+        - { from: dropout, to: train, label: "" }
+        - { from: augment, to: train, label: "" }
+        - { from: shuffle, to: train, label: "batches" }
+        - { from: val, to: eval, label: "held-out" }
+      caption: "Every arrow is a stream you either own explicitly or lose control of. The global `np.random` state collapses all five consumers into one arrow and makes the whole graph order-dependent."
+    - type: pipeline
+      title: "The five-step seed procedure"
+      nodes:
+        - label: "Declare one root seed"
+          note: "in config, not in a notebook cell"
+          detail: "Commit it with the code. A seed that lives in an uncommitted notebook is not a record of anything."
+        - label: "Derive a SeedSequence"
+          note: "SeedSequence(root)"
+          detail: "Never hand the raw integer to more than one component. The SeedSequence is the single distribution point, and its tree is what makes streams independent."
+        - label: "Spawn one child per component"
+          note: "data, init, dropout, augment, eval"
+          detail: "Components that share a stream are coupled: changing one changes the other's numbers. Isolation is what lets you change the augmentation without invalidating the baseline."
+        - label: "Log state and versions"
+          note: "bit_generator.state, numpy/torch/cuda versions"
+          detail: "The seed alone does not identify a run. The generator, its state, and the library versions do — that tuple is what a colleague needs to reproduce you."
+        - label: "Run k ≥ 5 seeds, report mean ± SE"
+          note: "state k and the per-seed sd"
+          detail: "A single number is a point estimate with hidden error bars. Publishing mean and standard error over seeds turns 'we think it helps' into a claim someone can check."
+    - type: mermaid
+      title: "One root seed, five independent streams"
+      code: |
+        graph TD
+          R["root seed = 1234"] --> S["SeedSequence(1234)"]
+          S --> C0["child 0 · spawn_key (0,)"]
+          S --> C1["child 1 · spawn_key (1,)"]
+          S --> C2["child 2 · spawn_key (2,)"]
+          S --> C3["child 3 · spawn_key (3,)"]
+          S --> C4["child 4 · spawn_key (4,)"]
+          C0 --> G0["Generator: weight init"]
+          C1 --> G1["Generator: dropout"]
+          C2 --> G2["Generator: augmentation"]
+          C3 --> G3["Generator: shuffling"]
+          C4 --> G4["Generator: val split"]
+    - type: stack
+      title: "Four layers you must not confuse"
+      layers:
+        - "Statistical validity: does the sampler produce the distribution you asked for? A seed neither helps nor hurts."
+        - "Stream independence: do components draw from disjoint streams? Guaranteed by spawn, broken by seed + i and by the global RNG."
+        - "Bit-exactness: do two runs on the same box produce identical bytes? Requires deterministic kernels and a fixed thread count."
+        - "Reported uncertainty: does the claim survive reseeding? Requires k runs, a mean, and a standard error."
+
+  markdown: |
+    ## Two runs, same seed, different numbers
+
+    You rerun last week's experiment. Same commit, same seed, same machine,
+    and validation accuracy moves from 0.912 to 0.908. Nothing in the model
+    changed. What changed is *how many numbers were pulled out of a generator*
+    before the model saw its first batch.
+
+    That is the whole subject in one sentence: a seed selects a stream, but the
+    stream is consumed by a call sequence you mostly did not write. Reproducing
+    a run means reproducing that sequence.
+
+    ## Four numbers, no two equal
+
+    Before going further, get the objects straight. These are all "a random
+    number after seeding", and they are all different:
+
+    | call | first value |
+    |---|---|
+    | `np.random.seed(0); np.random.rand()` | 0.5488135039273248 |
+    | `np.random.default_rng(0).random()` | 0.6369616873214543 |
+    | `np.random.default_rng(42).standard_normal()` | 0.30471707975443135 |
+    | `np.random.default_rng(np.random.SeedSequence(0).spawn(1)[0]).standard_normal()` | 1.4436909546981256 |
+
+    Row 1 is MT19937 through the legacy global state. Row 2 is PCG64 through an
+    independent generator. Rows 3 and 4 show that the *seed* is not the
+    identity of a stream: `SeedSequence(0).spawn(1)[0]` carries entropy 0 but
+    spawn key `(0,)`, so it is not the same stream as `default_rng(0)`.
+
+    A generator is a deterministic finite-state machine. PCG64 has 128 bits of
+    state and period $2^{128} \approx 3.4 \times 10^{38}$; MT19937 has 19,937
+    bits and period $2^{19937}-1$. Given the state, the next number is a pure
+    function — there is no entropy anywhere after the seed.
+
+    ## Why the seed is not the thing you control
+
+    The practical invariant is **the sequence of calls into a particular
+    generator object**, not the integer you passed it. Two consequences follow
+    immediately, and both are routinely missed:
+
+    1. Any change in the number of draws is a behavioural change. Adding a
+       dropout mask, sampling a debug metric, switching from one shuffle to
+       two — each shifts every later sample. The model maths did not change;
+       the experiment did.
+    2. Any shared generator is a coupling. If data loading and dropout draw
+       from the same stream, then changing the batch size changes the dropout
+       pattern. The two components are now entangled through state you cannot
+       see.
+
+    The fix is structural, not a matter of discipline: one `Generator` per
+    component, all descended from one root seed through `SeedSequence.spawn`.
+
+    ```python
+    root = np.random.SeedSequence(1234)
+    init_ss, drop_ss, aug_ss = root.spawn(3)
+    init_rng = np.random.default_rng(init_ss)
+    drop_rng = np.random.default_rng(drop_ss)
+    ```
+
+    `spawn` gives each child a distinct `spawn_key`, so collisions are
+    impossible by construction rather than improbable. `seed + i` gives you no
+    such guarantee, and it is exactly how folds end up sharing material.
+
+    One caveat worth knowing before you hit it: `SeedSequence` accepts ints and
+    sequences of ints, not strings. `SeedSequence("exp-7")` raises
+    `TypeError`, and the workaround people reach for — `SeedSequence(hash("exp-7"))`
+    — is worse than the error, because Python salts string hashes per process.
+    Hash with SHA-256 and take 128 bits.
+
+    ## Is the difference real? The arithmetic you already have
+
+    This is the standard error from *Probability Distributions and the Central
+    Limit Theorem*, with a different unit of randomness. There, the samples
+    were data points and the error fell as $\sigma/\sqrt{n}$. Here the samples
+    are whole runs:
+
+    $$\operatorname{SE}(\bar m) = \frac{\sigma_{\text{seed}}}{\sqrt{k}}$$
+
+    where $\sigma_{\text{seed}}$ is the standard deviation of the metric across
+    seeds and $k$ is how many seeds you ran.
+
+    | $k$ | SE, $\sigma = 0.8\%$ | 95% half-width |
+    |---|---|---|
+    | 1 | 0.80% | 1.57% |
+    | 5 | 0.36% | 0.70% |
+    | 10 | 0.25% | 0.50% |
+    | 28 | 0.15% | 0.30% |
+
+    Now the uncomfortable part. To claim a 0.6% improvement when the per-seed
+    standard deviation is 0.8%, you need the two 95% intervals not to overlap,
+    which requires $1.96\sigma/\sqrt{k} < 0.3\%$, i.e.
+
+    $$k > \left(\frac{3.92 \times 0.8}{0.6}\right)^2 \approx 27.3 \;\Rightarrow\; 28 \text{ seeds per arm.}$$
+
+    Fifty-six runs to defend a number most people report from two. The
+    alternative is to shrink $\sigma$: a validation set four times larger halves
+    it and cuts the required seeds by four — but it buys nothing against
+    initialisation or data-order variance, which is why seed averaging is
+    usually the better purchase.
+
+    ## Where the non-determinism actually comes from
+
+    | Source | Symptom | Fix |
+    |---|---|---|
+    | Global RNG | results change when an unrelated library call is added | one `Generator` per component |
+    | Seed reuse | folds or train/test overlap in stream space | `SeedSequence.spawn` |
+    | Reduction order | last-bit differences in loss, growing over steps | deterministic kernels, fixed thread count |
+    | Hash order | data order differs between processes | `PYTHONHASHSEED=0`, sort keys |
+    | Checkpoint resume | resumed run diverges from the uninterrupted one | save `bit_generator.state` |
+
+    The reduction-order row deserves a number. Accumulating
+    $2 \times 10^{6}$ uniform float32 values one at a time gives 1,000,274.1;
+    the exact sum is 1,000,263.9. The error is 10.3, or about $10^{-5}$
+    relative, and it appears because float32 has a 24-bit mantissa
+    ($\epsilon = 1.19 \times 10^{-7}$) and addition is not associative. GPU
+    atomics accumulate in whatever order the warps finish, so the same kernel
+    on the same data can differ in the last bits between runs. Over thousands
+    of steps that divergence compounds into visibly different curves.
+
+    ## Three levels, pick one deliberately
+
+    **Bit-exact.** Identical bytes. Needs a fixed kernel set, a fixed thread
+    count, and no atomics in any reduction. Costs 10–30% throughput and some
+    operations have no deterministic implementation at all. Use it to bisect a
+    numerical divergence or to lock a regression test.
+
+    **Statistically reproducible.** The same distribution of outcomes, not the
+    same draws. Requires $k$ seeds and a reported mean and standard error. Use
+    it for any scientific claim.
+
+    **Conclusion-reproducible.** The decision survives reseeding. Requires
+    enough seeds that the sign of the effect is stable. Use it for a launch.
+
+    Most teams pay for the first and need the third.
+
+    ## What to do on Monday
+
+    Put one root seed in config. Derive a `SeedSequence` from it. Spawn one
+    child per component that consumes randomness. Log, next to every run, the
+    generator type, its post-run state, and the numpy/torch/cuda versions.
+    Checkpoint the RNG state along with the weights. Then run five seeds and
+    report the mean and the standard error, because a single number is a point
+    estimate with error bars you have chosen not to look at.
+
+    ## The longer version
+
+    The remaining mechanisms, verbatim: the three levels of reproducibility and
+    what each costs, how a checkpoint breaks the stream, and the three-assertion
+    test that keeps a reproducibility contract alive.
+
+    ### Failure modes, in full
+
+    - You rerun last week's experiment with the same seed and get 0.4% different accuracy. Nothing in the model changed. A library added one more draw from the global RNG, and every number after that point came from a different stream.
+    - Your report says the new model beats the baseline by 0.6%. Your validation set is 2,000 examples at 90% accuracy, so the split alone moves that number by 0.67% — the "win" is smaller than the noise you never measured.
+    - Two engineers run "the same" experiment and get different curves. Nobody can say whether it is the code, the seed, the GPU, or the thread count, because none of those were recorded.
+    - You build 5-fold cross-validation by seeding each fold with `seed + i`, and quietly evaluate on overlapping data, because nothing about `seed + i` makes the streams independent.
+    - An interviewer asks how you would make a training run reproducible and expects you to separate three different problems — RNG state, kernel determinism, and data ordering — with three different fixes and three different costs.
+
+    ### The mechanisms, in full
+
+    - **A PRNG is a deterministic finite-state machine, and the seed sets the state.** NumPy's default generator is PCG64: 128 bits of state, period $2^{128} \approx 3.4 \times 10^{38}$. The legacy `RandomState` is MT19937: 19,937 bits of state, period $2^{19937}-1$. Both are pure functions from (state, call) to (value, next state), which is why `np.random.default_rng(0).random()` returns exactly 0.6369616873214543 on every machine and every NumPy release since 1.17 — the *stream* is specified, not merely the distribution. The trap is assuming the two generators agree: `np.random.seed(0); np.random.rand()` returns 0.5488135039273248. Same nominal seed, different generator, unrelated number.
+    - **Reproducibility is a property of the consumption path, not the seed value.** Insert one `rng.random()` call anywhere upstream and every downstream draw changes, with no error and no warning. Concretely, adding a single dropout mask before the first minibatch shifts every subsequent sample, so two runs that share a seed but not a call sequence are unrelated. The invariant you can actually maintain is "this sequence of calls into this generator object", which means any refactor that changes *how many* draws happen — rebatching, adding a sampling metric, changing a shuffle — is a behavioural change even when no arithmetic changed.
+    - **Global RNG state is shared mutable state, and it is the single largest source of unreproducibility.** `np.random.seed` and `np.random.rand` operate on one module-global `RandomState`; scikit-learn with `random_state=None`, `pandas.DataFrame.sample`, and most augmentation libraries all draw from it and therefore move *your* stream. A pipeline with 6 components on the global RNG has an implicit ordering dependency across all 6; the same pipeline with 6 explicitly passed `Generator` objects has none. `np.random.default_rng(seed)` returns an independent object, so the only code that can advance it is code you handed it to.
+    - **Seeds must be independent, not merely distinct — spawn them, do not add.** `SeedSequence(0).spawn(3)` yields three children that all carry entropy 0 but distinct `spawn_key`s `(0,)`, `(1,)`, `(2,)`, so the derivation is guaranteed collision-free by construction. The naive `seed + i` gives you no such guarantee, and it is how folds end up sharing stream material. Note that spawning changes the stream even for the first child: `default_rng(SeedSequence(0).spawn(1)[0])` produces 1.4436909546981256 as its first standard normal, while `default_rng(0)` produces 0.1257302210933933. Also note that NumPy refuses strings — `SeedSequence("exp-7")` raises `TypeError` — so hash the name yourself.
+    - **Hash-derived seeds must use a stable hash.** The obvious `SeedSequence(hash("augment"))` is a bug: Python salts `str.__hash__` per process, so the derived seed differs on every run unless `PYTHONHASHSEED` is pinned. Use `int.from_bytes(hashlib.sha256(name.encode()).digest()[:16], "big")` — 128 bits, stable across processes, machines, and Python versions. This is the same class of bug as `set` iteration order changing between runs: the code is deterministic per process and non-deterministic across processes, which is the worst combination because it passes your local test.
+    - **Same seed does not mean same result across the stack.** Four sources survive seeding entirely. (a) Library autotuning: cuDNN's benchmark mode picks a different kernel for the same shape on a different GPU, and different kernels reduce in different orders. (b) Floating-point non-associativity: accumulating $2 \times 10^{6}$ uniform values sequentially in float32 gives 1,000,274.1 against a true sum of 1,000,263.9 — an absolute error of 10.3, or $1 \times 10^{-5}$ relative, while NumPy's pairwise summation lands on 1,000,263.8. (c) Hash randomisation changes dict and set iteration order, which changes data order. (d) Thread count changes the reduction tree. `torch.use_deterministic_algorithms(True)` closes some of these, costs throughput, and cannot close all of them.
+    - **The seed is an untuned hyperparameter that flatters you, and averaging over seeds is the only honest correction.** Resampling one experiment across 2,000 seeds with 10,000 uniform draws each produced sample means from 0.490942 to 0.509710 around a true 0.5 — a $\pm 1.9\%$ spread with the extreme 3.5 standard deviations out, on an estimator that never changed. For accuracy on a 2,000-example validation set at 90%, the split-to-split standard deviation is $\sqrt{0.9 \cdot 0.1 / 2000} = 0.67\%$, so two runs differ with sd $0.95\%$, and a 0.6% claim from one seed per arm is noise wearing a result's clothing. The correction is the $\sigma/\sqrt{n}$ law from *Probability Distributions and the Central Limit Theorem* applied to a new unit of randomness: there the samples were data points, here they are whole runs, so $\operatorname{SE} = \sigma_{\text{seed}}/\sqrt{k}$. With per-seed sd 0.8%: one seed gives 0.80%, five give 0.36%, ten give 0.25% — and unlike a bigger test set, this also averages over initialisation, data order, and augmentation.
+    - **Reproducibility has three levels, and you must name which one you need.** *Bit-exact*: same seed, same hardware, same library versions, same thread count, identical bytes — the right target for chasing a numerical divergence and for regression tests, and it costs 10–30% throughput. *Statistically reproducible*: the same distribution, not the same draws — the right target for a paper. *Conclusion-reproducible*: the claim survives reseeding, reported as mean $\pm$ standard error over $k$ seeds — the right target for a launch decision, and the only one of the three that is cheap. Chasing bit-exactness for a launch decision costs weeks and buys nothing.
+    - **Resuming from a checkpoint silently breaks the stream.** Saving weights is not saving the run. A faithful checkpoint carries the model, the optimiser state, the epoch counter, the sampler's position, *and* every RNG: `gen.bit_generator.state` is a plain picklable dict for NumPy, `torch.get_rng_state()` for the CPU generator, plus one state per CUDA device and per DataLoader worker. Restore all of them and a resumed run reproduces the uninterrupted one bit for bit; restore only the weights and you have started a *different* run at the same weights. The test is four lines: run 10 steps, checkpoint at 5, resume, compare step 10's loss bytes against the uninterrupted run.
+    - **Reproducibility is a contract, and an untested contract rots.** A `--seed` flag that CI never exercises breaks within one release, usually because a dependency changed a default. The cheap test has three assertions, and the third is the one people omit: same seed twice in one process gives identical bytes; same seed in two fresh processes gives identical bytes; a *different* seed gives *different* bytes. Without the third, a "reproducibility test" that always passes usually means the RNG is not being consumed where you think it is — and a test that cannot fail is not a test.
+
+
+  derivations:
+    - title: "Why averaging over k seeds shrinks the error as 1/√k"
+      latex: |
+        Let $m_1, \dots, m_k$ be the metric from $k$ runs that differ only in
+        seed. Treat them as i.i.d. with mean $\mu$ and variance
+        $\sigma_{\text{seed}}^2$. Then
+        $$\bar m = \frac{1}{k}\sum_{i=1}^{k} m_i, \qquad
+          \operatorname{Var}(\bar m) = \frac{1}{k^2}\sum_{i=1}^{k}\sigma_{\text{seed}}^2
+          = \frac{\sigma_{\text{seed}}^2}{k},$$
+        so
+        $$\operatorname{SE}(\bar m) = \frac{\sigma_{\text{seed}}}{\sqrt{k}}.$$
+        With $\sigma_{\text{seed}} = 0.8\%$: $k=1 \to 0.80\%$,
+        $k=5 \to 0.36\%$, $k=10 \to 0.25\%$, $k=28 \to 0.15\%$.
+      prose: >-
+        The precision of a claim improves at the square-root rate, so four
+        times the compute buys twice the resolution. That is the same exchange
+        rate as collecting four times more test data — except seed averaging
+        also integrates over initialisation and data order, which a larger test
+        set cannot do.
+    - title: "How many seeds to defend a claimed improvement"
+      latex: |
+        Two arms, each averaged over $k$ seeds, with per-seed standard
+        deviation $\sigma$. The difference of the two means has standard
+        deviation
+        $$\operatorname{sd}(\bar m_A - \bar m_B) = \sigma\sqrt{\frac{2}{k}}.$$
+        Requiring the two 95% intervals not to overlap means each half-width
+        must be below $\delta/2$:
+        $$1.96\,\frac{\sigma}{\sqrt{k}} < \frac{\delta}{2}
+          \quad\Longrightarrow\quad
+          k > \left(\frac{3.92\,\sigma}{\delta}\right)^2.$$
+        For $\sigma = 0.8\%$ and $\delta = 0.6\%$:
+        $$k > \left(\frac{3.92 \times 0.8}{0.6}\right)^2 = 27.3
+          \quad\Longrightarrow\quad k = 28 \text{ per arm.}$$
+      prose: >-
+        Twenty-eight seeds per arm, fifty-six runs, to defend a number most
+        teams report from one run each. The formula also shows the two honest
+        ways out: reduce sigma with a larger evaluation set, or stop claiming
+        an effect smaller than your noise floor.
+    - title: "Why 128-bit seeds are never the thing that collides"
+      latex: |
+        Draw $m$ seeds uniformly from $2^{128}$ possibilities. The probability
+        of at least one collision is bounded by the union bound
+        $$P(\text{collision}) \;\lesssim\; \frac{m(m-1)}{2 \cdot 2^{128}}
+          \;\approx\; \frac{m^2}{2^{129}}.$$
+        For $m = 10^{6}$ runs: $10^{12} / 6.8 \times 10^{38} \approx 1.5 \times 10^{-27}$.
+        For $m = 10^{18}$ runs: $\approx 1.5 \times 10^{-3}$.
+      prose: >-
+        You would need a quintillion runs before seed collisions become
+        plausible. The failure mode in real pipelines is therefore never "two
+        seeds happened to collide" — it is "two components were handed the same
+        stream", which no amount of entropy at the root prevents. That is why
+        spawn keys, not seed width, are the thing to get right.
+
+  implementations:
+    - language: python
+      title: "One root seed, an explicit tree of streams, and a stable name hash"
+      note: >-
+        Correct as written, but it becomes silently wrong the moment
+        `derive_seed` is changed to use `hash(name)`: Python salts string
+        hashes per process, so the derived seed differs on every run unless
+        `PYTHONHASHSEED` is fixed, and every result drifts while every local
+        test still passes. It is also wrong in a subtler sense — `spawn`
+        guarantees disjoint streams, not statistically good ones; a biased
+        sampler stays biased no matter how cleanly you seed it.
+      code: |
+        import hashlib
+        import numpy as np
+
+        def derive_seed(name: str, root: int = 0) -> int:
+            """Stable 128-bit seed from a human-readable component name.
+
+            `hash(name)` is NOT usable here: str hashing is salted per
+            process, so the value changes on every run. sha256 is stable
+            across processes, machines and Python versions.
+            """
+            digest = hashlib.sha256(f"{root}:{name}".encode("utf-8")).digest()
+            return int.from_bytes(digest[:16], "big")   # 128 bits = PCG64 state
+
+        def component_rngs(root: int, names):
+            """One independent Generator per component, from a single root seed.
+
+            The children share `entropy` but differ in `spawn_key`, so no two
+            components can ever draw the same numbers.
+            """
+            children = np.random.SeedSequence(root).spawn(len(names))
+            return {name: np.random.default_rng(child)
+                    for name, child in zip(names, children)}
+
+        def describe(root: int, names):
+            """What to log next to a run, so someone else can reproduce it."""
+            rngs = component_rngs(root, names)
+            return {
+                "root_seed": root,
+                "generator": "PCG64",
+                "streams": {
+                    name: rng.bit_generator.state["state"]["state"]  # 128-bit position
+                    for name, rng in rngs.items()
+                },
+            }
+
+        if __name__ == "__main__":
+            rngs = component_rngs(1234, ["init", "dropout", "augment"])
+            print({k: float(v.standard_normal()) for k, v in rngs.items()})
+    - language: python
+      title: "A reproducibility test that can actually fail"
+      note: >-
+        This is numerically wrong if you compare floats instead of bytes: two
+        runs whose loss differs in the last bit compare unequal under `==` but
+        land in the same 1e-9 tolerance, which hides exactly the drift you are
+        testing for. Compare `.tobytes()` of the raw buffer, and compare in
+        *fresh processes* too — the salted-hash bug is invisible in-process
+        because both runs share the salt.
+      code: |
+        import pickle
+        import numpy as np
+
+        def run_steps(step, seed, n_steps):
+            """Run `step(state, rng)` n_steps times; return the raw loss bytes."""
+            rng = np.random.default_rng(seed)
+            state = {"w": np.zeros(4, dtype=np.float64), "loss": np.float64(0.0)}
+            for _ in range(n_steps):
+                step(state, rng)
+            # Bytes, not values: this is the only comparison that catches
+            # last-bit drift from a changed reduction order.
+            return state["loss"].tobytes()
+
+        def assert_reproducible(step, seed, other_seed, n_steps=10):
+            a = run_steps(step, seed, n_steps)
+            b = run_steps(step, seed, n_steps)
+            c = run_steps(step, other_seed, n_steps)
+            assert a == b, "same seed, different bytes: the stream was disturbed"
+            # The assertion everyone omits. If a different seed gives the same
+            # bytes, the RNG is not being consumed where you think it is, and
+            # the first assertion is passing for the wrong reason.
+            assert a != c, "different seed, identical bytes: this code is not random"
+            return True
+
+        def checkpoint(path, model, optimiser, rng, epoch):
+            """Everything needed to resume, not just the weights."""
+            with open(path, "wb") as f:
+                pickle.dump({
+                    "model": model,
+                    "optimiser": optimiser,
+                    "rng_state": rng.bit_generator.state,   # the part people drop
+                    "epoch": epoch,
+                }, f)
+
+        def restore(path, rng):
+            with open(path, "rb") as f:
+                ckpt = pickle.load(f)
+            rng.bit_generator.state = ckpt["rng_state"]
+            return ckpt["model"], ckpt["optimiser"], ckpt["epoch"]
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        Your training script sets `np.random.seed(42)` at the top. A colleague
+        adds one `np.random.rand()` call to a logging helper that runs before
+        the first minibatch. Why does the final loss change, when neither the
+        model nor the data changed?
+      answerKind: short_text
+      hint: "The seed sets a position in a stream. What determines the numbers you actually receive?"
+      solution: >-
+        Because the seed selects a stream and the *call sequence* consumes it.
+        One extra draw shifts every subsequent sample by one position, so the
+        weight init, the dropout masks, and the shuffle order are all different
+        from that point on. Nothing is broken and nothing warns you: the code
+        is doing exactly what it was told, with a stream that has moved by one.
+        The fix is not a better seed, it is isolation — one `Generator` per
+        component, so a logging helper cannot reach into the training stream.
+    - id: cp-2
+      question: >-
+        Seed 42 gives 91.2% and seed 43 gives 90.4% on the same code. Is the
+        model unstable, and what would you do before answering?
+      answerKind: short_text
+      hint: "What is the standard deviation of accuracy on a validation set of a given size?"
+      solution: >-
+        0.8 points is not evidence of instability; it is the expected
+        split-to-split variation. On a 2,000-example validation set at 91%
+        accuracy the standard error is $\sqrt{0.91 \cdot 0.09/2000} = 0.64\%$,
+        so a 0.8-point gap is about 1.25 standard deviations of a single run —
+        entirely ordinary. Before calling it instability, run 10 seeds and look
+        at the distribution. If the spread is much wider than the binomial
+        prediction, then something else is varying (data order, augmentation
+        strength, a nondeterministic kernel) and that is the actual finding.
+    - id: cp-3
+      question: >-
+        You checkpoint model weights every epoch and resume after a crash. The
+        resumed run's loss curve does not match the uninterrupted baseline.
+        Name the missing state.
+      answerKind: short_text
+      hint: "Weights are not the only thing that advances between steps."
+      solution: >-
+        You are missing (a) the optimiser state — momentum buffers and Adam's
+        second moments; (b) the NumPy generator state
+        (`gen.bit_generator.state`); (c) the torch CPU and per-device CUDA RNG
+        states; (d) the sampler's position and epoch counter; (e) the
+        DataLoader worker seeds. Miss any one and the resumed run is a new run
+        that happens to start at the same weights. The test is to checkpoint
+        mid-run, resume, and compare the next step's loss bytes against the
+        uninterrupted run — not to eyeball the curve.
+    - id: cp-4
+      question: >-
+        Why is `SeedSequence(root).spawn(k)` better than `[root + i for i in
+        range(k)]`, given that both produce k distinct integers?
+      answerKind: short_text
+      hint: "Distinctness is a property of the integers. What property do you actually need of the streams?"
+      solution: >-
+        You need the *streams* to be independent, and distinct seeds do not
+        guarantee that. `spawn` gives each child a distinct `spawn_key` inside a
+        tree rooted at one entropy value, so the derivation is collision-free
+        by construction and the children are separated by a mixing function
+        designed for exactly this. `root + i` gives adjacent integers with no
+        structural guarantee, and it silently breaks when two code paths derive
+        the same offset — which is how folds and train/test splits end up
+        sharing material. Note also that spawning changes the stream for the
+        first child: `SeedSequence(0).spawn(1)[0]` is not `default_rng(0)`.
+    - id: cp-5
+      question: >-
+        Same seed, same code, one machine with an A100 and one with an H100.
+        The losses differ in the fourth decimal. Is that a bug?
+      answerKind: short_text
+      hint: "What does the seed control, and what does it not control?"
+      solution: >-
+        Not a bug, and not fixable by seeding. The seed fixes the sequence of
+        random draws; it says nothing about how those numbers are combined.
+        Different GPUs autotune to different kernels, and different kernels
+        reduce in different orders, so float32 addition is non-associative
+        across the two. The divergence is real but tiny, and it compounds over
+        steps. Either accept it (report mean ± SE over seeds, which swamps it)
+        or pin the kernels and thread counts for bit-exactness and pay the
+        throughput cost.
+    - id: cp-6
+      question: >-
+        Your reproducibility test asserts that two runs with seed 7 produce
+        identical output, and it has passed for a year. Why is it probably
+        worthless?
+      answerKind: short_text
+      hint: "What would have to be true for that assertion to fail?"
+      solution: >-
+        It only fails if the RNG is consumed nondeterministically *within* a
+        process, which is rare. It cannot catch the common failures: a
+        dependency changing a default, a salted hash, a different thread count,
+        a different process. Worse, if the RNG is not being consumed at all in
+        the code path under test, the assertion passes trivially. Add the third
+        assertion — a different seed must produce different bytes — and run the
+        same comparison in two fresh processes. A test that cannot fail is not
+        evidence.
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A seed is a position in a deterministic stream, not a source of
+        randomness and not a guarantee of correctness. Everything that goes
+        wrong here goes wrong because the stream is consumed by code you did
+        not write: a library call moves the position, two components share one
+        position, or a kernel combines the same numbers in a different order.
+        Reproducibility is therefore an ownership problem — who holds which
+        stream — plus a reporting problem: one run is one draw, and you can
+        compute the width of the distribution it came from.
+      blocks:
+        - kind: checklist
+          body: |
+            - Seed = stream selector, not a correctness switch
+            - One Generator per component, never the module-global one
+            - Independent seeds come from spawn, not from seed + i
+            - Bit-exactness needs deterministic kernels, not just a seed
+            - Report mean ± SE over k seeds, and state k
+            - A reproducibility test that cannot fail is not a test
+      checkpoint: >-
+        Before reading on: if two runs with the same seed produce different
+        losses, which is more likely — the generator returned a different
+        number for the same state, or the code asked it for a different number
+        of numbers?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Separate the question you are answering. If you are chasing "why did
+        this run diverge from that one", you want bit-exactness: fix the
+        thread count, enable deterministic kernels, and bisect on the first
+        step where the bytes differ — the divergence is almost always an extra
+        or missing draw, not a kernel. If you are asking "is this improvement
+        real", you want the opposite tool: nothing deterministic at all, just
+        k seeds, a mean, and a standard error. Reach for `SeedSequence.spawn`
+        in both cases, because it is the only construction that makes stream
+        independence structural rather than hoped for.
+      blocks:
+        - kind: checklist
+          body: |
+            - Divergence between two known runs -> bit-exact path, bisect on bytes
+            - Claim about a method -> statistical path, k seeds, report SE
+            - Never both at once: determinism costs throughput and buys no validity
+            - Isolation first (one stream per component), then everything else
+      checkpoint: >-
+        Which path would you take if a reviewer asked whether your new
+        augmentation beats the baseline by 0.4%?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Two procedures, each short. Neither is hard; both are skipped.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # A. Structural seeding
+            root = SeedSequence(ROOT_SEED)
+            children = root.spawn(number_of_components)
+            for name, child in zip(names, children):
+                rng[name] = default_rng(child)
+            log(root_seed, generator_name, {name: rng.state})
+
+            # B. Is the difference real?
+            for s in seeds:                 # k >= 5
+                metric[s] = run(seed=s)
+            mean = average(metric)
+            se   = std(metric) / sqrt(k)
+            report(mean, se, k)
+
+            # C. Does the seed even matter?
+            assert run(seed=7) == run(seed=7)        # bytes
+            assert run(seed=7) != run(seed=8)        # bytes
+      checkpoint: >-
+        In part C, why is the second assertion the one that catches a broken
+        experiment, when the first one is the one everybody writes?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Both quantities you need come from the same variance algebra: the
+        variance of an average of independent things falls as $1/k$, and the
+        variance of a difference of two independent averages is the sum of
+        their variances.
+      blocks:
+        - kind: math
+          body: |
+            Let $m_1,\dots,m_k$ be the metric across $k$ seeds, i.i.d. with
+            variance $\sigma^2$:
+            $$\operatorname{Var}(\bar m) = \frac{\sigma^2}{k},
+              \qquad \operatorname{SE} = \frac{\sigma}{\sqrt{k}}$$
+
+            Difference of two arms, each with $k$ seeds:
+            $$\operatorname{sd}(\bar m_A - \bar m_B)
+              = \sigma\sqrt{\tfrac{1}{k} + \tfrac{1}{k}}
+              = \sigma\sqrt{\tfrac{2}{k}}$$
+
+            Non-overlapping 95% intervals require
+            $1.96\sigma/\sqrt{k} < \delta/2$, so
+            $$k > \left(\frac{3.92\,\sigma}{\delta}\right)^2$$
+            and with $\sigma = 0.8\%$, $\delta = 0.6\%$:
+            $k > 27.3 \Rightarrow 28$ per arm.
+
+            Seed collisions, for $m$ draws from $2^{128}$:
+            $$P \approx \frac{m^2}{2^{129}} = 1.5\times10^{-27}
+              \text{ at } m = 10^{6}.$$
+      checkpoint: >-
+        The collision bound says 128-bit seeds are effectively never the
+        problem. What does that leave as the actual cause of two "different"
+        runs producing identical numbers?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete pattern: a seed tree, a logged state, a checkpoint that
+        includes the generator, and a three-assertion test that can fail.
+      blocks:
+        - kind: warning
+          body: >-
+            Do not read this until you have written your own version. The
+            details that matter are not the API calls — they are the two
+            failure modes: `hash()` for names, and the assertion you forgot.
+        - kind: code
+          language: python
+          body: |
+            import hashlib, pickle
+            import numpy as np
+
+            def derive_seed(name, root=0):
+                # NOT hash(name): str hashing is salted per process.
+                d = hashlib.sha256(f"{root}:{name}".encode()).digest()
+                return int.from_bytes(d[:16], "big")
+
+            def component_rngs(root, names):
+                children = np.random.SeedSequence(root).spawn(len(names))
+                return {n: np.random.default_rng(c)
+                        for n, c in zip(names, children)}
+
+            def state_of(rngs):
+                return {n: r.bit_generator.state for n, r in rngs.items()}
+
+            def restore_state(rngs, saved):
+                for n, r in rngs.items():
+                    r.bit_generator.state = saved[n]
+
+            def run_bytes(step, seed, n=10):
+                rng = np.random.default_rng(seed)
+                state = {"loss": np.float64(0.0)}
+                for _ in range(n):
+                    step(state, rng)
+                return state["loss"].tobytes()
+
+            def check(step, seed=7, other=8):
+                a, b = run_bytes(step, seed), run_bytes(step, seed)
+                c = run_bytes(step, other)
+                assert a == b, "stream disturbed between identical runs"
+                assert a != c, "different seed, same bytes: RNG unused"
+                return True
+      checkpoint: >-
+        After restoring the saved state, a resumed generator must continue the
+        same stream. What would you compare to prove it did, and why is
+        comparing the next drawn value with `==` the wrong test?
+
+  problems:
+    - id: p-seeded-kfold
+      title: "Deterministic, disjoint k-fold splits"
+      difficulty: easy
+      prompt: >-
+        Implement `kfold_indices(n, k, seed)`. Draw a permutation of
+        `range(n)` with `np.random.default_rng(seed).permutation(n)` and deal
+        it into `k` folds by stride: fold `j` is `perm[j::k]`. Return a list of
+        `k` lists of plain Python ints, each sorted ascending. Fold sizes must
+        differ by at most one, and the folds must partition `range(n)`. This
+        exact dealing rule is part of the contract — the point of the exercise
+        is that "the same split" has to mean one specific sequence of draws.
+      starter: |
+        import numpy as np
+
+        def kfold_indices(n, k, seed):
+            """Return k sorted lists of test indices: fold j = perm[j::k]."""
+            # your implementation here
+            pass
+      language: python
+      entry: kfold_indices
+      testCases:
+        - input: "[6, 3, 0]"
+          expected: "[[3, 4], [0, 2], [1, 5]]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[10, 5, 7]"
+          expected: "[[6, 8], [0, 2], [4, 7], [1, 5], [3, 9]]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[7, 2, 1]"
+          expected: "[[1, 2, 3, 5], [0, 4, 6]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def kfold_indices(n, k, seed):
+            if k <= 0:
+                raise ValueError("k must be positive")
+            if k > n:
+                raise ValueError("cannot have more folds than samples")
+            perm = np.random.default_rng(seed).permutation(n)
+            # Strided dealing is exactly balanced: sizes differ by at most 1.
+            return [sorted(int(i) for i in perm[j::k]) for j in range(k)]
+      solutionExplanation: >-
+        One `permutation` call defines the whole split; deriving every fold from
+        that single permutation is what guarantees the folds are disjoint and
+        cover `range(n)` exactly once. Sorting is presentation only — the
+        membership is what matters. The trap this avoids is seeding each fold
+        separately with `seed + j`: those are distinct integers but not
+        independent streams, and nothing in the code prevents two folds from
+        sharing material. Because the permutation is drawn from an explicitly
+        passed `Generator`, no library call can move the stream between folds.
+      complexity: "O(n) time, O(n) space"
+      tags: [seeding, cross-validation, numpy]
+
+    - id: p-spawn-streams
+      title: "Independent streams from one root seed"
+      difficulty: medium
+      prompt: >-
+        Implement `spawn_streams(root_seed, n)`. Build
+        `np.random.SeedSequence(root_seed)`, spawn `n` children from it, and
+        return a list containing the first standard normal draw from each
+        child's generator, in spawn order. Return `[]` when `n == 0`.
+      starter: |
+        import numpy as np
+
+        def spawn_streams(root_seed, n):
+            # your implementation here
+            pass
+      language: python
+      entry: spawn_streams
+      testCases:
+        - input: "[0, 3]"
+          expected: "[1.4436909546981256, 0.8050894723742356, 0.9420990037776027]"
+          mode: json
+          tolerance: 1e-12
+        - input: "[42, 2]"
+          expected: "[0.41832996532437755, 1.2544943667397455]"
+          mode: json
+          tolerance: 1e-12
+        - input: "[7, 1]"
+          expected: "[-0.6300679245787791]"
+          mode: json
+          tolerance: 1e-12
+        - input: "[0, 0]"
+          expected: "[]"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def spawn_streams(root_seed, n):
+            children = np.random.SeedSequence(root_seed).spawn(n)
+            return [float(np.random.default_rng(child).standard_normal())
+                    for child in children]
+      solutionExplanation: >-
+        Each child carries the same entropy but a distinct `spawn_key` —
+        `(0,)`, `(1,)`, `(2,)` — so the streams are guaranteed disjoint by
+        construction rather than by luck. Note the first value for root seed 0:
+        1.4436909546981256. That is *not* `default_rng(0).standard_normal()`,
+        which is 0.1257302210933933, because spawning changes the spawn key even
+        for the first child. Confusing the two is the most common way to write a
+        "seeded" pipeline that silently shares a stream.
+      complexity: "O(n) time, O(n) space"
+      tags: [seedsequence, spawning, independence]
+
+    - id: p-monte-carlo-pi
+      title: "Monte Carlo with an honest error bar"
+      difficulty: medium
+      prompt: >-
+        Implement `monte_carlo_pi(n, seed)`. Draw `n` points as
+        `np.random.default_rng(seed).random((n, 2))` — a single call, so the
+        stream order is pinned — and count how many satisfy
+        $x^2 + y^2 \le 1$. Return `[estimate, standard_error]` where
+        `estimate = 4p` for the observed hit rate `p`, and
+        `standard_error = 4\sqrt{p(1-p)/n}`. Both as floats. The seed fixes the
+        estimate; the standard error is what tells you how much that estimate
+        would move under a different seed.
+      starter: |
+        import math
+        import numpy as np
+
+        def monte_carlo_pi(n, seed):
+            # your implementation here
+            pass
+      language: python
+      entry: monte_carlo_pi
+      testCases:
+        - input: "[1000, 0]"
+          expected: "[3.244, 0.049522358586804]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[10000, 7]"
+          expected: "[3.1644, 0.016260912151536886]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[100000, 42]"
+          expected: "[3.15008, 0.005174278687508047]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+        import numpy as np
+
+        def monte_carlo_pi(n, seed):
+            pts = np.random.default_rng(seed).random((n, 2))
+            inside = (pts[:, 0] ** 2 + pts[:, 1] ** 2) <= 1.0
+            p = float(inside.mean())
+            # sd of 4p is 4*sqrt(p(1-p)/n): the binomial standard error,
+            # rescaled by the 4 that turns a probability into pi.
+            return [4.0 * p, 4.0 * math.sqrt(p * (1.0 - p) / n)]
+      solutionExplanation: >-
+        The estimator is the hit rate times four, because the quarter disc has
+        area $\pi/4$ inside the unit square. Its standard error follows from
+        $\operatorname{Var}(4\hat p) = 16p(1-p)/n$, so
+        $\operatorname{SE} = 4\sqrt{p(1-p)/n}$ — the same binomial error from
+        *Probability Distributions*, rescaled. At $n = 10^5$ the error is 0.0052,
+        so the estimate 3.15008 is roughly 1.7 standard errors below $\pi$: a
+        perfectly ordinary draw, and precisely the point. Reporting 3.15008
+        without the second number would be reporting a seed, not a measurement.
+      complexity: "O(n) time, O(1) extra space"
+      tags: [monte-carlo, standard-error, seeding]
+
+  try_it: >-
+    Compute the split noise on your own validation number: 2,000 examples at 90%
+    accuracy gives a standard error of $\sqrt{0.9 \times 0.1 / 2000} = 0.67\%$.
+    Then rerun your last experiment with three seeds and see whether the 0.6%
+    "win" you were about to report survives the spread you just measured.
+  interview_questions:
+    - question: "Same seed, same code, different accuracy. How is that possible?"
+      level: mid
+      key_points:
+        - "Reproducibility is a property of the whole consumption path, not of the seed value: inserting one extra draw upstream shifts every subsequent sample."
+        - "Global RNG state is shared mutable state — `np.random.seed` and most augmentation libraries draw from one module-global stream, so any library call can perturb it."
+        - "Four sources survive seeding entirely: library autotuning (cuDNN benchmark picks a different kernel), floating-point non-associativity under different reduction orders, thread-count-dependent atomics, and version drift."
+        - "So the honest statement is 'bit-exact on this machine, this build, this thread count' — and that is a level you must name, not assume."
+      follow_up: "Which of those four would you attack first if a numerical divergence appeared after an upgrade?"
+    - question: "You spawn 32 data-loader workers. How do you give each an independent seed, and why is `seed + rank` not enough?"
+      level: senior
+      key_points:
+        - "`SeedSequence(0).spawn(32)` derives children that all carry the same entropy but distinct `spawn_key`s, so the streams are collision-free by construction."
+        - "`seed + rank` gives distinct seeds with no independence guarantee — adjacent integers can produce correlated initial states depending on the generator's mixing."
+        - "Hash-derived seeds must use a stable hash: Python salts `str.__hash__` per process, so `hash('augment')` differs every run unless `PYTHONHASHSEED` is pinned."
+        - "Use `int.from_bytes(hashlib.sha256(name.encode()).digest()[:16], 'big')` when you need a seed from a name rather than from a counter."
+      follow_up: "Two workers accidentally share a stream. What symptom would you see in the training curve?"
+    - question: "What must a checkpoint carry for a run to resume exactly?"
+      level: mid
+      key_points:
+        - "Weights are the smallest part: the optimiser state, the epoch counter and the sampler's position all change what happens next."
+        - "Every RNG needs saving — `gen.bit_generator.state` is a plain picklable dict for NumPy, and `torch.get_rng_state()` covers the torch global stream."
+        - "Resuming otherwise silently restarts every stream, so a run that looks resumed is a different experiment from the epoch boundary onward."
+        - "The contract needs a test: same seed twice in one process, same seed across two processes, and a resume that reproduces the uninterrupted tail."
+  common_mistakes:
+    - "Reporting a 0.6% improvement from a single seed when the validation split alone moves that number by 0.67%."
+    - "Deriving per-worker seeds with `seed + rank` and assuming independence, then debugging the correlation as if it were a model bug."
+    - "Using `hash('augment')` to derive a seed: Python salts string hashing per process, so the run differs every time unless `PYTHONHASHSEED` is pinned."
+  further_reading:
+    - label: "NumPy, Random sampling and SeedSequence"
+      url: "https://numpy.org/doc/stable/reference/random/index.html"
+    - label: "Bouthillier, Delaunay, Bronzi, Trofimov, Nichyporuk, Szeto, Sepah, Raff, Madan, Voleti, Kahou, Michalski, Serdyuk, Arbel, Pal, Varoquaux & Vincent, Accounting for Variance in Machine Learning Benchmarks (MLSys 2021)"

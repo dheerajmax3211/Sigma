@@ -1,0 +1,1423 @@
+id: kv-cache
+slug: kv-cache
+title: "The KV Cache: Prefill, Decode, and Memory"
+summary: >-
+  A decoder is causal, so every key and value it has ever computed stays valid;
+  caching them replaces an O(n^2) recomputation with an O(n) append, and moves
+  the serving bottleneck from the tensor cores to HBM. This topic derives the
+  2 L n_kv d_head bytes-per-token formula, prices a 7B and a 70B model at 4k,
+  32k and 128k, and shows why the cache, not the weights, decides how many users
+  fit on a GPU.
+kind: lesson
+difficulty: hard
+position: 8
+estMinutes: 24
+prerequisites: [transformer-block]
+phase: attention-core
+tags: [kv-cache, inference, prefill, decode, memory-bandwidth, arithmetic-intensity, gqa, mqa, roofline, serving]
+
+body:
+  big_idea: >-
+    Because attention is causal, past keys and values stay exactly right, so a
+    decoder stores them instead of recomputing: one trade of memory for
+    arithmetic that makes decode a memory problem, not a compute one.
+
+  problem:
+    - >-
+      Your 80 GiB card holds 33 conversations at 4k; product asks for 128k and
+      the same card now holds one, with no code change.
+    - >-
+      You add the cache and the output drifts by 11.8% while staying fluent:
+      no shape error, no exception, just a quietly worse model.
+    - >-
+      You batch 32 requests expecting 32x throughput, get about 6x, and cannot
+      say which part of the working set amortises.
+
+  analogy: |
+    You are taking minutes in a meeting where every new sentence needs the
+    whole conversation. The naive way is to replay the recording whenever
+    somebody speaks: perfect context, quadratically more expensive. The KV
+    cache is the transcript you keep, appending each line; and it is legal
+    because appending a line never changes an earlier one.
+
+  concept_points:
+    - >-
+      **The cache is legal because attention is masked, and that is the whole argument.**
+      With a causal mask, $x_j$ is a function of $x_{\le j}$ and the weights,
+      so $K_j$ and $V_j$ are fixed the moment position $j$ is processed.
+      Measured: a recompute-everything decoder and a cached one agree to
+      **5.22e-16** relative on a 384-token prompt; without the mask nothing
+      could be reused.
+    - >-
+      **Naive decoding recomputes the prefix, so its attention work is $\Theta(mn^2)$ instead of $\Theta(n^2 + mn)$.**
+      Prompt 4,096 and generate 512: the cached path costs **4.98 TFLOP**, the
+      recomputing path **2,545.6 TFLOP** — a ratio of **511x**, which is
+      exactly $m$. Measured on a toy at $n=384$, $m=32$: multiply-adds ratio
+      **31.9**, wall clock only **15x** because each step is launch-bound. The
+      ratio grows with output length.
+    - >-
+      **The cache costs $2 L n_{kv} d_{\text{head}} b$ bytes per token, and $d_{\text{model}}$ is not in the formula.**
+      At 7B, 32 layers, 32 KV heads, fp16:
+      $2 \cdot 32 \cdot 32 \cdot 128 \cdot 2 = 524{,}288$ bytes —
+      **512 KiB per token**. At 4k that is **2.00 GiB**, at 32k **16.0 GiB**,
+      at 128k **64.0 GiB**. Stopping at $2 \cdot 2 \cdot d_{\text{model}}$ is
+      32x too small.
+    - >-
+      **Grouped-query attention divides the cache by the group count, and the biggest model can end up with the smaller cache.**
+      7B with 8 KV heads is **128 KiB per token** (4x smaller); MQA is
+      **16 KiB** (32x). A 70B with 80 layers and 8 KV heads is
+      **320 KiB per token** —
+      **0.625x the 7B MHA cache while carrying 10x the parameters**.
+    - >-
+      **At 4k the cache is 13.3% of what a decode step moves; at 128k it is 83.1%.**
+      One 7B MHA step at batch 1 moves **16.15 GB** (14.0 GB weights plus 2.15
+      GB cache): **4.82 ms** at 3.35 TB/s, capping throughput at
+      **207 tokens/s**. At 128k the same step moves **82.7 GB** for 24.69 ms.
+      Crossover batch: 6.5, then **0.81** and **0.20**.
+    - >-
+      **Batching cannot fix decode, because the cache sets an asymptote far below the ridge point.**
+      With $I(B) = 2N/(Nb/B + C)$, intensity rises from **0.87** at $B=1$ to
+      **5.42** at $B=32$, then flattens at $2N/C = \mathbf{6.52}$ FLOP/byte
+      for 7B MHA at 4k — against a 295 FLOP/byte ridge, **45x short**. GQA
+      moves the ceiling to **26.1**, MQA to 208.6; only MQA gets within an
+      order of magnitude.
+
+  definitions:
+    - term: "KV cache"
+      meaning: >-
+        The stored keys and values of every processed token, per layer, kept so
+        that a decode step only computes the new token's own projections. Its
+        size is $2 L n_{kv} d_{\text{head}} n b$ bytes — 512 KiB per token for a
+        7B MHA model at fp16, independent of $d_{\text{model}}$ except through
+        $n_{kv} d_{\text{head}}$.
+    - term: "Prefill"
+      meaning: >-
+        The first pass over the prompt: all $n$ tokens at once, one forward
+        pass, high arithmetic intensity (4,096 FLOP/byte at 4k for a 7B) and
+        therefore compute-bound. It fills the cache and produces the first
+        logits, so its duration is time-to-first-token.
+    - term: "Decode"
+      meaning: >-
+        Generating one token per step, each step re-reading every weight plus
+        the whole cache. Intensity collapses to 0.87 FLOP/byte at 4k, so step
+        time is bytes divided by bandwidth and the tensor cores idle.
+    - term: "Time to first token (TTFT)"
+      meaning: >-
+        Queueing plus prefill. Scales with prompt length and with how much
+        compute the prefill gets, which is why it is the metric that degrades
+        under heavy batching.
+    - term: "Time per output token (TPOT)"
+      meaning: >-
+        The decode step time — bytes moved divided by bandwidth. At batch 1 on a
+        7B at 4k it is 4.82 ms; it is nearly independent of how many tokens have
+        already been generated until the cache itself starts to dominate.
+    - term: "Bytes per token"
+      meaning: >-
+        The cache's marginal cost: $2 L n_{kv} d_{\text{head}} b$. The single
+        number that determines concurrency, because capacity is free memory
+        divided by it. Halving it doubles the number of users.
+    - term: "Grouped-query attention (GQA)"
+      meaning: >-
+        Sharing each key/value head across a group of $G$ query heads. Cache
+        bytes fall by exactly $G$ and quality degrades far less than MQA's,
+        which is why nearly every model above 7B ships with $G$ between 4 and 8.
+    - term: "Multi-query attention (MQA)"
+      meaning: >-
+        The $G = n_{\text{heads}}$ limit: one KV head for all query heads. Cache
+        is 32x smaller than MHA at 32 heads, and the 4k intensity ceiling rises
+        from 6.52 to 208.6 FLOP/byte — the only configuration in this topic that
+        comes within an order of magnitude of the ridge point.
+    - term: "Arithmetic intensity"
+      meaning: >-
+        FLOPs performed per byte moved from HBM. Compared with the machine's
+        ridge point ($P/\text{BW} = 295$ FLOP/byte for an H100 at fp16) it says
+        whether a kernel is limited by the tensor cores or by memory. Prefill
+        sits 13.9x above it; decode sits 340x below.
+    - term: "Ridge point"
+      meaning: >-
+        $P/\text{BW}$, the intensity at which a kernel stops being
+        bandwidth-bound. 989 TFLOP/s over 3.35 TB/s is 295 FLOP/byte. It is a
+        property of the machine, not the model, which is why the decode ceiling
+        $2N/C$ can be compared against it directly.
+    - term: "Prefix caching"
+      meaning: >-
+        Reusing a cache across requests that share an exact token prefix. It
+        works because a cache entry is a pure function of the tokens before it;
+        it fails on "similar" prompts, because one changed token invalidates
+        every entry after it.
+    - term: "PagedAttention"
+      meaning: >-
+        Storing the cache in fixed-size blocks with a per-sequence block table
+        instead of one contiguous allocation per request, so that memory
+        fragmentation stops wasting 60-80% of the cache budget. It changes the
+        allocator, not the arithmetic.
+
+  diagrams:
+    - type: architecture
+      title: "One decode step is two reads and one matmul"
+      nodes:
+        - { id: w, x: 0, y: 0, label: "Weights  14 GB", kind: storage, detail: "Read in full on every step, whether the batch is 1 or 32. 14 GB at 3.35 TB/s is 4.18 ms before the cache is touched at all." }
+        - { id: c, x: 0, y: 2, label: "KV cache  2.00 GiB at 4k", kind: cache, detail: "512 KiB per token times 4,096 tokens. Grows by exactly one token per step, never shrinks, and is the only part of the working set that scales with context." }
+        - { id: sm, x: 2, y: 1, label: "Tensor cores: 1 token x 7B params", kind: gpu, detail: "14 GFLOP of work against 16.15 GB of traffic: 0.87 FLOP per byte, 340x below the 295 FLOP/byte ridge point. The unit spends the step waiting for memory." }
+        - { id: s, x: 3, y: 1, label: "Sample -> next token", kind: worker, detail: "One row of logits, one draw, then the loop repeats. Nothing about the weights changed between iterations, which is why the same 14 GB moves again." }
+      edges:
+        - { from: w, to: sm, label: "stream 14 GB" }
+        - { from: c, to: sm, label: "stream cache" }
+        - { from: sm, to: s, label: "logits (1, V)" }
+        - { from: s, to: c, label: "append k, v: 512 KiB", style: async }
+      caption: "The arrow that makes it a cache is the dashed one: each step adds 512 KiB and reads gigabytes. Everything else in the diagram is unchanged from the prefill pass."
+
+    - type: pipeline
+      title: "One request: what is computed, and what it costs"
+      nodes:
+        - label: "Tokenise the prompt"
+          note: "n tokens, no GPU work"
+          detail: "The token count, not the character count, is what every number in this topic multiplies."
+        - label: "Prefill: n tokens in one pass"
+          note: "57.34 TFLOP at 4k; 193 ms at 30% MFU"
+          detail: "Compute-bound at 4,096 FLOP/byte. The weights are read once and used n times, which is the definition of a good matmul."
+        - label: "Write K, V for all n positions"
+          note: "2.00 GiB at 4k, 512 KiB per token"
+          detail: "The only time the cache is filled in bulk. Everything after this appends one token's worth."
+        - label: "Sample the first token"
+          note: "TTFT ends here"
+          detail: "193 ms of prefill plus the LM head. This is the number users feel when they hit enter."
+        - label: "Decode step: 1 token"
+          note: "16.15 GB moved, 4.82 ms"
+          detail: "Read the weights, read the cache, one row of output. 0.87 FLOP/byte: the tensor cores are idle and the memory system is saturated."
+        - label: "Append k, v and repeat"
+          note: "512 KiB per step; TPOT"
+          detail: "The cache grows by one token, so the next step is 0.02% slower than this one. After 512 tokens that is a 12% cumulative slowdown, which is why long outputs decay."
+      caption: "Prefill is one expensive parallel step; decode is hundreds of cheap serial ones. At 4k and 512 output tokens, 92.7% of the wall clock is the serial part."
+
+    - type: compare
+      title: "Recompute versus cache, at prompt 4,096 and 512 generated tokens"
+      left_label: "No cache: re-run the model on the prefix"
+      left_points:
+        - "Per-step attention work grows as t^2; total is Theta(m n^2)"
+        - "2,545.6 TFLOP of attention arithmetic for this request"
+        - "511x the cached path's 4.98 TFLOP, and the factor is just m"
+        - "Memory is O(n) and transient: nothing persists between steps"
+        - "Numerically identical output, so no test catches the waste"
+        - "Measured on a toy at n=384, m=32: 1,102 ms against 72 ms"
+      right_label: "Cache: store K, V once and append"
+      right_points:
+        - "Per-step attention work grows as t; total is Theta(n^2 + mn)"
+        - "4.98 TFLOP, of which the prompt's own prefill is 4.3"
+        - "One extra 512 KiB write per token, no extra reads"
+        - "Memory is O(n) and persistent: 2.00 GiB per 4k sequence"
+        - "Agrees with the naive path to 5.22e-16 relative"
+        - "Same toy: 72 ms, i.e. 15.3x faster wall clock"
+
+    - type: plot
+      title: "Cache size against context length, four configurations"
+      chart: line
+      xLabel: "context length (tokens)"
+      yLabel: "KV cache per sequence (GiB)"
+      series:
+        - name: "7B MHA: 32 layers, 32 KV heads (512 KiB/token)"
+          points:
+            - { x: 1024, y: 0.5 }
+            - { x: 4096, y: 2.0 }
+            - { x: 8192, y: 4.0 }
+            - { x: 32768, y: 16.0 }
+            - { x: 131072, y: 64.0 }
+        - name: "70B GQA-8: 80 layers, 8 KV heads (320 KiB/token)"
+          points:
+            - { x: 1024, y: 0.3125 }
+            - { x: 4096, y: 1.25 }
+            - { x: 8192, y: 2.5 }
+            - { x: 32768, y: 10.0 }
+            - { x: 131072, y: 40.0 }
+        - name: "7B GQA-4: 32 layers, 8 KV heads (128 KiB/token)"
+          points:
+            - { x: 1024, y: 0.125 }
+            - { x: 4096, y: 0.5 }
+            - { x: 8192, y: 1.0 }
+            - { x: 32768, y: 4.0 }
+            - { x: 131072, y: 16.0 }
+        - name: "7B MQA: 32 layers, 1 KV head (16 KiB/token)"
+          points:
+            - { x: 1024, y: 0.015625 }
+            - { x: 4096, y: 0.0625 }
+            - { x: 8192, y: 0.125 }
+            - { x: 32768, y: 0.5 }
+            - { x: 131072, y: 2.0 }
+
+    - type: stack
+      title: "Where the cache has to live, and why that is the whole problem"
+      layers:
+        - "Registers and shared memory: 256 KiB per SM, microseconds of latency"
+        - "L2 cache: about 50 MB on an H100"
+        - "HBM: 80 GiB at 3.35 TB/s — the only place a 4k cache fits"
+        - "Host DRAM over PCIe: 64 GB/s, 50x slower than HBM"
+        - "NVMe: 7 GB/s, which turns a decode step into a disk read"
+      reversed: false
+
+  markdown: |
+    ## The cost of forgetting
+
+    A decoder-only transformer has no memory between calls. Ask it for token
+    900 and it will recompute the keys and values for tokens 1 through 899,
+    because nothing in the function signature says it kept them. That is what a
+    naive `model(tokens)` loop does, and it is correct: the 900th token's output
+    depends on all 900 positions, so it recomputes all 900.
+
+    The dependency is real, but it is only on the prefix. Because attention is
+    masked, $x_j$ is a function of $x_{\le j}$ and the weights, so
+    $K_j = x_j W_K^\top$ is fixed the moment position $j$ is processed. It can
+    be stored and reused for the rest of the generation. That is the entire
+    content of the KV cache.
+
+    ## What is in it, and how much
+
+    Each layer stores two tensors — keys and values — with $n_{kv} d_{\text{head}}$
+    numbers per token each. With $b$ bytes per element:
+
+    $$B_{\text{token}} = 2 \cdot L \cdot n_{kv} \cdot d_{\text{head}} \cdot b,
+      \qquad B_{\text{total}} = B_{\text{token}} \cdot n \cdot \text{batch}.$$
+
+    At $L = 32$, $n_{kv} = 32$, $d_{\text{head}} = 128$ and $b = 2$ this is
+    16 KiB per layer per token and 512 KiB per token overall. Four
+    configurations, three context lengths:
+
+    | model | KV width | bytes/token | 4k | 32k | 128k |
+    |---|---|---|---|---|---|
+    | 7B MHA, 32 layers x 32 heads | 4,096 | 512 KiB | 2.00 GiB | 16.0 GiB | 64.0 GiB |
+    | 7B GQA-4, 32 layers x 8 heads | 1,024 | 128 KiB | 0.50 GiB | 4.0 GiB | 16.0 GiB |
+    | 7B MQA, 32 layers x 1 head | 128 | 16 KiB | 0.06 GiB | 0.50 GiB | 2.0 GiB |
+    | 70B GQA-8, 80 layers x 8 heads | 1,024 | 320 KiB | 1.25 GiB | 10.0 GiB | 40.0 GiB |
+
+    Note the last row. The 70B has ten times the parameters and 0.625 times the
+    cache of the first row, because parameters scale as $L d^2$ while the cache
+    scales as $L n_{kv} d_{\text{head}}$. Nothing about "big model, big cache" is
+    true; what matters is how many key/value heads the architecture kept.
+
+    The same formula tells you the serving capacity, once you subtract the
+    weights: 80 GiB card, 13.04 GiB of 7B weights, 66.96 GiB for everything else.
+
+    | configuration | 4k | 32k | 128k |
+    |---|---|---|---|
+    | 7B MHA | 33 | 4 | 1 |
+    | 7B GQA-4 | 133 | 16 | 4 |
+    | 7B MQA | 1,071 | 133 | 33 |
+    | 70B GQA-8, two cards | 23 | 2 | 0 |
+
+    ## Prefill and decode are different machines
+
+    Prefill processes $n$ tokens at once. The weights are read once and used $n$
+    times, so the arithmetic intensity is $2Nn / (Nb) \approx n$: at 4k that is
+    4,096 FLOP/byte, 13.9x above the 295 FLOP/byte ridge point. It is
+    compute-bound, and the cost is $2Nn$ FLOPs — 57.34 TFLOP for a 7B at 4k, or
+    193 ms at 30% MFU.
+
+    Decode processes one token. The weights are read once and used once, and the
+    cache is read in full:
+
+    $$I = \frac{2NB}{Nb + B\,C_{\text{seq}}}
+      = \frac{2N}{Nb/B + C_{\text{seq}}}.$$
+
+    At batch 1 that is $14.0/16.15 = 0.87$ FLOP/byte, 340x below the ridge point,
+    so the step time is $16.15\ \text{GB} / 3.35\ \text{TB/s} = 4.82$ ms and the
+    ceiling is 207 tokens/s. Prefilling the same 4,096 tokens took 193 ms;
+    decoding them one at a time takes 18.4 s. Same weights, same per-token
+    arithmetic, 95x apart.
+
+    The bytes comparison is starkest per generated token. One step at batch 1
+    moves 16.15 GB and adds 512 KiB to the cache: **30,799 bytes of traffic per
+    byte stored**. At batch 32 with GQA-4 the step moves 31.18 GB for 32 tokens —
+    974 MB per generated token, **16.6x** less than batch 1 — because the weight
+    term divided by 32 and the cache term did not divide at all.
+
+    ## The ceiling batching cannot cross
+
+    Batch size is not a free throughput dial. Writing $W = Nb$,
+
+    $$I(B) = \frac{2N}{W/B + C_{\text{seq}}} \;\xrightarrow[B \to \infty]{}\;
+      \frac{2N}{C_{\text{seq}}},$$
+
+    and that limit has no hardware in it. For 7B MHA at 4k it is 6.52 FLOP/byte;
+    at 128k it is 0.20. Measured intensity goes 0.87 at $B=1$, 5.42 at $B=32$,
+    6.20 at $B=128$ — approaching 6.52 and never passing it. Since the ridge
+    point is 295, no batch size makes decode compute-bound at long context.
+
+    $$B^\star = \frac{W}{C_{\text{seq}}} = 6.5 \text{ at 4k},\quad
+      0.81 \text{ at 32k},\quad 0.20 \text{ at 128k}$$
+
+    is the batch at which the cache equals the weights. Past it, more batching
+    buys throughput by spending memory bandwidth on a linear term, and the
+    marginal cost per user stops falling.
+
+    ## What actually helps
+
+    Every real optimisation attacks bytes per token, because that is the only
+    term in the denominator that does not amortise:
+
+    - **GQA** divides the cache by the group count: 512 to 128 KiB, and the 4k
+      ceiling from 6.52 to 26.1.
+    - **Quantising the cache** to int8 halves both the read and the write, at a
+      quality cost that is smaller than quantising the weights.
+    - **Paging** (PagedAttention) does not change bytes, but stops fragmentation
+      from wasting 60-80% of the bytes you paid for.
+    - **Shorter contexts** — sliding windows, summarisation — cut $n$ directly,
+      and $n$ is the only variable the cache is linear in.
+
+    A faster GPU does not help a decode-bound workload at all: the bottleneck is
+    a byte count divided by a bandwidth, and both scale together when you buy the
+    next card.
+
+    ## The longer version
+
+    Because attention is causal, the keys and values of every past token are
+    still exactly right at the next step, so a decoder can store them instead of
+    recomputing them — and that one trade, memory for arithmetic, is what makes
+    autoregressive inference affordable while simultaneously turning it from a
+    compute problem into a memory problem.
+
+    You are taking minutes in a meeting where every new sentence has to be
+    written with the whole conversation in mind. The naive way is to replay the
+    recording from the beginning whenever somebody speaks: you always have
+    perfect context, and the meeting gets quadratically more expensive the longer
+    it runs. The KV cache is the transcript you keep instead — each new line is
+    appended, and to write the next line you re-read the transcript rather than
+    the room.
+
+    The mapping is exact about what is stored: not the words, but the per-layer,
+    per-head key and value vectors that attention actually consumes. And it is
+    exact about why it is legal: because attention is causal, appending a line
+    never changes an earlier one.
+
+    It breaks in three places. A transcript is faithful and readable; the cache
+    is a lossy projection chosen by weights you never inspected, so you cannot
+    reconstruct the conversation from it. A transcript costs the same per line
+    forever; the cache costs 512 KiB per token on a 7B model with 32 KV heads, so
+    a 128k meeting is 64 GiB of minutes. And a transcript can be corrected —
+    cross out a sentence and the rest still stands — while the cache has no edit:
+    change one token in the prefix and every entry after it is invalid, which is
+    why prefix caching only ever matches exact prefixes.
+
+    ### What goes wrong
+
+    - You serve a 7B model on one 80 GiB card and it holds 33 conversations at
+      4k. Product asks for 128k context. The same card now holds one, and
+      nothing in your code changed — the model, the weights and the batch size
+      are all identical.
+    - Your first decoder calls the model on the whole sequence in a loop. It
+      produces exactly the right text and is an order of magnitude slower than
+      the reference implementation. You cannot tell whether that is a bug you
+      can fix or arithmetic you cannot.
+    - You add the cache and the output drifts by 11.8% while staying fluent.
+      No shape error, no exception, no NaN — just a model that is quietly
+      worse, and a diff that shows nothing.
+    - You size VRAM from parameter count, quote "five 7B models per card", and
+      discover the weights were never the binding constraint once the context
+      got long.
+    - You batch 32 requests expecting 32x throughput, get about 6x, and cannot
+      explain the missing factor without knowing which part of the working set
+      amortises and which part does not.
+
+    ### The full treatment
+
+    **The cache is legal because attention is masked, and that is the whole
+    argument.** With a causal mask, $x_j$ is a function of $x_{\le j}$ and the
+    weights alone, so $K_j = x_j W_K^\top$ and $V_j = x_j W_V^\top$ are fixed
+    the moment position $j$ is processed and never need recomputing. Measured:
+    a recompute-everything decoder and a cached decoder agree to a relative
+    difference of **5.22e-16** on a 384-token prompt — float64 round-off, not
+    an approximation. Remove the mask and the claim dies: a bidirectional pass
+    over 901 tokens changes every earlier token's hidden state, so nothing
+    could be reused. This is why encoder models have no equivalent cache.
+
+    **Naive decoding recomputes the prefix, so its total attention work is
+    $\Theta(m n^2)$ instead of $\Theta(n^2 + mn)$.** Prompt 4,096 and generate
+    512: the cached path costs **4.98 TFLOP** of attention arithmetic, the
+    recomputing path **2,545.6 TFLOP** — a ratio of **511x**, which is just
+    $m$. Measured on a toy at $n = 384$, $m = 32$: the multiply-add ratio is
+    **31.9**, i.e. exactly $m$, while wall clock improves only **15x**
+    (about 1.1 s down to 72 ms) because at $d = 256$ each step is
+    launch-bound rather than arithmetic-bound. The trap is concluding the cache is a constant-factor
+    optimisation: the ratio is the number of tokens you generate, so it grows
+    with the output.
+
+    **The cache costs $2 L n_{kv} d_{\text{head}} b$ bytes per token, and
+    $d_{\text{model}}$ is not in the formula.** For a 7B with 32 layers, 32 KV
+    heads, $d_{\text{head}} = 128$ and fp16: $2 \cdot 32 \cdot 32 \cdot 128
+    \cdot 2 = 524{,}288$ bytes = **512 KiB per token**, or 16 KiB per token per
+    layer. At 4k that is **2.00 GiB**, at 32k **16.0 GiB**, at 128k **64.0
+    GiB** — and a $32 \times 2 \times 32 \times 4096 \times 128$ fp16 array
+    allocates exactly 2,147,483,648 bytes, so the formula is checkable against
+    real memory. The trap is computing $2 \cdot 2 \cdot d_{\text{model}} =
+    16$ KiB and stopping: that is the per-layer number, 32x too small, and it
+    is the single most common wrong answer in this topic.
+
+    **Grouped-query attention divides the cache by the group count, and the
+    biggest model can end up with the smaller cache.** 7B with 8 KV heads is
+    **128 KiB per token** (4x smaller); MQA with 1 KV head is **16 KiB** (32x).
+    A 70B with 80 layers and 8 KV heads is **320 KiB per token** — **0.625x the
+    7B MHA cache while carrying 10x the parameters** — because parameters scale
+    as $L d^2$ and the cache scales as $L n_{kv} d_{\text{head}}$. The trap is
+    sizing a cache from parameter count; the two quantities are not even
+    monotone in each other.
+
+    **At 4k the cache is 13.3% of what a decode step moves; at 128k it is
+    83.1%, and the batch at which it overtakes the weights is 6.5.** One 7B
+    MHA step at batch 1 moves **16.15 GB** (14.0 GB of weights plus 2.15 GB of
+    cache), which at 3.35 TB/s is **4.82 ms** and caps throughput at **207
+    tokens/s**. At 128k the same step moves **82.7 GB** for **24.69 ms** and
+    **40.5 tokens/s**. The crossover batch is $B^\star = W / C =
+    \frac{14.0\ \text{GB}}{2.15\ \text{GB}} = 6.5$ at 4k, **0.81** at 32k and
+    **0.20** at 128k — meaning that from 32k up, the cache is the majority of
+    the traffic even for a single user.
+
+    **Prefill is compute-bound at 4,096 FLOP/byte; decode is bandwidth-bound at
+    0.87, and the difference is 4,700x.** Prefilling 4,096 tokens is **57.34
+    TFLOP** against 14 GB of weights read once: **193 ms** at 30% MFU. Decoding
+    those same tokens one at a time is **18.4 s** once the growing cache is
+    counted — **95x** — because each step re-reads all 14 GB to produce one
+    token. Same arithmetic, same weights, different denominator. The trap is
+    profiling a model during prefill and concluding it is fast.
+
+    **Batching cannot fix decode, because the cache sets an asymptote the ridge
+    point is far above.** With $I(B) = 2N/(Nb/B + C)$, intensity rises from
+    **0.87** at $B = 1$ to **5.42** at $B = 32$ and then flattens at
+    $2N/C = \mathbf{6.52}$ FLOP/byte for 7B MHA at 4k — against a 295
+    FLOP/byte ridge point, **45x short**. GQA moves the ceiling to **26.1**,
+    MQA to **208.6**; only MQA gets within one order of magnitude, and still
+    does not cross. The trap is treating batch size as a throughput dial: past
+    $B^\star$ you are buying latency, not efficiency.
+
+    **Serving capacity is a division problem over cache bytes, not over
+    parameters.** One 80 GiB card, 13.04 GiB of 7B weights, 66.96 GiB left:
+    **33** sequences at 4k, **4** at 32k, **1** at 128k for MHA — and "1" means
+    64 GiB of cache with 3 GiB left for activations and the CUDA context, which
+    in practice is zero. GQA gives **133 / 16 / 4**; MQA gives **1071 / 133 /
+    33**. A 70B does not fit on the card at all (130.4 GiB), and on two cards
+    it holds **23 / 2 / 0**. The trap is quoting $80/13 = 6$ "models per card":
+    the weights are paid once, the cache is paid per user.
+
+    **TTFT is prefill and TPOT is decode, and they scale with different
+    variables.** A 4k prompt with 512 generated tokens on 7B MHA is **193 ms**
+    to first token and **4.82 ms** per subsequent token: 2.66 s total, of which
+    **92.7% is decode**. Doubling the prompt roughly doubles TTFT and adds
+    about 13% to TPOT (bytes, not FLOPs); doubling the output length doubles
+    total latency and leaves TPOT unchanged. The trap is optimising prefill for
+    a long-output workload, where it is 7% of the wall clock.
+
+    **A cached token is position-dependent, so appending without offsetting the
+    position is silently wrong.** RoPE encodes absolute angle, so the new
+    query must be rotated at position $n$, not at 0. Measured: getting this
+    wrong leaves every shape valid, the softmax a valid distribution, and the
+    output differing by **11.8% in relative norm** (max absolute 18.8) on the
+    toy model. The second, subtler failure is staleness: the cache is a
+    function of the exact prefix, so any change to an earlier token — a
+    different system prompt, a re-tokenised string — invalidates everything
+    after it.
+
+
+  derivations:
+    - title: "Why the cache turns quadratic work into linear work"
+      latex: |
+        Attention costs $2td$ multiply-adds per token at prefix length $t$ (the
+        score matrix and the value product). Generating $m$ tokens after a prompt
+        of $n$, the cached path computes each new token once:
+
+        $$\text{cached} = 2dL\left[n^2 + \sum_{i=1}^{m}(n+i)\right]
+          = 2dL\left[n^2 + mn + \frac{m(m+1)}{2}\right].$$
+
+        The recomputing path runs a full pass over the prefix for every new
+        token, so it pays $t^2$ at step $t$:
+
+        $$\text{naive} = 2dL\sum_{i=1}^{m}(n+i)^2
+          = 2dL\left[mn^2 + nm(m+1) + \frac{m(m+1)(2m+1)}{6}\right].$$
+
+        For $m \ll n$ the ratio collapses to
+
+        $$\frac{\text{naive}}{\text{cached}} \approx \frac{mn^2}{n^2} = m .$$
+
+        At $n = 4096$, $d = 4096$, $L = 32$, $m = 512$: cached 4.98 TFLOP,
+        naive 2,545.6 TFLOP, ratio 511 — which is $m$ to within the terms the
+        approximation dropped.
+      prose: >-
+        The exponent is the point. With a cache, per-token cost is linear in
+        context and total cost over a generation is quadratic; without one,
+        per-token cost is quadratic and total cost is cubic. The factor you save
+        is the number of tokens you generate, so the cache matters more the
+        longer the output — and it matters least for a one-word answer to a
+        long prompt, which is exactly backwards from the intuition most people
+        start with.
+
+    - title: "The memory formula, and the 7B versus 70B inversion"
+      latex: |
+        Per layer, per token, the cache holds one key vector and one value
+        vector. Each has $n_{kv}$ heads of width $d_{\text{head}}$, so
+
+        $$B_{\text{token}} = \underbrace{2}_{K,\,V} \cdot L \cdot n_{kv} \cdot
+          d_{\text{head}} \cdot b, \qquad
+          B_{\text{total}} = B_{\text{token}} \cdot n \cdot \text{batch}.$$
+
+        The product $n_{kv} d_{\text{head}}$ is the KV width. It equals
+        $d_{\text{model}}$ only in the MHA case $n_{kv} = n_{\text{heads}}$,
+        which is why "2 times the model width" is a rule that silently breaks on
+        every modern model.
+
+        Evaluating at $b = 2$, as two separate displays:
+
+        $$\text{7B MHA:}\quad 2 \cdot 32 \cdot 32 \cdot 128 \cdot 2 = 524{,}288
+          \ \text{bytes/token} = 512\ \text{KiB},$$
+
+        $$\text{70B GQA-8:}\quad 2 \cdot 80 \cdot 8 \cdot 128 \cdot 2 = 327{,}680
+          \ \text{bytes/token} = 320\ \text{KiB}.$$
+
+        The ratio between them is
+
+        $$\frac{B^{\text{70B}}}{B^{\text{7B}}} = \frac{80}{32} \cdot \frac{8}{32}
+          = 2.5 \cdot 0.25 = 0.625,$$
+
+        while the parameter ratio is $\frac{70}{7} = 10$. The cache scales with
+        $L n_{kv} d_{\text{head}}$; the parameters scale with $L d_{\text{model}}^2$.
+      prose: >-
+        Two knobs, two different scalings, and no monotone relationship between
+        them. A model can be ten times larger and hold less state per token,
+        because what it stores per token is not the representation — it is the
+        part of the representation that heads chose to write into keys and
+        values. That is exactly the lever GQA pulls, and it is why the memory
+        conversation in inference is about head counts rather than about
+        parameter counts.
+
+    - title: "The decode ceiling, and why batching has an asymptote"
+      latex: |
+        One step at batch $B$ reads the weights once and the cache $B$ times:
+
+        $$B_{\text{step}} = \underbrace{N b}_{\text{weights}} +
+          \underbrace{B \cdot C_{\text{seq}}}_{\text{cache}},
+          \qquad F_{\text{step}} = 2 N B,$$
+
+        so the intensity is
+
+        $$I(B) = \frac{2NB}{Nb + B C_{\text{seq}}}
+          = \frac{2N}{Nb/B + C_{\text{seq}}}.$$
+
+        The weight term is divided by $B$; the cache term is not. Hence
+
+        $$\lim_{B \to \infty} I(B) = \frac{2N}{C_{\text{seq}}}
+          = \frac{2N}{B_{\text{token}} n},$$
+
+        which contains no GPU, no batch size and no bandwidth. For 7B MHA at
+        4k, $C_{\text{seq}} = 2.15$ GB and the ceiling is 6.52 FLOP/byte. The
+        ridge point is $P/\text{BW} = 989/3.35 = 295$, so the decode path would need
+        $C_{\text{seq}} < 2N/295 = 47.5$ MB per sequence to become compute-bound
+        — at 4k that is 11,587 bytes per token, i.e. fewer than 0.71 KV heads per
+        layer. No real configuration gets there:
+
+        $$\text{MHA } 6.52,\qquad \text{GQA-4 } 26.1,\qquad
+          \text{MQA } 208.6 \quad(\text{all at } 4\text{k}).$$
+
+        Step time follows from the same count,
+        $t_{\text{step}} = B_{\text{step}} / \text{BW}$: 4.82 ms at $B=1$ and
+        4k, 24.69 ms at $B=1$ and 128k.
+      prose: >-
+        This is the arithmetic behind "inference is memory-bound". Batching is
+        the right first move because it divides the weight term by $B$, and it
+        is the wrong only move because the cache term is already linear in $B$.
+        The asymptote tells you where the returns stop, and the fact that it is
+        expressed in bytes per token — not in FLOPs — tells you what to attack
+        next: fewer KV heads, fewer bytes per element, or fewer tokens.
+
+  implementations:
+    - language: python
+      title: "Sizing the cache, checked against a real allocation"
+      note: >-
+        Correct, and deliberately checkable: it allocates an actual fp16 array of
+        shape (layers, 2, kv heads, sequence, head dim) and prints its byte count
+        next to the formula's prediction, which agrees to the byte at
+        2,147,483,648. Then it prints the four-configuration table and the
+        capacity table for one 80 GiB card. The `free` column is negative for the
+        70B because 130.4 GiB of fp16 weights do not fit on one card at all —
+        that is not a bug in the arithmetic, it is the answer, and it is why the
+        capacity column reads zero. Everything here assumes the cache is the only
+        thing besides weights in HBM, which is optimistic: activations, the CUDA
+        context and fragmentation all take a cut, so treat `max_sequences` as an
+        upper bound.
+      code: |
+        import numpy as np
+
+        GIB = 1024 ** 3
+        CARD = 80 * GIB                      # one H100, in bytes
+
+        def kv_bytes(n_layer, n_kv_head, head_dim, seq, batch=1, b=2):
+            return 2 * n_layer * n_kv_head * head_dim * b * seq * batch
+
+        CONFIGS = {
+            "7B  MHA   L32 kv32": (32, 32, 128, 7.0e9),
+            "7B  GQA-4 L32 kv8 ": (32, 8, 128, 7.0e9),
+            "7B  MQA   L32 kv1 ": (32, 1, 128, 7.0e9),
+            "70B GQA-8 L80 kv8 ": (80, 8, 128, 70.0e9),
+        }
+
+        # 1. Does the formula match an allocation you can actually make?
+        c = np.zeros((32, 2, 32, 4096, 128), dtype=np.float16)
+        print("allocated %d bytes  formula %d" % (c.nbytes, kv_bytes(32, 32, 128, 4096)))
+        del c
+
+        # 2. Bytes per token, then the same cache at three context lengths.
+        for name, (L, nkv, dh, N) in CONFIGS.items():
+            per_tok = 2 * L * nkv * dh * 2
+            row = "".join("  %3dk %7.2f" % (n // 1024, kv_bytes(L, nkv, dh, n) / GIB)
+                          for n in (4096, 32768, 131072))
+            print("%s %6.0f KiB/tok%s" % (name, per_tok / 1024, row))
+
+        # 3. Capacity, with the weights paid for first.
+        for name, (L, nkv, dh, N) in CONFIGS.items():
+            w = N * 2
+            free = CARD - w
+            row = "".join("  %3dk:%4d" % (n // 1024, max(0, int(free // kv_bytes(L, nkv, dh, n))))
+                          for n in (4096, 32768, 131072))
+            print("%s weights %6.1f GiB  free %6.1f GiB%s" % (name, w / GIB, free / GIB, row))
+
+        # allocated 2147483648 bytes  formula 2147483648
+        # 7B  MHA   L32 kv32    512 KiB/tok    4k    2.00   32k   16.00  128k   64.00
+        # 7B  GQA-4 L32 kv8     128 KiB/tok    4k    0.50   32k    4.00  128k   16.00
+        # 7B  MQA   L32 kv1      16 KiB/tok    4k    0.06   32k    0.50  128k    2.00
+        # 70B GQA-8 L80 kv8     320 KiB/tok    4k    1.25   32k   10.00  128k   40.00
+        # 7B  MHA   L32 kv32 weights   13.0 GiB  free   67.0 GiB    4k:  33   32k:   4  128k:   1
+        # 7B  GQA-4 L32 kv8  weights   13.0 GiB  free   67.0 GiB    4k: 133   32k:  16  128k:   4
+        # 7B  MQA   L32 kv1  weights   13.0 GiB  free   67.0 GiB    4k:1071   32k: 133  128k:  33
+        # 70B GQA-8 L80 kv8  weights  130.4 GiB  free  -50.4 GiB    4k:   0   32k:   0  128k:   0
+
+    - language: python
+      title: "Recompute, cache, and the position bug that survives every shape check"
+      note: >-
+        `decode` is correct and `prefill`/`decode` together match the
+        recomputing path to **5.22e-16 relative** — the cache is an exact
+        transformation, not an approximation. It is also faster: about 1.1 s
+        against 72 ms for a 384-token prompt and 32 generated tokens, 15x, while
+        the multiply-add count falls 31.9x (from 5,109,936 to 160,240). Wall clock
+        trails the arithmetic because at $d = 256$ and one token per step the
+        kernel is launch-bound, which is itself the lesson: at small sizes
+        overhead dominates, at 7B scale bandwidth does.
+        The last function is **numerically WRONG**: `bad_decode` rotates each new
+        query at position 0 instead of at its real position. RoPE encodes
+        absolute angle, so the query meets cached keys at the wrong relative
+        offset. Nothing raises, every shape is valid, the softmax is still a
+        distribution — and the output differs from the correct one by **11.8% in
+        relative norm** (max absolute 18.8). If your cache "works" but quality
+        dropped, this is the first thing to check, and the second is whether the
+        cached keys were written before or after the rotation.
+      code: |
+        import numpy as np, time
+
+        d, L, H, DH = 256, 4, 4, 64
+        EPS = 1e-5
+
+        def ln(x, g, b):
+            mu, var = x.mean(-1, keepdims=True), x.var(-1, keepdims=True)
+            return g * (x - mu) / np.sqrt(var + EPS) + b
+
+        def softmax(z):
+            z = z - z.max(-1, keepdims=True)
+            e = np.exp(z)
+            return e / e.sum(-1, keepdims=True)
+
+        def rope(x, pos):                       # rotate half-split pairs by absolute position
+            half = x.shape[-1] // 2
+            ang = pos * 10000.0 ** (-np.arange(half) / half)
+            c, s = np.cos(ang), np.sin(ang)
+            a, b = x[..., :half], x[..., half:]
+            return np.concatenate([a * c - b * s, a * s + b * c], axis=-1)
+
+        def split(A, n):
+            return A.reshape(n, H, DH).transpose(1, 0, 2)
+
+        def merge(A, n):
+            return A.transpose(1, 0, 2).reshape(n, d)
+
+        def init(seed=0):
+            r, s = np.random.default_rng(seed), 1.0 / np.sqrt(d)
+            return [dict({k: r.standard_normal((d, d)) * s for k in ("q", "k", "v", "o")},
+                         W1=r.standard_normal((4 * d, d)) * s,
+                         W2=r.standard_normal((d, 4 * d)) / np.sqrt(4 * d)) for _ in range(L)]
+
+        def block(p, x, n, past, pos0):
+            h = ln(x, np.ones(d), np.zeros(d))
+            Q, K, V = (split(h @ p[w].T, n) for w in "qkv")
+            pos = np.arange(pos0, pos0 + n)[None, :, None]
+            Q, K = rope(Q, pos), rope(K, pos)
+            if past is not None:                       # <-- the whole cache, in two lines
+                K = np.concatenate([past[0], K], axis=1)
+                V = np.concatenate([past[1], V], axis=1)
+            S = Q @ K.transpose(0, 2, 1) / np.sqrt(DH)
+            if n > 1:
+                keep = np.arange(n)[:, None] + (K.shape[1] - n) >= np.arange(K.shape[1])[None, :]
+                S = np.where(keep, S, -np.inf)
+            x = x + merge(softmax(S) @ V, n) @ p["o"].T
+            h2 = ln(x, np.ones(d), np.zeros(d))
+            return x + np.maximum(h2 @ p["W1"].T, 0) @ p["W2"].T, (K, V)
+
+        def prefill(X, Ps):
+            x, caches = X, []
+            for p in Ps:
+                x, kv = block(p, x, len(X), None, 0)
+                caches.append(kv)
+            return x[-1], caches
+
+        def decode(x1, caches, Ps, pos):
+            new = []
+            for p, kv in zip(Ps, caches):
+                h, kv = block(p, x1[None, :], 1, kv, pos)
+                x1 = h[0]
+                new.append(kv)
+            return x1, new
+
+        N, M = 384, 32
+        X = np.random.default_rng(1).standard_normal((N, d))
+        P = init()
+
+        t = time.perf_counter()
+        seq, naive = X.copy(), []
+        for _ in range(M):
+            naive.append(prefill(seq, P)[0])            # recompute the whole prefix
+            seq = np.vstack([seq, naive[-1][None, :]])
+        t_naive = time.perf_counter() - t
+
+        t = time.perf_counter()
+        out, caches = prefill(X, P)
+        cached = [out]
+        for i in range(M):
+            out, caches = decode(out, caches, P, N + i)
+            cached.append(out)
+        t_cached = time.perf_counter() - t
+
+        a, b = np.array(naive), np.array(cached[:-1])
+        print("naive vs cached: rel %.2e   (%.0f ms vs %.0f ms)" %
+              (np.linalg.norm(a - b) / np.linalg.norm(a), t_naive * 1e3, t_cached * 1e3))
+
+        # WRONG: every new token is rotated at position 0 instead of its real position.
+        out, caches = prefill(X, P)
+        bad = [out]
+        for _ in range(M):
+            out, caches = decode(out, caches, P, 0)     # <-- pos should be N + i
+            bad.append(out)
+        c = np.array(bad[:-1])
+        print("wrong positions: rel %.3f  max abs %.2f" %
+              (np.linalg.norm(c - b) / np.linalg.norm(b), np.abs(c - b).max()))
+
+        naive_macs = sum((N + i) ** 2 for i in range(M))
+        cached_macs = N ** 2 + sum(N + i for i in range(M))
+        print("attention MACs %d vs %d  ratio %.1f" % (naive_macs, cached_macs, naive_macs / cached_macs))
+        print("cache bytes %d == formula %d" % (sum(k.nbytes + v.nbytes for k, v in caches),
+                                                2 * L * H * DH * (N + M) * 8))
+
+        # naive vs cached: rel 5.22e-16   (~1.1 s vs ~72 ms on a laptop)
+        # wrong positions: rel 0.118  max abs 18.82
+        # attention MACs 5109936 vs 160240  ratio 31.9
+        # cache bytes 6815744 == formula 6815744
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        Token 900's key vector was computed during prefill, 900 steps ago. Why is
+        it still the right key to use now, and what would break the argument?
+      answerKind: short_text
+      hint: >-
+        Write down what $K_{900}$ is a function of. Then ask what a bidirectional
+        attention mask would add to that list.
+      solution: >-
+        $K_j = x_j W_K^\top$, and with a causal mask $x_j$ depends only on
+        $x_{\le j}$ and the weights — never on any later token. So as the
+        sequence grows, $K_j$ does not change, and recomputing it is pure waste.
+        Two things break the argument. A bidirectional mask: then $x_j$ depends
+        on every token in the sequence, including ones not yet generated, so no
+        earlier state survives a new token and there is nothing to cache — which
+        is why encoder models have no equivalent. And any change to an earlier
+        token: re-tokenise the prompt, change the system message, and every cache
+        entry from that position onward is stale, because it was computed from a
+        prefix that no longer exists.
+    - id: cp-2
+      question: >-
+        A 70B model with 80 layers and 8 KV heads uses 320 KiB per token. A 7B
+        with 32 layers and 32 KV heads uses 512 KiB. Explain the inversion in one
+        paragraph, without looking at the formula.
+      answerKind: short_text
+      hint: >-
+        Which two widths does each quantity multiply? Parameters use the model
+        width; the cache uses the key/value width.
+      solution: >-
+        The cache is $2 L n_{kv} d_{\text{head}} b$; parameters are roughly
+        $12 L d_{\text{model}}^2$. The 70B has 2.5x the layers but one quarter the
+        KV heads, and the two effects multiply to 0.625, so its per-token cache
+        is smaller despite 10x the parameters. The parameters are large because
+        $d_{\text{model}}$ is large (8192), and the cache does not contain
+        $d_{\text{model}}$ at all — it contains $n_{kv} d_{\text{head}} = 1024$
+        numbers per token per layer, which is one eighth of the model width.
+        GQA is precisely the decision to make that ratio small, and it is why the
+        memory profile of a model is not predictable from its parameter count.
+    - id: cp-3
+      question: >-
+        7B GQA-4 at 4k context, batch 32. What fraction of the bytes a step moves
+        is the cache, what is the arithmetic intensity, and how far is that from
+        the ridge point?
+      answerKind: short_text
+      hint: >-
+        Weights are read once per step regardless of batch; the cache is read
+        once per sequence. Compute both, then divide 14 GFLOP by the total.
+      solution: >-
+        Weights: $7\text{e}9 \times 2 = 14.0$ GB, read once. Cache: 128 KiB per
+        token times 4,096 tokens times 32 sequences = 0.537 GB per sequence times
+        32 = 17.18 GB. Total 31.18 GB, of which the cache is 55.1%. FLOPs are
+        $2 \cdot 7\text{e}9 \cdot 32 = 448$ GFLOP, so the intensity is
+        $448/31.18 = 14.37$ FLOP/byte — 0.049x the 295 ridge point, i.e. 20.5x
+        below it. Note what the batch bought: intensity rose from 0.96 at batch 1
+        to 14.37 at batch 32, a factor of 15 from a factor of 32 in batch, because
+        the cache term grew with the batch and the weight term did not.
+    - id: cp-4
+      question: >-
+        Your cached decoder agrees with a naive one to 5e-16 on a 384-token test
+        and drifts 11.8% in production. Name the two most likely causes and say
+        how you would tell them apart.
+      answerKind: short_text
+      hint: >-
+        One cause is in how a new token is positioned; the other is in what the
+        cache is assumed to be a function of. They fail on different inputs.
+      solution: >-
+        First, position handling: if the query is rotated (or the positional
+        encoding added) at position 0 for each new token instead of at its
+        absolute position, every score is computed at the wrong relative offset.
+        Shapes stay valid and the softmax stays normalised, so only a comparison
+        catches it — and only when the sequence is long enough for the angle error
+        to matter, which is why a short test passes. Second, staleness: the cache
+        is a function of an exact token prefix, so a changed system prompt, a
+        re-tokenised string, or a cache entry reused across requests with
+        different prefixes produces confident nonsense from a valid-looking
+        buffer. Tell them apart by feeding the same prompt through a fresh cache
+        and the shared one: if the divergence appears only with the shared cache,
+        it is staleness; if it appears with a fresh cache and grows with position,
+        it is the offset.
+    - id: cp-5
+      question: >-
+        Batching divides the weight term by B and leaves the cache term alone, so
+        intensity rises and then flattens. Write the limit, evaluate it for 7B
+        MHA at 4k, and say what it implies about buying a faster GPU.
+      answerKind: short_text
+      hint: >-
+        Take the limit of $2N/(Nb/B + C)$ as B grows. Then compare it with
+        295 FLOP/byte.
+      solution: >-
+        $I \to 2N/C_{\text{seq}} = 14.0\ \text{GFLOP} / 2.15\ \text{GB} = 6.52$
+        FLOP/byte at 4k for 7B MHA, and 0.20 at 128k. The ridge point is 295, so
+        the ceiling is 45x below it at 4k and 1,448x below at 128k: no batch size
+        makes decode compute-bound. A faster GPU raises both $P$ and BW, so the
+        ridge point moves little and the intensity — which is a ratio of FLOPs to
+        bytes, both model properties — does not move at all. Decode time is bytes
+        divided by bandwidth, so the only things that help are fewer bytes
+        (GQA/MQA, quantisation) or fewer tokens (shorter context). Buying the
+        next card buys bandwidth linearly and nothing else.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        The cache is not an optimisation of the model; it is a consequence of the
+        model being causal. Every token's key and value, once computed, is a
+        permanent fact about the prefix, so a decoder can either store it or
+        recompute it, and recomputing costs you the whole prefix every step.
+
+        Two quantities then decide everything downstream. How many bytes one
+        token of cache costs — which depends on layers and key/value heads, not on
+        how big the model is — and how many bytes one decode step must move,
+        which is the weights plus the cache. Capacity is the first number
+        divided into free memory; speed is the second divided by bandwidth.
+      blocks:
+        - kind: checklist
+          body: |
+            - Causality is what makes reuse legal
+            - The cache is per layer, per KV head, per token, times two for K and V
+            - Cache bytes scale with KV width; parameters scale with model width
+            - A decode step reads all the weights plus the whole cache
+            - Prefill reuses the weights across tokens; decode does not
+            - Capacity = free memory divided by cache bytes per sequence
+      checkpoint: >-
+        Before going on: if you doubled the model width and kept the head count
+        and head dimension fixed, which of the two numbers would change — bytes
+        per token, or bytes per step? Think about which one has the model width
+        in it at all.
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Count bytes, not parameters. Every question in this topic reduces to two
+        multiplications and one division, and the commonest error is using the
+        wrong width in the first one.
+
+        For the cache, the width that matters is $n_{kv} d_{\text{head}}$ — the
+        key/value width — not $d_{\text{model}}$. For the step, remember that
+        the weights are read once per step no matter how many sequences are in
+        the batch, while the cache is read once per sequence. For capacity,
+        subtract the weights first and then divide; the weights are a fixed cost,
+        the cache is a per-user cost.
+      blocks:
+        - kind: checklist
+          body: |
+            - Per token per layer: two vectors, each n_kv * d_head numbers
+            - Multiply by layers, then by tokens, then by batch, then by bytes
+            - Weights are N * bytes_per_element, read once per step
+            - Cache is per sequence, so it multiplies by batch
+            - Free memory is card size minus weights, not card size
+            - A 70B at fp16 does not fit on one 80 GiB card at all
+      checkpoint: >-
+        Which of these quantities would change if you halved the number of KV
+        heads and doubled the number of layers — bytes per token, or parameters?
+        Work out the ratio before you trust an intuition about it.
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Write the accounting before the code. Three functions: bytes per token,
+        bytes per step, and sequences per card. Every reported number in this
+        topic is one of those three.
+      blocks:
+        - kind: pseudocode
+          body: |
+            bytes_per_token(layers, kv_heads, head_dim, b):
+                return 2 * layers * kv_heads * head_dim * b
+
+            cache_bytes(layers, kv_heads, head_dim, seq, batch, b):
+                return bytes_per_token(...) * seq * batch
+
+            step_bytes(params, layers, kv_heads, head_dim, seq, batch, b):
+                weights = params * b            # once, not per sequence
+                cache   = cache_bytes(...)
+                return weights + cache
+
+            max_sequences(card, params, b, seq, ...):
+                free = card - params * b
+                return floor(free / cache_bytes(..., batch=1))
+
+            # and the two derived ratios
+            intensity = 2 * params * batch / step_bytes(...)
+            crossover_batch = weights / cache_bytes(..., batch=1)
+      checkpoint: >-
+        In that pseudocode, `step_bytes` does not multiply `weights` by `batch`,
+        but it does multiply `cache` by it. What would you conclude about a
+        batching strategy that ignored the distinction — and at what batch does
+        the error exceed a factor of two?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Two formulas, evaluated. Take the model first, then the machine.
+      blocks:
+        - kind: math
+          body: |
+            Cache per token, per layer, is $2 n_{kv} d_{\text{head}} b$ — two
+            vectors (K and V), each with the key/value width. Over the stack and
+            the sequence:
+
+            $$B_{\text{token}} = 2 L n_{kv} d_{\text{head}} b, \qquad
+              B_{\text{total}} = B_{\text{token}} \, n \, \text{batch}.$$
+
+            For 7B MHA ($L = 32$, $n_{kv} = 32$, $d_{\text{head}} = 128$,
+            $b = 2$): $2 \cdot 32 \cdot 32 \cdot 128 \cdot 2 = 524{,}288$ B per
+            token, so 2.00 GiB at 4k, 16.0 GiB at 32k, 64.0 GiB at 128k.
+            For 70B GQA-8 ($L = 80$, $n_{kv} = 8$): 327,680 B per token, so
+            1.25 / 10.0 / 40.0 GiB.
+
+            Step bytes and intensity:
+
+            $$B_{\text{step}} = N b + B \cdot B_{\text{token}} n, \qquad
+              I(B) = \frac{2 N B}{N b + B \cdot B_{\text{token}} n}
+              = \frac{2N}{Nb/B + C}.$$
+
+            At $B = 1$, 4k, 7B MHA: $14.0 + 2.15 = 16.15$ GB, so
+            $t = 16.15/3.35\text{e}3 = 4.82$ ms and $I = 14/16.15 = 0.87$
+            FLOP/byte. Against a ridge point of $989/3.35 \approx 295$, that is
+            340x below.
+
+            Capacity: $80 - 13.04 = 66.96$ GiB free, so
+            $\lfloor 66.96 / 2.00 \rfloor = 33$ sequences at 4k, 4 at 32k, 1 at
+            128k — and 133 / 16 / 4 with GQA-4.
+      checkpoint: >-
+        The a-priori estimate for a decode step is "read the weights", which at
+        batch 1 is 4.18 ms for a 7B. The full answer at 4k is 4.82 ms. Where does
+        the extra 0.64 ms come from, and at what context does it exceed the
+        weights' own read time?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The whole topic is four lines of arithmetic and one inequality. Here they
+        are, with the numbers filled in, plus the diagnostics that tell you
+        whether a real deployment matches the estimate.
+      blocks:
+        - kind: warning
+          body: >-
+            Two estimates are optimistic and both are common. Treating the card
+            as fully available ignores activations, the CUDA context and
+            fragmentation — plan on 90% of free memory, and know that
+            PagedAttention exists because fragmentation alone used to waste
+            60-80% of the cache budget. And treating "80 GB" as 80e9 bytes rather
+            than 80 GiB makes every capacity number 7% too high; the vendor's
+            80 GB is 85.9e9 bytes of addressable memory.
+        - kind: code
+          language: python
+          body: |
+            GIB = 2 ** 30
+
+            def bytes_per_token(L, n_kv, d_head, b=2):
+                return 2 * L * n_kv * d_head * b
+
+            def step_bytes(params, L, n_kv, d_head, seq, batch=1, b=2):
+                weights = params * b                       # once per step
+                cache = bytes_per_token(L, n_kv, d_head, b) * seq * batch
+                return weights + cache
+
+            def sequences_per_card(card, params, L, n_kv, d_head, seq, b=2):
+                free = card - params * b
+                per_seq = bytes_per_token(L, n_kv, d_head, b) * seq
+                return max(0, int(free // per_seq)) if free > 0 else 0
+
+            def intensity(params, L, n_kv, d_head, seq, batch=1, b=2):
+                return (2 * params * batch) / step_bytes(params, L, n_kv, d_head, seq, batch, b)
+
+            P7, CARD = 7.0e9, 80 * GIB
+            for n in (4096, 32768, 131072):
+                print(n, "MHA seqs", sequences_per_card(CARD, P7, 32, 32, 128, n),
+                      "GQA seqs", sequences_per_card(CARD, P7, 32, 8, 128, n),
+                      "I(1) %.2f" % intensity(P7, 32, 32, 128, n),
+                      "I(32) %.2f" % intensity(P7, 32, 32, 128, n, 32),
+                      "ceiling %.2f" % (2 * P7 / (bytes_per_token(32, 32, 128) * n)))
+        - kind: checklist
+          body: |
+            - 512 KiB per token, 2.00 GiB per 4k sequence, 64.0 GiB per 128k sequence (7B MHA)
+            - 320 KiB per token for the 70B GQA-8 — ten times the parameters, 0.625 times the cache
+            - 16.15 GB moved per decode step at 4k, batch 1: 4.82 ms, 207 tokens/s
+            - 0.87 FLOP/byte at batch 1, 6.52 at infinite batch, 295 at ridge: never compute-bound
+            - 33 / 4 / 1 sequences at 4k / 32k / 128k on one 80 GiB card, MHA
+            - The one number to remember: bytes per token decides capacity, bytes per step decides speed
+      checkpoint: >-
+        `intensity` returns 0.87 at batch 1 and 6.52 at batch 10,000 for the same
+        4k sequence. What is the limit algebraically, and why is it the same
+        number you get by asking "what if the weights were free"?
+
+  problems:
+    - id: p-kv-footprint
+      title: "Size the cache and the card"
+      difficulty: easy
+      prompt: >-
+        Implement `kv_footprint(n_layer, n_kv_head, head_dim, seq, batch=1,
+        dtype_bytes=2, n_param=0)` returning the cache footprint of a
+        decoder-only model.
+
+        The returned dict must have exactly the keys `bytes_per_token`,
+        `bytes_per_sequence`, `total_bytes` and `total_gib`, plus, when
+        `n_param` is non-zero, `weight_gib`, `cache_over_weights` and
+        `max_sequences_80gb`.
+
+        Use the key/value formula: two vectors (K and V) of width
+        `n_kv_head * head_dim` per layer per token, `dtype_bytes` bytes per
+        element. `bytes_per_sequence` is `bytes_per_token * seq`;
+        `total_bytes` multiplies that by `batch`. `total_gib` is `total_bytes`
+        divided by `2**30`. `weight_gib` is `n_param * dtype_bytes / 2**30` and
+        `cache_over_weights` is `total_bytes / (n_param * dtype_bytes)`.
+        `max_sequences_80gb` is how many sequences of this length fit on an
+        80 GiB card once the weights are resident: floor of free bytes divided
+        by `bytes_per_sequence`, clamped at zero when the weights do not fit.
+        Note the unit: the card is 80 GiB, which is 85.9e9 bytes, not 80e9.
+      starter: |
+        def kv_footprint(n_layer, n_kv_head, head_dim, seq, batch=1, dtype_bytes=2, n_param=0):
+            # your implementation here
+            pass
+      language: python
+      entry: kv_footprint
+      testCases:
+        - input: '[32, 32, 128, 4096, 1, 2, 7000000000]'
+          expected: '{"bytes_per_token": 524288, "bytes_per_sequence": 2147483648, "total_bytes": 2147483648, "total_gib": 2.0, "weight_gib": 13.0385160446167, "cache_over_weights": 0.15339168914285714, "max_sequences_80gb": 33}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[32, 8, 128, 131072, 1, 2, 7000000000]'
+          expected: '{"bytes_per_token": 131072, "bytes_per_sequence": 17179869184, "total_bytes": 17179869184, "total_gib": 16.0, "weight_gib": 13.0385160446167, "cache_over_weights": 1.2271335131428571, "max_sequences_80gb": 4}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[80, 8, 128, 32768, 8, 2, 70000000000]'
+          expected: '{"bytes_per_token": 327680, "bytes_per_sequence": 10737418240, "total_bytes": 85899345920, "total_gib": 80.0, "weight_gib": 130.385160446167, "cache_over_weights": 0.6135667565714286, "max_sequences_80gb": 0}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[32, 32, 128, 131072, 1, 1, 7000000000]'
+          expected: '{"bytes_per_token": 262144, "bytes_per_sequence": 34359738368, "total_bytes": 34359738368, "total_gib": 32.0, "weight_gib": 6.51925802230835, "cache_over_weights": 4.9085340525714285, "max_sequences_80gb": 2}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[12, 12, 64, 2048, 1, 2, 124000000]'
+          expected: '{"bytes_per_token": 36864, "bytes_per_sequence": 75497472, "total_bytes": 75497472, "total_gib": 0.0703125, "weight_gib": 0.23096799850463867, "cache_over_weights": 0.30442529032258064, "max_sequences_80gb": 1134}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[32, 1, 128, 4096, 64, 2, 7000000000]'
+          expected: '{"bytes_per_token": 16384, "bytes_per_sequence": 67108864, "total_bytes": 4294967296, "total_gib": 4.0, "weight_gib": 13.0385160446167, "cache_over_weights": 0.3067833782857143, "max_sequences_80gb": 1071}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def kv_footprint(n_layer, n_kv_head, head_dim, seq, batch=1, dtype_bytes=2, n_param=0):
+            gib = 2 ** 30
+            per_token = 2 * n_layer * n_kv_head * head_dim * dtype_bytes
+            per_seq = per_token * seq
+            total = per_seq * batch
+            out = {"bytes_per_token": per_token,
+                   "bytes_per_sequence": per_seq,
+                   "total_bytes": total,
+                   "total_gib": total / gib}
+            if n_param:
+                w = n_param * dtype_bytes
+                out["weight_gib"] = w / gib
+                out["cache_over_weights"] = total / w
+                out["max_sequences_80gb"] = max(0, int((80 * gib - w) // per_seq))
+            return out
+      solutionExplanation: >-
+        The first two cases are the same architecture at 4k and at 128k: bytes
+        per token is identical at 524,288, and only the multiplier changes, which
+        is the whole reason long context is a memory problem rather than a
+        compute one. The second case is also the one that shows GQA working —
+        131,072 bytes is exactly a quarter of 524,288, because 8 KV heads is a
+        quarter of 32. The third case is the inversion: a 70B uses 327,680 bytes
+        per token, 0.625 of the 7B's, and its 130.4 GiB of fp16 weights make free
+        memory negative so the answer is zero — the model does not fit on the
+        card, let alone the cache. The fourth case halves `dtype_bytes` to int8
+        and lands at exactly half the fp16 bytes per token while `weight_gib`
+        falls to 6.52, which lets two 128k sequences fit. The fifth is a small
+        12-layer model: 72 MiB of cache, 0.30 of the weights, 1,134 sequences of
+        headroom. The sixth is MQA with a batch of 64, where 4 GiB of cache costs
+        0.31 of the weights and 1,071 sequences fit. If your first case returns
+        16,384, you computed the per-layer value and forgot the 32 layers.
+      complexity: "O(1) time and space"
+      tags: [kv-cache, memory, gqa, capacity-planning]
+
+    - id: p-decode-roofline
+      title: "The decode step on a roofline"
+      difficulty: medium
+      prompt: >-
+        Implement `decode_step(n_param, n_layer, n_kv_head, head_dim, seq,
+        batch=1, dtype_bytes=2, bandwidth=3.35e12, peak=989e12)` returning a
+        dict with exactly the keys `bytes`, `flops`, `cache_share`, `ms`,
+        `tok_s`, `intensity` and `ridge_ratio`.
+
+        A decode step reads the weights once and the cache once per sequence, so
+        `bytes = n_param * dtype_bytes + cache_per_token * seq * batch`, where
+        `cache_per_token` is the usual 2 x layers x kv heads x head dim x bytes.
+        `flops` is `2 * n_param * batch` — two floating-point operations per
+        parameter per token per sequence. `cache_share` is the cache's share of
+        `bytes`. `ms` is `bytes / bandwidth * 1e3`. `tok_s` is aggregate
+        throughput, `batch / (bytes / bandwidth)`. `intensity` is `flops / bytes`
+        and `ridge_ratio` is that divided by `peak / bandwidth`.
+      starter: |
+        def decode_step(n_param, n_layer, n_kv_head, head_dim, seq, batch=1,
+                        dtype_bytes=2, bandwidth=3.35e12, peak=989e12):
+            # your implementation here
+            pass
+      language: python
+      entry: decode_step
+      testCases:
+        - input: '[7000000000, 32, 32, 128, 4096, 1]'
+          expected: '{"bytes": 16147483648, "flops": 14000000000, "cache_share": 0.1329918453434064, "ms": 4.820144372537314, "tok_s": 207.46266557854202, "intensity": 0.8670081546565935, "ridge_ratio": 0.0029367819192109086}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[7000000000, 32, 8, 128, 4096, 32]'
+          expected: '{"bytes": 31179869184, "flops": 448000000000, "cache_share": 0.5509923432525456, "ms": 9.307423637014926, "tok_s": 3438.1157716662215, "intensity": 14.368245015918538, "ridge_ratio": 0.04866897957869273}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[7000000000, 32, 32, 128, 131072, 1]'
+          expected: '{"bytes": 82719476736, "flops": 14000000000, "cache_share": 0.8307532814226917, "ms": 24.69238111522388, "tok_s": 40.4983219452845, "intensity": 0.16924671857730839, "ridge_ratio": 0.0005732826160100942}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[70000000000, 80, 8, 128, 4096, 8]'
+          expected: '{"bytes": 150737418240, "flops": 1120000000000, "cache_share": 0.07123260014248205, "ms": 44.996244250746265, "tok_s": 177.79261654415345, "intensity": 7.430139198860144, "ridge_ratio": 0.025167812250941845}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[7000000000, 32, 8, 128, 32768, 4]'
+          expected: '{"bytes": 31179869184, "flops": 56000000000, "cache_share": 0.5509923432525456, "ms": 9.307423637014926, "tok_s": 429.7644714582777, "intensity": 1.7960306269898172, "ridge_ratio": 0.006083622447336591}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def decode_step(n_param, n_layer, n_kv_head, head_dim, seq, batch=1,
+                        dtype_bytes=2, bandwidth=3.35e12, peak=989e12):
+            cache_per_token = 2 * n_layer * n_kv_head * head_dim * dtype_bytes
+            weights = n_param * dtype_bytes
+            cache = cache_per_token * seq * batch
+            total = weights + cache
+            flops = 2 * n_param * batch
+            step_s = total / bandwidth
+            intensity = flops / total
+            return {"bytes": total,
+                    "flops": flops,
+                    "cache_share": cache / total,
+                    "ms": step_s * 1e3,
+                    "tok_s": batch / step_s,
+                    "intensity": intensity,
+                    "ridge_ratio": intensity / (peak / bandwidth)}
+      solutionExplanation: >-
+        The trap is multiplying the weights by `batch`. They are read once per
+        step, not once per sequence, and that single decision is what makes
+        batching worth doing at all: in case 2 the step serves 32 sequences for
+        31.2 GB, which is only 1.9x the bytes of the batch-1 step in case 1. Get
+        it wrong — multiply the weights by the batch — and `bytes` becomes 465 GB,
+        `ms` 138.9, and `tok_s` 230 instead of 3,438, fifteen times too slow. The
+        second trap is `tok_s`: it is aggregate, so case 2's 3,438 is
+        107.4 per sequence, only half of case 1's 207 — batching raises total
+        throughput and lowers per-stream speed, which is the trade every scheduler
+        makes. Case 3 is the 128k version of case 1: same weights read, 64 GiB of
+        cache, 5.1x the step time and the cache at 83.1% of traffic. Case 4 is a
+        70B at batch 8: 7.43 FLOP/byte, worst of the five, because 140 GB of
+        weights are amortised over only 8 sequences. Case 5 is 7B GQA at 32k and
+        batch 4, which lands on exactly the same byte count as case 2 at a
+        different batch and context — 31.18 GB either way, a coincidence worth
+        noticing because it shows the two knobs trade against each other.
+      complexity: "O(1) time and space"
+      tags: [roofline, arithmetic-intensity, decode, batching]
+
+    - id: p-cached-attend
+      title: "One cached attention step, from scratch"
+      difficulty: medium
+      prompt: >-
+        Implement `attend_cached(K, V, q, k, v)`: one token's attention against a
+        cache, returning the output vector as a list of floats.
+
+        `K` and `V` are the cached keys and values, each an `n x dh` list of
+        lists and possibly empty (`n = 0`). `q`, `k` and `v` are the new token's
+        query, key and value, each of length `dh`. Append `k` and `v` to the
+        cache, compute scaled dot-product scores against every key including the
+        new one (scale `1 / sqrt(dh)`), softmax them numerically stably, and
+        return the weighted sum of the values. The function must not mutate its
+        arguments.
+      starter: |
+        import math
+
+        def attend_cached(K, V, q, k, v):
+            # your implementation here
+            pass
+      language: python
+      entry: attend_cached
+      testCases:
+        - input: '[[], [], [1.0, 0.0], [1.0, 0.0], [0.5, -0.25]]'
+          expected: '[0.5, -0.25]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]'
+          expected: '[0.4011120926797859, 0.5988879073202141]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0, 0.0, 0.0]], [[2.0, 0.0, 0.0, 0.0]], [1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 3.0, 0.0, 0.0]]'
+          expected: '[1.0, 1.5, 0.0, 0.0]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], [[1.0, 0.0], [0.0, 1.0], [0.0, -1.0]], [2.0, 0.0], [0.0, 2.0], [1.0, 1.0]]'
+          expected: '[0.804429682506957, 0.2763973877330972]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.5, -1.0, 2.0]], [[1.0, 1.0, 1.0]], [0.3, 0.9, -0.2], [0.7, 0.1, -0.4], [1.0, -1.0, 0.5]]'
+          expected: '[1.0, -0.4150301922282686, 0.6462424519429328]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+
+        def attend_cached(K, V, q, k, v):
+            dh = len(q)
+            keys = [list(map(float, row)) for row in K] + [list(map(float, k))]
+            vals = [list(map(float, row)) for row in V] + [list(map(float, v))]
+            scale = math.sqrt(dh)
+            scores = [sum(a * b for a, b in zip(q, row)) / scale for row in keys]
+            m = max(scores)
+            e = [math.exp(s - m) for s in scores]
+            z = sum(e)
+            w = [x / z for x in e]
+            return [sum(w[j] * vals[j][i] for j in range(len(vals))) for i in range(dh)]
+      solutionExplanation: >-
+        The empty cache is the case that catches people: `max()` over an empty
+        list raises, and the correct answer is simply `v` because a softmax over
+        one score is 1.0. The second case is the one to check by hand — scores
+        are 0.7071, 0.0, 0.7071 over sqrt(2), so the softmax is
+        (0.4011, 0.1978, 0.4011) and the output is 0.4011 * [1,0] plus
+        (0.1978 + 0.4011) * [0,1]. The third case is exact on purpose: both
+        scores are equal, so the weights are 0.5 and 0.5 and the answer is the
+        mean of [2,0,0,0] and [0,3,0,0], which is [1, 1.5, 0, 0] with no
+        rounding at all. If you got [0, 3, 0, 0] you forgot the cached value;
+        if you got [2, 0, 0, 0] you forgot to append the new one. The fourth
+        case has a negative score and a long cache, which distinguishes a real
+        softmax from a bare exponential sum. The fifth has three cached entries
+        and mixed signs, so an implementation that does not subtract the row
+        maximum before exponentiating still passes here but will overflow on a
+        longer sequence with larger logits — use the stability fix from the
+        start, not after the first inf.
+      complexity: "O(n d) time, O(d) space beyond the cache"
+      tags: [attention, kv-cache, softmax, incremental-decoding]
+
+  visualizers:
+    - id: vs-cache-growth
+      kind: shape_flow
+      title: "Where the bytes come from as the context grows"
+      description: >-
+        Move the layer count, KV head count and head dimension and watch bytes
+        per token move with the KV width rather than the model width. At 4k, a
+        7B MHA sequence holds 2.00 GiB; dropping to 8 KV heads holds 0.50 GiB;
+        dropping to one holds 0.06 GiB. At 128k those become 64.0, 16.0 and
+        2.0 GiB — and the weights never change.
+      params:
+        n_layers: 32
+        n_kv_heads: [32, 8, 1]
+        head_dim: 128
+        contexts: [4096, 32768, 131072]
+        dtype_bytes: 2
+    - id: vs-decode-roofline
+      kind: computation_graph
+      title: "One decode step: bytes in, tokens out"
+      description: >-
+        Set the batch and the context and read three numbers: bytes per step
+        (weights plus batch times cache), intensity (2N B over those bytes), and
+        the intensity ceiling 2N over the cache. The ceiling does not move with
+        batch, which is the reason the curve flattens and the reason a faster
+        GPU does not fix decode.
+      params:
+        n_param: 7000000000
+        n_layers: 32
+        n_kv_heads: 32
+        head_dim: 128
+        bandwidth: 3.35e12
+        peak_flops: 989e12
+        batches: [1, 4, 16, 64, 256]
+
+
+  try_it: >-
+    Compute the KV cache for a 7B with 32 layers, 32 KV heads, $d_{\text{head}} = 128$ in fp16 at
+    4k and at 128k, then divide one 80 GiB card's free memory by it. You should get 512 KiB per
+    token and 33 sequences at 4k against 1 at 128k.
+  interview_questions:
+    - question: 'Derive the bytes per token in the KV cache and explain why d_model does not appear in the formula.'
+      level: mid
+      key_points:
+        - 'The formula is 2 * L * n_kv * d_head * bytes: two tensors, every layer, every key/value head, per token.'
+        - 'For 32 layers, 32 KV heads, d_head 128 and fp16 that is 524,288 bytes, or 512 KiB per token, which is 16 KiB per token per layer.'
+        - 'd_model is already the product n_kv * d_head, so it enters only through those two factors and writing it separately double-counts.'
+        - 'Grouped-query attention divides the cache by the group count: 8 KV heads give 128 KiB per token, and one KV head gives 16 KiB.'
+    - question: 'Batching 32 requests gives about 6x throughput, not 32x. Explain the ceiling.'
+      level: senior
+      key_points:
+        - 'Decode intensity is I(B) = 2N / (N b / B + C), with the weights amortised across the batch and the cache not.'
+        - 'It rises from 0.87 FLOP/byte at B = 1 to 5.42 at B = 32 and then flattens at 2N/C = 6.52 for 7B MHA at 4k.'
+        - 'The ridge point is 295 FLOP/byte, so even at large batch the step stays memory-bound and the cache dominates the bytes.'
+        - 'The asymptote is a division over cache bytes: 13.04 GiB of weights leaves 66.96 GiB, which is 33 sequences at 4k, 4 at 32k and 1 at 128k.'
+      follow_up: 'If batching is capped by cache bytes rather than by weights, what does that imply about how a serving system should schedule requests of different lengths?'
+    - question: 'Prefill and decode are different machines. Give both intensities and say what each optimisation buys.'
+      level: mid
+      key_points:
+        - 'Prefill runs at about 4,096 FLOP/byte and is compute-bound; decode runs at 0.87 and is bandwidth-bound, a ratio of 4,700x.'
+        - 'Prefilling 4,096 tokens is 57.34 TFLOP against 14 GB of weights read once, about 193 ms at 30% MFU.'
+        - 'Decoding the same tokens one at a time costs 18.4 s, because each step moves the weights and the whole cache for one token of arithmetic.'
+        - 'So prefill optimises FLOPs (fusion, tensor cores, larger tiles) and decode optimises bytes (quantisation, smaller cache, batching).'
+  common_mistakes:
+    - 'Recomputing the cached prefix each step, which costs Theta(m n^2) instead of Theta(n^2 + mn): 2,545.6 TFLOP against 4.98 TFLOP, a ratio of 511x.'
+    - 'Forgetting the position offset when appending to a cached sequence, so every shape stays valid and the output is silently wrong.'
+    - 'Sizing the server by parameter count instead of cache bytes, then finding that one 128k sequence needs 64 GiB of an 80 GiB card.'
+  further_reading:
+    - label: "Kwon, Li, Zhuang, Sheng, Zheng, Yu, Gonzalez, Zhang & Stoica, Efficient Memory Management for Large Language Model Serving with PagedAttention (SOSP 2023)"
+    - label: "Ainslie, Lee-Thorp, de Jong, Zemlyanskiy, Lebrón & Sanghai, GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints (EMNLP 2023)"

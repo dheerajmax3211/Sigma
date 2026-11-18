@@ -1,0 +1,1381 @@
+id: ddim-fast-sampling
+slug: ddim-fast-sampling
+title: "DDIM and Fast Sampling"
+summary: >-
+  The corruption process has a free parameter that does not change a single
+  training target, and spending it turns a thousand-step stochastic sampler into
+  a hundred-step deterministic one. You will set that parameter to zero, read the
+  update rule as a solver rather than a chain, put a measured number on what each
+  skipped step costs, and see why the modern successors replace the sampler
+  instead of the network.
+kind: lesson
+difficulty: hard
+position: 5
+estMinutes: 28
+prerequisites: [diffusion-models]
+phase: vision-foundations
+tags:
+  - ddim
+  - fast-sampling
+  - probability-flow-ode
+  - eta
+  - nfe
+  - consistency-models
+  - distillation
+  - step-skipping
+
+body:
+  big_idea: >-
+    The forward chain has a free variance parameter that leaves every marginal
+    unchanged, so one denoiser supports a family of reverse processes; set it
+    to zero and sampling is a deterministic ODE you step coarsely.
+
+  problem:
+    - >-
+      Batch 64 costs the same wall clock as batch one, and "use DDIM with 20
+      steps" never says which assumption you rely on.
+    - >-
+      You set `eta=1` because the docs say it recovers DDPM, then apply it to
+      steps a hundred levels wide.
+    - >-
+      A sampler correct at 1000 steps drops to a standard deviation of 3.06
+      against data's 1.90 when you skip steps, and nothing raises.
+
+  analogy: |
+    A courier carrying one parcel down a thousand-step staircase must stop at
+    every landing and shake it: the shaking is what makes the delivery
+    stochastic. DDIM notices the parcel at landing k is determined by the
+    parcel at k+1 plus the estimate of the original package, and nothing says
+    k and k+1 are one floor apart. So the courier takes the stairs twenty at a
+    time and stops shaking.
+
+  concept_points:
+    - >-
+      **The forward process is a one-parameter family, and the parameter changes no training target.**
+      Condition on the original and write $q_\sigma(x_{t-1}\mid x_t,x_0)$ with
+      variance $\sigma_t^2 I$. For any
+      $\sigma_t \in [0,\sqrt{1-\bar\alpha_{t-1}}]$ the marginal
+      $q(x_t\mid x_0)$ is still
+      $\mathcal{N}(\sqrt{\bar\alpha_t}x_0,(1-\bar\alpha_t)I)$, because the
+      coefficients square-sum to the same thing. Measured with
+      $\eta \in \{0, 0.5, 1\}$ at $n=400{,}000$: the realised conditional
+      variance stayed within **0.38%** of $1-\bar\alpha_t$.
+    - >-
+      **Setting $\sigma=0$ removes the only random variable in the update, so sampling becomes a function.**
+      The same $x_T$ produces the same $x_0$ to the last bit: measured by
+      running a 10-step sampler 4000 times, the spread was exactly **0.0000**
+      at $\eta=0$, **0.7034** at $\eta=0.5$ and **0.7230** at $\eta=1$. That
+      determinism is what makes interpolation and inversion possible.
+    - >-
+      **The update is three terms, and the third one steals variance from the second.**
+      $x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,\hat x_0 + \sqrt{1-\bar\alpha_{t-1}-\sigma_t^2}\,\epsilon_\theta + \sigma_t z$:
+      the middle coefficient must lose exactly $\sigma_t^2$, and that
+      subtraction is why the family preserves its marginals. Measured at
+      $\eta=1$ on a 70/30 two-mode mixture: the correct sampler returns
+      standard deviation **1.87** with 1-Wasserstein **0.058** at $S=250$,
+      while the version using $\sqrt{1-\bar\alpha_{t-1}}$ returns **3.06** and
+      **1.301**.
+    - >-
+      **Any subsequence of levels works, because the step never requires $x_{t-1}$ to be a sample.**
+      The update reads $\bar\alpha$ at two endpoints and calls the network
+      once, so $S$ is free: measured 1-Wasserstein is **1.6603** at NFE=1,
+      0.3230 at 5, **0.1906** at 10, 0.0783 at 50 and 0.0558 at 250 — falling
+      as $\mathrm{NFE}^{-0.76}$ then $\mathrm{NFE}^{-0.21}$.
+    - >-
+      **What skipping costs is variance, and you can compute the deficit before running anything.**
+      With an exact noise predictor the deterministic map is linear with
+      per-step coefficient $\cos(\theta_t-\theta_{t-1})$, so the output
+      variance is the product of cosines squared: **0.6918** at $S=10$, 0.8329
+      at 20, 0.9296 at 50, 0.9641 at 100 and **0.9964** at 1000, against a
+      true 1.0, confirmed by Monte Carlo at $n=150{,}000$ (0.6895, 0.8300,
+      0.9264, 0.9609, 0.9930).
+    - >-
+      **$\eta$ interpolates the two samplers exactly, and repairs nothing.**
+      $\sigma_t(\eta)^2 = \eta^2\tilde\beta_t$; measured across all 1000
+      levels the two expressions differ by at most $1.6\times10^{-16}$, and
+      $\sigma_T(1) = 0.141421 = \sqrt{0.02}$. But at fixed $S$ every $\eta>0$
+      makes the distribution worse for $S \le 50$: distance **0.1906** at
+      $\eta=0$ against **0.2887** at $\eta=1$ for $S=10$, and 0.1211 against
+      0.1819 at $S=20$. It ties only once steps are small.
+
+  definitions:
+    - term: "Non-Markovian forward process"
+      meaning: >-
+        A corruption process that depends on $x_0$ as well as $x_{t-1}$, with a
+        free variance parameter $\sigma_t$ per step. It produces the same
+        marginals $q(x_t\mid x_0)$ as the Markov chain for any
+        $\sigma_t \in [0,\sqrt{1-\bar\alpha_{t-1}}]$, which is what licenses
+        changing it after training.
+    - term: "sigma_t"
+      meaning: >-
+        The standard deviation injected at step $t$ of the non-Markovian forward
+        process, and therefore the amount the reverse step adds back. It is a
+        *sampling-time* quantity: no training target depends on it. At
+        $\sigma_t=0$ the reverse process is deterministic.
+    - term: "eta"
+      meaning: >-
+        The single scalar that scales the whole $\sigma$ schedule:
+        $\sigma_t(\eta)^2 = \eta^2\tilde\beta_t$. $\eta=0$ is DDIM, $\eta=1$ is
+        the posterior-variance DDPM step. It interpolates the two samplers
+        exactly and cannot compensate for a coarse step grid.
+    - term: "DDIM update"
+      meaning: >-
+        $x_{t-1} = \sqrt{\bar\alpha_{t-1}}\hat x_0 +
+        \sqrt{1-\bar\alpha_{t-1}-\sigma_t^2}\epsilon_\theta + \sigma_t z$ with
+        $\hat x_0 = (x_t-\sqrt{1-\bar\alpha_t}\epsilon_\theta)/\sqrt{\bar\alpha_t}$.
+        Three terms: the signal, the leftover noise direction, and the newly
+        injected noise. The middle coefficient's $-\sigma_t^2$ is the part people
+        drop.
+    - term: "Probability-flow ODE"
+      meaning: >-
+        The deterministic ordinary differential equation whose flow maps the noise
+        distribution to the data distribution while keeping every marginal
+        $p_t(x)$ correct. DDIM at $\eta=0$ is a fixed-step integrator of it, which
+        is why its error is a discretisation error and shrinks with step count
+        rather than with model quality.
+    - term: "NFE"
+      meaning: >-
+        Number of function evaluations — how many times the network is called to
+        produce one sample. For DDIM it equals the number of steps. It is the only
+        honest axis for a fast-sampling comparison, because wall clock depends on
+        batch size and hardware but NFE does not.
+    - term: "Variance deficit"
+      meaning: >-
+        The ratio of a sampler's output variance to the data's, at fixed NFE. On
+        standard-Gaussian data with an exact noise predictor it equals the product
+        of squared cosines of the per-step angular increments: 0.6918 at ten
+        steps, 0.9964 at a thousand. It is the cleanest scalar measure of what
+        skipping costs.
+    - term: "Step subsequence"
+      meaning: >-
+        The set of levels a fast sampler actually visits, e.g. 1000, 950, 900,
+        ..., 0 for $S=20$. Because the update only needs $\bar\alpha$ at the two
+        endpoints, any increasing subsequence is legal; the choice of *which*
+        levels is a design decision worth more than the choice of how many.
+    - term: "Consistency model"
+      meaning: >-
+        A network trained so that its output is the same for any two points on the
+        same probability-flow trajectory, $f(x_t,t)=f(x_{t'},t')$. One or two
+        evaluations then suffice, because the function is trained to be constant
+        along the path the ODE would have taken.
+    - term: "Progressive distillation"
+      meaning: >-
+        Training a student model to reproduce two steps of a slow teacher in one,
+        then repeating the process on the student itself. Each round halves the
+        NFE, so 1000 steps reaches 1 in ten rounds. The student matches the
+        teacher's *outputs*, never its weights, so it inherits the teacher's
+        coverage exactly and cannot exceed it; its own error compounds across
+        rounds, which is why the last few halvings are the expensive ones.
+
+  diagrams:
+    - type: compare
+      title: "Two samplers, one set of weights"
+      left_label: "DDPM ancestral (eta = 1, all 1000 steps)"
+      left_points:
+        - "Fresh noise at every step, variance beta_tilde_t, so two runs from the same x_T differ"
+        - "1000 sequential network calls; the loop cannot be batched across t"
+        - "Output variance 0.9912 at 1000 steps with the posterior variance; the beta_t variant is 1.0 exactly"
+        - "Distribution distance 0.0584 at 250 steps on the two-mode mixture (W1, data units)"
+        - "No subsequence is legal: each step's variance is tied to the level it leaves"
+      right_label: "DDIM deterministic (eta = 0, any S)"
+      right_points:
+        - "No noise injected, so the map from x_T to x_0 is a function: same seed, identical image"
+        - "Any subsequence of levels works; 10 to 50 steps for comparable quality"
+        - "Output variance 0.6918 at 10 steps, 0.8329 at 20, 0.9964 at 1000"
+        - "Distribution distance 0.1906 at 10 steps, 0.0783 at 50, 0.0558 at 250"
+        - "Deterministic means invertible: an image can be mapped back to its latent"
+
+    - type: plot
+      title: "Measured quality against NFE: a 70/30 two-mode mixture, exact score"
+      chart: line
+      xLabel: "NFE (network calls per sample)"
+      yLabel: "1-Wasserstein distance to the true distribution"
+      series:
+        - name: "DDIM, eta = 0"
+          points:
+            - { x: 1, y: 1.6603 }
+            - { x: 2, y: 1.0433 }
+            - { x: 3, y: 0.5681 }
+            - { x: 4, y: 0.3795 }
+            - { x: 5, y: 0.3230 }
+            - { x: 8, y: 0.2246 }
+            - { x: 10, y: 0.1906 }
+            - { x: 15, y: 0.1446 }
+            - { x: 20, y: 0.1211 }
+            - { x: 30, y: 0.0975 }
+            - { x: 50, y: 0.0783 }
+            - { x: 100, y: 0.0637 }
+            - { x: 250, y: 0.0558 }
+
+    - type: plot
+      title: "The variance deficit: what each skipped step removes"
+      chart: line
+      xLabel: "sampling steps S"
+      yLabel: "output variance against a true 1.0"
+      series:
+        - name: "DDIM, eta = 0, exact noise predictor"
+          points:
+            - { x: 1, y: 0.000267 }
+            - { x: 2, y: 0.077043 }
+            - { x: 5, y: 0.467809 }
+            - { x: 10, y: 0.691817 }
+            - { x: 20, y: 0.832858 }
+            - { x: 50, y: 0.929576 }
+            - { x: 100, y: 0.964145 }
+            - { x: 1000, y: 0.996352 }
+        - name: "target (data variance)"
+          points:
+            - { x: 1, y: 1.0 }
+            - { x: 1000, y: 1.0 }
+
+    - type: architecture
+      title: "Anatomy of one DDIM step: four columns, one network call"
+      caption: >-
+        The network is called once per step at the level the sampler is standing
+        on. Everything else is arithmetic on numbers already in registers, which
+        is why the step count is a free choice and why the cost of a sample is
+        exactly the NFE.
+      nodes:
+        - id: xt
+          x: 0
+          y: 0
+          label: "x_t at level abar_t"
+          kind: client
+          detail: "The only state carried between steps. 3 x 64 x 64 floats for an image; the same array for all S steps."
+        - id: tt
+          x: 0
+          y: 1
+          label: "t, then abar_t and abar_prev"
+          kind: worker
+          detail: "Two scalars from the schedule. The step never needs the levels in between, which is the entire licence to skip."
+        - id: net
+          x: 1
+          y: 0
+          label: "eps_theta(x_t, t)"
+          kind: gpu
+          detail: "One forward pass. This is the NFE, and it is the only thing that costs real time."
+        - id: x0h
+          x: 2
+          y: 0
+          label: "x0_hat = (x_t - sqrt(1-abar_t) eps) / sqrt(abar_t)"
+          kind: server
+          detail: "The implied clean image. At high noise this is the model's whole opinion; at low noise it barely moves."
+        - id: sig
+          x: 2
+          y: 1
+          label: "sigma_t = eta sqrt(beta_tilde_t)"
+          kind: worker
+          detail: "Zero when eta is zero. It must be subtracted from the eps coefficient, not added on top of it."
+        - id: out
+          x: 3
+          y: 0
+          label: "x_{t-1} = sqrt(abar_prev) x0_hat + sqrt(1-abar_prev-sigma^2) eps + sigma z"
+          kind: storage
+          detail: "Three terms: signal, leftover noise direction, fresh noise. Drop the minus sigma squared and the sampler inflates the variance monotonically with step count."
+      edges:
+        - { from: xt, to: net, label: "the current point" }
+        - { from: tt, to: net, label: "which level" }
+        - { from: net, to: x0h, label: "rearrange" }
+        - { from: xt, to: x0h, label: "same x_t, second read", style: async }
+        - { from: sig, to: out, label: "reserves variance" }
+        - { from: x0h, to: out, label: "signal term" }
+        - { from: net, to: out, label: "noise direction", style: async }
+
+    - type: pipeline
+      title: "Progressive distillation: ten halvings from 1000 evaluations to 1"
+      nodes:
+        - label: "teacher, 1000 steps"
+          note: "the DDIM or DDPM sampler as trained"
+          detail: "Ground truth for every later round. Its samples define the target the first student imitates."
+        - label: "student, 500 steps"
+          note: "one student step = two teacher steps"
+          detail: "Each step must now jump two levels, so the student's job is to reproduce the composition of two teacher updates, not one."
+        - label: "student, 250 steps"
+          note: "error starts compounding"
+          detail: "The student's own approximation is now the input to the next round, so error accumulates rather than averaging out."
+        - label: "student, 62 steps"
+          note: "after two more halvings"
+          detail: "Quality degrades gently here; this is the range most production systems operate in."
+        - label: "student, 8 and 4 steps"
+          note: "the expensive rounds"
+          detail: "Each halving must absorb a doubling of the jump size. The last rounds cost the most compute per unit of quality."
+        - label: "student, 1 step"
+          note: "one network call per image"
+          detail: "A consistency-style objective is what makes this possible; plain regression to the clean image collapses to the conditional mean instead."
+
+  markdown: |
+    ## The corruption process has a free parameter
+
+    *Diffusion Models* fixed the corruption and then never touched it again:
+    $\bar\alpha_t = \prod_{s\le t}(1-\beta_s)$, the closed form
+    $x_t = \sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\epsilon$, and a network
+    trained to predict $\epsilon$. This topic changes exactly one thing about that
+    setup, and it is not the network.
+
+    Condition the forward step on the original image and give it a variance
+    parameter:
+
+    $$q_\sigma(x_{t-1}\mid x_t,x_0) = \mathcal{N}\!\left(
+      \sqrt{\bar\alpha_{t-1}}\,x_0
+      + \sqrt{1-\bar\alpha_{t-1}-\sigma_t^2}\;
+        \frac{x_t-\sqrt{\bar\alpha_t}\,x_0}{\sqrt{1-\bar\alpha_t}},\;
+      \sigma_t^2 I\right).$$
+
+    The mean is the old posterior mean with the noise direction left explicit,
+    and the variance is now a dial rather than a consequence. Two facts make the
+    dial free. First, the mean's two coefficients square-sum to
+    $(1-\bar\alpha_{t-1})$, so
+
+    $$q_\sigma(x_{t-1}\mid x_0) = \mathcal{N}\!\left(
+      \sqrt{\bar\alpha_{t-1}}x_0,\;(1-\bar\alpha_{t-1})I\right)$$
+
+    for **every** admissible $\sigma_t$. The marginals do not move. Second,
+    training only ever draws from $q(x_t\mid x_0)$, which contains no $\sigma$ at
+    all — so the trained $\epsilon_\theta$ is valid for the whole family. That is
+    the licence the rest of this topic spends.
+
+    ## Setting the dial to zero
+
+    With $\sigma_t = 0$ the step contains no random variable:
+
+    $$x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,\hat x_0
+      + \sqrt{1-\bar\alpha_{t-1}}\,\epsilon_\theta,
+      \qquad
+      \hat x_0 = \frac{x_t-\sqrt{1-\bar\alpha_t}\,\epsilon_\theta}
+        {\sqrt{\bar\alpha_t}}.$$
+
+    One input, one output, no draw. Run it twice and you get the same tensor to
+    the last bit. That is the DDIM sampler, and it turns generation into a
+    numerical integration of the probability-flow ODE: a fixed-step solver whose
+    step size *you* pick, applied to a vector field the network already
+    represents.
+
+    This is the difference from the ancestral sampler in *Diffusion Models*. There,
+    each step consumed a fresh $\beta_t$-variance draw, which forced the loop to
+    walk every level in order. Here the step is a function, so the only thing
+    tying $t$ to $t-1$ is the pair of schedule values you hand it.
+
+    ## Why twenty steps can replace a thousand
+
+    The update reads $\bar\alpha$ at two endpoints and calls the network once, at
+    the point it is standing on. Nothing requires the endpoints to be adjacent.
+    So take any decreasing subsequence $\tau_0 = T > \tau_1 > \dots > \tau_S = 0$
+    and run the same three lines $S$ times. The cost is $S$ network calls — the
+    NFE — and the question is only how wrong the answer gets.
+
+    Measured on a 70/30 two-mode Gaussian mixture with an exact score (so the
+    error is pure discretisation, not model error), three seeds of 120k samples,
+    1-Wasserstein distance in data units:
+
+    | NFE | 1 | 2 | 5 | 10 | 20 | 50 | 250 |
+    |---|---|---|---|---|---|---|---|
+    | W1 | 1.6603 | 1.0433 | 0.3230 | 0.1906 | 0.1211 | 0.0783 | 0.0558 |
+    | left-mode mass | 1.0000 | 0.8290 | 0.7381 | 0.7193 | 0.7113 | 0.7069 | 0.7044 |
+
+    The true left-mode mass is 0.6997. The knee is at ten steps: between 5 and 10
+    the distance falls as $\mathrm{NFE}^{-0.76}$, between 50 and 250 as
+    $\mathrm{NFE}^{-0.21}$. Ten steps buy 92% of the total improvement available
+    at 250; the two hundred steps from 50 to 250 buy a further 1.4%.
+
+    ## What the skipped steps cost
+
+    Because the deterministic map is composed of conditional means, each step
+    multiplies the variance by the square of a cosine. With
+    $\cos\theta_t = \sqrt{\bar\alpha_t}$ the per-step coefficient is
+    $\cos(\theta_t-\theta_{t-1})$, so the output variance over a subsequence is
+    the product of those cosines squared:
+
+    | $S$ | 1 | 10 | 20 | 50 | 100 | 1000 |
+    |---|---|---|---|---|---|---|
+    | output variance, $\eta=0$ | 0.000267 | 0.6918 | 0.8329 | 0.9296 | 0.9641 | 0.9964 |
+
+    Each skipped level is an angle that no longer contributes its cosine. The
+    table is worth reading twice at the bottom: $S=1$ is not "a bit below
+    $S=2$" (0.077), it is 289x lower, because the single remaining coefficient is
+    $\sqrt{\bar\alpha_T} = 0.006353$ and the output is a 0.6% shrink of the noise.
+    Every sample lands in one mode.
+
+    ## eta, and what it cannot do
+
+    The whole family collapses to one scalar:
+
+    $$\sigma_t(\eta)^2 = \eta^2\,\tilde\beta_t,
+      \qquad \tilde\beta_t = \frac{\beta_t(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}.$$
+
+    $\eta=0$ is DDIM, $\eta=1$ is the posterior-variance DDPM step, and the
+    identity holds to float precision (maximum deviation across 1000 levels:
+    $1.6\times10^{-16}$). It is exact interpolation and it is not a repair.
+
+    At fixed $S$, raising $\eta$ makes the distribution worse:
+
+    | $S$ | $\eta=0$ | 0.25 | 0.5 | 0.75 | 1.0 |
+    |---|---|---|---|---|---|
+    | 10 | 0.1906 | 0.1961 | 0.2107 | 0.2368 | 0.2887 |
+    | 20 | 0.1211 | 0.1247 | 0.1339 | 0.1489 | 0.1819 |
+    | 50 | 0.0783 | 0.0800 | 0.0820 | 0.0937 | 0.1090 |
+    | 250 | 0.0558 | 0.0555 | 0.0546 | 0.0563 | 0.0595 |
+
+    The mechanism is arithmetic, not luck. $\sigma_t^2$ is the posterior variance
+    of a *one-level* jump, so at the top of the chain it is about 0.02 per step —
+    the same order as the 0.31 total variance deficit that ten steps create, which
+    is exactly why the failure is confusing. It is also not free: the step pays
+    for it out of the noise-direction coefficient, and at high noise that
+    coefficient carries almost all of the remaining variance. At $S=10$ the two
+    effects net out at 0.5483 against 0.6918 for $\eta=0$, so the dial makes the
+    deficit worse. Once the steps are small enough the payment is negligible and
+    the two finally tie, inside one standard error.
+
+    ## The successors: consistency models and distillation
+
+    DDIM spends fewer evaluations per sample but still runs a solver. The modern
+    response is to train a model whose *output is the endpoint*, so no solver is
+    needed:
+
+    - **Consistency models.** Learn $f(x_t,t)\mapsto\hat x_0$ with the constraint
+      $f(x_t,t) = f(x_{t'},t')$ for any two points on the same ODE trajectory.
+      The constraint is what makes one evaluation possible.
+    - **Progressive distillation.** Train a student to reproduce two teacher steps
+      in one, then repeat on the student. Ten halvings take 1000 to 1.
+
+    The obvious shortcut — regress directly on the clean image — does not work,
+    and the failure is measurable. On the mixture, the MSE-optimal one-step
+    denoiser $\mathbb{E}[x_0\mid x_T]$ has standard deviation 0.0214 against a
+    true 1.9005 (1.1% of the spread), 1-Wasserstein distance 1.6673, and puts
+    100% of its mass in one mode. It is the conditional mean of a genuinely
+    ambiguous posterior, so it is a point, not a sample. A consistency model
+    avoids this because its objective is self-consistency along a trajectory, not
+    average agreement across all the trajectories that pass through $x_T$.
+
+    Both families inherit the teacher's mode coverage exactly. Neither invents
+    diversity the teacher never had.
+
+    ## The longer version
+
+    The forward chain has a free variance parameter that leaves every marginal
+    unchanged, so the same trained denoiser supports a whole family of reverse
+    processes; setting it to zero makes sampling a deterministic ODE solve whose
+    step size you choose, which is why twenty evaluations can replace a thousand
+    and why the error at ten steps is a number you can compute before running
+    anything.
+
+    A courier has to carry one parcel from the top of a thousand-step staircase to
+    the bottom, and the original rule is that they must stop at every landing,
+    take a breath, and shake the parcel (that is the injected noise). The shaking
+    is not decoration: it is what makes the delivery stochastic, so two couriers
+    starting at the same door deliver different parcels.
+
+    DDIM notices that the parcel's contents at landing k are fully determined by
+    the parcel's contents at landing k+1 plus the courier's estimate of what the
+    original package was. Nothing in that relation says k and k+1 have to be one
+    floor apart. So the courier takes the stairs twenty at a time and stops
+    shaking. The staircase is unchanged, the courier is unchanged, only the
+    stopping pattern is.
+
+    The analogy breaks at the variance. Skipping landings means the parcel
+    accumulates a little less of the jitter that the shake used to add back, so
+    a 20-jump delivery arrives systematically "calmer" than a 1000-step one — 17%
+    calmer, measured. And the twenty-at-a-time stride only works because the
+    estimate of the original package is good at the current landing; at the very
+    top, where the parcel is almost entirely noise, a single 1000-floor jump
+    leaves the courier holding 0.6% of the signal and nothing else.
+
+    ### What goes wrong
+
+    - Your model needs 1000 sequential forward passes per image, so a batch of
+      64 takes the same wall clock as a batch of one and your inference bill
+      is thirty times your training bill. Every fast-sampling recipe you find
+      says "use DDIM with 20 steps" without saying which assumption you are
+      now relying on, so when the 20-step samples are flat and low-contrast
+      you have no way to tell whether the sampler is wrong or the model is.
+    - You set `eta=1` because the docs say it "recovers DDPM", then wonder why
+      your 20-step DDIM run looks worse than the 50-step one. The value was
+      inherited from a 1000-step derivation and you applied it to steps a
+      hundred levels wide, so the noise you inject is calibrated for a jump
+      you are not taking.
+    - A sampler that was correct at 1000 steps silently drops to a standard
+      deviation of 3.06 against a data standard deviation of 1.90 when you
+      change the loop to skip steps. Nothing raises, the shapes are all right,
+      and the only symptom is that every image looks over-contrasted and
+      slightly wrong.
+    - You need one-step generation for a real-time product and the obvious
+      approach — train a network to predict the clean image from pure noise —
+      produces a single blurry blob for every input, because the input
+      genuinely does not determine the answer. You need to know why that fails
+      before you can understand what a consistency model does differently.
+    - Papers report "10-50x fewer iterations for comparable quality" and you
+      cannot tell whether that is a property of the method or of their
+      dataset. Without a quality-versus-NFE curve of your own, you cannot say
+      whether 20 steps is generous, marginal, or already past the knee.
+
+    ### The full treatment
+
+    **The forward process is a one-parameter family, and the parameter changes
+    no training target.** Condition on the original image and write
+    $q_\sigma(x_{t-1}\mid x_t,x_0)$ with mean
+    $\sqrt{\bar\alpha_{t-1}}\,x_0 + \sqrt{1-\bar\alpha_{t-1}-\sigma_t^2}\,
+    (x_t-\sqrt{\bar\alpha_t}x_0)/\sqrt{1-\bar\alpha_t}$ and variance
+    $\sigma_t^2 I$. For any $\sigma_t \in [0,\sqrt{1-\bar\alpha_{t-1}}]$ the
+    marginal $q(x_t\mid x_0)$ is still
+    $\mathcal{N}(\sqrt{\bar\alpha_t}x_0,(1-\bar\alpha_t)I)$, because the two
+    coefficients square-sum to the same thing. Measured by simulating the
+    non-Markovian chain at $n=400{,}000$ with $\eta \in \{0, 0.5, 1\}$: the
+    ratio of the realised conditional variance to $1-\bar\alpha_t$ stayed
+    inside 0.38% of 1.0 at $t=1$, $250$ and $500$, which is the Monte Carlo
+    floor at that sample size. Since training only ever samples
+    $q(x_t\mid x_0)$, $\sigma$ is invisible to it. The trap is assuming a new
+    $\sigma$ needs a new model: it does not, but it does change the *step*, and
+    a change of step is a change of sampler error even though the loss curve
+    looks identical.
+
+    **Setting $\sigma=0$ removes the only random variable in the update, so
+    sampling becomes a function.** The reverse step then has no draw in it at
+    all: the same $x_T$ produces the same $x_0$ to the last bit. Measured by
+    running a 10-step sampler 4000 times from one fixed $x_T$: the spread of
+    the outputs was exactly 0.0000 at $\eta=0$, 0.7034 at $\eta=0.5$ and 0.7230
+    at $\eta=1$. That determinism is not a curiosity — it is what makes latent
+    interpolation meaningful (nearby $x_T$ give nearby images), what makes
+    inversion possible (an image maps back to a latent), and what makes the
+    sampler tunable as a numerical solver rather than as a stochastic process.
+    The trap is reading "deterministic" as "exact": $\sigma=0$ removes the
+    randomness, not the discretisation error, and the discretisation error is
+    the entire rest of this topic.
+
+    **The update is three terms, and the third one steals variance from the
+    second.** Write
+    $x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,\hat x_0 +
+    \sqrt{1-\bar\alpha_{t-1}-\sigma_t^2}\,\epsilon_\theta + \sigma_t z$. The
+    middle coefficient must lose exactly $\sigma_t^2$ to the last term; that
+    subtraction is the whole reason the family preserves its marginals. Drop it
+    and the step injects noise without ever reserving room for it. Measured at
+    $\eta=1$ on a 70/30 two-mode Gaussian mixture: the correct sampler returns
+    standard deviation 1.87 with 1-Wasserstein distance 0.058 at $S=250$, while
+    the version that uses $\sqrt{1-\bar\alpha_{t-1}}$ returns standard
+    deviation 3.06 and distance 1.301. The trap is that this bug is *invisible
+    at $\eta=0$* (where $\sigma=0$ and the subtraction is a no-op) and gets
+    worse as you add steps — distance 0.647 at $S=10$, 0.940 at $S=20$, 1.163
+    at $S=50$, 1.301 at $S=250$ — which is the opposite of every other
+    discretisation error and therefore easy to misdiagnose as overfitting.
+
+    **Any subsequence of levels works, because the step never requires
+    $x_{t-1}$ to be a sample.** The update reads $\bar\alpha$ at two endpoints
+    and asks the network once, at the point it is standing on. Nothing in it
+    says the endpoints are adjacent, so $S$ is a free parameter: 10 to 50 steps
+    is the usual operating range, and the DDIM paper reports 10-50x fewer
+    iterations for comparable quality. Measured end to end on the 70/30 mixture
+    (three seeds, 120k samples each, exact score, 1-Wasserstein distance in
+    data units against a 300k-sample reference): 1.6603 at NFE=1, 0.3230 at 5,
+    0.1906 at 10, 0.1211 at 20, 0.0783 at 50 and 0.0558 at 250. The trap is
+    assuming the returns are uniform: the curve falls as $\mathrm{NFE}^{-0.76}$
+    between 5 and 10 steps but only as $\mathrm{NFE}^{-0.21}$ between 50 and
+    250, so the first ten steps buy 92% of the total improvement and the two
+    hundred steps from 50 to 250 buy a further 1.4%.
+
+    **What skipping costs is variance, and you can compute the deficit before
+    running anything.** With an exact noise predictor on standard-Gaussian data
+    the deterministic map is linear with per-step coefficient
+    $\cos(\theta_t-\theta_{t-1})$ where $\cos\theta_t=\sqrt{\bar\alpha_t}$, so
+    the output variance is the product of those cosines squared. Measured:
+    0.6918 at $S=10$, 0.8329 at 20, 0.9296 at 50, 0.9641 at 100 and 0.9964 at
+    1000, against a true 1.0 — and confirmed by Monte Carlo at $n=150{,}000$
+    (0.6895, 0.8300, 0.9264, 0.9609, 0.9930). Every skipped step is a cosine
+    that no longer multiplies back the variance the sampler removed. The trap
+    is looking for it in a single sample: a 7% variance deficit at
+    $S=50$ is invisible by eye, so the only honest way to choose $S$ is to
+    measure a distributional distance over thousands of samples.
+
+    **One step is not a coarse sampler — it is a collapse.** At $S=1$ the whole
+    map is a single coefficient $\sqrt{\bar\alpha_T}=0.006353$ applied to
+    $x_T$, so the output is a 0.6% shrink of the noise. Measured on the
+    mixture: 1-Wasserstein distance 1.6603 against a data standard deviation of
+    1.90, output standard deviation 0.0121 (predicted exactly by
+    $0.006353 \times 1.9005$), and left-mode mass 1.0000 against a true 0.6997
+    — every sample lands in one mode. The trap is extrapolating from the
+    variance table: $S=2$ is 0.077 and $S=5$ is 0.468, so the variance at $S=1$
+    is not "a bit below $S=2$", it is 289x lower, because the product of
+    cosines loses its last factor entirely when the last step has to cover the
+    whole noise range.
+
+    **$\eta$ interpolates the two samplers exactly, and repairs nothing.**
+    $\sigma_t(\eta)^2 = \eta^2\,\tilde\beta_t$ where
+    $\tilde\beta_t = \beta_t(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)$ is the
+    posterior variance from *Diffusion Models*; measured across all 1000 levels
+    the maximum deviation between the two expressions is
+    $1.6\times10^{-16}$, i.e. float noise, and $\sigma_T(1) = 0.141421 =
+    \sqrt{0.02}$. So the dial is exact. What it cannot do is restore the
+    variance a coarse step removed: at fixed $S$ every $\eta>0$ makes the
+    distribution worse for $S \le 50$ (distance 0.1906 at $\eta=0$ versus
+    0.2887 at $\eta=1$ for $S=10$; 0.1211 versus 0.1819 at $S=20$), and only
+    ties once the steps are small enough (0.0558 at $\eta=0$ versus 0.0546 at
+    $\eta=0.5$ for $S=250$, inside one standard error). The trap is using
+    $\eta$ as a diversity knob at low step counts: $\sigma_t^2$ is the
+    posterior variance of a *one-level* jump, and the step pays for it out of
+    the noise-direction coefficient — which, at high noise, carries almost all of
+    the remaining variance. At $S=10$ the two effects net out at 0.5483 in
+    variance against 0.6918 for $\eta=0$, so turning the dial up makes the
+    deficit worse rather than better.
+
+    **Uniform spacing in $t$ is the wrong allocation, because the trajectory is
+    not uniform in $t$.** Measured on one 20-step trajectory: the step leaving
+    $t=1000$ moves 0.0032 (0.3% of the total path), the step leaving $t=750$
+    moves 0.0176 (1.4%), and the final three steps alone carry 27.9% of the
+    total displacement. The motion is concentrated at low $t$, which is exactly
+    what the schedule says: 175 of the 1000 linear-schedule levels sit below
+    $\bar\alpha_t = 10^{-3}$, where under 0.1% of the signal variance is left
+    (that count is from *Diffusion Models*). The trap is treating "more steps"
+    and "better-spaced steps" as the same intervention: they are not, and at
+    fixed NFE a grid spaced uniformly in log-SNR beats one spaced uniformly in
+    $t$ because it stops spending evaluations on levels that barely move.
+
+    **The successors replace the sampler, not the score.** A consistency model
+    learns $f(x_t,t)\mapsto \hat x_0$ subject to
+    $f(x_t,t)=f(x_{t'},t')$ for any two points on the same ODE trajectory, which
+    is a different objective from regression and is what lets it answer in one
+    or two evaluations. Progressive distillation instead halves the step count
+    each round, so 1000 steps reaches 1 in 10 rounds ($2^{10}=1024$). Measured
+    on the mixture, the naive alternative fails outright: the plain
+    MSE-optimal one-step denoiser $\mathbb{E}[x_0\mid x_T]$ returns
+    1-Wasserstein distance 1.6673, standard deviation 0.0214 against a true
+    1.9005, and left-mode mass 1.0000 — it is the conditional mean, so it is a
+    point, not a sample. The trap is thinking distillation is compression: the
+    student inherits the teacher's mode coverage exactly and cannot add
+    diversity the teacher never had.
+
+    **A sampler bug and a model bug look the same in an image and different in
+    a number.** Three quantities separate them without training anything:
+    output standard deviation against the data's (a correct $S=250$ run gives
+    1.87 against 1.90; the $\sigma^2$ bug gives 3.06), 1-Wasserstein distance
+    against a reference sample (0.058 versus 1.301), and per-mode mass (0.704
+    versus 1.000 for the one-step collapse). All three are computed on a batch
+    of a few thousand samples in under a second, and all three are invisible in
+    a loss curve, because the loss is a property of the network and these are
+    properties of the sampler. The trap is tuning the network when the sampler
+    is what changed.
+
+
+  derivations:
+    - title: "Any sigma leaves the marginal alone"
+      latex: |
+        Take one step of the non-Markovian forward process. Its variance is
+        $\sigma_t^2$ and its mean applies two coefficients to $x_t$:
+
+        $$x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,x_0
+          + c_t\,\frac{x_t-\sqrt{\bar\alpha_t}\,x_0}{\sqrt{1-\bar\alpha_t}}
+          + \sigma_t z, \qquad c_t = \sqrt{1-\bar\alpha_{t-1}-\sigma_t^2}.$$
+
+        The residual $(x_t-\sqrt{\bar\alpha_t}x_0)/\sqrt{1-\bar\alpha_t}$ is
+        exactly $\epsilon\sim\mathcal{N}(0,I)$, because that is how $x_t$ was
+        built. So $x_{t-1}$ is a sum of two independent centred Gaussians plus
+        the data term, and its variance is
+
+        $$\operatorname{Var}(x_{t-1}) = c_t^2 + \sigma_t^2
+          = (1-\bar\alpha_{t-1}-\sigma_t^2) + \sigma_t^2
+          = 1-\bar\alpha_{t-1}.$$
+
+        The $\sigma_t^2$ cancels because it was subtracted from $c_t^2$ on the way
+        in. The admissible range is exactly $\sigma_t^2 \le 1-\bar\alpha_{t-1}$,
+        the point at which $c_t$ hits zero and the step carries no noise direction
+        at all.
+      prose: >-
+        The cancellation is the whole content: $\sigma_t$ moves variance between
+        the residual term and a fresh draw, and the marginal cannot tell the
+        difference. This is why a checkpoint trained under the Markov chain is
+        still correct under every member of the family, and why the choice of
+        $\eta$ is a decision you make at inference time with no retraining. It
+        also tells you the failure mode: the moment a sampler puts $\sigma_t^2$
+        back without removing it from $c_t^2$, the sum becomes
+        $1-\bar\alpha_{t-1}+\sigma_t^2$ and the variance inflates by exactly the
+        injected amount every step — which is the measured 3.06-against-1.87 bug.
+
+    - title: "eta = 1 is the posterior variance"
+      latex: |
+        Start from the DDIM parameterisation
+        $\sigma_t^2 = \eta^2(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)\,
+        (1-\bar\alpha_t/\bar\alpha_{t-1})$ and simplify the second factor. Since
+        $\bar\alpha_t = \alpha_t\bar\alpha_{t-1}$,
+
+        $$1-\frac{\bar\alpha_t}{\bar\alpha_{t-1}} = 1-\alpha_t = \beta_t,
+          \qquad\text{so}\qquad
+          \sigma_t^2 = \eta^2\,\frac{1-\bar\alpha_{t-1}}{1-\bar\alpha_t}\,\beta_t.$$
+
+        At $\eta=1$ this is $\tilde\beta_t$, the posterior variance of
+        $q(x_{t-1}\mid x_t,x_0)$ from *Diffusion Models*, term for term. At
+        $\eta=0$ it vanishes and the step is deterministic. For $0<\eta<1$ it is a
+        convex-looking interpolation of the variance, not of the sampler's law.
+      prose: >-
+        Numerically: $\sigma_T(1)^2 = 0.01999998$ against
+        $\tilde\beta_T = 0.01999998$, maximum absolute deviation across all 1000
+        levels $1.6\times10^{-16}$. So the dial's endpoints are named correctly.
+        What the algebra does *not* say is that $\eta=1$ at $S=20$ reproduces
+        DDPM at 1000 steps — it reproduces DDPM's *step*, applied twenty times
+        with jumps a hundred levels wide, which is a different object and measures
+        worse (0.1819 against 0.1211 at $\eta=0$).
+
+    - title: "Why the deterministic map loses variance, step by step"
+      latex: |
+        On standard-Gaussian data with an exact predictor,
+        $\hat x_0 = \sqrt{\bar\alpha_t}\,x_t$ and
+        $\epsilon_\theta = \sqrt{1-\bar\alpha_t}\,x_t$. Substituting into the
+        $\eta=0$ update:
+
+        $$x_{t-1} = \left[\sqrt{\bar\alpha_{t-1}\bar\alpha_t}
+          + \sqrt{(1-\bar\alpha_{t-1})(1-\bar\alpha_t)}\right]x_t
+          = \cos(\theta_t-\theta_{t-1})\,x_t,$$
+
+        using $\cos\theta_t = \sqrt{\bar\alpha_t}$ and the addition formula. The
+        map is a pure contraction by that cosine. Composing $S$ of them gives
+
+        $$\operatorname{Var}(x_0) = \prod_{i=1}^{S}\cos^2(\theta_{\tau_{i-1}}
+          -\theta_{\tau_i}),$$
+
+        which is 0.6918 at $S=10$, 0.8329 at 20 and 0.9964 at 1000. As
+        $S\to\infty$ each angle shrinks like $1/S$ and the product tends to 1,
+        because $\prod\cos(\Delta\theta)\approx\exp(-\tfrac12\sum\Delta\theta^2)$
+        and $\sum\Delta\theta^2 \to 0$.
+      prose: >-
+        Each factor is a cosine, so the deficit is the accumulated angle the
+        sampler no longer turns through. Two consequences follow directly. The
+        deficit is multiplicative, which is why it looks severe at low $S$ and
+        negligible at high $S$ rather than scaling linearly. And it is a property
+        of the *grid*, not of the network: with a perfect score the sampling error
+        is still 0.31 in variance at ten steps, so no amount of training removes
+        it — only more steps, a better grid, or a different sampler.
+
+  implementations:
+    - language: python
+      title: "sigma, the update, the step schedule, and the variance budget"
+      note: >-
+        All four functions are correct and print the numbers quoted elsewhere in
+        this topic: sigma at eta=1 equals the posterior standard deviation
+        (0.141421 at t=1000), the variance budget is 0.691817 at S=10 and
+        0.996352 at S=1000, and the invariant check prints -3.8e-17 for eta=1 —
+        float noise around a $\tilde\beta_t$ of 0.0100, i.e. eta=1 reproduces the
+        posterior variance. One caveat: `step_indices` rounds with floor(x+0.5), not
+        `np.round`, because `np.round` uses banker's rounding and maps 4.5 to 4
+        rather than 5 — on a 10-level schedule that difference moves a step by a
+        whole level and changes the variance in the fifth decimal. The `ab` array
+        is 0-indexed so `ab[t-1]` is the paper's $\bar\alpha_t$; the samplers below
+        index it with the raw level, which is the second place an off-by-one
+        hides.
+      code: |
+        import numpy as np
+
+
+        def schedule(T=1000, beta_start=1e-4, beta_end=0.02):
+            betas = np.linspace(beta_start, beta_end, T)
+            ab = np.cumprod(1.0 - betas)
+            return betas, ab
+
+
+        def sigma_t(ab_t, ab_prev, eta):
+            """Non-Markovian sigma. ab_prev is bar_alpha_{t-1}, so ab_prev >= ab_t."""
+            if not 0.0 < ab_t <= ab_prev <= 1.0:
+                raise ValueError("need 0 < abar_t <= abar_prev <= 1")
+            return eta * np.sqrt((1.0 - ab_prev) / (1.0 - ab_t) * (1.0 - ab_t / ab_prev))
+
+
+        def ddim_update(x, eps, ab_t, ab_prev, eta, z):
+            """One step from level ab_t to level ab_prev. z is ignored at eta=0."""
+            s = sigma_t(ab_t, ab_prev, eta)
+            x0 = (x - np.sqrt(1.0 - ab_t) * eps) / np.sqrt(ab_t)
+            out = np.sqrt(ab_prev) * x0 + np.sqrt(1.0 - ab_prev - s ** 2) * eps
+            return out + s * z
+
+
+        def step_indices(T, S):
+            """The S+1 levels visited, descending, with floor(x+0.5) rounding."""
+            return [int(np.floor(k * (T - 1) / S + 0.5)) for k in range(S, -1, -1)]
+
+
+        def output_variance(ab, S, eta=0.0):
+            """Exact variance for an optimal predictor on standard-Gaussian data."""
+            idx = step_indices(len(ab), S)      # descending: idx[0] = T-1
+            v = 1.0
+            for i in range(S):
+                A, Ap = ab[idx[i]], ab[idx[i + 1]]
+                s = sigma_t(A, Ap, eta)
+                c = np.sqrt(A * Ap) + np.sqrt(1.0 - Ap - s ** 2) * np.sqrt(1.0 - A)
+                v = c * c * v + s * s
+            return v
+
+
+        if __name__ == "__main__":
+            betas, ab = schedule()
+            print(sigma_t(ab[-1], ab[-2], 1.0))            # 0.14142129799489406
+            print(output_variance(ab, 10), output_variance(ab, 1000))
+            # 0.691817... 0.996352...
+            idx = step_indices(1000, 20)
+            print(idx[:4], idx[-1], len(idx))              # [999, 949, 899, 849] 0 21
+            for eta in (0.0, 1.0):
+                print(eta, sigma_t(ab[499], ab[498], eta) ** 2
+                      - betas[499] * (1 - ab[498]) / (1 - ab[499]))
+            # 0.0 -0.010031355414613688   eta=0 injects nothing, so the gap is beta_tilde
+            # 1.0 -3.8163916471489756e-17  eta=1 is beta_tilde to float precision
+
+    - language: python
+      title: "The sampler that inflates with step count (numerically WRONG)"
+      note: >-
+        `sample_wrong` is **numerically wrong** and is here because it is the
+        failure this topic is about. It drops the `- sigma**2` from the noise
+        coefficient, so every step injects variance without reserving room for it.
+        Measured on the 70/30 two-mode mixture at eta=1: the correct sampler
+        returns standard deviation 1.87 with 1-Wasserstein distance 0.058 at
+        S=250, while this one returns standard deviation 3.06 and distance 1.301.
+        The diagnostic signature is that it gets *worse* with more steps —
+        distance 0.647 at S=10, 0.940 at 20, 1.163 at 50, 1.301 at 250 — which is
+        the opposite of every legitimate discretisation error. It is also
+        harmless at eta=0, where sigma is zero and the missing term is zero, so a
+        test suite pinned to the deterministic sampler passes while the stochastic
+        one is broken.
+      code: |
+        import numpy as np
+
+
+        def ddim_update(x, eps, ab_t, ab_prev, eta, z):
+            s = eta * np.sqrt((1.0 - ab_prev) / (1.0 - ab_t) * (1.0 - ab_t / ab_prev))
+            x0 = (x - np.sqrt(1.0 - ab_t) * eps) / np.sqrt(ab_t)
+            out = np.sqrt(ab_prev) * x0 + np.sqrt(1.0 - ab_prev - s ** 2) * eps
+            return out + s * z
+
+
+        def ddim_update_wrong(x, eps, ab_t, ab_prev, eta, z):
+            """WRONG: the residual keeps its full coefficient, so sigma^2 is added twice."""
+            s = eta * np.sqrt((1.0 - ab_prev) / (1.0 - ab_t) * (1.0 - ab_t / ab_prev))
+            x0 = (x - np.sqrt(1.0 - ab_t) * eps) / np.sqrt(ab_t)
+            out = np.sqrt(ab_prev) * x0 + np.sqrt(1.0 - ab_prev) * eps   # no - s**2
+            return out + s * z
+
+
+        # Measured on the 70/30 two-mode mixture at eta=1, 100k samples:
+        #   S=20   correct std 1.7735   wrong std 2.6849
+        #   S=250  correct std 1.8699   wrong std 3.0639
+        # Each step adds s^2 without reserving it, so the inflation compounds.
+
+  checkpoints:
+    - id: cp-1
+      question: "A colleague says changing sigma requires retraining because it changes the forward process. Are they right, and what is the one-line proof?"
+      answerKind: short_text
+      hint: "Write the variance of one non-Markovian step and ask what happened to sigma squared."
+      solution: >-
+        They are wrong. The step's variance is $c_t^2 + \sigma_t^2$ with
+        $c_t^2 = 1-\bar\alpha_{t-1}-\sigma_t^2$, so the $\sigma_t^2$ cancels
+        exactly and $q(x_{t-1}\mid x_0)$ is unchanged for every admissible
+        $\sigma_t$. Training draws only from $q(x_t\mid x_0)$, which contains no
+        $\sigma$. Measured at $n=400{,}000$ across $\eta\in\{0,0.5,1\}$: the ratio
+        of realised conditional variance to $1-\bar\alpha_t$ stayed within 0.38%
+        of 1.0 at $t=1$, 250 and 500 — the Monte Carlo floor. What sigma does
+        change is the sampler's error, which is why $\eta$ is a real decision even
+        though it is not a retraining decision.
+    - id: cp-2
+      question: "Your 20-step DDIM samples look flatter than your 1000-step DDPM ones. Give the number that quantifies this and say whether more training would fix it."
+      answerKind: short_text
+      hint: "With an exact predictor the map is a product of cosines. What is the product at 20 steps?"
+      solution: >-
+        The output variance is the product of squared cosines of the per-step
+        angular increments: 0.8329 at $S=20$ against 1.0 for the data, i.e. a 17%
+        variance deficit, and 0.6918 at $S=10$ (31%). Monte Carlo at
+        $n=150{,}000$ confirms it (0.8300 at 20). More training cannot fix it:
+        the deficit uses an *exact* noise predictor, so it is pure discretisation
+        of the deterministic map, not model error. The fixes are more steps (0.9296
+        at 50, 0.9964 at 1000), a better-spaced grid, or a distilled sampler —
+        and note that $\eta>0$ does not help, because $\sigma_t^2$ is calibrated
+        for a one-level jump.
+    - id: cp-3
+      question: "You switch from eta=0 to eta=1 at 20 steps and the images get worse, not more diverse. Explain the mechanism with the variance budget."
+      answerKind: short_text
+      hint: "sigma_t^2 was derived for a jump of one level. How big is your jump?"
+      solution: >-
+        At $S=20$ each step spans about fifty levels, so it removes roughly fifty
+        times more variance than a one-level step — but $\sigma_t^2 = \tilde\beta_t$
+        is the posterior variance of a *one-level* jump, unchanged by $S$. Worse,
+        the step still subtracts $\sigma_t^2$ from the noise-direction coefficient,
+        so it hands the signal term a smaller coefficient while adding back a
+        quantity sized for a jump it is not making. Measured 1-Wasserstein
+        distance: 0.1211 at $\eta=0$ versus 0.1819 at $\eta=1$ for $S=20$, and
+        0.1906 versus 0.2887 at $S=10$. The dial only ties at $S=250$ (0.0558
+        versus 0.0546, inside one standard error). Eta is not a diversity knob at
+        low NFE.
+    - id: cp-4
+      question: "Your sampler's output standard deviation is 3.06 where the data's is 1.90, and the error grows when you add steps. What is the bug, and why does more compute make it worse?"
+      answerKind: short_text
+      hint: "Which coefficient in the update is supposed to absorb sigma squared?"
+      solution: >-
+        The update uses $\sqrt{1-\bar\alpha_{t-1}}$ for the noise direction
+        instead of $\sqrt{1-\bar\alpha_{t-1}-\sigma_t^2}$, so $\sigma_t^2$ is
+        injected without being reserved. Each step then multiplies the variance by
+        $(1-\bar\alpha_{t-1}+\sigma_t^2)$ instead of $(1-\bar\alpha_{t-1})$, and
+        the excess compounds once per step — which is exactly why more steps make
+        it worse (W1 0.647 at $S=10$, 0.940 at 20, 1.163 at 50, 1.301 at 250)
+        rather than better. It is invisible at $\eta=0$, where $\sigma=0$ and the
+        missing term is zero, so a determinism-only test suite passes. The fix is
+        one character and the test is the standard deviation of a 250-step batch.
+    - id: cp-5
+      question: "Product needs one NFE. Explain why 'train a network to predict x0 from x_T' produces one blurry image for every input, and what a consistency model does instead."
+      answerKind: short_text
+      hint: "What is the MSE-optimal function when many x0 are consistent with the same x_T?"
+      solution: >-
+        The MSE-optimal one-step map is $\mathbb{E}[x_0\mid x_T]$, the conditional
+        mean over every image consistent with that noise. Measured on the 70/30
+        mixture: standard deviation 0.0214 against a true 1.9005 (1.1% of the
+        spread), 1-Wasserstein distance 1.6673, left-mode mass 1.0000. It is one
+        point because the posterior is genuinely broad — the many-to-one forward
+        map cannot be inverted by regression. A consistency model instead enforces
+        $f(x_t,t)=f(x_{t'},t')$ for any two points on the *same* ODE trajectory, so
+        it commits to one trajectory per noise draw rather than averaging across
+        trajectories. That is a different objective, and it is what makes 1-2 NFE
+        generation possible without collapsing.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        The forward process you were taught has a variance term that is chosen,
+        not derived. Every question in this topic is a question about that term:
+        what happens to the marginal when you change it (nothing), what happens to
+        the sampler when you set it to zero (it becomes a function), and what
+        happens when you then take bigger steps (the function is a contraction,
+        and the contraction is measurable). Keep three objects separate — the
+        schedule, the sampler, and the network — because the whole point is that
+        the first two can change while the third is untouched.
+      blocks:
+        - kind: checklist
+          body: |
+            - Schedule: fixed arrays of beta, alpha, alpha_bar. Never changes at inference.
+            - Sampler: how many levels you visit and how much variance you inject. Free choice.
+            - Network: trained on q(x_t|x_0) only, so it never sees sigma.
+            - Setting sigma to zero makes the step a function of x_t alone
+            - A function can be evaluated at any pair of levels, so the step count is yours
+            - Every skipped level removes a cosine from the variance
+      checkpoint: >-
+        If changing sigma leaves the training distribution untouched, what exactly
+        is the thing that gets worse when you take fewer steps?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Write the update in three terms — signal, residual noise direction, fresh
+        noise — and check that the second and third coefficients' squares sum to
+        $1-\bar\alpha_{t-1}$. That single check catches the bug that costs most
+        people a week. Then separate the two error sources: the model's error
+        (which training fixes) and the sampler's discretisation error (which it
+        does not). To tell them apart, measure on data where you know the score
+        exactly: standard Gaussians for variance, a two-mode mixture for
+        distributional distance. If the error persists with a perfect score, it is
+        the sampler.
+      blocks:
+        - kind: checklist
+          body: |
+            - Check: coef_signal^2 + coef_eps^2 = 1 - alpha_bar_prev, to 1e-12
+            - eta=0 first, always; it isolates the discretisation error from the noise
+            - Measure output std against data std before looking at any image
+            - Measure a distributional distance (W1) over 1e5 samples, not one sample
+            - Compare at matched NFE, never at matched wall clock
+      checkpoint: >-
+        Which of those five checks would fail on a sampler that is correct at
+        eta=0 and broken at eta=1?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Four procedures. The scheduler turns (T, S) into the levels you visit; the
+        sigma function turns (level pair, eta) into a scalar; the step turns
+        (x, eps, levels, sigma) into the next x; the budget turns (levels, eta)
+        into the variance you should expect, with no data at all.
+      blocks:
+        - kind: pseudocode
+          body: |
+            step_indices(T, S):
+                return [ floor(k*(T-1)/S + 0.5) for k = S down to 0 ]
+
+            sigma(ab_t, ab_prev, eta):
+                assert 0 < ab_t <= ab_prev <= 1
+                return eta * sqrt( (1-ab_prev)/(1-ab_t) * (1 - ab_t/ab_prev) )
+
+            step(x, eps, ab_t, ab_prev, eta, z):
+                s   = sigma(ab_t, ab_prev, eta)
+                x0  = (x - sqrt(1-ab_t) * eps) / sqrt(ab_t)
+                out = sqrt(ab_prev) * x0
+                    + sqrt(1 - ab_prev - s^2) * eps        # the subtraction matters
+                    + s * z
+                return out
+
+            variance(levels, eta):                             # analytic, no samples
+                v = 1
+                for (t, prev) in consecutive_pairs(levels):
+                    s = sigma(ab[t], ab[prev], eta)
+                    c = sqrt(ab[t]*ab[prev]) + sqrt(1-ab[prev]-s^2)*sqrt(1-ab[t])
+                    v = c*c*v + s*s
+                return v
+      checkpoint: >-
+        In `sigma`, what happens as `ab_t` approaches `ab_prev`, and why is that
+        the right limit for a zero-length step?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three results carry the topic: the cancellation that makes sigma free, the
+        algebra that names eta's endpoints, and the cosine product that prices a
+        skipped step.
+      blocks:
+        - kind: math
+          body: |
+            Marginal invariance. With
+            $c_t^2 = 1-\bar\alpha_{t-1}-\sigma_t^2$ and residual
+            $\epsilon=(x_t-\sqrt{\bar\alpha_t}x_0)/\sqrt{1-\bar\alpha_t}$,
+
+            $$\operatorname{Var}(x_{t-1}) = c_t^2 + \sigma_t^2 = 1-\bar\alpha_{t-1}.$$
+
+            Eta's endpoints. Since $\bar\alpha_t=\alpha_t\bar\alpha_{t-1}$,
+
+            $$1-\frac{\bar\alpha_t}{\bar\alpha_{t-1}} = \beta_t
+              \;\Longrightarrow\;
+              \sigma_t^2 = \eta^2\frac{1-\bar\alpha_{t-1}}{1-\bar\alpha_t}\beta_t
+              = \eta^2\tilde\beta_t.$$
+
+            Cosine product. On standard-Gaussian data with an exact predictor,
+            $\hat x_0=\sqrt{\bar\alpha_t}x_t$ and
+            $\epsilon_\theta=\sqrt{1-\bar\alpha_t}x_t$, so the $\eta=0$ step is
+
+            $$x_{t-1}=\Big[\sqrt{\bar\alpha_{t-1}\bar\alpha_t}
+              +\sqrt{(1-\bar\alpha_{t-1})(1-\bar\alpha_t)}\Big]x_t
+              =\cos(\theta_t-\theta_{t-1})x_t,$$
+
+            and $S$ of them give
+            $\prod_i\cos^2(\theta_{\tau_{i-1}}-\theta_{\tau_i})$ = 0.6918 at
+            $S=10$, 0.8329 at 20, 0.9964 at 1000.
+      checkpoint: >-
+        The cosine product tends to 1 as S grows because the angles shrink. What
+        does that imply about where a non-uniform grid should spend its levels?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A correct sigma, a correct three-term step, a step schedule with explicit
+        rounding, and the analytic variance budget — plus the measurement that
+        separates each from its plausible-looking wrong version.
+      blocks:
+        - kind: warning
+          body: >-
+            Three failures that produce valid tensors. Dropping `- sigma**2` from
+            the residual coefficient inflates the variance every step and gets
+            worse with more steps (std 3.06 against 1.87, W1 1.301 against 0.058
+            at S=250). Rounding step indices with `np.round` instead of
+            `floor(x+0.5)` moves steps by a whole level on small schedules.
+            Cranking eta at low NFE to "add diversity" makes the distribution
+            worse (0.2887 against 0.1906 at S=10). None of the three raises, and
+            all three are visible in two numbers: output standard deviation, and
+            Wasserstein distance against a reference batch.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def schedule(T=1000):
+                betas = np.linspace(1e-4, 0.02, T)
+                return betas, np.cumprod(1.0 - betas)
+
+
+            def sigma_t(ab_t, ab_prev, eta):
+                return eta * np.sqrt((1.0 - ab_prev) / (1.0 - ab_t)
+                                     * (1.0 - ab_t / ab_prev))
+
+
+            def step(x, eps, ab_t, ab_prev, eta, z):
+                s = sigma_t(ab_t, ab_prev, eta)
+                x0 = (x - np.sqrt(1.0 - ab_t) * eps) / np.sqrt(ab_t)
+                return (np.sqrt(ab_prev) * x0
+                        + np.sqrt(1.0 - ab_prev - s ** 2) * eps
+                        + s * z)
+
+
+            def step_indices(T, S):
+                return [int(np.floor(k * (T - 1) / S + 0.5)) for k in range(S, -1, -1)]
+
+
+            if __name__ == "__main__":
+                betas, ab = schedule()
+                print(sigma_t(ab[-1], ab[-2], 1.0), np.sqrt(0.01999998352656061))
+                print(step_indices(10, 4))     # [9, 7, 5, 2, 0]
+      checkpoint: >-
+        `step_indices(10, 4)` gives `[9, 7, 5, 2, 0]` rather than
+        `[9, 7, 4, 2, 0]`. Which one is right depends on a convention, so which
+        convention belongs in a docstring?
+
+  problems:
+    - id: p-sigma-eta
+      title: "The sigma schedule"
+      difficulty: easy
+      prompt: >-
+        Implement `sigma_eta(alpha_bar_t, alpha_bar_prev, eta)`: the standard
+        deviation injected at one step of the non-Markovian forward process, where
+        `alpha_bar_prev` is $\\bar\\alpha_{t-1}$ and is therefore *larger* than
+        `alpha_bar_t` (the chain runs backwards in $\\bar\\alpha$). Return
+        $\\eta\\sqrt{(1-\\bar\\alpha_{t-1})/(1-\\bar\\alpha_t)\\,(1-\\bar\\alpha_t/\\bar\\alpha_{t-1})}$
+        as a float. At `eta = 0` the answer is exactly 0; at `eta = 1` it is the
+        posterior standard deviation $\\sqrt{\\tilde\\beta_t}$. Reject arguments
+        that violate $0 < \\bar\\alpha_t \\le \\bar\\alpha_{t-1} \\le 1$.
+      starter: |
+        import numpy as np
+
+        def sigma_eta(alpha_bar_t, alpha_bar_prev, eta):
+            # your implementation here
+            pass
+      language: python
+      entry: sigma_eta
+      testCases:
+        - input: '[0.81, 0.9025, 1.0]'
+          expected: '0.2293362825317736'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.81, 0.9025, 0.5]'
+          expected: '0.1146681412658868'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.64, 0.81, 1.0]'
+          expected: '0.33281853251132276'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.25, 0.5, 0.75]'
+          expected: '0.4330127018922193'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.0625, 0.25, 1.0]'
+          expected: '0.7745966692414834'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.9, 0.99, 0.0]'
+          expected: '0.0'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def sigma_eta(alpha_bar_t, alpha_bar_prev, eta):
+            if not (0.0 < alpha_bar_t <= 1.0) or not (0.0 < alpha_bar_prev <= 1.0):
+                raise ValueError("alpha_bar values must lie in (0, 1]")
+            if alpha_bar_prev < alpha_bar_t:
+                raise ValueError("alpha_bar_prev must be >= alpha_bar_t")
+            if eta < 0.0:
+                raise ValueError("eta must be non-negative")
+            inner = (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
+            inner *= (1.0 - alpha_bar_t / alpha_bar_prev)
+            return float(eta * np.sqrt(max(inner, 0.0)))
+      solutionExplanation: >-
+        The two factors do different jobs. $(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)$
+        is the ratio of noise variances between the two levels — slightly above 1
+        because the earlier level is noisier. $(1-\bar\alpha_t/\bar\alpha_{t-1})$
+        is what makes the first factor safe: it equals $\beta_t/\alpha_t$ in the
+        $\bar\alpha$ parameterisation, so the product is at most 1 and the sigma
+        never exceeds the noise budget. Test case 5 is the interesting one
+        numerically: with $\bar\alpha_t = 1/16$ and $\bar\alpha_{t-1} = 1/4$ the
+        answer is exactly $\sqrt{0.6} = 0.7745966692414834$, which a solution that
+        forgot the second factor would report as $\sqrt{(3/4)/(15/16)} =
+        0.8944$. Test case 4 checks $\eta$ scales linearly rather than
+        quadratically: $0.75 \times \sqrt{1/3} = 0.4330$, and a solution that
+        multiplied by $\eta^2$ would return 0.3248. `max(inner, 0.0)` guards the
+        float case where $\bar\alpha_t$ and $\bar\alpha_{t-1}$ are equal to
+        within an ulp and the second factor computes as $-10^{-17}$.
+      complexity: "O(1) time and space"
+      tags: [ddim, sigma, eta, schedule]
+
+    - id: p-ddim-update
+      title: "One step of the DDIM update"
+      difficulty: medium
+      prompt: >-
+        Implement `ddim_update(x, eps, alpha_bar_t, alpha_bar_prev, eta, z)`: one
+        step from level `alpha_bar_t` to level `alpha_bar_prev`, elementwise, where
+        `x`, `eps` and `z` are lists of the same shape. Form the implied clean
+        estimate
+        $\\hat x_0 = (x - \\sqrt{1-\\bar\\alpha_t}\\,\\epsilon)/\\sqrt{\\bar\\alpha_t}$,
+        then return
+        $\\sqrt{\\bar\\alpha_{t-1}}\\,\\hat x_0 + \\sqrt{1-\\bar\\alpha_{t-1}-\\sigma^2}\\,\\epsilon + \\sigma z$
+        with $\\sigma$ from the previous problem. The `- sigma**2` inside the second
+        square root is the whole exercise: it is what reserves room for the noise
+        that `z` carries. Return nested lists.
+      starter: |
+        import numpy as np
+
+        def ddim_update(x, eps, alpha_bar_t, alpha_bar_prev, eta, z):
+            # your implementation here
+            pass
+      language: python
+      entry: ddim_update
+      testCases:
+        - input: '[[1.0], [0.5], 0.81, 0.9025, 0.0, [0.0]]'
+          expected: '[0.9816275057175355]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[2.0, -1.0], [0.5, 0.25], 0.64, 0.81, 0.0, [0.0, 0.0]]'
+          expected: '[2.130444947177034, -1.1847775264114828]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1.0], [0.5], 0.81, 0.9025, 1.0, [0.25]]'
+          expected: '[0.9887904719017916]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1.0, 2.0], [0.0, 0.0], 0.0625, 0.25, 0.0, [0.0, 0.0]]'
+          expected: '[2.0, 4.0]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1.0], [0.0], 0.36, 0.49, 1.0, [1.0]]'
+          expected: '[1.6264664234375144]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def ddim_update(x, eps, alpha_bar_t, alpha_bar_prev, eta, z):
+            if not (0.0 < alpha_bar_t <= 1.0) or not (0.0 < alpha_bar_prev <= 1.0):
+                raise ValueError("alpha_bar values must lie in (0, 1]")
+            if alpha_bar_prev < alpha_bar_t:
+                raise ValueError("alpha_bar_prev must be >= alpha_bar_t")
+            x = np.asarray(x, dtype=float)
+            eps = np.asarray(eps, dtype=float)
+            z = np.asarray(z, dtype=float)
+            if x.shape != eps.shape or x.shape != z.shape:
+                raise ValueError("x, eps and z must share a shape")
+            s2 = float(eta * eta * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
+                       * (1.0 - alpha_bar_t / alpha_bar_prev))
+            x0 = (x - np.sqrt(1.0 - alpha_bar_t) * eps) / np.sqrt(alpha_bar_t)
+            out = np.sqrt(alpha_bar_prev) * x0
+            out = out + np.sqrt(max(1.0 - alpha_bar_prev - s2, 0.0)) * eps
+            return (out + np.sqrt(max(s2, 0.0)) * z).tolist()
+      solutionExplanation: >-
+        Test case 3 is the one that catches the missing subtraction. With
+        $\bar\alpha_t=0.81$, $\bar\alpha_{t-1}=0.9025$ and $\eta=1$,
+        $\sigma^2 = 0.0525951$, so the residual coefficient is
+        $\sqrt{0.0975-0.0525951} = \sqrt{0.0449049} = 0.211908$, not
+        $\sqrt{0.0975} = 0.312250$. The correct answer is 0.98879; the version
+        without the subtraction returns 1.03896. Both look plausible and only one
+        is a sampler. Test case 4 pins the algebra with `eps = 0`: then
+        $\hat x_0 = x/\sqrt{\bar\alpha_t} = 1/0.25 = 4$, and the output is
+        $\sqrt{0.25}\times 4 = 2.0$ — a solution that returned $\sqrt{\bar\alpha_{t-1}/\bar\alpha_t}\,x$
+        gets the same answer here, which is why case 2 (where it gives 2.25
+        instead of 2.1304) is needed alongside. Test case 5 is the only one where
+        `z` is nonzero with a nontrivial `x0`, so a solution that silently dropped
+        the noise term still passes the first four.
+      complexity: "O(n) time and space in the number of elements; four square roots per call"
+      tags: [ddim, sampling, variance, eta]
+
+    - id: p-step-indices
+      title: "Which levels a fast sampler visits"
+      difficulty: easy
+      prompt: >-
+        Implement `step_indices(T, S)`: the $S+1$ levels a fast sampler visits,
+        from `T - 1` down to `0`, spaced as evenly as the integer grid allows.
+        Element $k$ of the output (counting from the front) must be
+        `floor(k * (T - 1) / S + 0.5)` for `k = S, S-1, ..., 0`, returned as a
+        plain list of ints. Round half **up**, not to even: `np.round(4.5)` is 4,
+        and this function must give 5. The output always starts at `T - 1`, always
+        ends at `0`, and has exactly `S + 1` entries (repeats are possible when
+        `S >= T`; a repeated level is a legal zero-length step).
+      starter: |
+        def step_indices(T, S):
+            # your implementation here
+            pass
+      language: python
+      entry: step_indices
+      testCases:
+        - input: '[1001, 10]'
+          expected: '[1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[1000, 4]'
+          expected: '[999, 749, 500, 250, 0]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[10, 4]'
+          expected: '[9, 7, 5, 2, 0]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[1000, 20]'
+          expected: '[999, 949, 899, 849, 799, 749, 699, 649, 599, 549, 500, 450, 400, 350, 300, 250, 200, 150, 100, 50, 0]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[5, 5]'
+          expected: '[4, 3, 2, 2, 1, 0]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def step_indices(T, S):
+            if T < 1:
+                raise ValueError("T must be at least 1")
+            if S < 1:
+                raise ValueError("S must be at least 1")
+            return [int(k * (T - 1) / S + 0.5) for k in range(S, -1, -1)]
+      solutionExplanation: >-
+        The rounding convention is the content. Test case 3 is the discriminator:
+        $k(T-1)/S$ for $k=2$ is $2 \times 9/4 = 4.5$, and `np.round` sends 4.5 to
+        4 (banker's rounding, to the even neighbour) while this function must
+        produce 5; for $k=1$ it is 2.25, which goes to 2 either way. So a solution
+        using `round` fails only on the midpoint, which is exactly the kind of
+        bug that survives a spot check on a 1000-level schedule. Test case 4 is
+        the realistic one and shows why the schedule is not uniform in the integer
+        index: 21 levels, gaps of 50, except a gap of 49 between 599 and 549
+        because 499.5 rounds up to 500. Test case 5 documents the degenerate
+        case: with $S \geq T$ the grid repeats a level, and the update handles it
+        exactly — when the two levels are equal, $\sigma = 0$ (the factor
+        $1-\bar\alpha_t/\bar\alpha_{t-1}$ is zero) and the two coefficients become
+        $\bar\alpha + (1-\bar\alpha) = 1$, so the step is the identity. A solution
+        that raised on duplicates would reject a legal, harmless schedule.
+      complexity: "O(S) time and space; one multiply, one divide and one round per level"
+      tags: [ddim, sampling, schedule, rounding]
+
+  visualizers:
+    - id: vs-ddim-steps
+      kind: loss_surface
+      title: "Quality and variance against step count"
+      description: >-
+        Sweep $S$ from 1 to 250 and watch the 1-Wasserstein distance fall from
+        1.6603 to 0.0558 while the output variance climbs from 0.000267 to
+        0.9855. The distance curve is steep below ten steps and almost flat above
+        fifty; the variance curve is the product of squared cosines and can be
+        computed without sampling at all.
+      params:
+        T: 1000
+        steps: [1, 2, 5, 10, 20, 50, 100, 250]
+        etas: [0.0, 0.5, 1.0]
+        schedule: linear
+
+  try_it: >-
+    Build the linear schedule and take two step subsequences, S = 10 and S = 20. Compute the
+    product of cos(θ_t − θ_{t−1}) for each, where cos θ_t = sqrt(bar_alpha_t), and check the
+    results against 0.6918 and 0.8329. Then run the same deterministic sampler twice from one
+    fixed x_T and confirm the two outputs are bit-identical.
+  interview_questions:
+    - question: "A 20-step DDIM run gives slightly flat, low-contrast images. Is the sampler wrong or is the model?"
+      level: mid
+      key_points:
+        - "With eta = 0 there is no draw in the update at all, so the map is a function: 4000 runs from one fixed x_T had output spread exactly 0.0000."
+        - "Skipping levels costs variance that you can compute in advance — the product of cosines is 0.6918 at S = 10, 0.8329 at 20 and 0.9641 at 100 against a target of 1.0."
+        - "A correct 250-step run returns output standard deviation 1.87 against data 1.90; the classic sigma-squared bug returns 3.06, so one number separates a sampler bug from a model bug."
+        - "The repair is more steps or eta > 0, not retraining — the weights were never the problem."
+      follow_up: "What does eta = 1 do at 20 steps, and why is it not a repair?"
+    - question: "Why is any subsequence of timesteps valid for DDIM but not for DDPM?"
+      level: senior
+      key_points:
+        - "The DDIM update reads bar_alpha at two endpoints and asks the network once at the point it is standing on; nothing in it requires the endpoints to be adjacent."
+        - "DDPM's step is a draw from q(x_{t−1} | x_t) whose variance is tied to that specific beta_t, so skipping levels changes the distribution being sampled."
+        - "The one-parameter family q_sigma leaves every marginal unchanged for any sigma_t, because the middle coefficient loses exactly sigma_t squared to the injected noise; that is what licenses choosing the spacing."
+        - "eta interpolates the family: sigma_t(eta) squared is eta squared times beta_tilde_t, and eta = 1 recovers DDPM exactly."
+      follow_up: "If any subsequence is valid, why does uniform spacing in t waste evaluations?"
+    - question: "Why can't one-step generation be obtained by training a network to predict x_0 from pure noise?"
+      level: mid
+      key_points:
+        - "The forward map is many-to-one: at T the signal coefficient is sqrt(bar_alpha_T) = 0.006353, so x_T retains almost nothing about any particular x_0."
+        - "The optimal predictor therefore returns the conditional mean; measured at S = 1 the output standard deviation is 0.0121 and the 1-Wasserstein distance is 1.6603 against a data standard deviation of 1.90 — one blurry blob per input."
+        - "A consistency model instead enforces f(x_t, t) = f(x_t', t') for two points on the same ODE trajectory, which learns the map rather than the marginal."
+        - "Progressive distillation takes the other route, training a two-step sampler to match a one-step teacher so the step count halves per round."
+      follow_up: "Which property does a consistency model preserve that a plain x_0 regressor cannot?"
+  common_mistakes:
+    - "Setting eta = 1 at 20 steps because the docs say it recovers DDPM — the injected noise is calibrated for adjacent steps, not for 50-level jumps."
+    - "Reading flat, low-contrast samples as a model failure when the variance deficit is the sampler's: 0.8329 at S = 20, 0.9641 at S = 100."
+    - "Spacing steps uniformly in t and assuming the path is uniform too — the final three of a 20-step trajectory carry 27.9% of the total displacement."
+  further_reading:
+    - label: "Song, Meng, Ermon, Denoising Diffusion Implicit Models (DDIM), ICLR 2021"
+    - label: "Song, Sohl-Dickstein, Kingma, Kumar, Ermon, Poole, Score-Based Generative Modeling through Stochastic Differential Equations, ICLR 2021"

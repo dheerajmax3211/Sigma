@@ -1,0 +1,1519 @@
+id: fine-tuning-lora
+slug: fine-tuning-lora
+title: "Fine-Tuning: Full, LoRA, QLoRA, Prefix, and Adapter"
+summary: >-
+  Fine-tuning changes a model's function without changing most of its weights: a
+  rank-r update added to six matrices per layer touches 0.59% of a 7B model's
+  parameters, and the engineering is deciding which matrices, at what rank, at
+  what precision, and whether the update has to survive being merged back into
+  the base. Measured here on a 2-layer transformer fine-tuned on three tasks:
+  rank 1 to 4 buys a 60x loss reduction and rank 8 to 64 buys 2.5x, attention
+  adapters fit a re-routing task to 0.0033 nats while MLP adapters sit at 3.13,
+  and a 4-bit base costs 3.9x less memory for no measurable accuracy.
+kind: lesson
+difficulty: expert
+position: 10
+estMinutes: 34
+prerequisites: [pretraining-objectives, optimisation-in-practice]
+phase: "adaptation"
+tags:
+  - fine-tuning
+  - lora
+  - qlora
+  - peft
+  - low-rank
+  - nf4
+  - quantisation
+  - adapters
+  - prefix-tuning
+  - merging
+  - catastrophic-forgetting
+
+body:
+  big_idea: >-
+    A fine-tune only has to change the model's function, and a rank- $r$
+    update to a few weight matrices changes it enough while touching a
+    fraction of a percent of the parameters.
+
+  problem:
+    - >-
+      Full fine-tuning needs 16 bytes of state per parameter — 100.4 GiB
+      before an activation — which does not fit on eight 80 GB cards.
+    - >-
+      You ship a fine-tuned 7B that can no longer do arithmetic, and eleven
+      variants at 12.6 GiB each is 151 GiB for one product surface.
+    - >-
+      You merge the adapter and the outputs are wrong, because the merge
+      scaled by $\alpha$ instead of $\alpha/r$: eight times too large.
+
+  analogy: |
+    A road atlas has 400 pages. Instead of reprinting it, you lay tracing
+    paper over each page and draw the corrections: this bridge is closed, that
+    junction is now a roundabout. The atlas underneath is untouched; your copy
+    is atlas plus one sheet per page. The sheets start blank, which is what
+    initialising $B$ at zero buys.
+
+  concept_points:
+    - >-
+      **The update is a product of two thin matrices, so its rank is bounded by $r$ and its bill is $r(d+k)$ rather than $dk$.**
+      For $d \times k$ weights you train $B \in \mathbb{R}^{d \times r}$ and
+      $A \in \mathbb{R}^{r \times k}$, adding $\Delta W = \frac{\alpha}{r}BA$.
+      On a 7B with $d = 4096$: $r=4$ gives 9,994,240 parameters (0.1483%),
+      $r=8$ 19,988,480 (**0.2966%**), $r=16$ 39,976,960 (0.5932%), $r=64$
+      159,907,840 (2.3730%).
+    - >-
+      **Initialising $B = 0$ makes step zero an exact no-op, and it also makes $A$'s gradient exactly zero for one step.**
+      Measured, the loss before and after attaching the adapter is 13.733208
+      against 13.733208, with max logit change exactly **0.000e+00**. The
+      gradient to $A$ is $\frac{\alpha}{r}B^\top\partial L/\partial W'$ =
+      **0.0**, while $B$ gets 0.1907, so only $B$ moves first. Initialise
+      **both** factors at zero and the adapter is dead forever.
+    - >-
+      **$\alpha/r$ is a scale on the update, not a schedule, and it does not commute with the learning rate.**
+      At fixed $r=8$, lr $=5\times10^{-3}$, 200 steps: $\alpha=2$ reaches
+      2.5208, $\alpha=8$ 1.5590, $\alpha=32$ **0.0355**, $\alpha=128$
+      **3.4400** — against $\ln 32 = 3.4657$, so the largest scale has
+      flattened the model to uniform. Five runs at constant
+      $\text{scale} \times \text{lr}$ gave 3.4322 down to 0.0011.
+    - >-
+      **Rank has a knee, and past the knee the parameters are wasted.** Same
+      task, 800 steps, $\alpha = 2r$ so scale is fixed: $r=1$ gives 0.0510
+      nats (1,792 parameters), $r=2$ 0.0041, $r=4$ 0.00085, $r=8$ 0.00085,
+      $r=16$ **0.00038**, $r=64$ 0.00034. The first two doublings buy 60x, the
+      last three 2.5x. A full fine-tune's top 8 singular values hold **79.5%**
+      of the update's energy on this task.
+    - >-
+      **Placement is a property of the change the task requires, not of LoRA.**
+      At $r=8$, $\alpha=16$, 800 steps on a base scoring 13.73 nats: a
+      *re-routing* task is fitted by attention adapters alone (0.0033) against
+      **3.1251** for MLP adapters alone — MLP-only is **6,430x** worse. A
+      *relabelling* task is fitted by either (0.0035 attention, 0.0054 MLP,
+      0.0015 all). A task needing both moves under neither group.
+    - >-
+      **The merge is where the $\alpha/r$ convention either survives or breaks silently.**
+      Serving folds the adapter in because
+      $(W + \frac{\alpha}{r}BA)x = Wx + \frac{\alpha}{r}B(Ax)$: measured,
+      factorised and merged paths agree to **4.796e-14** absolute in float64.
+      Merge with scale $\alpha$ instead of $\alpha/r$ — 8x too large at $r=8$
+      — and held-out loss goes from 0.001934 to **3.9646** (2,050x) with a max
+      logit change of 18.22. Nothing raises.
+
+  definitions:
+    - term: "LoRA (low-rank adaptation)"
+      meaning: >-
+        Freezing $W$ and training two small matrices $B$ ($d \times r$) and $A$
+        ($r \times k$) whose product, scaled by $\alpha/r$, is added to $W$. The
+        parameter count is $r(d+k)$ instead of $dk$ and the update's rank is at
+        most $r$; the point is that the frozen base can be shared across many
+        adapters and the adapter can be merged away at serving time.
+    - term: "Rank r"
+      meaning: >-
+        The inner dimension of the adapter, and therefore the maximum rank of
+        $\Delta W$ — the number of independent directions the fine-tune is
+        allowed to move the layer in. Measured here: $r = 1$ already reaches
+        0.9989 accuracy on a relabelling task, the re-routing task's loss stops
+        improving between 4 and 8, and $r = 64$ is still not enough for a task
+        that needs a two-token arithmetic table.
+    - term: "alpha (lora_alpha)"
+      meaning: >-
+        A scalar with no parameters that divides by $r$ and multiplies the
+        low-rank term, so the update is $(\alpha/r)BA$. It exists so that
+        changing $r$ does not force you to retune the learning rate; setting
+        $\alpha = 2r$ holds the scale at 2. It is the only part of the adapter
+        that lives purely in code, which is why it is the part a merge script
+        gets wrong.
+    - term: "Delta W"
+      meaning: >-
+        The additive update $\frac{\alpha}{r}BA$ to a frozen weight matrix.
+        Low-rank by construction, but not necessarily small: measured at 66.5%
+        of the adapted matrices' combined Frobenius norm for an adapter that
+        solved the routing task.
+    - term: "Adapter"
+      meaning: >-
+        Any small trainable module attached to a frozen base. LoRA's adapter is
+        a parallel low-rank branch that can be merged; a Houlsby adapter layer
+        is a serial bottleneck MLP that cannot. "Adapter" alone does not tell
+        you which, and the difference decides your inference cost.
+    - term: "QLoRA"
+      meaning: >-
+        LoRA on a base quantised to 4-bit NF4, with the adapters kept in bf16
+        and gradients computed through a dequantised copy of each block. The
+        base is frozen and never updated, so the quantisation error is fixed
+        rather than accumulated — which is why 4-bit weights work here but not
+        in full fine-tuning.
+    - term: "NF4 (4-bit NormalFloat)"
+      meaning: >-
+        A 16-entry codebook whose levels are quantiles of a standard normal, so
+        that each level is equally likely for normally distributed weights.
+        Stored as 4-bit indices plus one absmax scale per block of 64. Measured
+        against uniform int4 on Gaussian weights it is 1.060x closer; with 1%
+        of weights at 10 sigma it is 1.472x closer, which is the case the
+        codebook exists for.
+    - term: "Double quantisation"
+      meaning: >-
+        Quantising the absmax constants themselves, in blocks of 256, with
+        8-bit values and one fp32 scale per block. The absmax goes from 0.5 bits
+        per weight to 0.127, so the format goes from 4.5 bits to 4.127 — 0.5625
+        to 0.5159 bytes per parameter, an 8.3% saving on the weight bytes.
+    - term: "Merged weights"
+      meaning: >-
+        $W' = W + \frac{\alpha}{r}BA$, materialised so the adapter disappears
+        from the forward pass. Algebraically exact, numerically exact to
+        3.2e-15 relative in float64 and 1.1e-06 in float32 (measured), and
+        irreversible: after merging you can no longer separate the adapter from
+        the base to serve a second task.
+    - term: "Prefix tuning"
+      meaning: >-
+        Learning $p$ key/value vectors per layer and prepending them to every
+        attention call, so the "prompt" is trained rather than written.
+        2,621,440 parameters at $p = 10$ on a 32-layer 7B (0.0389%), but it
+        consumes $p$ context positions, costs 5.0 MiB of KV cache per sequence,
+        and cannot be merged.
+    - term: "Adapter layer (Houlsby)"
+      meaning: >-
+        A bottleneck MLP — down-project to $r$, nonlinearity, up-project back to
+        $d$ — inserted in series after attention and after the FFN, with a
+        residual. 4,194,304 parameters at $r = 16$ on a 32-layer 7B (0.0622%),
+        but it adds depth to the network, so its latency is paid on every token
+        and it cannot be folded into an existing weight.
+    - term: "Catastrophic forgetting"
+      meaning: >-
+        The loss of pretrained capability that accompanies full fine-tuning,
+        because every weight is free to move. LoRA does not abolish it — a
+        rank-8 update at 66% of the base's norm can still change every
+        prediction — but it bounds the update's rank and leaves the base
+        untouched as an artefact you can always go back to.
+
+  diagrams:
+    - type: architecture
+      title: "Where the adapter sits, and what the merge removes"
+      nodes:
+        - id: x
+          x: 0
+          y: 1
+          label: "hidden state x"
+          kind: model
+          detail: "One token's residual stream, 4096 floats. Every adapted matrix in the block reads from this same vector, which is why the adapters compose additively rather than in series."
+        - id: w
+          x: 1
+          y: 0
+          label: "frozen W"
+          kind: storage
+          detail: "4096 x 4096, 16.7M parameters, bf16, never updated and never in the optimizer. This is the object that gets shared across every adapter you train."
+        - id: b
+          x: 1
+          y: 2
+          label: "B: 4096 x r"
+          kind: model
+          detail: "Initialised to zero, so the branch contributes nothing at step 0. Its gradient at step 0 is the only non-zero one in the adapter, which is why it moves first."
+        - id: a
+          x: 2
+          y: 2
+          label: "A: r x 4096"
+          kind: model
+          detail: "Initialised randomly at 1/sqrt(d) and frozen for exactly one step, because its gradient is proportional to B. Rank r is the whole budget: A and B together hold r(d+k) numbers."
+        - id: sum
+          x: 3
+          y: 1
+          label: "Wx + (alpha/r) B(Ax)"
+          kind: server
+          detail: "The merge replaces this node with a single matrix W' = W + (alpha/r) BA, at which point the branch and its two matmuls disappear. Measured agreement between the two forms: 3.2e-15 relative in float64."
+      edges:
+        - from: x
+          to: w
+          label: "x"
+        - from: x
+          to: b
+          label: "x (same vector)"
+        - from: b
+          to: a
+          label: "r floats"
+        - from: w
+          to: sum
+          label: "dk"
+        - from: a
+          to: sum
+          label: "scaled by alpha/r"
+      caption: "The adapter is a parallel branch, not an inserted layer. That is the structural reason it can be merged: both paths are linear in x, so they add — which is exactly what a prefix or a bottleneck adapter cannot do."
+
+    - type: plot
+      title: "Rank against held-out loss at a fixed alpha/r scale of 2"
+      chart: line
+      xLabel: "rank r"
+      yLabel: "held-out loss, nats"
+      series:
+        - name: "re-routing task (all six matrices)"
+          points:
+            - { x: 1, y: 0.050967 }
+            - { x: 2, y: 0.004107 }
+            - { x: 4, y: 0.000847 }
+            - { x: 8, y: 0.000853 }
+            - { x: 16, y: 0.000383 }
+            - { x: 32, y: 0.000360 }
+            - { x: 64, y: 0.000345 }
+        - name: "relabelling task (all six matrices)"
+          points:
+            - { x: 1, y: 0.082869 }
+            - { x: 2, y: 0.010616 }
+            - { x: 4, y: 0.003123 }
+            - { x: 8, y: 0.001624 }
+            - { x: 16, y: 0.000787 }
+            - { x: 32, y: 0.000461 }
+            - { x: 64, y: 0.000270 }
+      caption: "Same steps, same data, alpha = 2r so the scale is constant and rank is the only variable. r = 1 to 4 buys 60x; r = 8 to 64 buys 2.5x for 8x the parameters. The parameters go 1,792 to 114,688 across the axis."
+
+    - type: plot
+      title: "Which matrices, on three tasks with different requirements"
+      chart: bar
+      xLabel: "adapted matrices (1 = attention only, 2 = MLP only, 3 = all six)"
+      yLabel: "log10 of held-out loss (lower is better)"
+      series:
+        - name: "re-routing task"
+          points:
+            - { x: 1, y: -2.487 }
+            - { x: 2, y: 0.495 }
+            - { x: 3, y: -3.313 }
+        - name: "relabelling task"
+          points:
+            - { x: 1, y: -2.457 }
+            - { x: 2, y: -2.266 }
+            - { x: 3, y: -2.821 }
+        - name: "two-token arithmetic"
+          points:
+            - { x: 1, y: 0.540 }
+            - { x: 2, y: 0.540 }
+            - { x: 3, y: 0.517 }
+      caption: "r = 8, alpha = 16, 800 steps, batch 128, two seeds. Raw losses: re-routing 0.0033 / 3.1251 / 0.00049; relabelling 0.0035 / 0.0054 / 0.0015; arithmetic 3.4682 / 3.4666 / 3.2861 against a base of 14.32. The relabelling task is the one where placement does not matter, and the reason is that a 32-token relabel is a linear map on 64-dimensional embeddings."
+
+    - type: compare
+      title: "Full fine-tuning, LoRA, and QLoRA on the same 7B"
+      left_label: "Full fine-tuning: every parameter, 16 bytes of state each"
+      left_points:
+        - "100.41 GiB of weights, gradients, fp32 master copy and two Adam moments, before any activation"
+        - "One model per task: 12 variants is 151 GiB of bf16 weights to host"
+        - "Measured on this rig's hardest task: 0.0434 nats, the best number any method reached"
+        - "Every weight is free to move, so pretrained capability is not protected"
+        - "No merge step, because there is nothing separate to merge"
+      right_label: "LoRA and QLoRA: 0.59% of the parameters at r = 16"
+      right_points:
+        - "12.92 GiB for LoRA on a bf16 base; 3.61 GiB for QLoRA on an NF4 base"
+        - "One base plus 76.25 MiB per adapter at r = 16, so 100 tasks is 7.45 GiB of adapters"
+        - "Measured: 0.00038 on re-routing against full FT's 0.00153; 0.179 against 0.0434 on the arithmetic task"
+        - "The base is frozen, so the worst case is a bad adapter, not a damaged base"
+        - "Mergeable: measured agreement 3.2e-15 in float64, 1.1e-06 in float32"
+      caption: "The trade is not quality against memory; it is rank against everything you can no longer express. Compared at 800 steps and batch 128 on identical data, with lr 5e-3 for the adapters and 2e-3 for full fine-tuning — matched on tokens and steps, not on tuning. Two of three tasks favoured the adapter; the third needed a computation the base could not express at rank 8."
+
+    - type: pipeline
+      title: "One adapter, from a frozen checkpoint to a merged model"
+      nodes:
+        - label: "Load the base in the serving dtype"
+          note: "bf16, or NF4 if memory is the binding constraint"
+          detail: "Freeze everything: no gradients, no optimizer state, no fp32 master copy. This single decision is where 16 bytes per parameter becomes 2."
+        - label: "Choose the matrices"
+          note: "all six per layer, or attention only at 4x the rank for the same bill"
+          detail: "Measured: attention-only fits a re-routing task to 0.0033 and cannot fit a two-token arithmetic task at all. All-linear is the safe default until you have measured otherwise."
+        - label: "Attach A and B"
+          note: "A random at 1/sqrt(d), B exactly zero"
+          detail: "B = 0 makes step 0 an exact no-op and zeroes A's gradient for one step. Both zero is a dead adapter with two exactly-zero gradients."
+        - label: "Train adapters only"
+          note: "alpha = 2r, lr 5e-3 here, cosine over 800 steps"
+          detail: "The effective scale on the update is alpha/r times the Adam step in B. Keeping the product constant across ranks is not the same as keeping the behaviour constant: at a fixed product of 0.04, five alpha/lr pairs ranged from 0.0011 to 3.4322."
+        - label: "Evaluate on held-out data"
+          note: "report the loss, the accuracy, and the rank that produced them"
+          detail: "Rank 1 to 4 bought 60x here and rank 8 to 64 bought 2.5x, so the number you quote has to carry its rank or it means nothing."
+        - label: "Merge, or keep the adapter separate"
+          note: "merge for one task, keep separate for many"
+          detail: "Merging is exact to 3.2e-15 relative in float64. Merging with alpha instead of alpha/r multiplies the update by r and took this topic's loss from 0.0019 to 3.9646."
+      caption: "Every step has a number that can go wrong silently. The two that fail without an exception are the matrix choice (it just trains badly) and the merge scale (it just produces a different model)."
+
+  markdown: |
+    ## The update is a product
+
+    A fine-tune wants to change $W$ by some $\Delta W$. LoRA's assumption is that
+    the $\Delta W$ a fine-tune needs is low-rank, so it parameterises the update
+    as a product of two thin matrices:
+
+    $$\Delta W = \frac{\alpha}{r}BA, \qquad B \in \mathbb{R}^{d \times r},
+      \quad A \in \mathbb{R}^{r \times k}, \qquad
+      \operatorname{rank}(\Delta W) \le \min(\operatorname{rank}B,
+      \operatorname{rank}A) \le r .$$
+
+    The forward pass never materialises $\Delta W$:
+
+    $$h = Wx + \frac{\alpha}{r}B(Ax),$$
+
+    which costs $dk$ multiply-adds for the frozen path and $r(d+k)$ for the
+    branch — 0.39% extra at $r = 8$ on a $4096 \times 4096$ matrix. The parameter
+    bill is the same $r(d+k)$, so for a Llama-shaped 7B with $d = 4096$,
+    32 layers, $d_{ff} = 11008$ and 6,738,713,856 parameters:
+
+    | rank | attention only ($q,k,v,o$) | % of 7B | all linear (+ MLP) | % of 7B |
+    |---|---|---|---|---|
+    | 4 | 4,194,304 | 0.0622% | 9,994,240 | 0.1483% |
+    | 8 | 8,388,608 | 0.1245% | 19,988,480 | 0.2966% |
+    | 16 | 16,777,216 | 0.2490% | 39,976,960 | 0.5932% |
+    | 64 | 67,108,864 | 0.9959% | 159,907,840 | 2.3730% |
+
+    The oft-quoted "0.6% of the parameters" is the right-hand column at
+    $r = 16$: every linear layer. The same 40.0M parameters is approximately
+    $r = 38$ on attention alone, and a table that quotes the fraction without
+    the rank and the module list is quoting a coincidence.
+
+    ## Initialisation: why $B = 0$
+
+    At $B = 0$ the branch contributes the zero matrix, so step 0 *is* the
+    pretrained model. Measured on this rig: loss 13.733208 before attaching the
+    adapter and 13.733208 after, with a maximum change in any logit of exactly
+    0.000e+00.
+
+    The gradients explain why the asymmetry is deliberate:
+
+    $$\frac{\partial L}{\partial B} = \frac{\alpha}{r}\,
+      \frac{\partial L}{\partial W'}A^{\top}, \qquad
+      \frac{\partial L}{\partial A} = \frac{\alpha}{r}\,
+      B^{\top}\frac{\partial L}{\partial W'}.$$
+
+    At $B = 0$ the second is exactly zero, so $A$ cannot move on step 1 while
+    $B$ moves with gradient 0.1907 (measured); from step 2 both move. Zeroing
+    *both* factors kills both gradients — measured 0.0 and 0.0 — so the origin
+    is an absorbing state, which is why "initialise everything to zero so it
+    starts neutral" produces a module that trains forever and changes nothing.
+
+    ## alpha, r, and the learning rate
+
+    $\alpha$ has no parameters. It exists so that changing $r$ does not change
+    the size of the update, and $\alpha = 2r$ holds the scale at 2 regardless of
+    rank. Measured at fixed $r = 8$, lr $= 5\times10^{-3}$, 200 steps:
+
+    | alpha | scale alpha/r | held-out loss | accuracy |
+    |---|---|---|---|
+    | 2 | 0.25 | 2.5208 | 0.367 |
+    | 8 | 1.0 | 1.5590 | 0.595 |
+    | 32 | 4.0 | 0.0355 | 0.992 |
+    | 128 | 16.0 | 3.4400 | 0.068 |
+
+    The last row is the useful one: 3.4400 is $\ln 32 = 3.4657$ to within 0.026
+    nats, so the largest scale did not train faster — it flattened the model to
+    the uniform distribution. And $(\alpha, \text{lr})$ are not interchangeable
+    even at constant product: five runs with
+    $\text{scale} \times \text{lr} = 0.04$ gave 3.4322, 3.4244, 2.8752, 0.0079
+    and 0.0011 as the scale moved from 1 to 16 and the lr fell to compensate.
+    Adam normalises the gradient, so the lr sets the step in $B$ while
+    $\alpha/r$ scales the product $BA$; moving the scale into the lr unbalances
+    the factorisation.
+
+    ## Which matrices
+
+    | task | attention only | MLP only | all six |
+    |---|---|---|---|
+    | re-routing (attend 15-t instead of t-8) | 0.0033 | 3.1251 | **0.00049** |
+    | relabelling (fixed permutation of tokens) | 0.0035 | 0.0054 | **0.0015** |
+    | two-token arithmetic (retrieve two, add mod 32) | 3.4682 | 3.4666 | **3.2861** |
+
+    The base model scores 13.73, 14.32 and 15.21 nats on those three tasks
+    before any adapter is attached. Every run above is $r = 8$, $\alpha = 16$,
+    800 steps, batch 128, two seeds. The relabelling row explains the folklore:
+    mapping 32 embedding vectors onto 32 others is a linear map with 2,048
+    constraints and 4,096 free parameters in a single output projection, so it
+    needs no MLP and no rank — MLP-only lands at 0.0054, within 3.5x of the
+    best. The arithmetic task needs a computation the base's features do not
+    contain, and neither group alone moves it. The routing row is where
+    placement is not a matter of taste: MLP-only is 6,430x worse than
+    all-linear.
+
+    ## Rank is a capacity ceiling
+
+    On the arithmetic task, the $r = 8$ adapter sits at 3.4548, 3.4680, 3.4690
+    and 3.4683 for lr $= 2\times10^{-3}, 2\times10^{-2}, 5\times10^{-2},
+    2\times10^{-1}$ — a 100x range that moves the loss by 0.014 nats. At
+    $r = 64$, same steps, same lr $= 2\times10^{-3}$, it reaches 0.1793
+    (accuracy 0.9745); full fine-tuning reaches 0.0434. That is a rank ceiling
+    demonstrated by *failing* to move it with the learning rate, which is the
+    only way to tell the two apart.
+
+    But the ceiling is task-specific: on re-routing LoRA at $r = 16$ reaches
+    0.00038 against full fine-tuning's 0.00153, and on relabelling 0.00079
+    against 0.00097 — same steps and batch, but lr $5\times10^{-3}$ against
+    $2\times10^{-3}$, so matched on tokens and steps rather than on tuning. Both
+    generalisations — "LoRA matches full FT" and "LoRA cannot learn algorithms"
+    — are wrong as stated.
+
+    ## Memory, and what QLoRA's 4 bits buy
+
+    NF4 stores 4-bit indices plus one fp32 absmax per 64 weights — 4.5 bits,
+    or 0.5159 bytes once the absmax is itself double-quantised, against 2.0 for
+    bf16 and 4.0 for fp32. On the 7B that is 3.24 GiB against 12.55 and 25.10.
+    Total training memory is 100.41 GiB for a full fine-tune at 16 bytes per
+    parameter, 12.92 GiB for LoRA on a bf16 base and 3.61 GiB for QLoRA — the
+    frozen base is 97% of LoRA's bill, and the adapter's gradients and optimizer
+    state are the other 0.37 GiB.
+
+    The quality side, measured: the same adapter, same 800 steps, on an NF4 base
+    against a float64 base gave 0.000463/0.000451 and 0.000877/0.000545 on
+    re-routing, 0.001632/0.001431 and 0.001581/0.001559 on relabelling — up to
+    61% more nats on a number whose absolute value is 5e-4, with accuracy
+    1.0000 against 0.9999 in the worst run.
+
+    ## Merging
+
+    $$(W + \frac{\alpha}{r}BA)x = Wx + \frac{\alpha}{r}B(Ax)$$
+
+    is an identity, so a merged model is not an approximation. Measured over
+    1,024 sequences: 3.236e-15 relative in float64 and 1.144e-06 in float32 —
+    association order, not algebra. The failure mode is the convention:
+    merging with $\alpha$ instead of $\alpha/r$ multiplies the update by $r$,
+    and at $r = 8$ that took the held-out loss from 0.001934 to 3.9646.
+
+    ## Why the other methods cannot do that
+
+    Prefix tuning learns $2Lpd$ parameters — 2,621,440 at $p = 10$ on this 7B,
+    0.0389% — and prepends them to every attention call. It is *cheaper* than
+    LoRA at $r = 16$ (0.5932%) and it cannot be merged: the prefix occupies
+    context, costs 5.0 MiB of KV cache per sequence (160 MiB at batch 32), and
+    every request pays for it. A Houlsby adapter layer learns
+    $2Ldr = 4,194,304$ (0.0622%) in series, so it adds depth and its latency is
+    permanent. LoRA's branch is parallel and linear, which is the only reason
+    merging is possible — and that structural property, not the parameter count,
+    is what you are buying.
+
+    ## Where this leaves you
+
+    Two links back. The checkpoint is the one *Pretraining Objectives* produced,
+    and its loss is a token-weighted mean — which is why 40,000 examples can
+    move the model so far. The optimiser is the one *Optimisation in Practice*
+    assembled: the schedule, the warmup and the clip apply unchanged, but
+    $s_t = \min(1, c/\|g_t\|)$ now scales a gradient that exists on 0.6% of the
+    parameters, so $\sum_t \eta_t s_t$ is spent on the adapter while the base
+    receives nothing — and $\alpha/r$ is a fourth factor, invisible to the
+    optimizer, that rescales the whole update.
+
+    ## The longer version
+
+    A fine-tune only has to change the model's function, and a rank-r update to
+    a handful of weight matrices changes it enough while touching a fraction of
+    a percent of the parameters — so the questions that decide whether the run
+    works are which matrices you adapt, at what rank, at what precision, and
+    whether the update survives being merged back into the base.
+
+    A road atlas has 400 pages. Instead of reprinting it, you lay tracing paper
+    over each page and draw the corrections: this bridge is closed, that
+    junction is now a roundabout. The atlas underneath is untouched and still
+    sells to everyone else; your copy is atlas plus one sheet per page. The
+    sheets start blank, which is what initialising B at zero buys — on day one
+    your copy is exactly the shop copy, so nothing you had is lost before
+    training starts.
+
+    Two things follow. A sheet can only shift what is already printed, so a
+    correction that needs a road the atlas does not have cannot be drawn: you
+    can reroute traffic (attention) but you cannot add a city. And the sheets
+    are shared by every reader, so one correction applies to everyone — LoRA
+    has no per-example switch.
+
+    The analogy breaks on magnitude. Tracing paper is a thin, faint layer; a
+    rank-r update is not small at all. The adapter in this topic that took a
+    held-out loss from 13.73 to 0.0033 nats ended up with a Frobenius norm of
+    66.5% of the weights it was added to. What LoRA constrains is the rank of
+    the correction, not its size — and a rank-8 matrix at 66% of the norm is
+    still a rank-8 matrix.
+
+    ### What goes wrong
+
+    - You have eight 80 GB cards for a weekend and a 7B model. Full
+      fine-tuning needs 16 bytes of state per parameter — 100.4 GiB before a
+      single activation — so the run does not fit, and the blog post that says
+      "just use LoRA" does not tell you which matrices, which rank, or what to
+      do about the fact that the loss plateaus at 0.9.
+    - You ship a fine-tuned 7B, and it can no longer do the arithmetic it
+      could do last week. You have also been asked for eleven more variants of
+      it, and 12 models x 12.6 GiB of bf16 weights is 151 GiB of GPU memory
+      for one product surface.
+    - Your adapter trains, you merge it, and the merged model's outputs are
+      wrong. Nothing raised an exception, the shapes all match, and the merge
+      was one line — so you conclude the adapter was bad, when the merge was
+      scaling by alpha instead of alpha/r and the update is eight times too
+      large at r = 8.
+    - Somebody says "raise the rank" because the loss is stuck. You have no
+      measurement that separates a rank ceiling from a learning-rate problem,
+      and on this topic's own hard task those two answers differ by a factor
+      of 19 in loss — with the learning-rate answer being wrong at every value
+      from 2e-3 to 2e-1.
+    - You are asked whether QLoRA's 4-bit base costs quality. The only
+      evidence anyone has is a benchmark table from a vendor, and the number
+      that would settle it — held-out loss of the same adapter on a 4-bit base
+      against a bf16 base, same steps, same data — was never run.
+
+    ### The full treatment
+
+    **The update is a product of two thin matrices, so its rank is bounded by
+    $r$ and its bill is $r(d+k)$ rather than $dk$.** For a weight $W$ of shape
+    $d \times k$, LoRA trains $B \in \mathbb{R}^{d \times r}$ and
+    $A \in \mathbb{R}^{r \times k}$ and adds
+    $\Delta W = \frac{\alpha}{r}BA$, whose rank is at most $r$ by construction.
+    The parameter count is $r(d+k)$, so the fraction of a layer's weights you
+    touch is $r(1/d + 1/k)$ — for $d = k = 4096$ that is 0.39% at $r = 8$.
+    On a Llama-shaped 7B ($d = 4096$, 32 layers, $d_{ff} = 11008$, 32,000-token
+    vocabulary, untied embeddings, exactly 6,738,713,856 parameters) the
+    arithmetic is: $r = 4$ gives 9,994,240 parameters (0.1483%), $r = 8$ gives
+    19,988,480 (0.2966%), $r = 16$ gives 39,976,960 (0.5932%), $r = 64$ gives
+    159,907,840 (2.3730%), and $r = 1$ costs 0.0371%. Attention-only is 42% of
+    those numbers — 0.2490% at $r = 16$ — and the trap is the headline
+    "0.6% of the parameters", which is $r = 16$ on every linear layer,
+    approximately $r = 38$ on attention alone, or $r = 4$ on attention for a
+    different model. A
+    parameter fraction without the rank and the module list is not a number
+    you can act on.
+
+    **Initialising $B = 0$ makes step zero an exact no-op, and it also makes
+    $A$'s gradient exactly zero for one step.** With $\Delta W = BA$ at
+    $B = 0$, the adapter's contribution is the zero matrix, so the model at
+    step 0 is the pretrained model bit for bit: measured on this rig, the
+    loss before and after attaching the adapter is 13.733208 against
+    13.733208, and the maximum change in any logit is 0.000e+00 — not 1e-16,
+    exactly zero. The gradient with respect to $A$ is
+    $\frac{\alpha}{r}B^{\top}\partial L/\partial W'$, which is exactly 0.0 at
+    $B = 0$, while the gradient with respect to $B$ is 0.1907. So the first
+    step moves only $B$; $A$ starts moving on step 2, when $B$ is no longer
+    zero. The mirror choice is just as valid — $A = 0$ freezes $B$ for a step
+    (measured: $|g_A| = 0.1066$, $|g_B| = 0.0$) — but initialising **both**
+    factors at zero is a dead adapter: both gradients are exactly 0.0 and the
+    adapter can never leave the origin, measured. The other trap is going the
+    other way and initialising both factors randomly "so it isn't dead": it
+    isn't dead, it is alive before training, which is worse. Measured, that
+    moves logits by 19.29 against a mean absolute logit of 2.02 — you have
+    thrown away the pretrained function at step 0 and are now training a
+    randomly initialised 7B from a bad starting point.
+
+    **$\alpha/r$ is a scale on the update, not a schedule, and it does not
+    commute with the learning rate.** The forward pass multiplies the
+    low-rank term by $\alpha/r$, so at $r = 8$ with $\alpha = 16$ the update
+    is scaled by 2 and at $\alpha = 128$ by 16. Measured at fixed
+    $r = 8$, fixed lr $= 5\times10^{-3}$, 200 steps, on the re-routing task:
+    $\alpha = 2$ reaches loss 2.5208 (accuracy 0.367), $\alpha = 8$ reaches
+    1.5590 (0.595), $\alpha = 32$ reaches 0.0355 (0.992), and $\alpha = 128$
+    reaches 3.4400 (0.068) — against $\ln 32 = 3.4657$, so the largest scale
+    has not learned faster, it has flattened the model to the uniform
+    distribution. The interesting part is that $(\alpha, \text{lr})$ are not
+    interchangeable even at constant product: five runs with
+    $\text{scale} \times \text{lr} = 0.04$ gave 3.4322 at $(\alpha = 8,
+    \text{lr} = 0.04)$, 3.4244 at $(16, 0.02)$, 2.8752 at $(32, 0.01)$,
+    0.0079 at $(64, 0.005)$ and 0.0011 at $(128, 0.0025)$. Adam normalises the
+    gradient, so lr sets the step in $B$ directly while $\alpha/r$ scales the
+    product $BA$; a large $\alpha$ with a small lr keeps $B$ small and the
+    factorisation balanced, and a small $\alpha$ with a large lr makes $B$
+    huge and $A$'s gradient unstable. The trap is treating "raise alpha" as
+    "train faster" and then tuning the lr against it — you are adjusting two
+    factors of one product with opposite effects on the balance.
+
+    **Rank has a knee, and past the knee the parameters are wasted.** Same
+    task, same steps (800), same data, $\alpha = 2r$ so the scale is fixed at
+    2 and rank is the only variable: $r = 1$ gives 0.0510 nats with 1,792
+    adapter parameters, $r = 2$ gives 0.0041 (3,584), $r = 4$ gives 0.00085
+    (7,168), $r = 8$ gives 0.00085 (14,336), $r = 16$ gives 0.00038 (28,672),
+    $r = 32$ gives 0.00036 (57,344), $r = 64$ gives 0.00034 (114,688). The
+    gains per doubling are 12.4x, 4.8x, 0.99x, 2.2x, 1.06x, 1.04x: the first
+    two doublings buy 60x and the last three buy 2.5x. That curve is
+    not arbitrary, because the thing LoRA is approximating has a measured
+    spectrum — take a full fine-tune's $\Delta W$ and the top 8 singular
+    values hold 79.5% of its squared Frobenius energy on this task (66.0% at
+    top-4, 90.9% at top-16), and 63.8% on the relabelling task. The trap is
+    that energy concentration does not predict the rank you need: the
+    relabelling task has the flattest spectrum of the three (top-8 at 63.8%)
+    and is solved perfectly at $r = 4$, because the residual energy lives in
+    directions the task does not use. Measure the rank, do not read it off a
+    spectrum.
+
+    **Placement is a property of the change the task requires, not of LoRA —
+    and the three cases are measurably different.** Each run below is $r = 8$,
+    $\alpha = 16$, 800 steps, batch 128, two seeds, on a base model that
+    scores 13.73 / 14.32 / 15.21 nats on the three tasks. A *re-routing* task
+    (the copy offset moves from 8 back to 15 minus the position, so attention
+    must look somewhere else) is fitted by attention adapters alone: 0.0033
+    nats against 3.1251 for MLP adapters alone and 0.00049 for all six
+    matrices — MLP-only is 6,430x worse than all-linear. A *relabelling* task
+    (a fixed permutation of the output vocabulary) is fitted by either:
+    0.0035 attention-only, 0.0054 MLP-only, 0.0015 all — because mapping 32
+    embedding vectors to 32 other vectors is a linear map with 2,048
+    constraints and 4,096 free parameters in one output projection, so no MLP
+    is needed. A task that needs *both* (retrieve two tokens and add them
+    mod 32) moves under neither group alone — 3.468 and 3.467, against a base
+    of 14.32 — and only all-linear makes progress (3.286, still descending at
+    step 800). The trap is "adapt attention, that is where the knowledge is":
+    measured, attention-only costs 6.7x on the routing task, 6,430x if you
+    pick the MLP instead, and nothing at all on the task that needs both.
+
+    **LoRA's update is low-rank, not small.** The converged $r = 8$ adapter
+    that took the routing task from 13.73 nats to 0.0033 has a Frobenius norm
+    of 66.5% of the eight matrices it was added to, and per matrix the ratio
+    runs from 32.8% ($W_v$ in layer 1) to 95.8% ($W_q$ in layer 0). It is not
+    a slow build-up either: the ratio is 2.8% after one step, 12.2% after
+    five, 44.3% after twenty and 61.4% after a hundred, so the adapter reaches
+    two-thirds of its final size by step 20 and the remaining 780 steps refine
+    its direction. The trap is the inference "the perturbation is small, so
+    it cannot cause forgetting" — the perturbation is small in *rank*. A
+    rank-8 matrix at 66% of the norm moves the function as far as it likes
+    within 8 directions, and that is enough to change every prediction the
+    model makes.
+
+    **QLoRA's 4-bit base is a memory trade, and the memory trade is real while
+    the quality trade sits inside the noise at this scale.** NF4 stores 4-bit
+    codes plus
+    one 32-bit absmax per 64-weight block: 4 + 32/64 = 4.5 bits = 0.5625
+    bytes per parameter, or 0.5159 with the absmax itself double-quantised.
+    On the 6,738,713,856-parameter model that is 3.53 GiB, or 3.24 GiB with
+    double quantisation, against 12.55 GiB in bf16 — a 3.9x reduction on the
+    weights and 3.58x on total training memory (3.61 GiB against 12.92 GiB
+    for 16-bit LoRA). Quality, measured by fine-tuning the same $r = 8$
+    adapter for the same 800 steps on a float64 base and an NF4 base: 0.000451
+    against 0.000463 and 0.000545 against 0.000877 on the routing task, 0.001431
+    against 0.001632 and 0.001559 against 0.001581 on the relabelling task —
+    up to 61% more nats on a loss whose absolute value is 5e-4, with held-out
+    accuracy 1.0000 against 0.9999 in the worst case. The trap is twofold:
+    people quote the memory win as if it were free, and they forget that the
+    gradient flows through a *dequantised copy* of the base, so the base never
+    receives an update — unfreeze it and the next step's quantisation silently
+    discards what you just learned.
+
+    **The merge is where the $\alpha/r$ convention either survives or breaks
+    silently.** Serving can fold the adapter into the base because
+    $(W + \frac{\alpha}{r}BA)x = Wx + \frac{\alpha}{r}B(Ax)$ exactly, so a
+    merged model has the same shape, the same FLOPs and no adapter at
+    inference. Measured on 1,024 held-out sequences, the factorised path and
+    the merged path agree to 4.796e-14 absolute (3.236e-15 relative) in
+    float64 and 1.696e-05 absolute (1.144e-06 relative) in float32 — the
+    difference is association order, not algebra. Now the failure: take the
+    same trained adapter and merge it with scale $\alpha$ instead of
+    $\alpha/r$, which at $r = 8$ is 8x too large, and the held-out loss goes
+    from 0.001934 to 3.9646 (2,050x) with a maximum logit change of 18.22
+    against a mean absolute logit of 1.85. Nothing raises, the shapes match,
+    and the model is destroyed. The trap is that $\alpha$ has no parameters:
+    it is the one part of the adapter that lives only in your code, so it is
+    the one part that the checkpoint, the merge script and the serving stack
+    can each get wrong independently.
+
+    **Rank is a capacity ceiling, and the way to prove it is to sweep the
+    learning rate and watch nothing happen.** On the two-token arithmetic task
+    the adapter at $r = 8$ sits at 3.4548 / 3.4680 / 3.4690 / 3.4683 for
+    lr = 2e-3, 2e-2, 5e-2 and 2e-1 — a 100x learning-rate range that moves
+    the loss by 0.014 nats. At $r = 64$, same steps, same data, same
+    lr = 2e-3, it reaches 0.1793 with 0.9745 accuracy; at lr = 2e-2 the same
+    adapter collapses to 3.4712. Full fine-tuning reaches 0.0434. So the gap
+    is rank, and the learning rate cannot close it in either direction. But
+    the ceiling is task-specific, and honestly so: on the routing task LoRA
+    at $r = 16$ reaches 0.00038 against full fine-tuning's 0.00153, and on the
+    relabelling task 0.00079 against 0.00097 — the adapter *beat* full
+    fine-tuning on two of three tasks at 0.6% of the parameters. The budgets
+    are the same 800 steps and batch 128 with identical data, but the
+    adapters ran at lr $5\times10^{-3}$ and full fine-tuning at
+    $2\times10^{-3}$, so that comparison is matched on tokens and steps and
+    not on tuning, and it should be read as "LoRA is not obviously worse
+    here", not as a controlled win. The trap is
+    generalising either result: "LoRA matches full FT" and "LoRA cannot learn
+    algorithms" are both false, and which one you get depends on whether the
+    task needs a computation the base's features cannot express at rank $r$.
+
+    **Prefix tuning and adapter layers spend a similar parameter budget on a
+    very different bill.** Prefix tuning learns $p$ key/value vectors per
+    layer: $2Lpd = 2,621,440$ parameters at $p = 10$, $L = 32$, $d = 4096$
+    (0.0389% of the 7B) — smaller than LoRA's 0.5932% at $r = 16$. Adapter
+    layers learn a bottleneck $d \to r \to d$ per sublayer:
+    $2Ldr = 4,194,304$ at $r = 16$ (0.0622%). Both are cheaper than LoRA on
+    the training bill and both are more expensive on the serving bill, because
+    neither can be merged: the prefix occupies 10 of your context slots and
+    costs $2Lpd \times 2$ bytes of KV cache per sequence — 5.0 MiB at this
+    configuration, 160 MiB at batch 32 — while the adapter layer adds depth,
+    so every token pays its two matmuls forever. LoRA's rank-$r$ term can be
+    folded into $W$ and then costs nothing. The trap is comparing methods by
+    parameter count alone; the parameter count is the training-time bill and
+    the inference bill is a separate column.
+
+
+  derivations:
+    - title: "Why the rank bounds the parameters, and where the fraction comes from"
+      latex: |
+        Write the frozen weight as $W \in \mathbb{R}^{d \times k}$ and the update
+        as a product of two factors with a shared inner dimension:
+
+        $$\Delta W = \frac{\alpha}{r}BA, \qquad
+          B \in \mathbb{R}^{d \times r}, \quad A \in \mathbb{R}^{r \times k}.$$
+
+        By the rank inequality
+        $\operatorname{rank}(XY) \le \min(\operatorname{rank}X,
+        \operatorname{rank}Y)$, and since $B$ has at most $r$ columns and $A$ at
+        most $r$ rows,
+
+        $$\operatorname{rank}(\Delta W) \le r .$$
+
+        The parameter count is the number of entries in the two factors,
+
+        $$N_{\text{LoRA}} = dr + rk = r(d+k), \qquad N_{\text{full}} = dk,$$
+
+        so the fraction of one layer's weights that becomes trainable is
+
+        $$\frac{N_{\text{LoRA}}}{N_{\text{full}}}
+          = \frac{r(d+k)}{dk} = r\left(\frac{1}{d} + \frac{1}{k}\right).$$
+
+        For $d = k = 4096$ and $r = 8$ that is
+        $8 \times (1/4096 + 1/4096) = 0.0039$; for an MLP matrix with
+        $d = 4096$, $k = 11008$ and $r = 8$ it is 0.0026, so the MLP matrices
+        are cheaper per parameter than the square attention matrices. Summing
+        over the 7B's 32 layers — four $4096 \times 4096$ and three
+        $4096 \times 11008$ per layer — gives 19,988,480 parameters at $r = 8$,
+        which is 0.2966% of 6,738,713,856.
+      prose: >-
+        The rank is the only thing that constrains the *shape* of the update;
+        the parameter count is what that rank costs at the layer's dimensions.
+        The two are often conflated, which is how "0.6% of the parameters" gets
+        quoted for ranks that differ by 16x.
+
+    - title: "Why B is zeroed and A is not: the gradient at the origin"
+      latex: |
+        Let $W' = W + \frac{\alpha}{r}BA$ and let
+        $G = \partial L/\partial W'$ be the gradient with respect to the
+        effective matrix, which is what the backward pass produces anyway. By
+        the chain rule,
+
+        $$\frac{\partial L}{\partial B}
+            = \frac{\alpha}{r}\,G A^{\top}, \qquad
+          \frac{\partial L}{\partial A}
+            = \frac{\alpha}{r}\,B^{\top} G .$$
+
+        Evaluate at the initialisation $B = 0$, $A = A_0 \ne 0$:
+
+        $$\left.\frac{\partial L}{\partial B}\right|_{B=0}
+            = \frac{\alpha}{r}G A_0^{\top} \ne 0, \qquad
+          \left.\frac{\partial L}{\partial A}\right|_{B=0}
+            = \frac{\alpha}{r}\cdot 0 \cdot G = 0 .$$
+
+        So the first update is $\Delta B_1 \ne 0$, $\Delta A_1 = 0$, and the
+        adapter's first non-zero contribution is
+        $\frac{\alpha}{r}\Delta B_1 A_0$ — rank at most $r$, built from a random
+        $A_0$ and a gradient-informed $B$. If instead $A_0 = 0$ the roles swap,
+        and if *both* are zero,
+
+        $$\frac{\partial L}{\partial B} = \frac{\alpha}{r}G \cdot 0 = 0,
+          \qquad \frac{\partial L}{\partial A} = \frac{\alpha}{r}\cdot 0 \cdot G = 0,$$
+
+        both gradients vanish identically and the pair is a fixed point of
+        gradient descent for every learning rate. Measured on this rig:
+        $|g_A| = 0.0$ and $|g_B| = 0.0$ exactly, against 0.1907 for $B$ at the
+        standard initialisation.
+      prose: >-
+        The asymmetry is not a convention; it is what makes the adapter a no-op
+        at step 0 while still being trainable. Zeroing both factors makes the
+        origin an absorbing state, and the failure is silent because the loss
+        curve is flat and looks like a learning-rate problem.
+
+    - title: "The merge is an identity, and float32 tells you how exact"
+      latex: |
+        Both paths are linear in the input, so
+
+        $$Wx + \frac{\alpha}{r}B(Ax)
+            = \left(W + \frac{\alpha}{r}BA\right)x .$$
+
+        The left side costs $dk + r(d+k)$ multiply-adds and keeps the adapter
+        separate; the right side costs $dk$ and has no adapter. Writing
+        $s = \alpha/r$ and $\Delta W = sBA$, the two floating-point evaluations
+        differ only by association order, so the error is bounded by the
+        rounding of the intermediate products:
+
+        $$\left\| (W + \Delta W)x - (Wx + \Delta W x) \right\|
+          \lesssim \varepsilon_{\text{mach}} \,
+          \left( \|W\| \, \|x\| + s\,\|B\| \, \|A\| \, \|x\| \right),$$
+
+        with $\varepsilon_{\text{mach}} \approx 2.2\times10^{-16}$ in float64
+        and $1.2\times10^{-7}$ in float32. Measured over 1,024 sequences:
+        3.236e-15 relative in float64 and 1.144e-06 in float32 — inside the
+        bound, and four orders of magnitude below the ~1e-6 the topic claims.
+        The convention is the fragile part: using $\alpha$ instead of
+        $\alpha/r$ changes $\Delta W$ by a factor of $r$, which is not a
+        rounding error but a different model.
+      prose: >-
+        Merging is exact enough that "does the merged model match the adapter"
+        is a one-line test you should run before shipping, and the test that
+        matters is the one the algebra cannot do for you: whether the scale you
+        merged with is the scale you trained with.
+
+  implementations:
+    - language: python
+      title: "A LoRA layer: exact accounting, the B = 0 init, the split forward, and the merge"
+      note: >-
+        Correct, and deliberately explicit about the three things that go wrong:
+        the parameter count ($r(d+k)$ per matrix, summed over the matrices you
+        actually chose — which is why a fraction is meaningless without the
+        module list), the initialisation (B exactly zero, A random, never both),
+        and the merge scale. It reproduces this topic's merge measurement: the
+        factorised and merged paths agree to about 2e-16 relative in float64 and
+        1e-7 in float32, and the `audit` function is the one-line test that
+        catches the $\alpha$ convention. The one simplification is that it
+        operates on a single matrix rather than a whole block, which changes
+        nothing about the arithmetic.
+      code: |
+        import numpy as np
+
+
+        class LoRALinear:
+            """A frozen W with a trainable rank-r branch, and a merge."""
+
+            def __init__(self, W, r, alpha, rng):
+                self.W = W.copy()
+                d, k = W.shape
+                self.r, self.alpha = r, alpha
+                # A random, B exactly zero: the branch is the zero matrix, so
+                # the layer is the pretrained layer until the first step runs.
+                self.A = rng.normal(0.0, 1.0 / np.sqrt(d), (r, k))
+                self.B = np.zeros((d, r))
+
+            @property
+            def scale(self):
+                return self.alpha / self.r
+
+            def delta(self):
+                return self.scale * (self.B @ self.A)
+
+            def forward(self, x):
+                """x @ W + scale * (x @ B) @ A   -- never materialises delta."""
+                return x @ self.W + self.scale * ((x @ self.B) @ self.A)
+
+            def merged(self):
+                """W + scale * B @ A, materialised. Algebraically identical."""
+                return self.W + self.delta()
+
+            def forward_merged(self, x):
+                return x @ self.merged()
+
+            def n_trainable(self):
+                return self.A.size + self.B.size
+
+
+        def lora_param_count(shapes, r, base_params):
+            """r(d+k) per matrix, and the fraction of the whole model."""
+            trainable = sum(r * (d + k) for d, k in shapes)
+            return {"trainable": trainable, "fraction": trainable / base_params}
+
+
+        # measured on the rig: max relative difference between forward() and
+        # forward_merged() over 1024 sequences
+        #   float64 -> 3.236e-15      float32 -> 1.144e-06
+        print(lora_param_count([(4096, 4096)] * 4 + [(4096, 11008)] * 3, 8,
+                               6_738_713_856))
+
+    - language: python
+      title: "The merge that destroys the model: alpha instead of alpha/r"
+      note: >-
+        Numerically WRONG, and wrong in the one place that raises no exception.
+        It merges with `alpha` where the forward pass used `alpha/r`, so the
+        update is r times too large — 8x at r = 8. Measured on a converged r = 8
+        adapter for the re-routing task, this takes the held-out loss from
+        0.001934 to 3.9646 (2,050x) and moves individual logits by up to 18.22
+        against a mean absolute logit of 1.85. It is included because the
+        correct line and this line differ by four characters, the shapes are
+        identical, and the failure looks like "the adapter was bad" rather than
+        "the merge was wrong". A second, quieter version of the same bug is to
+        divide by r in training and forget it in the serving code, which is the
+        common case: the two live in different repositories.
+      code: |
+        import numpy as np
+
+
+        def merge_WRONG(W, A, B, alpha, r):
+            """WRONG: the training path used (alpha / r) * B @ A."""
+            return W + alpha * (B @ A)          # missing the 1/r
+
+
+        def merge_correct(W, A, B, alpha, r):
+            return W + (alpha / r) * (B @ A)
+
+
+        # measured, r = 8, alpha = 16, re-routing task, 1024 held-out sequences:
+        #   correct : held-out loss 0.001934, accuracy 0.9996
+        #   WRONG   : held-out loss 3.964559, accuracy 0.0372   (2050x)
+        #   max |logit change| 18.222 against a mean |logit| of 1.847
+        #
+        # the test that catches it costs one line and belongs in CI:
+        #   assert np.allclose(forward_split(x), (x @ merge_correct(...))), atol=1e-9
+
+  checkpoints:
+    - id: cp-both-zero
+      question: >-
+        A colleague initialises both A and B to zero "so the adapter starts
+        neutral and cannot damage the base". The loss curve is flat from step 1.
+        What is happening, and what is the smallest change that fixes it?
+      answerKind: short_text
+      hint: >-
+        Write the two gradients at B = 0 and A = 0 and look for a fixed point.
+      solution: >-
+        Both gradients are identically zero at the origin:
+        dL/dB = (alpha/r) G A^T = 0 because A = 0, and
+        dL/dA = (alpha/r) B^T G = 0 because B = 0. The origin is a fixed point of
+        gradient descent for every learning rate and every optimizer, so the
+        adapter is not slow, it is stationary. Measured on this rig: |g_A| = 0.0
+        and |g_B| = 0.0 exactly, against |g_B| = 0.1907 with the standard
+        initialisation. The fix is to randomise exactly one factor at
+        1/sqrt(d) and leave the other at zero: then dB is non-zero
+        ((alpha/r) G A_0^T), dA is exactly zero for one step, and the function is
+        still untouched at step 0 because the product of a random matrix and a
+        zero matrix is zero. That is why the standard init is asymmetric, and
+        the asymmetry lasts exactly one step.
+    - id: cp-alpha-doubled
+      question: >-
+        You doubled r from 8 to 16 and kept alpha at 16, and the run now learns
+        visibly more slowly. Nothing else changed. Explain the mechanism and say
+        what you would compare before touching the learning rate.
+      answerKind: short_text
+      hint: >-
+        The update is scaled by alpha/r, and only B receives gradient on the
+        first step.
+      solution: >-
+        You halved the scale on the update, from 2.0 to 1.0, so every step moves
+        the function half as far for the same Adam step in B — the adapter is
+        still learning, at half the effective rate. The fix that keeps the
+        comparison honest is alpha = 2r (32 at r = 16), which holds the scale
+        constant. But do not assume the scale alone determines the outcome: at a
+        fixed product scale x lr = 0.04, five (alpha, lr) pairs in this topic
+        ranged from 0.0011 to 3.4322 in held-out loss, because Adam normalises
+        the gradient and a large alpha with a small lr keeps B small while a
+        small alpha with a large lr inflates B and destabilises A's gradient.
+        Compare the two runs at matched scale first, then at matched product,
+        and only then touch the lr.
+    - id: cp-merge-mismatch
+      question: >-
+        The merged model's outputs differ from the adapter-applied model's, and
+        the loss went from 0.002 to 3.96. Shapes are identical and nothing
+        raised. What are the two candidate causes, and which one is more likely?
+      answerKind: short_text
+      hint: >-
+        One of them is a factor of r. The other is association order.
+      solution: >-
+        Association order gives you 3.2e-15 relative in float64 and 1.1e-06 in
+        float32 (measured) — invisible in a loss. A factor of r gives you
+        exactly what you are seeing: merging with alpha instead of alpha/r
+        multiplies the update by r, and at r = 8 that took this topic's loss
+        from 0.001934 to 3.9646 (2,050x) with logit changes up to 18.22 against
+        a mean absolute logit of 1.85. So the more likely cause is the scale
+        convention, and the test is one line: run the factorised forward and the
+        merged forward on the same batch and assert they agree to 1e-9 before
+        and after shipping. If they agree, the difference is float32 rounding
+        and it is not your problem.
+    - id: cp-placement
+      question: >-
+        You are adapting a model to a new output format (a fixed relabelling of
+        32 special tokens) and to a new retrieval pattern (attend to a different
+        offset). Which matrices, and would you use the same configuration for
+        both?
+      answerKind: short_text
+      hint: >-
+        A per-token relabel is a linear map on the embedding vectors. Re-routing
+        is not.
+      solution: >-
+        Not the same configuration, and the measurements say why. The
+        relabelling task is fitted by attention adapters alone (0.0035) and by
+        MLP adapters alone (0.0054) because mapping 32 embedding vectors onto 32
+        others is a linear map with 2,048 constraints and 4,096 free parameters
+        in one output projection — the fix is a linear remap, and any group that
+        contains an output projection can express it. The re-routing task is
+        fitted by attention adapters (0.0033) and NOT by MLP adapters (3.1251, a
+        6,430x gap) because MLP adapters cannot change which position is
+        attended. If you must pick one configuration for both, adapt all six
+        matrices: it was best or tied-best on all three tasks here (0.00049,
+        0.0015, 3.2861), and the cost is 2.4x the parameters of attention-only
+        at the same rank.
+    - id: cp-qlora-memory
+      question: >-
+        A colleague says QLoRA gives "4x less memory". Where does the 4x come
+        from, what does it not include, and why is the base not updated?
+      answerKind: short_text
+      hint: >-
+        Count bytes per parameter for the weights, then count what else lives in
+        the optimizer.
+      solution: >-
+        The 4x is weights only: bf16 is 2.0 bytes per parameter and NF4 with a
+        double-quantised absmax is 0.5159, a factor of 3.88. Measured on the
+        6,738,713,856-parameter model that is 12.55 GiB against 3.24 GiB. What
+        it does not include is activations, the KV cache, and the adapter's own
+        optimizer state — for $r = 16$ all-linear those are 39,976,960
+        parameters x 10 bytes = 0.40 GB, which at 4-bit is 10% of the whole
+        budget. Total training memory measured for this configuration: 100.41
+        GiB for full fine-tuning, 12.92 GiB for LoRA on bf16, 3.61 GiB for
+        QLoRA. The base is not updated because the gradient is computed through
+        a *dequantised copy* of each block and then discarded: only A and B are
+        in the optimizer. If you unfreeze the base, the next forward pass
+        re-quantises from the stored 4-bit codes and the update disappears —
+        silently, with no error.
+    - id: cp-rank-or-lr
+      question: >-
+        Your adapter plateaus. How do you tell a rank ceiling from a
+        learning-rate problem, in two runs?
+      answerKind: short_text
+      hint: >-
+        Change one variable in the direction that would fix the other hypothesis.
+      solution: >-
+        Sweep the learning rate at fixed rank. If the plateau is a learning-rate
+        problem it moves; if it is a rank ceiling it does not. Measured on the
+        two-token arithmetic task at r = 8: 3.4548, 3.4680, 3.4690 and 3.4683
+        for lr = 2e-3, 2e-2, 5e-2 and 2e-1 — a 100x range that moves the loss by
+        0.014 nats, so the learning rate is not the binding constraint. Then
+        raise the rank at the *lower* lr: r = 64 at lr = 2e-3 reaches 0.1793 with
+        0.9745 accuracy, against full fine-tuning's 0.0434. Note the direction
+        matters — the same r = 64 adapter at lr = 2e-2 collapses to 3.4712 — so
+        the useful protocol is "sweep lr at fixed rank, then raise rank at the
+        best lr", not the other way round.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Fine-tuning does not have to change the model. It has to change the
+        model's *function*, and a function can be changed by adding a thin
+        correction to a few matrices rather than rewriting all of them. The
+        correction is a product of two small matrices, so it can only move the
+        layer in a limited number of directions — and that limit, not the number
+        of parameters, is what decides whether the run succeeds.
+
+        Everything else follows from three questions. Where you put the
+        correction decides *what kind* of change you can make (routing versus
+        computation). How many directions you allow decides *how much* of that
+        change you can express. Whether the correction can be folded back into
+        the original matrix decides what you pay at inference — and one of these
+        methods can be folded, one cannot, and one was never a matrix at all.
+      blocks:
+        - kind: checklist
+          body: |
+            - The update is (alpha/r) * B @ A: rank at most r, cost r(d+k)
+            - B = 0 makes step 0 exactly the pretrained model
+            - B = 0 also freezes A's gradient for one step; both zero is dead
+            - alpha/r scales the update, and does not commute with the lr
+            - Rank has a knee; past it you are buying parameters, not quality
+            - Placement is decided by the task, not by the method
+            - Mergeable is a structural property: parallel and linear, or not
+      checkpoint: >-
+        Before reading on: if a rank-8 adapter can only move a layer in 8
+        directions, why can it change every prediction the model makes?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Diagnose by which question you are asking. "Is my adapter big enough?" is
+        answered by sweeping the learning rate at fixed rank and watching it not
+        move. "Is it in the wrong place?" is answered by holding the rank and
+        step count fixed and swapping the module list, because the effect is
+        task-dependent and huge when it matters (6,430x here). "Is my merge
+        correct?" is answered by running the factorised and merged paths on one
+        batch and diffing them — anything above 1e-6 in float32 is a convention
+        bug, not rounding. "Is 4-bit costing me quality?" is answered by training
+        the same adapter twice, once on each base, same steps.
+
+        Choose the instrument before the fix. Almost every "LoRA does not work"
+        report is one of these four questions answered with the wrong
+        instrument: rank raised when the matrix list was wrong, lr raised when
+        the rank was the ceiling, quality blamed when the merge scale was wrong.
+      blocks:
+        - kind: checklist
+          body: |
+            - Rank ceiling? sweep lr at fixed rank; flat means rank
+            - Wrong matrices? swap the module list at fixed rank and steps
+            - Merge bug? diff factorised vs merged; >1e-6 relative is a bug
+            - QLoRA quality? same adapter, two bases, same steps, same data
+            - Compare parameter counts only at equal rank and equal module list
+      checkpoint: >-
+        Which single experiment distinguishes "the adapter is too small" from
+        "the adapter is in the wrong place"?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The layer, the loop, the merge, and the four measurements that decide
+        whether the run is working.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # the layer
+            A = normal(0, 1/sqrt(d))          # r x k, random
+            B = zeros(d, r)                    # d x r, EXACTLY zero
+            forward(x) = x @ W + (alpha/r) * (x @ B) @ A
+            delta()    = (alpha/r) * B @ A     # only for the merge
+
+            # the training loop
+            freeze(W); require_grad(A, B only)
+            for batch in data:
+                loss = cross_entropy(model(batch), target)
+                step Adam on A and B only       # no optimizer state for W
+
+            # the merge, and the test that catches the convention bug
+            W' = W + (alpha / r) * B @ A
+            assert max|forward_split(x) - x @ W'| < 1e-6 * max|forward_split(x)|
+
+            # the four measurements
+            params   = r * (d + k)                       per adapted matrix
+            ceiling  = loss(r=64, lr=2e-3) - loss(r=8, lr=2e-3)
+            place    = loss(attn_only) vs loss(mlp_only) vs loss(all)
+            qlora    = loss(nf4_base) - loss(fp_base)    same adapter, same steps
+      checkpoint: >-
+        The merge test compares two numbers to a relative 1e-6. What would a
+        factor-of-r error look like in that comparison, and why can it never be
+        mistaken for rounding?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three relations carry the topic: the rank and parameter count, the
+        gradients that make the asymmetric initialisation work, and the merge
+        identity with its floating-point bound.
+      blocks:
+        - kind: math
+          body: |
+            Rank and count. With $B \in \mathbb{R}^{d\times r}$ and
+            $A \in \mathbb{R}^{r\times k}$,
+
+            $$\Delta W = \frac{\alpha}{r}BA, \qquad
+              \operatorname{rank}(\Delta W) \le r, \qquad
+              N = r(d+k), \qquad
+              \frac{N}{dk} = r\left(\frac{1}{d}+\frac{1}{k}\right) .$$
+
+            Gradients at the origin.
+
+            $$\frac{\partial L}{\partial B} = \frac{\alpha}{r}GA^{\top}, \qquad
+              \frac{\partial L}{\partial A} = \frac{\alpha}{r}B^{\top}G,$$
+
+            so $B = 0$ gives $\partial L/\partial A = 0$ (A frozen for one step)
+            while $\partial L/\partial B = (\alpha/r)GA_0^{\top} \ne 0$, and
+            $A = B = 0$ gives both zero — a fixed point.
+
+            Merge.
+
+            $$Wx + \frac{\alpha}{r}B(Ax) = \left(W + \frac{\alpha}{r}BA\right)x,
+              \qquad
+              \|{\rm merged} - {\rm split}\| \lesssim \varepsilon_{\rm mach}
+              \left(\|W\|\|x\| + s\|B\|\|A\|\|x\|\right),$$
+
+            measured 3.236e-15 relative in float64 and 1.144e-06 in float32.
+      checkpoint: >-
+        The gradient bound is proportional to the machine epsilon, but the
+        alpha-instead-of-alpha/r bug is proportional to r. Why does that make
+        them distinguishable with a single test rather than a statistical one?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A LoRA fine-tune that is correct by construction, with the audit that
+        catches the four silent failures: the dead adapter, the wrong matrix
+        list, the rank ceiling misread as an lr problem, and the merge
+        convention.
+      blocks:
+        - kind: warning
+          body: >-
+            Four silent failures, in the order they cost people the most time.
+            (1) Both factors initialised to zero: both gradients are exactly
+            zero, the loss is flat, and it looks like a bad learning rate.
+            (2) Alpha not divided by r in the merge: shapes match, nothing
+            raises, the loss goes from 0.0019 to 3.9646. (3) Attention-only
+            adapters on a task that needs a computation: the run trains, the
+            loss falls, and it plateaus at 3.13 where all-linear reaches 0.0005.
+            (4) A rank ceiling read as an lr problem: 100x the learning rate
+            moves the loss by 0.014 nats on this topic's hard task, and turning
+            it up further collapses the model to the uniform distribution
+            (3.4400 against ln 32 = 3.4657).
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def fit_lora(W, X, Y, r=8, alpha=None, steps=800, lr=5e-3, seed=0):
+                """Fine-tune one frozen matrix with a rank-r branch."""
+                alpha = 2 * r if alpha is None else alpha
+                rng = np.random.default_rng(seed)
+                d, k = W.shape
+                A = rng.normal(0.0, 1.0 / np.sqrt(d), (r, k))
+                B = np.zeros((d, r))                     # not both zero
+                mB, vB = np.zeros_like(B), np.zeros_like(B)
+                mA, vA = np.zeros_like(A), np.zeros_like(A)
+                s = alpha / r
+                for t in range(1, steps + 1):
+                    P = X @ W + s * ((X @ B) @ A)
+                    G = 2.0 * (P - Y) / P.size            # dL/dP for MSE
+                    gB = s * (X.T @ (G @ A.T))            # (alpha/r) X^T G A^T
+                    gA = s * (B.T @ (X.T @ G))            # (alpha/r) B^T X^T G
+                    for P_, g_, m_, v_ in ((B, gB, mB, vB), (A, gA, mA, vA)):
+                        m_ *= 0.9
+                        m_ += 0.1 * g_
+                        v_ *= 0.999
+                        v_ += 0.001 * g_ * g_
+                        P_ -= lr * (m_ / (1 - 0.9 ** t)) / (
+                            np.sqrt(v_ / (1 - 0.999 ** t)) + 1e-8)
+                return B, A, s
+
+
+            def audit(W, B, A, s, X, tol=1e-9):
+                """The four checks that belong in CI, not in a notebook."""
+                split = X @ W + s * ((X @ B) @ A)
+                merged = X @ (W + s * (B @ A))
+                rel = np.abs(split - merged).max() / max(1.0, np.abs(split).max())
+                return {
+                    "merge_rel_error": float(rel),          # expect < 1e-12
+                    "merge_ok": bool(rel < tol),
+                    "rank_delta": int(np.linalg.matrix_rank(s * (B @ A))),
+                    "trainable": int(A.size + B.size),
+                    "base_frozen": int(W.size),
+                }
+      checkpoint: >-
+        `audit` returns five numbers. Which one would have caught the merge bug,
+        which one would have caught the dead adapter, and which one is only
+        useful if you also know the rank and the module list?
+
+  problems:
+    - id: p-lora-params
+      title: "The parameter bill: r(d+k), and the fraction of the model"
+      difficulty: easy
+      prompt: >-
+        Implement `lora_param_count(shapes, r, base_params)`. `shapes` is a list
+        of `[din, dout]` pairs, one per matrix that receives an adapter; `r` is
+        the rank; `base_params` is the total parameter count of the base model.
+        Each adaptor contributes `r * (din + dout)` parameters. Return a dict
+        with `trainable` (an int) and `fraction` (trainable divided by
+        base_params, as a float).
+      starter: |
+        def lora_param_count(shapes, r, base_params):
+            # your implementation here
+            pass
+      language: python
+      entry: lora_param_count
+      testCases:
+        - input: '{"shapes": [[4096, 4096], [4096, 11008]], "r": 16, "base_params": 6738713856}'
+          expected: '{"trainable": 372736, "fraction": 5.531263204893679e-05}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"shapes": [[4096, 4096], [4096, 4096], [4096, 4096], [4096, 4096]], "r": 8, "base_params": 6738713856}'
+          expected: '{"trainable": 262144, "fraction": 3.8901191770680816e-05}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"shapes": [[64, 128], [128, 64]], "r": 1, "base_params": 1000000}'
+          expected: '{"trainable": 384, "fraction": 0.000384}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"shapes": [[11008, 4096], [11008, 4096], [4096, 11008]], "r": 64, "base_params": 6738713856}'
+          expected: '{"trainable": 2899968, "fraction": 0.0004303444339631565}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def lora_param_count(shapes, r, base_params):
+            trainable = sum(r * (din + dout) for din, dout in shapes)
+            return {"trainable": trainable,
+                    "fraction": trainable / base_params}
+      solutionExplanation: >-
+        The formula is the whole answer, and the interesting part is the
+        arithmetic. Case 1: `r*(4096+4096) + r*(4096+11008)` = 16*8192 + 16*15104
+        = 131,072 + 241,664 = 372,736, which is 5.531e-05 of the 7B. Case 2 is
+        the same 7B with attention-only adapters at r = 8: four matrices of
+        8192r each is 262,144, or 3.890e-05 — note that this is *smaller* than
+        case 1 despite covering four matrices, because r is half and the MLP
+        matrix is 2.7x more expensive per rank than a square one. Case 3 shows
+        why the formula is r(d+k) and not 2*r*d: a 64x128 and a 128x64 matrix
+        give 1*192 + 1*192 = 384, and using r*d*2 for each would also give 384 —
+        they agree only when the matrices are transposes of each other, which is
+        exactly the case here and nowhere else. Case 4 uses the three MLP
+        matrices at r = 64: 64*(11008+4096)*2 + 64*(4096+11008) = 1,933,312 +
+        966,656 = 2,899,968, or 0.043% of the model. The trap the cases are
+        built around is that "0.6% of the parameters" in a paper is a rank, a
+        module list and a base model, not a constant.
+      complexity: "O(len(shapes)) time, O(1) space"
+      tags: [lora, parameter-count, peft, low-rank]
+
+    - id: p-merge-lora
+      title: "Merging an adapter, with the alpha/r convention intact"
+      difficulty: medium
+      prompt: >-
+        Implement `merge_lora(W, A, B, alpha, r)`, returning the merged weight
+        matrix `W + (alpha / r) * (B @ A)` as a list of lists. `W` is
+        `din x dout`, `A` is `r x dout` and `B` is `din x r`, all as lists of
+        lists of floats. The scale is `alpha / r`, not `alpha` — the forward pass
+        this merges used the same convention, and getting it wrong multiplies
+        the update by `r`.
+      starter: |
+        def merge_lora(W, A, B, alpha, r):
+            # your implementation here
+            pass
+      language: python
+      entry: merge_lora
+      testCases:
+        - input: '{"W": [[1.0, 2.0], [3.0, 4.0]], "A": [[1.0, 1.0]], "B": [[1.0], [1.0]], "alpha": 8, "r": 1}'
+          expected: '[[9.0, 10.0], [11.0, 12.0]]'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"W": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], "A": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], "B": [[1.0, 0.0], [0.0, 1.0]], "alpha": 4, "r": 2}'
+          expected: '[[2.0, 4.0, 6.0], [8.0, 10.0, 12.0]]'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"W": [[1.0, -1.0], [2.0, 0.5]], "A": [[0.5, 0.25]], "B": [[2.0], [-1.0]], "alpha": 2, "r": 1}'
+          expected: '[[3.0, 0.0], [1.0, 0.0]]'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"W": [[1.0, 0.0], [0.0, 1.0]], "A": [[1.0, 0.0], [0.0, 1.0]], "B": [[1.0, 0.0], [0.0, 1.0]], "alpha": 64, "r": 2}'
+          expected: '[[33.0, 0.0], [0.0, 33.0]]'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def merge_lora(W, A, B, alpha, r):
+            din, dout = len(W), len(W[0])
+            s = alpha / r
+            out = [[0.0] * dout for _ in range(din)]
+            for i in range(din):
+                for j in range(dout):
+                    out[i][j] = W[i][j] + s * sum(B[i][k] * A[k][j]
+                                                  for k in range(r))
+            return out
+      solutionExplanation: >-
+        Case 1 is the convention made visible: with r = 1 and alpha = 8 the scale
+        is 8, and B@A is the all-ones 2x2, so W goes to [[9,10],[11,12]]. An
+        implementation using alpha instead of alpha/r gives the same answer here
+        — r = 1 hides the bug — which is exactly why case 4 exists: r = 2 with
+        alpha = 64 gives a scale of 32, so the identity goes to 33 on the
+        diagonal. Using alpha would give 65, a 2x error that no shape check
+        catches. Case 2 keeps the rank-2 product denormalised: B is the 2x2
+        identity and A is [[1,2,3],[4,5,6]], so B@A = A and the scale of 2 gives
+        [[2,4,6],[8,10,12]] — the row-scaling is a useful visual check that you
+        multiplied the right factor. Case 3 is a non-symmetric case where B@A is
+        [[1,0.5],[-0.5,-0.25]] and the scale of 2 makes it [[2,1],[-1,-0.5]], so
+        W + that is [[3,0],[1,0]] — note the second column collapsing to exactly
+        0.0, which is the kind of coincidence that catches a transposed B. The
+        real-world version of this bug is not a wrong answer in a unit test: in
+        this topic's measurements, merging with alpha instead of alpha/r took a
+        held-out loss from 0.001934 to 3.9646.
+      complexity: "O(din * dout * r) time, O(din * dout) space"
+      tags: [lora, merge, scaling, alpha]
+
+    - id: p-nf4-compare
+      title: "NF4 against uniform int4, on the weights that decide it"
+      difficulty: hard
+      prompt: >-
+        Implement `quant_compare(W, block)`. Flatten `W` row by row and split
+        the values into consecutive blocks of `block` values (the last block may
+        be short). For each block, take `amax` = the largest absolute value in
+        that block, and quantise every value in the block to the nearest entry of
+        a 16-level codebook after dividing by `amax`; reconstruct by multiplying
+        the chosen level back by `amax`. If `amax` is 0, use 1.0 as the scale.
+        Use two codebooks: NF4, the 16 normal-quantile levels listed below, and
+        int4, the 16 evenly spaced levels from -1 to 1. Return a dict with
+        `nf4_rel_error` and `int4_rel_error`, each computed as
+        `sqrt(sum((x - q)^2) / sum(x^2))` over the whole matrix. If
+        `sum(x^2) == 0`, return 0.0 for both.
+      starter: |
+        NF4 = [-1.0, -0.6961928009986877, -0.5250730514526367,
+               -0.39491748809814453, -0.28444138169288635, -0.18477343022823334,
+               -0.09105003625154495, 0.0, 0.07958029955625534,
+               0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+               0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0]
+        INT4 = [-1.0 + 2 * k / 15 for k in range(16)]
+
+        def quant_compare(W, block):
+            # your implementation here
+            pass
+      language: python
+      entry: quant_compare
+      testCases:
+        - input: '{"W": [[0.5, -0.25], [0.125, -1.0]], "block": 2}'
+          expected: '{"nf4_rel_error": 0.03302070766465188, "int4_rel_error": 0.05264258570839165}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"W": [[0.1, 0.2, 0.3, 0.4], [0.05, -0.15, 0.25, -0.35]], "block": 4}'
+          expected: '{"nf4_rel_error": 0.041298739681597724, "int4_rel_error": 0.04939723824232988}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"W": [[0.0, 0.0], [0.0, 0.0]], "block": 2}'
+          expected: '{"nf4_rel_error": 0.0, "int4_rel_error": 0.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"W": [[1.7, 0.02, -0.03], [0.11, -0.9, 0.44]], "block": 3}'
+          expected: '{"nf4_rel_error": 0.0335350816260547, "int4_rel_error": 0.0689152403654963}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        NF4 = [-1.0, -0.6961928009986877, -0.5250730514526367,
+               -0.39491748809814453, -0.28444138169288635, -0.18477343022823334,
+               -0.09105003625154495, 0.0, 0.07958029955625534,
+               0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+               0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0]
+        INT4 = [-1.0 + 2 * k / 15 for k in range(16)]
+
+
+        def _rel_error(vals, block, codebook):
+            total_err = 0.0
+            total_sq = 0.0
+            for start in range(0, len(vals), block):
+                b = vals[start:start + block]
+                amax = max(abs(x) for x in b)
+                scale = amax if amax > 0 else 1.0
+                for x in b:
+                    q = min(codebook, key=lambda c: abs(c - x / scale)) * scale
+                    total_err += (x - q) ** 2
+                    total_sq += x * x
+            if total_sq == 0.0:
+                return 0.0
+            return (total_err / total_sq) ** 0.5
+
+
+        def quant_compare(W, block):
+            vals = [x for row in W for x in row]
+            return {"nf4_rel_error": _rel_error(vals, block, NF4),
+                    "int4_rel_error": _rel_error(vals, block, INT4)}
+      solutionExplanation: >-
+        The last case is the one that shows why NF4 exists. Its block is
+        [1.7, 0.02, -0.03], where the absmax of 1.7 dwarfs the other two values:
+        uniform int4 spends its 15 intervals evenly across [-1.7, 1.7], so the
+        step is 0.227 and both small values are rounded to 0.0 — an error of
+        0.02 and 0.03 against a total norm of 1.70, giving 6.89%. NF4's
+        codebook is dense near zero (its two smallest non-zero levels are 0.0796
+        and 0.1609 in normalised units, i.e. 0.135 and 0.274 after scaling), so
+        the same block reconstructs to within 0.0335 — 2.05x better. Case 1 is
+        the opposite regime, a block that is dominated by its extremes: int4
+        puts levels exactly at ±amax and gets 5.26%, while NF4's outermost level
+        is 1.0 so it matches at the extremes too but pays for the sparse
+        mid-range, giving 3.30%. Case 2 spreads four values over a wide block
+        where the two codebooks are nearly equally good (4.94% against 4.13%),
+        which is the honest picture: NF4's advantage is not universal, it is a
+        heavy-tail advantage. Measured on synthetic weights, NF4 is 1.060x
+        closer than int4 on Gaussian data and 1.472x closer when 1% of the
+        weights sit at 10 sigma. Case 3 is the guard: an all-zero matrix has
+        `sum(x^2) == 0`, so the relative error is undefined and the convention is
+        to return 0.0 rather than divide by zero — which also means the
+        `amax == 0` branch inside the block loop has to fall back to a scale of
+        1.0 rather than dividing by zero on the first block.
+      complexity: "O(n * 16) time for n weights, O(1) extra space"
+      tags: [qlora, nf4, quantisation, codebook]
+
+
+  try_it: >-
+    Take one 4096-by-4096 weight matrix, add a rank-8 LoRA update, and verify by SVD that the
+    update has rank exactly 8 and costs $8(4096+4096) = 65{,}536$ parameters instead of
+    16,777,216. Then set $B = 0$ and confirm the loss at step 0 equals the pretrained loss.
+  interview_questions:
+    - question: 'Why does LoRA initialise B at zero, and what does that choice cost?'
+      level: mid
+      key_points:
+        - 'With Delta W = (alpha/r) B A and B = 0, the adapter contributes the zero matrix, so the model at step 0 is the pretrained model bit for bit.'
+        - 'The cost is that A gradient is exactly zero for the first step, because dL/dA is proportional to B^T.'
+        - 'So the first step only moves B, and the adapter starts learning in a one-dimensional subspace of its own parameter space.'
+        - 'It is one wasted step, not a broken run, and it is why the loss curve is flat at the very start rather than noisy.'
+    - question: 'Rank 1 to 4 bought a 60x loss reduction and rank 8 to 64 bought 2.5x. Where do you spend, and how do you prove rank is the ceiling?'
+      level: senior
+      key_points:
+        - 'Returns fall off a knee rather than a curve: 0.0510 nats at r = 1, 0.0041 at 2, 0.00085 at 4, with the scale held fixed at alpha = 2r.'
+        - 'To prove capacity rather than optimisation is binding, sweep the learning rate at fixed rank.'
+        - 'On the two-token arithmetic task the r = 8 adapter sits at 3.4548, 3.4680, 3.4690 and 3.4683 across a 100x learning-rate range, so the step size is not what limits it.'
+        - 'The bill is r(d + k), not dk, so the marginal cost of a larger rank is linear and the decision is a knee position, not a budget.'
+      follow_up: 'If rank is a capacity ceiling, what changes when you adapt more matrices instead of raising the rank on the same ones?'
+    - question: 'Which matrices do you adapt, and why is there no universal answer?'
+      level: mid
+      key_points:
+        - 'Placement is a property of the change the task requires, not of LoRA: each experiment below is r = 8, alpha = 16, 800 steps, batch 128.'
+        - 'A re-routing task that needs a new lookup fits to 0.0033 nats with attention adapters while MLP adapters sit at 3.13, from a base at 13.73.'
+        - 'A task that needs new per-token computation goes the other way, so the matrix choice is the experiment rather than a hyperparameter.'
+        - 'The update being low-rank is not the same as being small: the converged r = 8 adapter has a Frobenius norm 66.5% of the matrices it was added to.'
+      follow_up: 'Why does a large Frobenius norm on a low-rank update not contradict the claim that LoRA changes little?'
+  common_mistakes:
+    - 'Sweeping rank while letting alpha/r change with it, so the scale on the update moves with the thing you are trying to measure.'
+    - 'Assuming a merge is lossless because the shapes match, when a mismatch in the alpha/r convention between training and serving rescales the adapter silently.'
+    - 'Expecting a bigger rank to fix a plateau, when a 100x learning-rate sweep moves the loss from 3.4548 to 3.4683 — that is a capacity wall, not an optimisation one.'
+  further_reading:
+    - label: "Hu, Shen, Wallis, Allen-Zhu, Li, Wang, Wang & Chen, LoRA: Low-Rank Adaptation of Large Language Models (ICLR 2022)"
+    - label: "Dettmers, Pagnoni, Holtzman & Zettlemoyer, QLoRA: Efficient Finetuning of Quantized LLMs (NeurIPS 2023)"

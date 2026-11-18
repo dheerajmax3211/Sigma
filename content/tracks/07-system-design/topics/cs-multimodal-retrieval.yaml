@@ -1,0 +1,698 @@
+id: cs-multimodal-retrieval
+slug: cs-multimodal-retrieval
+title: "Case Study: Joint Text and Image Retrieval"
+summary: >-
+  Build one embedding space for text and images, then pay for it: 1.3 billion
+  vectors, 32 GB of PQ codes, a 43 ms cross-encoder rerank, and an alignment
+  problem that no index can fix.
+kind: lesson
+difficulty: expert
+position: 17
+estMinutes: 21
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [multimodal, retrieval, clip, ann, reranking, embeddings]
+
+body:
+  big_idea: >-
+    Joint text-image retrieval is two towers, one space, three budgets:
+    alignment is a training problem, compression an index problem, ordering a
+    compute problem — confusing them ships good recall and bad ordering.
+  problem:
+    - "You index images and text in one 1.3-billion-vector index and every query scans all of it: partitioning by modality is 62% less work."
+    - "You ship a dual encoder and \"red car on a bridge at night\" retrieves the three separately: a dot product cannot express conjunction."
+    - "You rerank the top 1,000 and p99 goes from 40 ms to 460 ms: at 0.43 ms per pair the budget affords about 140."
+  analogy: >-
+    A bilingual library where every book has a title in one language and a
+    cover in another. You do not translate the query: you keep one shelf order
+    both languages agree on, learned by putting matching pairs next to each
+    other. That order is the embedding space — cheap to search because it is
+    one list, lossy because a single position cannot encode "red AND car AND
+    night".
+  concept_points:
+    - "**Two towers, one space, and the space is the product.** An image tower and a text tower project into a shared 512-dimensional unit sphere; retrieval is a dot product. Everything else — index, shards, reranker — exists to make that dot product affordable at 1.3 billion vectors."
+    - "**Index size is bytes, and the three precisions span 32x.** 500M images x 512 dims x 4 B = **1.02 TB** fp32; int8 gives **256 GB**; PQ-64 gives **32 GB**. Text adds 800M x 512 x 1 B = 410 GB int8, or 51 GB as codes, so the joint index is **83 GB of codes** against 1.4 TB of fp32."
+    - "**Partition by modality and you stop scanning the wrong half.** A text query only needs the image index, an image query only the text index. Indexing both in one space makes every query scan 1.3B vectors instead of 500M — **2.6x** the work for an answer that cannot include the other modality anyway."
+    - "**A dot product cannot express conjunction.** Dual encoders compress a whole caption into one vector, so \\\"red car on a bridge at night\\\" becomes a single point near red cars, near bridges and near night scenes but not necessarily near the intersection. That is a representational limit, and it is why a fusion reranker exists."
+    - "**The reranker is the expensive stage and the budget is pairs, not queries.** A 0.3B cross-encoder over a 288-token pair costs $2 \\times 3e8 \\times 288 = 173$ GFLOP, or **0.43 ms** at 400 TFLOP/s, so a 60 ms budget affords **about 139 pairs**. At 6,944 peak qps and 100 pairs, the fleet is **299 GPUs** — scale set by pairs, not scans."
+    - "**The modality gap is real and measurable.** Even a well-trained CLIP-style model places text and image embeddings in different cones of the sphere, so the nearest neighbour of an image is often another image rather than its caption. Ranking stays within-modality consistent, so retrieval works — but cross-modal score thresholds do not transfer."
+  definitions:
+    - { term: "Dual encoder", meaning: "Two independent towers producing vectors in a shared space; retrieval is a dot product, so both sides are precomputable." }
+    - { term: "Cross-encoder", meaning: "A model that takes text and image together and outputs a relevance score; accurate and impossible to precompute." }
+    - { term: "Contrastive loss", meaning: "Training objective pulling matched pairs together and unmatched pairs apart, usually with in-batch negatives." }
+    - { term: "Temperature", meaning: "The scale on logits in contrastive loss; low values sharpen the distribution and emphasise hard negatives." }
+    - { term: "Modality gap", meaning: "The systematic offset between text and image embeddings in a joint space, even for matched pairs." }
+    - { term: "Recall@k", meaning: "Fraction of true matches in the top k of a stage; the metric for retrieval, not for ordering." }
+    - { term: "Fusion", meaning: "Combining modality signals: early (concatenate features), late (combine scores), or cross-attention (joint encoding)." }
+    - { term: "PQ", meaning: "Product quantisation: subspace-wise vector quantisation to bytes, trading fidelity for memory." }
+    - { term: "Modality partition", meaning: "Separate indexes per modality, so a query only scans the target modality." }
+    - { term: "Hard negative", meaning: "A negative that is close to the query in embedding space; the examples that actually move the decision boundary." }
+
+  diagrams:
+    - type: architecture
+      title: "Two towers, two indexes, one reranker"
+      nodes:
+        - { id: q, x: 0, y: 0, label: "Query encoder", kind: "model", detail: "Text tower, 110M params, 32 tokens: 7 GFLOP per query, effectively free against retrieval." }
+        - { id: ii, x: 1, y: 0, label: "Image index", kind: "database", detail: "500M x 512-d PQ-64 codes = 32 GB. Scanned by text-to-image queries, which are 80% of traffic." }
+        - { id: ti, x: 1, y: 2, label: "Text index", kind: "database", detail: "800M passages = 51 GB of codes. Reached only by image-to-text queries; sized for capacity, not for rate." }
+        - { id: rr, x: 2, y: 1, label: "Cross-encoder", kind: "gpu", detail: "100 pairs x 173 GFLOP = 17.3 TFLOP, 43 ms. 299 GPUs at peak; the budget affords ~139 pairs in 60 ms." }
+        - { id: log, x: 0, y: 2, label: "Click log", kind: "external", detail: "Only pairs that were shown are labelled, so hard negatives come from the current policy's near misses." }
+      edges:
+        - { from: q, to: ii, label: "text to image" }
+        - { from: q, to: ti, label: "image to text", style: "solid" }
+        - { from: ii, to: rr, label: "top 100" }
+        - { from: ti, to: rr, label: "top 100" }
+        - { from: rr, to: log, label: "impressions", style: "async" }
+        - { from: log, to: rr, label: "hard negatives", style: "async" }
+    - type: plot
+      title: "Rerank GPU-seconds per query versus pairs scored"
+      chart: "line"
+      xLabel: "pairs scored per query"
+      yLabel: "ms of GPU time per query"
+      series:
+        - name: "0.3B cross-encoder"
+          points:
+            - { x: 25, y: 10.8 }
+            - { x: 50, y: 21.6 }
+            - { x: 100, y: 43.2 }
+            - { x: 200, y: 86.4 }
+            - { x: 500, y: 216.0 }
+            - { x: 1000, y: 432.0 }
+    - type: compare
+      title: "One index versus modality-partitioned"
+      left_label: "Single joint index, 1.3B vectors"
+      left_points:
+        - "Every query scans 1.3e9 codes"
+        - "83 GB of codes against 2.66 TB of fp32 vectors"
+        - "2.6x the scan work of the target-only index"
+        - "Cross-modal contamination: nearest text may be another text"
+      right_label: "Partitioned by modality"
+      right_points:
+        - "Text query scans 500M, image query 800M"
+        - "62% less scan work for text-to-image"
+        - "Independent refresh cadence per modality"
+        - "Two indexes to build, monitor, and rebalance"
+
+  problem_statement: >-
+    Design a retrieval service that answers both "find images matching this
+    caption" and "find passages describing this image" over 500 million images and
+    800 million text passages, at 200 million queries per day with a 150 ms p99
+    and a measured recall@10 target. The two modalities must live in one
+    comparable space, the system must support incremental text edits, and the
+    ordering must handle compositional queries that a single dot product gets
+    wrong.
+
+  requirements:
+    functional:
+      - "Retrieve top-k images for a text query and top-k passages for an image query."
+      - "Support compositional queries via a reranking stage that sees both modalities at once."
+      - "Accept near-real-time text edits while image ingestion remains a daily batch."
+      - "Report recall@10 per query type against a sampled brute-force reference."
+    non_functional:
+      - "p99 150 ms end to end at 6,944 peak qps, with reranking capped at 60 ms."
+      - "Index memory under 200 GB across both modalities at PQ-64."
+      - "Recall@10 at least 0.90 for text-to-image and 0.85 for image-to-text on held-out queries."
+      - "Text edits visible within 15 minutes without a full index rebuild."
+
+  clarifying_questions:
+    - question: "Are queries mostly text-to-image, image-to-text, or balanced?"
+      why_it_matters: "The mix decides which index gets the replicas: 80/20 text-to-image means the image index carries the QPS and the text index only carries capacity, which is a very different shard plan."
+    - question: "Do queries need composition ('red car on a bridge at night') or single-attribute matching?"
+      why_it_matters: "Composition requires a cross-encoder reranker, which is 43 ms per 100 pairs; if queries are simple, a dual encoder alone fits a far tighter budget and a much smaller fleet."
+    - question: "What is the acceptable staleness for text edits?"
+      why_it_matters: "Text changes continuously while images arrive in batches, so a 15-minute upsert requirement forces a mutable index on one side and permits a rebuild on the other."
+    - question: "Is the embedding space shared with an existing model or trained for this catalogue?"
+      why_it_matters: "Reusing a public CLIP checkpoint is free and misaligned with your catalogue's vocabulary; training your own costs a large batch-contrastive run but fixes recall on your actual distribution."
+    - question: "How is relevance labelled, and how biased is that label?"
+      why_it_matters: "Click logs only label what was shown, so hard negatives come from the current policy. Training on them without correction reproduces the policy's blind spots as ground truth."
+
+  capacity_estimation:
+    assumptions:
+      - "500M images and 800M text passages, both projected to 512 dimensions."
+      - "PQ with 64 subquantisers of 8 bits; int8 as an intermediate precision; fp32 for exact reranking of a shortlist."
+      - "200M queries per day, 80% text-to-image and 20% image-to-text, with a 3x peak factor."
+      - "Cross-encoder with 0.3B parameters over 288-token pairs at 400 TFLOP/s effective."
+      - "150 ms p99 budget: encode 12, retrieval 45, rerank 43, network 22, post 13, slack 15."
+    arithmetic:
+      - label: "Image index size at three precisions"
+        calculation: "500e6 x 512 x 4 B = 1.024e12 B = 1.02 TB fp32; x 1 B for int8 = 256 GB; 500e6 x 64 B PQ = 3.2e10 B = 32 GB"
+        conclusion: "1.02 TB, 256 GB, or 32 GB for the same 500M images. The index that fits in RAM with room for replicas is the PQ one, and everything downstream is designed around its fidelity."
+      - label: "Joint index size"
+        calculation: "Images 32 GB (PQ-64) + text 800e6 x 64 B = 51.2 GB; total 8.32e10 B = 83.2 GB; fp32 equivalent 1.02 TB + 1.64 TB = 2.66 TB"
+        conclusion: "83 GB of codes against 2.66 TB uncompressed. Compression is 32x, which is the difference between a two-node and a twenty-node index."
+      - label: "Query rate and mix"
+        calculation: "200e6 / 86,400 = 2,315 rps mean; x 3 peak = 6,944 rps; 80% text-to-image = 5,556 rps, 20% image-to-text = 1,389 rps"
+        conclusion: "5,556 text-to-image queries per second at peak hit the image index; the text index sees 1,389 despite being 1.6x larger. Capacity and traffic are inversely related across the two."
+      - label: "Partition saving"
+        calculation: "Single index: 1.3e9 codes per query. Partitioned: 500e6 for text-to-image. 1.3e9 / 5e8 = 2.6x"
+        conclusion: "Partitioning removes 62% of the scan work for the dominant query type, and it also prevents the wrong modality from occupying the top of the candidate list."
+      - label: "Cross-encoder cost per pair"
+        calculation: "2 x 0.3e9 params x 288 tokens = 1.728e11 FLOP = 173 GFLOP; / 4e14 FLOP/s = 4.32e-4 s"
+        conclusion: "0.43 ms per pair. At 100 pairs that is 43 ms of GPU time per query, which is 29% of the 150 ms budget and the largest single stage."
+      - label: "Rerank fleet at peak"
+        calculation: "6,944 qps x 0.0432 s = 300 GPU-seconds per second"
+        conclusion: "300 GPUs purely for reranking at peak, against 100 pairs per query. Doubling pairs to 200 doubles it to 600 — the rack cost of better ordering is explicit."
+      - label: "Pairs affordable in a 60 ms budget"
+        calculation: "0.060 s / 4.32e-4 s per pair = 138.9"
+        conclusion: "139 pairs. You cannot rerank the top 1,000 within 60 ms — the rerank depth is a budget decision, and 100 pairs is the round number that fits."
+
+  architecture_summary: >-
+    Queries are encoded by the matching tower into a 512-dimensional unit vector
+    and routed by modality: text-to-image queries hit the image index, image-to-text
+    queries hit the text index. Each index is PQ-64 with IVF coarse quantisation,
+    sharded by scan bandwidth, and returns its top 100. A cross-encoder scores
+    those 100 pairs on GPU, sees both modalities jointly, and reorders them; a
+    policy layer then applies dedupe and safety filters. Text edits stream into the
+    text index through an incremental upsert path with tombstones, while images are
+    ingested in a daily batch that rebuilds into a shadow index. A cached encoder
+    handles repeated query strings, which is where the cheap latency wins live.
+
+  deep_dives:
+    - topic: "Dual encoder versus fusion"
+      explanation: >-
+        The dual encoder is a bag-of-meaning compression: everything a caption
+        says must fit in one vector, and the dot product is the only interaction.
+        That is what makes retrieval precomputable and therefore cheap. A
+        cross-encoder sees the pair jointly, with full token-level interaction, so
+        it can represent "red car on a bridge at night" as a conjunction — and it
+        cannot be precomputed, so it can only run on a shortlist. The architecture
+        is therefore always a two-stage compromise: cheap recall from the dual
+        encoder, expensive precision from fusion.
+      tradeoffs:
+        - option: "Dual encoder only"
+          pros: "Precomputable, 32 GB for 500M images, tens of milliseconds end to end; trivially shardable."
+          cons: "Cannot represent conjunction or negation; recall on compositional queries is structurally limited regardless of index quality."
+        - option: "Dual encoder plus cross-encoder rerank of top 100"
+          pros: "Fixes ordering and composition on the shortlist at 43 ms; keeps the index cheap and the recall stage unchanged."
+          cons: "Cannot recover a relevant item absent from the top 100; adds 300 GPUs at peak and a second model to version."
+        - option: "Early fusion with joint encoding of every candidate"
+          pros: "Best possible relevance, since every pair is scored with full interaction."
+          cons: "Cost scales with catalogue, not with shortlist — 500M pairs per query is not a system, it is a thought experiment."
+
+    - topic: "Training the alignment"
+      explanation: >-
+        The space is learned by contrastive training: matched pairs close,
+        everything else apart. Batch size is the lever, because in-batch negatives
+        give n-1 negatives per positive, so a 16,384 batch provides far more signal
+        than 256. Temperature controls how hard the model pushes on near misses;
+        around 0.07 is the common operating point. Two failure modes dominate:
+        false negatives (a caption that describes another image in the batch gets
+        pushed away) and the modality gap (text and image occupy different cones
+        even when matched), which makes cross-modal thresholds unstable.
+      tradeoffs:
+        - option: "Large batch, in-batch negatives, no filtering"
+          pros: "Simple and cheap per sample; batch size alone gives most of the gain; scales with data."
+          cons: "A few percent of in-batch negatives are true matches, which teaches the model to separate correct pairs and caps alignment quality."
+        - option: "Large batch plus supervised positive filtering"
+          pros: "Removes false negatives; measurable alignment improvement on retrieval benchmarks."
+          cons: "Requires a labelling or matching step per batch, and an error in the filter becomes a silent bias."
+        - option: "Add hard negatives mined from the current index"
+          pros: "Focuses capacity on the examples that actually separate; the standard way to push recall past a plateau."
+          cons: "Mined negatives are policy-dependent — you train on the current model's near misses, which narrows the distribution over time."
+
+    - topic: "Index partitioning and sharding"
+      explanation: >-
+        There are two orthogonal splits. Partitioning by modality means a query
+        scans only its target index, which removes 62% of the work for the
+        dominant text-to-image path and stops the wrong modality from occupying
+        the shortlist. Sharding within a modality is a scan-bandwidth decision:
+        with 32,768 IVF lists over 500M images, a 64-probe scan reads
+        15,259 x 64 x 64 B = 62.5 MB, so 5,556 rps is 347 GB/s at peak — four to
+        six nodes at 60-80 GB/s each. The text index is 1.6x larger but receives a fifth of the
+        traffic, so it is sized for capacity and idle most of the time — a
+        mismatch worth naming in the design review rather than discovering in the
+        bill.
+      tradeoffs:
+        - option: "Partition by modality, shard within each"
+          pros: "Minimal scan work per query; independent refresh cadence; failure in one index does not take down the other."
+          cons: "Two builds, two monitoring stacks, and skewed utilisation — the text index is large and lightly used."
+        - option: "Single joint index, filter by modality at query time"
+          pros: "One index to operate; cross-modal queries can search everything at once; simpler backfill."
+          cons: "Scans 2.6x more vectors for the common query, and post-filtering by modality wastes the shortlist when the filter is selective."
+        - option: "One index per modality with a shared coarse quantiser"
+          pros: "Keeps list structure comparable across modalities, so cross-modal calibration is easier."
+          cons: "Couples the two builds: retraining centroids for one modality forces a re-quantisation of both."
+
+    - topic: "Reranking budget allocation"
+      explanation: >-
+        The rerank stage is the only one with a linear cost in pairs, so it is the
+        easiest to overspend on. At 0.43 ms per pair, 100 pairs is 43 ms and 1,000
+        is 432 ms — the difference between a 150 ms SLO and a system that cannot
+        answer. The allocation question is whether marginal pairs improve ordering:
+        recall@100 from the dual encoder is usually high enough that pairs 101-200
+        contribute little, while pairs 1-20 carry most of the ordering signal.
+        Measuring NDCG at 20, 50, and 100 pairs tells you where to stop, and that
+        measurement is cheaper than the GPUs.
+      tradeoffs:
+        - option: "Rerank top 100"
+          pros: "Fits a 60 ms budget at 100 pairs; captures most ordering gains; 300 GPUs at peak."
+          cons: "Misses relevant items ranked 101-500 by the dual encoder, which is exactly the tail composition hurts."
+        - option: "Rerank top 20, spend the savings on a wider recall stage"
+          pros: "Cheaper rerank, more candidates from retrieval; better when the encoder is weak and the reranker is strong."
+          cons: "A short rerank list gives the cross-encoder little to choose from; gains saturate quickly."
+        - option: "Two-level rerank: cheap pairwise model on 500, cross-encoder on 50"
+          pros: "Allocates compute where it changes the order; can beat a flat 100-pair budget at similar cost."
+          cons: "Three models in the path, and the cheap model's errors propagate invisibly into the final order."
+
+  bottlenecks:
+    - failure: "Out-of-distribution query images collapse recall"
+      symptom: "Recall@10 is 0.90 on the eval set and 0.62 on mobile uploads; the encoder's embedding norms for phone images sit outside the training distribution, and nearest neighbours look random."
+      mitigation: "Augment training with the actual capture pipeline (compression, rotation, crop), monitor embedding norm and neighbour-distance distributions per client type, and keep a per-segment recall measurement against brute force."
+    - failure: "Rerank stage dominates p99"
+      symptom: "Retrieval p99 is 45 ms and end-to-end p99 is 320 ms; the rerank queue depth grows with query rate while GPU utilisation sits near 100%, and the tail tracks the longest pair."
+      mitigation: "Cap pairs per query, truncate pair length at 288 tokens, batch pairs across queries to fill the GPU, and shed to dual-encoder ordering when the rerank queue exceeds its deadline."
+    - failure: "Text index falls behind on edits"
+      symptom: "Deleted or edited passages remain retrievable for hours; queries return content that no longer exists and the discrepancy is only visible in user reports."
+      mitigation: "Incremental upserts with tombstones filtered at merge time, a freshness SLO measured as p99 edit-to-visible latency, and a compaction job that rebuilds lists when the tombstone ratio crosses a threshold."
+
+  what_to_steal:
+    - "Count bytes before models: 500M images is 1.02 TB fp32, 256 GB int8, 32 GB as PQ-64 — the index precision decides the fleet."
+    - "Partition by modality: a text query has no business scanning 800M passages, and paying 2.6x for the privilege is a choice, not a requirement."
+    - "Budget the reranker in pairs, not queries: 0.43 ms per pair means a 60 ms budget affords about 139 pairs."
+    - "Measure recall per query type: aggregate recall hides the segment where the encoder is out of distribution."
+
+  markdown: |
+    ## Three numbers decide the index
+
+    Five hundred million images at 512 dimensions:
+
+    $$5\times10^{8} \times 512 \times 4\ \text{B} = 1.024\times10^{12}\ \text{B}
+    = 1.02\ \text{TB}.$$
+
+    In int8 that is 256 GB; as PQ-64 codes it is
+
+    $$5\times10^{8} \times 64\ \text{B} = 3.2\times10^{10}\ \text{B} = 32\ \text{GB}.$$
+
+    Add the text side — 800 million passages, 51 GB of codes — and the joint index
+    is **83 GB**, against 2.66 TB uncompressed. A **32x** compression is what makes
+    a two-node index possible; without it the design is a twenty-node cluster with
+    a scan-bandwidth problem.
+
+    ## Partition before you shard
+
+    A text query cannot return a passage, because the user asked for an image. So
+    why scan the text index?
+
+    | Query type | Single index | Partitioned | Work ratio |
+    |---|---|---|---|
+    | Text to image (80%) | 1.3e9 codes | 500e6 codes | 2.6x |
+    | Image to text (20%) | 1.3e9 codes | 800e6 codes | 1.6x |
+
+    Partitioning removes **62%** of the scan for the dominant path and stops the
+    wrong modality from filling the shortlist — a text query against a joint index
+    can return ten near-identical captions before it returns an image, because
+    text embeddings cluster more tightly.
+
+    The cost is asymmetric utilisation: the text index is 1.6x larger and receives
+    a fifth of the traffic. Say that out loud in the design review instead of
+    discovering it in the bill.
+
+    ## The reranker is where ordering is bought
+
+    A 0.3B cross-encoder over a 288-token pair:
+
+    $$2 \times 3\times10^{8} \times 288 = 1.73\times10^{11}\ \text{FLOP}
+    = 173\ \text{GFLOP},$$
+
+    which is **0.43 ms** at 400 TFLOP/s. Multiply by pairs, not queries:
+
+    | Pairs | GPU time per query | Fleet at 6,944 peak qps |
+    |---|---|---|
+    | 25 | 10.8 ms | 75 GPUs |
+    | 50 | 21.6 ms | 150 GPUs |
+    | **100** | **43.2 ms** | **300 GPUs** |
+    | 1,000 | 432 ms | 3,000 GPUs |
+
+    A 60 ms rerank budget affords **139 pairs**. Anyone who asks for "rerank the
+    top 1,000" is asking for a 432 ms stage and a fleet ten times larger, and the
+    answer is a measurement: NDCG at 20, 50, and 100 pairs tells you where the
+    ordering gains stop.
+
+    ## The alignment problem no index can fix
+
+    Contrastive training puts matched pairs close and everything else apart. Two
+    things go wrong that look like index bugs and are not.
+
+    **False negatives.** At batch 16,384, a few percent of the "negatives" for a
+    given caption are other images that the caption also describes. The loss pushes
+    them apart, so the model learns to separate correct pairs. The symptom is a
+    plateau that no amount of index tuning moves.
+
+    **The modality gap.** Even a well-trained model places text and image
+    embeddings in different regions of the sphere, so an image's nearest neighbour
+    is often another image rather than its caption. Ranking within a modality still
+    works; a global similarity threshold does not transfer across modalities, which
+    is why calibration has to be per direction.
+
+    ## Training the space
+
+    Contrastive training is a batch-size game. A batch of 16,384 gives each
+    positive 16,383 in-batch negatives, so the gradient signal scales with batch
+    and a 256-batch run is training a different, weaker objective. Temperature
+    around 0.07 sharpens the distribution enough that near misses dominate the
+    loss, which is what you want — and small enough that label noise becomes
+    expensive, which is what you get.
+
+    The encoder cost is asymmetric and that asymmetry is the design. A 110M text
+    tower over 32 tokens is 7 GFLOP per query — nothing. A 304M image tower over
+    257 tokens (16 x 16 patches plus CLS) is 156 GFLOP per image, so re-embedding
+    500M images is
+
+    $$5\times10^{8} \times 1.56\times10^{11} = 7.8\times10^{19}\ \text{FLOP}
+    \quad\Longrightarrow\quad 195{,}000\ \text{GPU-s} = 54\ \text{GPU-hours}.$$
+
+    Two days of a small cluster. That number is the reason an encoder upgrade is
+    a quarterly decision rather than a weekly one, and the reason a query-side
+    model change is nearly free by comparison: you re-embed queries as they
+    arrive, but you cannot avoid re-embedding the catalogue.
+
+    ## Failure modes you will actually hit
+
+    **The catalogue's vocabulary is not the model's.** A checkpoint trained on web
+    alt-text knows "dog" and "sunset" and does not know your product SKUs, your
+    internal jargon, or the difference between two near-identical components.
+    Retrieval looks fine in a demo and fails on the queries that matter
+    commercially.
+
+    **Thresholds do not transfer across modalities.** Because of the modality gap,
+    a cosine of 0.31 that means "good match" for text-to-image means something
+    else for image-to-text. Every threshold is per direction, measured on held-out
+    data, and re-measured after any encoder change.
+
+    **Policy contamination is the silent one.** The click log only contains pairs
+    the system chose to show, so the hard negatives you mine are the current
+    model's near misses. Train on them long enough and the model learns the
+    policy's blind spots as ground truth — the retrieval version of the feedback
+    loop, and just as invisible on a dashboard.
+
+    **The two indexes are not equally loaded.** At an 80/20 mix the image index
+    serves 5,556 queries per second and the text index 1,389, while the text index
+    is 1.6x larger. Capacity and traffic point in opposite directions, so any
+    single "index cluster" sizing is wrong for one of them; name the skew in the
+    design and give each index its own replica count.
+
+    ## Where the analogy breaks
+
+    The shelf order is learned from co-occurrence, so it inherits what the data
+    bothered to mention. A caption that never names colour teaches nothing about
+    colour, and the embedding has no dimension reserved for the concept — the
+    failure is silent and looks like a hard query rather than a missing label.
+
+    And the geometry is not shared: text and images occupy different cones of the
+    same sphere. The library's shelf is one arrangement, but the two languages do
+    not stand on the same spot, which is why every cross-modal threshold has to be
+    measured rather than assumed.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Joint text-image retrieval is **two towers, one space, three budgets**. The towers must be trained so that a caption and its image land near each other, which is an alignment problem; the space must be indexed so that a query reaches the right candidates in tens of milliseconds, which is a compression problem; and the final ordering needs a model that sees both modalities at once, which is a compute problem. Confusing the three is how teams ship a system with good recall, bad ordering, and no idea which stage to fix.
+
+    ### The analogy, in full
+
+    A bilingual library where every book has a title in one language and a cover in another, and you want to find books by either. You do not translate the query — you keep a single shelf order that both languages agree on, learned by putting matching pairs next to each other until the arrangement becomes meaningful. The shelf order is the embedding space. It is cheap to search because it is one dimension-reduced list, and it is lossy because a single position cannot encode "red AND car AND bridge AND night". Two ways the analogy breaks. First, the arrangement is learned from co-occurrence, so it inherits the biases of what was paired: a caption that never mentions colour teaches nothing about colour. Second, the shelf has a geometry problem — text embeddings and image embeddings occupy slightly different regions of the same space even when they mean the same thing, so the nearest text to an image is often another text.
+
+    ### Failure modes, in full
+
+    - You index images and text in one 1.3-billion-vector index and every query scans all of it. Partitioning by modality means a text query scans 500M images instead of 1.3B vectors — 62% less work for the same answer.
+    - You ship a dual encoder because it is cheap, and compositional queries fail: 'red car on a bridge at night' retrieves red cars, bridges, and night scenes separately. The dot product cannot represent conjunction, and no amount of index tuning fixes it.
+    - You add a cross-encoder reranker over the top 1,000 and the p99 goes from 40 ms to 460 ms: 1,000 pairs at 0.43 ms each is 430 ms of GPU time, which is why the budget only affords about 140 pairs.
+    - Your text-to-image recall is 0.81 on the eval set and 0.62 on mobile traffic, because the image tower was trained on web-resolution photos and phone uploads are compressed, rotated, and cropped — the embeddings are out of distribution, not the index.
+    - You train with in-batch negatives at batch 4,096 and 6% of your 'negatives' are actually matching pairs, so the model is taught to push true pairs apart and alignment plateaus.
+
+    ### The mechanisms, in full
+
+    - **Two towers, one space, and the space is the product.** An image tower and a text tower project into a shared 512-dimensional unit sphere; retrieval is a dot product. Everything else — index, shards, reranker — exists to make that dot product affordable at 1.3 billion vectors.
+    - **Index size is bytes, and the three precisions span 32x.** 500M images x 512 dims x 4 B = **1.02 TB** fp32; int8 gives **256 GB**; PQ-64 gives **32 GB**. Text adds 800M x 512 x 1 B = 410 GB int8, or 51 GB as codes, so the joint index is **83 GB of codes** against 1.4 TB of fp32.
+    - **Partition by modality and you stop scanning the wrong half.** A text query only needs the image index, an image query only the text index. Indexing both in one space makes every query scan 1.3B vectors instead of 500M — **2.6x** the work for an answer that cannot include the other modality anyway.
+    - **A dot product cannot express conjunction.** Dual encoders compress a whole caption into one vector, so "red car on a bridge at night" becomes a single point that is near red cars, near bridges, and near night scenes but not necessarily near the intersection. That is a representational limit, and it is why a fusion reranker exists.
+    - **The reranker is the expensive stage and the budget is pairs, not queries.** A 0.3B cross-encoder over a 288-token pair costs 2 x 3e8 x 288 = **173 GFLOP**, or **0.43 ms** at 400 TFLOP/s. A 60 ms rerank budget therefore affords **about 139 pairs** — not 1,000.
+    - **Rerank GPUs scale with peak qps times pairs.** At 6,944 peak qps and 100 pairs per query, reranking costs 43 ms of GPU time per request, so the fleet is 6,944 x 0.043 = **299 GPUs**. Retrieval GPUs scale with scan bytes; rerank GPUs scale with pairs, and the two numbers move independently.
+    - **Alignment is a training problem with a temperature and a batch size.** Contrastive loss with temperature around 0.07 and a large batch gives many in-batch negatives, but at batch 16,384 a few percent of those negatives are true matches, which teaches the model to separate things that belong together. Deduplicate or use a supervised positive filter.
+    - **The modality gap is real and measurable.** Even a well-trained CLIP-style model places text and image embeddings in different cones of the sphere, so the nearest neighbour of an image is often another image rather than its caption. Retrieval still works because ranking is within-modality consistent — but cross-modal score thresholds do not transfer.
+    - **Recall is measured per query type, not in aggregate.** Text-to-image, image-to-text, and image-to-image have different failure modes and different index paths. A single recall number hides the segment that is broken, and the broken segment is usually the one with the least training data.
+    - **Freshness splits by modality.** Images are ingested in bulk and indexed daily; text is edited continuously, so the text index needs incremental upserts while the image index can be rebuilt. Assuming one refresh cadence for both means either stale text or a rebuild storm.
+  derivations:
+    - title: "Index bytes and compression"
+      latex: |
+        For $n$ vectors of dimension $d$ in $b$ bytes, storage is $n d b$. With
+        PQ of $m$ subquantisers at 8 bits, code size is $m$ bytes and the ratio is
+        $$\rho = \frac{d b}{m}.$$
+        At $d = 512$, $b = 4$, $m = 64$: $\rho = 2048/64 = 32$.
+      prose: >-
+        The ratio is independent of $n$, so compression is a per-vector decision
+        that scales the whole index. Doubling $m$ halves the ratio and roughly
+        halves the quantisation error, which is the dial you turn when recall is
+        short.
+    - title: "Cross-encoder cost per pair"
+      latex: |
+        For parameters $N$ and pair length $T$ tokens, forward FLOPs are $2NT$, so
+        the per-pair time at effective throughput $F$ is
+        $$\tau = \frac{2NT}{F}.$$
+        At $N = 3\times10^{8}$, $T = 288$, $F = 4\times10^{14}$:
+        $$\tau = 4.32\times10^{-4}\ \text{s}.$$
+      prose: >-
+        0.43 ms per pair. Note the linear dependence on pair length: truncating
+        from 512 to 288 tokens cuts the rerank bill by 44%, which is usually a
+        better trade than scoring fewer pairs.
+    - title: "Rerank fleet from pairs and rate"
+      latex: |
+        If each query scores $P$ pairs at $\tau$ seconds each, GPU-seconds per
+        query is $P\tau$, and the fleet at rate $R$ is
+        $$G = R P \tau.$$
+        At $R = 6{,}944$, $P = 100$, $\tau = 4.32\times10^{-4}$:
+        $$G = 6{,}944 \times 100 \times 4.32\times10^{-4} = 300.$$
+      prose: >-
+        The formula is linear in both pairs and rate, and independent of index
+        size — which is why reranking and retrieval scale on different axes and
+        why a change in rerank depth never shows up in retrieval dashboards.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Two towers make one space; the space is indexed in bytes; the ordering is
+        bought in pairs. Partition by modality, compress to PQ, and rerank only as
+        deep as the budget affords.
+      blocks:
+        - kind: checklist
+          body: |
+            - 500M x 512 x 4 = 1.02 TB; PQ-64 = 32 GB
+            - Text index 51 GB of codes, 1.6x larger and 5x less used
+            - Partition: text query scans 500M, not 1.3B
+            - 0.43 ms per rerank pair; 60 ms affords 139 pairs
+            - 300 GPUs for 100 pairs at 6,944 qps
+      checkpoint: >-
+        Why does partitioning by modality help more for text-to-image than for
+        image-to-text?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Decide the space first (shared, trained, 512-d), then the index precision,
+        then the rerank depth, then the shard count per index. The query mix
+        decides how the replicas are split.
+      blocks:
+        - kind: checklist
+          body: |
+            - Train or adopt the space; measure recall per query type
+            - Choose PQ depth from the memory budget
+            - Partition by modality, shard by scan bandwidth
+            - Set rerank depth from NDCG, not from habit
+            - Give each modality its own refresh cadence
+      checkpoint: >-
+        A stakeholder asks for top-1,000 reranking. What two measurements do you
+        bring to that conversation?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The query path and the sizing arithmetic.
+      blocks:
+        - kind: pseudocode
+          body: |
+            bytes_fp32 = n_img * d * 4
+            bytes_pq   = n_img * m
+            rerank_ms  = pairs * (2 * N * T / F) * 1000
+
+            query(q):
+              v      = tower_for(q.modality)(q)
+              idx    = image_index if q.wants_images else text_index
+              cands  = idx.search(v, k=100)
+              scored = cross_encoder([(q, c) for c in cands])
+              return policy_filter(sort(scored))[:10]
+      checkpoint: >-
+        Where would you cut first if the p99 is 320 ms and retrieval is only 45 ms
+        of it?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Compression, per-pair cost, fleet.
+      blocks:
+        - kind: math
+          body: |
+            **Compression.** $\rho = db/m$; 512 x 4 / 64 = 32.
+
+            **Per pair.** $\tau = 2NT/F$; 2 x 3e8 x 288 / 4e14 = 0.43 ms.
+
+            **Fleet.** $G = RP\tau$; 6,944 x 100 x 4.32e-4 = 300.
+      checkpoint: >-
+        What happens to G if you truncate pair length from 288 to 192 tokens?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The capacity model plus the two measurements that keep it honest.
+      blocks:
+        - kind: warning
+          body: >-
+            Aggregate recall is the trap. Text-to-image and image-to-text fail
+            differently, and the smaller segment is usually the one that is broken.
+            Report recall per direction, per client type, against a brute-force
+            sample.
+        - kind: code
+          language: python
+          body: |
+            def index_gb(n, d=512, mode="pq64"):
+                per = {"fp32": d * 4, "int8": d, "pq64": 64}[mode]
+                return n * per / 1e9
+
+            def rerank_gpus(qps, pairs, params=3e8, tokens=288, flops=4e14):
+                per_pair = 2 * params * tokens / flops
+                return qps * pairs * per_pair
+      checkpoint: >-
+        With 200 GB of memory, what is the largest image count you can index at
+        PQ-64 with two replicas?
+  try_it: >-
+    Compute the index three ways: 500M x 512 x 4 bytes is 1.02 TB fp32, 256 GB as
+    int8, and 32 GB as PQ-64 codes. Then compute rerank cost: 2 x 0.3e9 x 288 is
+    173 GFLOP, or 0.43 ms per pair, so a 60 ms budget affords about 139 pairs and
+    100 pairs at 6,944 peak qps needs 300 GPUs.
+  interview_questions:
+    - question: "Why not use a single joint index for text and images?"
+      level: senior
+      key_points:
+        - "A text query cannot return a passage, so scanning the 800M-vector text index is pure waste: partitioning cuts the dominant path from 1.3e9 to 5e8 codes, 62% less work."
+        - "Text embeddings cluster more tightly than image embeddings, so a joint index can fill the shortlist with near-duplicate captions before any image appears."
+        - "Separate indexes allow different refresh cadences: images rebuild daily, text needs 15-minute upserts."
+        - "The cost is asymmetric utilisation — the text index is 1.6x larger and gets a fifth of the traffic — which has to be planned rather than discovered."
+      follow_up: "How would you handle a query that genuinely mixes modalities, like 'find images and passages about this'?"
+    - question: "Walk me through the cost of reranking the top 100."
+      level: staff
+      key_points:
+        - "A 0.3B cross-encoder over a 288-token pair is 2 x 3e8 x 288 = 173 GFLOP, or 0.43 ms at 400 TFLOP/s."
+        - "One hundred pairs is 43 ms of GPU time per query, 29% of a 150 ms budget and the largest single stage."
+        - "At 6,944 peak qps that is 300 GPUs, so the fleet is linear in both pairs and rate and independent of index size."
+        - "A 60 ms budget affords 139 pairs, which is why 'rerank the top 1,000' implies a 432 ms stage and 3,000 GPUs."
+      follow_up: "What measurement would convince you that 50 pairs is enough?"
+    - question: "Your dual encoder has great recall but bad ordering on compositional queries. What do you do?"
+      level: staff
+      key_points:
+        - "A dot product compresses a whole caption into one vector, so conjunction and negation are not representable — this is structural, not a training deficiency."
+        - "The fix is a fusion reranker that sees text and image jointly over a shortlist, which is why the two-stage architecture is standard."
+        - "Reranking cannot recover an item missing from the shortlist, so recall depth and rerank depth are separate budgets."
+        - "If composition dominates traffic, the rerank stage deserves more of the 150 ms and a wider shortlist; if it is rare, dual-encoder ordering is enough."
+      follow_up: "What would you do differently for negation, which even cross-encoders handle poorly?"
+    - question: "Recall drops from 0.90 to 0.62 on mobile traffic. Is that an index problem?"
+      level: senior
+      key_points:
+        - "Almost certainly not: phone images are compressed, rotated, and cropped, so the image tower's embeddings are out of distribution."
+        - "The index returns the nearest vectors it has; if the query vector is in the wrong region, the nearest neighbours are meaningless."
+        - "Mitigate by augmenting training with the real capture pipeline and monitoring embedding norm and neighbour-distance distributions per client type."
+        - "Measure recall per segment against brute force, because the aggregate number hides exactly this failure."
+      follow_up: "How would you detect this before a user report, using only production telemetry?"
+  common_mistakes:
+    - "Indexing text and images in one space and scanning 1.3B vectors per query when the target modality holds 500M."
+    - "Reranking the top 1,000 because it sounds thorough: 432 ms of GPU time and 3,000 GPUs at peak."
+    - "Reporting one aggregate recall number across query types, hiding the direction where the encoder is out of distribution."
+    - "Training with large in-batch negatives without filtering true matches, then wondering why alignment plateaus."
+  further_reading:
+    - label: "Radford et al., Learning Transferable Visual Models From Natural Language Supervision (CLIP), ICML 2021"
+    - label: "Jia et al., Scaling Up Visual and Vision-Language Representation Learning With Noisy Text Supervision (ALIGN), ICML 2021"
+    - label: "Liang, Zhang, Kwon, Yeung, Zou, Mind the Gap: Understanding the Modality Gap in Multi-modal Contrastive Representation Learning, NeurIPS 2022"
+  implementations:
+    - language: python
+      title: "Why one dot product cannot express a conjunction"
+      note: >-
+        A text encoder turns the query red car into one vector that weights the adjective more than the noun. The dot product then prefers a red truck because redness dominates, while a late-interaction score that keeps the attributes separate (the minimum of the two matches) returns the red car. This is the alignment-versus-ordering distinction the case study insists on; the vectors are illustrative, not a trained CLIP.
+      code: |
+        import numpy as np
+
+        DIM = 16
+        # (name, redness, car-ness): a caption is a conjunction of two attributes.
+        ITEMS = [
+            ("red car", 1.0, 1.0),
+            ("red truck", 2.2, 0.2),
+            ("blue car", -1.8, 1.0),
+            ("blue truck", -2.0, -0.2),
+            ("green car", -0.2, 1.1),
+            ("green truck", -0.1, -1.2),
+        ]
+        RERANK_FLOPS_PER_PAIR = 2 * 0.3e9 * 288
+
+
+        def embed(redness, carness, rng):
+            v = np.zeros(DIM)
+            v[0], v[1] = redness, carness
+            v[2:] = rng.normal(scale=0.02, size=DIM - 2)
+            return v / np.linalg.norm(v)
+
+
+        def main():
+            rng = np.random.default_rng(0)
+            images = [embed(r, c, rng) for _, r, c in ITEMS]
+            query = embed(1.0, 0.4, rng)          # "red car": the text tower weights "red" more
+
+            dot = [float(query @ im) for im in images]
+            # Late interaction keeps the attributes separate instead of summing them:
+            # score = min(redness match, car-ness match).
+            conj = [min(im[0], im[1]) for im in images]
+            dot_top = ITEMS[int(np.argmax(dot))][0]
+            conj_top = ITEMS[int(np.argmax(conj))][0]
+            print(f"single dot-product top-1: {dot_top}")
+            print(f"attribute conjunction top-1: {conj_top}")
+
+            ms = 100 * RERANK_FLOPS_PER_PAIR / 400e12 * 1e3
+            print(f"rerank 100 pairs: {ms:.1f} ms of a 60 ms budget")
+            print(f"index: 500M x 512 x 4 B = {500e6*512*4/1e12:.2f} TB fp32, "
+                  f"{500e6*64/1e9:.0f} GB as PQ-64")
+
+            assert dot_top == "red truck"        # redness overwhelms the conjunction
+            assert conj_top == "red car"
+            assert ms < 60
+            assert abs(RERANK_FLOPS_PER_PAIR - 172.8e9) < 1
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-multimodal-cosine
+      title: "Cosine score of one attribute vector"
+      difficulty: easy
+      prompt: >-
+        Return the cosine similarity between an image vector `(redness, carness)` and a text
+        query vector `(q_red, q_car)`. Use it to compare the red car (1.0, 1.0) with the red
+        truck (2.2, 0.2) for the query (1.0, 0.4).
+      language: python
+      entry: cosine_score
+      testCases:
+        - input: '{"redness": 1.0, "carness": 1.0}'
+          expected: "0.919145"
+          tolerance: 1e-6
+        - input: '{"redness": 2.2, "carness": 0.2}'
+          expected: "0.958288"
+          tolerance: 1e-6
+      solution: |
+        import math
+
+        def cosine_score(redness, carness, q_red=1.0, q_car=0.4):
+            return (redness * q_red + carness * q_car) / (
+                math.hypot(redness, carness) * math.hypot(q_red, q_car))
+      solutionExplanation: >-
+        The truck scores higher because the query weights redness, which is the single-vector
+        conjunction failure. Keeping the attributes separate and taking the minimum returns the
+        car.
+      tags: [retrieval, multimodal]

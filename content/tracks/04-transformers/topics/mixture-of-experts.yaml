@@ -1,0 +1,1607 @@
+id: mixture-of-experts
+slug: mixture-of-experts
+title: "Mixture of Experts: Routing, Capacity, and Sparsity"
+summary: >-
+  Replace the block's single FFN with E experts and a router that sends each
+  token to k of them, then price the bargain: parameters scale with E, per-token
+  arithmetic with k, all E experts stay resident in memory, capacity factors
+  decide which tokens get computed at all, and the router collapses to five dead
+  experts in fifty steps unless a load-balancing loss is calibrated against the
+  task gradient rather than copied from a paper.
+kind: lesson
+difficulty: expert
+position: 13
+estMinutes: 30
+prerequisites: [transformer-block, mlp-from-scratch]
+phase: attention-core
+tags: [mixture-of-experts, routing, top-k, load-balancing, expert-collapse, capacity-factor, token-dropping, expert-parallelism, all-to-all, conditional-computation, mistral, mixtral, switch-transformer]
+
+body:
+  big_idea: >-
+    An MoE swaps one FFN for $E$ of them plus a router that activates $k$ per
+    token: parameters grow with $E$, arithmetic with $k$, and the trade pays
+    only if the router spreads load.
+
+  problem:
+    - >-
+      You replicate the FFN eight times: VRAM goes 14 GB to 95 GB, throughput
+      is flat, and loss improves less than a width bump.
+    - >-
+      Three days in, five of eight experts receive zero tokens and zero
+      gradient: a 3-expert model with 5 experts' worth of memory.
+    - >-
+      You set capacity factor 1.0 and 6.4% of tokens are silently discarded;
+      at 1.25 it is 0.2%, and a collapsed router needs 2.83.
+
+  analogy: |
+    A hospital with eight specialists and one triage desk. Every patient is
+    seen by two, but all eight specialists are on the payroll whether or not
+    anyone walks into their office. The triage nurse is evaluated only on how
+    well the two she picked treated the patient, and nothing in her review
+    mentions the queue, so she keeps sending everyone to whoever did well last
+    week.
+
+  concept_points:
+    - >-
+      **Routing is a linear map, a softmax, and a hard selection, and only the softmax carries gradient.**
+      With $z = W_g x$, $p = \operatorname{softmax}(z)$ and
+      $a = \operatorname{TopK}(p)$, the layer computes
+      $y = \sum_{i \in a} p_i f_i(x)$; the selection is piecewise constant, so
+      $\partial a/\partial W_g = 0$ almost everywhere. At init the measured
+      routing entropy is **2.991 bits** against $\log_2 8 = 3.000$.
+    - >-
+      **The load-balancing loss is a proxy for a quantity that has no gradient, and the product is the trick.**
+      $L_{\text{aux}} = \alpha E \sum_i f_i P_i$ with $f_i$ the fraction of
+      assignments and $P_i$ the mean router probability. At $f = P = 1/E$ it
+      is exactly **1.0000**; at total collapse **8.0000**. Measured: 1.000 at
+      init, 1.013 balanced, **2.349** with five dead. Using $E\sum_i f_i^2$
+      instead has exactly zero gradient.
+    - >-
+      **Without an aux loss, five of eight experts are dead by step 100 and never come back.**
+      On a 512-token batch, 8 linear experts, top-1, 600 steps: load entropy
+      falls from **2.950** bits to **1.723** at step 50 and **1.572** at step
+      100, then never moves. Final counts `[0, 0, 167, 0, 0, 181, 164, 0]`.
+      Rich-get-richer: a dead expert produces no gradient to revive it.
+    - >-
+      **Alpha is not a constant; it is the ratio between two gradients, and the published default can be 349x too weak.**
+      At init, mean $|\partial L_{\text{task}}/\partial z| = 8.2\times10^{-2}$
+      against $2.35\times10^{-4}$ for the aux term at $\alpha = 0.01$ —
+      **349:1**. The measurements are a step function: $\alpha=0.01$ leaves
+      1.584 bits with 5 dead, 0.1 gives 2.377 with 2 dead, 0.5 gives **2.981**
+      with 8 alive and max share **0.158**.
+    - >-
+      **Parameters scale with $E$, FLOPs with $k$, and the gap is the entire point.**
+      At $d = 768$, $d_{ff} = 3072$ a dense block is **7,080,960** parameters;
+      with $E=8$, $k=2$ the block is **40,111,104** total (5.66x) and
+      **11,799,552** active (1.67x), because attention and norms are shared.
+      Experts are **94.11%** of the block. Mixtral shape: **47.38B** total,
+      **13.55B** active — 0.286.
+    - >-
+      **Every expert is resident, so eight times the parameters costs eight times the memory for twice the arithmetic.**
+      47.38B in fp16 is **94.75 GB** against **27.11 GB** active — 6.77x a 7B
+      dense model's 14.0 GB. One Mixtral expert is **352.3 MB**, so fetching
+      it over PCIe 4.0 x16 costs **14.1 ms**; a batch-1 step needs 64 of
+      those, 22.5 GB and 0.90 s per token.
+
+  definitions:
+    - term: "Router (gate)"
+      meaning: >-
+        The matrix $W_g \in \mathbb{R}^{E \times d}$ that turns a token's hidden
+        state into $E$ logits, plus the softmax that makes them a distribution
+        and the top-k that makes them a decision. It is the only trained
+        component whose job is selection, and at 8 experts and $d = 4096$ it is
+        32,768 parameters — 0.00007% of a 47B model, deciding where 100% of the
+        compute goes.
+    - term: "Top-k routing"
+      meaning: >-
+        Each token is sent to the $k$ experts with the highest router
+        probability and its output is the probability-weighted sum of their
+        outputs. $k = 1$ is Switch (one expert, FLOPs equal to a dense model of
+        the same width); $k = 2$ is GShard and Mixtral (twice the FFN FLOPs,
+        smoother gradients, better quality per parameter).
+    - term: "Load-balancing loss (aux loss)"
+      meaning: >-
+        $\alpha E \sum_i f_i P_i$, where $f_i$ is the hard assignment fraction
+        and $P_i$ the mean soft probability for expert $i$. Bounded below by 1 at
+        a uniform router and above by $E$ at total collapse. It is an auxiliary
+        objective, not a constraint: it can be outvoted by the task gradient, and
+        usually is at the coefficient people copy.
+    - term: "Expert collapse"
+      meaning: >-
+        The router converging to a distribution concentrated on a few experts,
+        leaving the rest with zero assignments and therefore exactly zero
+        gradient. Experts have no assigned speciality — at initialisation all $E$
+        are near-identical, so the specialisation that appears is whatever the
+        router's noise plus the data produced. Measured here: load entropy 2.950
+        bits to 1.584 bits within 100 steps, five of eight experts at zero, no
+        recovery in 6,000 steps at alpha = 0.01.
+    - term: "Load entropy"
+      meaning: >-
+        $-\sum_i f_i \log_2 f_i$ over the assignment distribution, in bits, with
+        a ceiling of $\log_2 E$. Three bits for 8 experts when balanced, 1.584
+        when three experts share everything. It is the single number to log
+        during MoE training; a falling curve is collapse in progress.
+    - term: "Capacity factor (CF)"
+      meaning: >-
+        The multiplier in $C = \lfloor \mathrm{CF} \cdot kT / E \rfloor$, the
+        number of token slots each expert is given. It exists so the per-expert
+        matmul has a static shape; the cost is that any excess is dropped and any
+        shortfall is wasted allocation. 1.0 is no slack, 1.25 is the common
+        training default, 2.0 is what people reach for after a collapse.
+    - term: "Token dropping"
+      meaning: >-
+        Discarding the assignments beyond capacity. A dropped token is not
+        removed from the sequence: the block's residual carries it through
+        unchanged, so the layer is an identity for that token. Dropping is a
+        silent quality regression, not an error.
+    - term: "Active vs total parameters"
+      meaning: >-
+        Total counts every expert; active counts only the $k$ used per token plus
+        the shared dense parts. 47.38B total against 13.55B active for an
+        8-expert, top-2 model at $d = 4096$ — the ratio that decides whether the
+        memory bill is payable.
+    - term: "Expert parallelism (EP)"
+      meaning: >-
+        Placing different experts on different devices so each rank holds $E/N$
+        of them. It shards the parameter memory that made the model unloadable,
+        and it introduces the two all-to-all passes per layer that make the layer
+        a distributed synchronisation problem.
+    - term: "All-to-all"
+      meaning: >-
+        The collective where every rank sends a different buffer to every other
+        rank — the transpose of a matmul's data flow. Dispatch sends tokens to
+        the ranks owning their experts, combine sends the results back. Two per
+        layer, so 64 per forward pass at 32 layers.
+
+  diagrams:
+    - type: architecture
+      title: "One MoE layer: the FFN is replicated, everything else is untouched"
+      nodes:
+        - { id: x, x: 0, y: 0, label: "x  (n, d)", kind: client, detail: "The residual stream entering the layer. Every token in it is routed independently; nothing about the router sees the other tokens." }
+        - { id: router, x: 1, y: 0, label: "Router  W_g  (E, d)", kind: worker, detail: "32,768 parameters at E=8 and d=4096 — 0.00007% of a 47B model, and it decides where 100% of the layer's compute goes. Logits come out as (n, E)." }
+        - { id: topk, x: 2, y: 0, label: "softmax + top-k", kind: worker, detail: "Softmax makes a distribution; top-k keeps k of it. The selection is piecewise constant, so gradient reaches the router only through the kept probabilities, never through the choice." }
+        - { id: cap, x: 3, y: 0, label: "capacity + dispatch", kind: queue, detail: "Each expert gets floor(CF * k * n / E) slots. Overflow is dropped: the token keeps its residual and skips the experts. This is also where the first all-to-all happens under expert parallelism." }
+        - { id: ex, x: 3, y: 1, label: "E experts, E ranks", kind: gpu, detail: "Each expert is a full FFN: at d=4096, ff=14336 that is 3 x 4096 x 14336 = 176,160,768 parameters, 352.3 MB in fp16, and all E of them stay resident all the time." }
+        - { id: comb, x: 2, y: 1, label: "combine (all-to-all)", kind: queue, detail: "The second collective per layer: every rank ships its experts' outputs back to the ranks that own the tokens. 268.4 MB per layer at 8,192 tokens." }
+        - { id: sum, x: 1, y: 1, label: "weighted sum of experts", kind: server, detail: "Weighted sum over the k selected experts, using the router probabilities as weights. No parameters here; k=1 makes this a scalar multiply." }
+        - { id: out, x: 0, y: 1, label: "x + moe(x)", kind: external, detail: "The residual add, identical to the dense block's. A token that was dropped at this layer leaves with x unchanged — the layer is an identity for it." }
+      edges:
+        - { from: x, to: router, label: "read" }
+        - { from: router, to: topk, label: "logits (n, E)" }
+        - { from: topk, to: cap, label: "k indices + probs" }
+        - { from: cap, to: ex, label: "dispatch", style: async }
+        - { from: ex, to: comb, label: "expert outputs", style: async }
+        - { from: comb, to: sum, label: "gathered" }
+        - { from: sum, to: out, label: "update" }
+        - { from: x, to: out, label: "identity, 0 params" }
+      caption: "Everything except the FFN is the block you already have. The two async edges are the only ones that cross a device boundary, and they are where expert parallelism lives."
+
+    - type: pipeline
+      title: "One token through the layer, with the decision made at each step"
+      nodes:
+        - label: "x_t  (d)"
+          note: "one token, one row"
+          detail: "Routing is per token. Batch it as (n, d) and every row makes its own decision, which is why the load is a property of the batch, not of the model."
+        - label: "router logits  (E numbers)"
+          note: "E logits, 8 numbers"
+          detail: "At init with W_g ~ N(0, 0.02^2), logit std is 0.113 over E=8 — the router has no opinion yet and the tokens land nearly uniformly."
+        - label: "p = softmax(z)"
+          note: "per-token entropy 2.991 of 3.000 bits at init"
+          detail: "Nearly uniform at initialisation. After training with a balanced load the per-token entropy falls to 1.624 bits: the router becomes confident about a token while the load stays spread. Per-token confidence is good; load concentration is not."
+        - label: "top-k  ->  k experts"
+          note: "k=1 Switch, k=2 Mixtral"
+          detail: "The selection has no gradient. What has a gradient is p_i, and it enters the output as a multiplier."
+        - label: "capacity check"
+          note: "C = floor(CF * k * n / E)"
+          detail: "If the expert is full, this assignment is dropped. Measured: 62.5% of assignments dropped at CF=1.0 under a collapsed router, 0.0% at CF=1.25 under a balanced one."
+        - label: "expert FFN  d -> ff -> d"
+          note: "k x 2 d ff MACs per token"
+          detail: "The only arithmetic that scales with k. At d=768, ff=3072, k=2 that is 9,437,184 MACs against the dense block's 4,718,592."
+        - label: "weighted sum + residual"
+          note: "x + weighted sum"
+          detail: "A dropped token contributes nothing and the residual carries it: the layer is the identity for that token."
+      caption: "Five of the seven steps are bookkeeping and one is arithmetic. That ratio is why MoE kernels are dispatch code with a matmul in the middle."
+
+    - type: plot
+      title: "Where 512 tokens went, after 600 steps, with and without a load-balancing loss"
+      chart: bar
+      xLabel: "expert index"
+      yLabel: "tokens assigned (of 512)"
+      series:
+        - name: "no aux loss"
+          points:
+            - { x: 0, y: 0 }
+            - { x: 1, y: 0 }
+            - { x: 2, y: 167 }
+            - { x: 3, y: 0 }
+            - { x: 4, y: 0 }
+            - { x: 5, y: 181 }
+            - { x: 6, y: 164 }
+            - { x: 7, y: 0 }
+        - name: "alpha = 0.5"
+          points:
+            - { x: 0, y: 81 }
+            - { x: 1, y: 64 }
+            - { x: 2, y: 56 }
+            - { x: 3, y: 58 }
+            - { x: 4, y: 68 }
+            - { x: 5, y: 45 }
+            - { x: 6, y: 71 }
+            - { x: 7, y: 69 }
+
+    - type: plot
+      title: "Load entropy during training: collapse happens in 50 steps and never reverses"
+      chart: line
+      xLabel: "training step"
+      yLabel: "load entropy (bits, ceiling 3.000)"
+      series:
+        - name: "no aux loss"
+          points:
+            - { x: 0, y: 2.950 }
+            - { x: 50, y: 1.723 }
+            - { x: 100, y: 1.572 }
+            - { x: 150, y: 1.579 }
+            - { x: 200, y: 1.581 }
+            - { x: 250, y: 1.584 }
+            - { x: 300, y: 1.573 }
+            - { x: 350, y: 1.563 }
+            - { x: 400, y: 1.578 }
+            - { x: 450, y: 1.584 }
+            - { x: 500, y: 1.579 }
+            - { x: 550, y: 1.583 }
+            - { x: 599, y: 1.584 }
+        - name: "alpha = 0.01 (published default)"
+          points:
+            - { x: 0, y: 2.950 }
+            - { x: 50, y: 1.710 }
+            - { x: 100, y: 1.570 }
+            - { x: 150, y: 1.579 }
+            - { x: 200, y: 1.581 }
+            - { x: 250, y: 1.584 }
+            - { x: 300, y: 1.573 }
+            - { x: 350, y: 1.563 }
+            - { x: 400, y: 1.578 }
+            - { x: 450, y: 1.584 }
+            - { x: 500, y: 1.579 }
+            - { x: 550, y: 1.583 }
+            - { x: 599, y: 1.584 }
+        - name: "alpha = 0.5"
+          points:
+            - { x: 0, y: 2.950 }
+            - { x: 50, y: 2.498 }
+            - { x: 100, y: 2.675 }
+            - { x: 150, y: 2.857 }
+            - { x: 200, y: 2.960 }
+            - { x: 250, y: 2.972 }
+            - { x: 300, y: 2.977 }
+            - { x: 350, y: 2.973 }
+            - { x: 400, y: 2.957 }
+            - { x: 450, y: 2.986 }
+            - { x: 500, y: 2.952 }
+            - { x: 550, y: 2.976 }
+            - { x: 599, y: 2.981 }
+
+    - type: compare
+      title: "A dense FFN and an 8-expert top-2 MoE FFN, same width, same layers"
+      left_label: "Dense: one FFN per block (d = 768, 12 layers)"
+      left_points:
+        - "Block: 7,080,960 parameters; 12 layers 84,971,520"
+        - "7,077,888 MACs per token per block, all of them used"
+        - "Weights in fp16: 162 MiB for 12 blocks"
+        - "No router, no dispatch, no capacity, no dropping"
+        - "Every token sees every parameter — no conditional computation"
+      right_label: "MoE: 8 experts, top-2 (d = 768, d_ff = 3072, 12 layers)"
+      right_points:
+        - "Block: 40,111,104 parameters (5.66x); 12 layers 481,333,248"
+        - "11,796,480 MACs per token per block (1.67x) — experts are 94.11% of the weights"
+        - "Weights in fp16: 918 MiB for 12 blocks, all resident at all times"
+        - "Router, 64 all-to-all barriers per forward, capacity factor, token dropping"
+        - "Five of eight experts died in 50 steps without an aux loss; alpha had to be 0.5, not 0.01"
+
+  markdown: |
+    ## The substitution
+
+    A block is $x \leftarrow x + \operatorname{MLP}(\operatorname{LN}(x))$ — the
+    wiring from *The Full Transformer Block*, unchanged down to the two additions
+    and the fact that the stream is never normalised in place. MoE keeps the norm,
+    keeps the addition, and replaces the one MLP with $E$ of them plus a router.
+    What gets replicated is the sublayer from *MLP: Layers, Activations, and
+    Initialisation* — two or three matrices and a nonlinearity — so everything
+    that topic says about width, activation, and initialisation applies $E$ times
+    over, and nothing in this topic changes it:
+
+    $$y = \sum_{i \in \operatorname{TopK}(p)} p_i \, f_i(\operatorname{LN}(x)),
+      \qquad p = \operatorname{softmax}\!\left(W_g \operatorname{LN}(x)\right).$$
+
+    The shape is unchanged, so nothing downstream knows. That is the whole
+    architectural change, and it buys something no dense model has: two
+    independent knobs. Parameters grow with $E$; per-token arithmetic grows with
+    $k$. A dense model has one knob and both quantities move together.
+
+    Everything else in this topic is the bill for separating them.
+
+    ## What actually gets a gradient
+
+    $W_g \in \mathbb{R}^{E \times d}$ is 32,768 parameters at $E = 8$ and
+    $d = 4096$ — 0.00007% of a 47B model, deciding where 100% of the compute
+    goes. It is trained by one path only: the probability $p_i$ that multiplies
+    the selected expert's output. The selection itself is piecewise constant, so
+
+    $$\frac{\partial \operatorname{TopK}(p)}{\partial W_g} = 0
+      \quad \text{almost everywhere.}$$
+
+    At initialisation the logits are tiny and the router is nearly uniform:
+    measured per-token entropy **2.991 bits** of a possible $\log_2 8 = 3.000$.
+    It starts with no opinion, and the first hundred steps are a race to acquire
+    one. That race has a winner-take-all structure, which is the next section.
+
+    ## Why it collapses
+
+    The winning expert gets the token, therefore the gradient, therefore becomes
+    better at that token, therefore wins it again. Measured on 512 tokens, 8
+    linear experts, top-1 routing:
+
+    | step | load distribution | load entropy | per-token entropy |
+    |---|---|---|---|
+    | 0 | 36 69 64 48 60 66 72 97 | 2.950 bits | 2.991 bits |
+    | 50 | 0 0 130 4 5 216 153 4 | 1.723 bits | 2.709 bits |
+    | 100 | 0 0 183 0 0 190 139 0 | 1.572 bits | 2.107 bits |
+    | 599 | 0 0 167 0 0 181 164 0 | 1.584 bits | 0.865 bits |
+
+    Five experts are at exactly zero from step 100 onward, and a further 6,000
+    steps at alpha = 0.01 does not bring one of them back (final entropy 1.581
+    bits). A dead expert produces no output, so it receives no gradient, so it
+    cannot become worth routing to. The only force that could break the loop is
+    an explicit one.
+
+    Note the two entropies moving in opposite directions and meaning different
+    things. Per-token entropy falling from 2.991 to 0.865 bits is *good*: each
+    token has become confident about which expert suits it. Load entropy falling
+    from 2.950 to 1.584 is *bad*: the population of tokens is no longer spread.
+    A healthy router has low per-token entropy and high load entropy at the same
+    time — the alpha = 0.5 run reaches 1.624 and 2.981 respectively.
+
+    ## The load-balancing loss
+
+    $$L_{\text{aux}} = \alpha \, E \sum_{i=1}^{E} f_i P_i, \qquad
+      f_i = \frac{1}{kT}\sum_{t=1}^{T} \mathbf{1}\!\left[i \in
+      \operatorname{TopK}(p_t)\right], \qquad
+      P_i = \frac{1}{T}\sum_{t=1}^{T} p_{t,i}.$$
+
+    At a uniform router $f_i = P_i = 1/E$ and the sum is exactly 1. At total
+    collapse $f = P = e_j$ and it is $E$. Measured: **1.000** at initialisation,
+    **1.013** with a balanced router, **2.349** with five dead experts, **8.000**
+    at the theoretical extreme.
+
+    The reason it is a *product* and not a penalty on $f$ alone is differentiability.
+    $f$ comes from an argmax and has zero derivative; $P$ is a smooth function of
+    $W_g$ and is not the quantity you want to constrain. Their product moves in
+    the right direction: an expert whose hard load exceeds its soft share has its
+    logit pushed down, in proportion to the excess.
+
+    Alpha is the part people copy without measuring. In the run above the task
+    gradient through the gate has mean magnitude $8.2\times10^{-2}$ and the aux
+    gradient at alpha = 0.01 has $2.35\times10^{-4}$ — a ratio of 349:1, which is
+    why alpha = 0.01 produces a curve indistinguishable from no aux loss at all.
+    Alpha = 0.5 holds all eight experts alive. The coefficient is not a property
+    of MoE; it is the exchange rate between two gradients in your model at your
+    batch size.
+
+    ## Two counts, two growth rates
+
+    | | dense block | MoE block, E=8, k=2 |
+    |---|---|---|
+    | attention + norms | 2,362,368 | 2,362,368 (shared) |
+    | expert FFNs | 4,718,592 | 37,748,736 (8x) |
+    | **total parameters** | **7,080,960** | **40,111,104** (5.66x) |
+    | **active per token** | **7,080,960** | **11,799,552** (1.67x) |
+    | experts' share of params | 66.64% | 94.11% |
+
+    At a Mixtral shape — $d = 4096$, $d_{ff} = 14336$, 32 layers, $V = 32000$ —
+    the same arithmetic gives 47.38B total and 13.55B active, an active share of
+    0.286. The name on the box says 8x7B; the parameter count is 47.4B, not 56B,
+    because the attention stack exists once.
+
+    ## Capacity, and what dropping actually does
+
+    $$C = \left\lfloor \mathrm{CF} \cdot \frac{kT}{E} \right\rfloor .$$
+
+    Capacity is allocated per expert whether or not the tokens arrive, which is
+    what makes the per-expert matmul a fixed-shape GEMM instead of a dynamic
+    scatter. The price is measured in the table below, using the two real loads
+    from the collapse experiment (512 tokens, 8 experts, $k = 1$):
+
+    | capacity factor | capacity | dropped, collapsed load | dropped, balanced load |
+    |---|---|---|---|
+    | 1.00 | 64 | 62.5% | 6.4% |
+    | 1.25 | 80 | 53.1% | 0.2% |
+    | 2.00 | 128 | 25.0% | 0.0% |
+
+    The rule is $\mathrm{CF} \ge E \cdot s$ where $s$ is the largest share any
+    expert receives: $0.354 \times 8 = 2.83$ for the collapsed router, so no
+    reasonable capacity factor saves it, and $0.158 \times 8 = 1.26$ for the
+    balanced one, which 1.25 almost exactly meets. The capacity factor is not a
+    safety margin you can spend your way out of a collapse with; it is a bet that
+    the router is already balanced.
+
+    A dropped token does not disappear. The residual carries it, so it is the
+    identity for that token at that layer:
+
+    $$x_{l+1} = x_l + \mathbf{1}\!\left[\text{kept}\right]
+      \sum_{i \in a} p_i f_i\!\left(\operatorname{LN}(x_l)\right)$$
+
+    where the indicator is zero when every one of the token's $k$ assignments was
+    cut by capacity. That is why dropping shows up as a slow quality regression
+    rather than an exception, and why it is invisible in a loss curve for a long
+    time.
+
+    ## Where the money goes
+
+    Two costs dominate, and neither is FLOPs.
+
+    **Memory.** All $E$ experts are resident. 47.38B parameters in fp16 is
+    94.75 GB against 27.11 GB for the active set, and 6.77x a 7B dense model.
+    Paging is not an option: one Mixtral expert is 352.3 MB, so a batch-1 decode
+    step's $kL = 64$ expert fetches would be 22.5 GB and 0.90 seconds per token
+    over PCIe at 25 GB/s. You buy the memory up front or you do not run the model.
+
+    **Barriers.** Each layer does two all-to-all passes, moving $2kTdb$ bytes:
+    268.4 MB per layer and 8.59 GB per forward pass at 8,192 tokens — 9.1% of
+    the weight traffic, at an arithmetic intensity of 25,600 FLOP/byte. Bandwidth
+    is not the problem. The problem is that there are $2L = 64$ collectives per
+    forward and each is a barrier whose latency is set by the slowest rank, and
+    the slowest rank is by construction the one whose experts drew the most
+    tokens. Load imbalance stops being a FLOP inefficiency and becomes a
+    synchronisation cost.
+
+    ## What to check, in order
+
+    Log load entropy per layer, not just the loss: $\log_2 E = 3$ bits is the
+    ceiling at $E = 8$ and anything under 2.5 is collapse in progress. Log both gradient
+    norms and set alpha from their ratio rather than from a paper. Compute
+    $E \cdot s$ from the measured maximum share before choosing a capacity
+    factor, and if it exceeds 2 fix the router instead. And compare *active*
+    parameters against the dense model you were going to train instead, because
+    the total is not what you will be running.
+
+    ## The longer version
+
+    An MoE swaps one FFN for E of them plus a router that activates k per token,
+    so parameters grow with E while per-token arithmetic grows only with k — a
+    trade that pays for itself only if the router spreads the load, and nothing
+    in the task loss makes it.
+
+    A hospital with eight specialists and one triage desk. Every patient is seen
+    by two of them, so the building can treat more cases per hour than a single
+    general practitioner could — but all eight specialists must be on the
+    payroll whether or not anyone walks into their office, and every patient has
+    to physically walk from triage to each specialist's building and back.
+
+    The triage nurse is the router. She is the only thing deciding who goes
+    where, and she is evaluated only on how well the two specialists she picked
+    treated the patient. Nothing in her performance review mentions the queue.
+    So she keeps sending everyone to whoever did well last week, that
+    specialist gets better at everything because she sees everything, and the
+    other seven read magazines. That is expert collapse, and it is not a bug in
+    the nurse — it is what you asked her to optimise.
+
+    The analogy breaks in two places, both of which matter. First, a real triage
+    nurse can see the waiting room; the router sees one token at a time and has
+    no representation of the load at all, which is exactly why the aux loss has
+    to be bolted on as an artificial view of the queue. Second, a real hospital
+    can send a patient home; here a patient who overflows a specialist's capacity
+    is not lost, they simply pass through that floor unchanged — dropping degrades
+    the representation quietly instead of raising an error, which is why it
+    survives code review.
+
+    ### What goes wrong
+
+    - You want more capacity without more arithmetic, so you replicate the FFN
+      eight times. VRAM goes from 14 GB to 95 GB, throughput per token is
+      unchanged, and the loss improves by less than a width bump would have
+      given you. You have bought parameters, not compute, and nobody told you
+      which one you were short of.
+    - Three days in, five of your eight experts are receiving zero tokens.
+      Their gradients are exactly zero, they will never recover, and the only
+      symptom is that your model is a 3-expert model with 5 experts' worth of
+      wasted memory. The training loss curve looks fine.
+    - You add the load-balancing loss at alpha = 0.01 because that is what the
+      paper used. Measured, it changes the final expert load by 0.000 bits of
+      entropy: the task gradient through the gate is 349x larger than the aux
+      gradient in this configuration, so the default is decorative.
+    - You set capacity factor 1.0 to avoid wasting expert compute and 6.4% of
+      your tokens are silently discarded — not lost, just not transformed at
+      that layer. At capacity factor 1.25 it is 0.2%; with a collapsed router
+      no capacity factor under 2.83 saves you.
+    - You move from one GPU to eight with expert parallelism and throughput
+      goes down. The weights are sharded perfectly and the arithmetic is
+      identical; what you added is 64 global barriers per forward pass, each
+      of which waits for the rank whose experts got the most tokens.
+
+    ### The full treatment
+
+    **Routing is a linear map, a softmax, and a hard selection, and only the
+    softmax carries gradient.** With $z = W_g x$ for $W_g \in
+    \mathbb{R}^{E \times d}$, $p = \operatorname{softmax}(z)$ and $a =
+    \operatorname{TopK}(p)$, the layer computes $y = \sum_{i \in a} p_i
+    f_i(x)$. The selection is piecewise constant, so $\partial a / \partial
+    W_g = 0$ almost everywhere; the only differentiable path is the gate
+    scalar $p_i$ multiplying the chosen expert's output. At initialisation
+    with $W_g \sim \mathcal{N}(0, 0.02^2)$ and $d = 32$ the logits have
+    standard deviation $\sqrt{32} \cdot 0.02 = 0.113$, which is nearly flat
+    over 8 experts — measured per-token routing entropy is **2.991 bits**
+    against a ceiling of $\log_2 8 = 3.000$. The router starts with no opinion.
+    The trap is expecting it to learn from "which expert was right"; it cannot,
+    because that information only reaches it through a multiplicative gate.
+
+    **The load-balancing loss is a proxy for a quantity that has no gradient,
+    and the product is the whole trick.** $L_{\text{aux}} = \alpha E \sum_i
+    f_i P_i$ with $f_i$ the fraction of *assignments* to expert $i$ and $P_i$
+    the mean router probability for expert $i$. At $f = P = 1/E$ it evaluates
+    to exactly **1.0000**; at total collapse to **8.0000**, which is $E$. The
+    count $f$ is the thing you want to control and has zero derivative; $P$ is
+    the thing you can differentiate and is not the thing you want. Multiplying
+    them gives a surface whose gradient pushes down the logit of any expert
+    whose hard load exceeds its soft share. Measured values in the run below:
+    **1.000** at initialisation, **1.013** with a balanced router, **2.349**
+    with five dead experts. The trap is using $E\sum_i f_i^2$ instead: it has
+    the same value at both extremes and a gradient of exactly zero, so training
+    is bit-identical to having no aux loss at all.
+
+    **Without an aux loss, five of eight experts are dead by step 100 and never
+    come back.** Measured on a 512-token batch, 8 linear experts, top-1
+    routing, 600 steps: load entropy falls from **2.950** bits to **1.723** by
+    step 50 and **1.572** by step 100, then never moves again (**1.584** at
+    step 600). Final counts are `[0, 0, 167, 0, 0, 181, 164, 0]` — three
+    experts absorb all 512 tokens and five receive exactly zero. The mechanism
+    is rich-get-richer: the expert that wins a token gets the gradient, becomes
+    slightly better, and wins the next one. The trap is waiting for recovery.
+    At alpha = 0.01 this run is still at 1.581 bits after **6,000** steps,
+    because a dead expert produces no gradient and the only force that could
+    revive it is the aux loss, which is not strong enough to.
+
+    **Alpha is not a constant; it is the ratio between two gradients, and the
+    published default can be 349x too weak.** Measured at initialisation of
+    the same run: mean $|\partial L_{\text{task}} / \partial z| = 8.2 \times
+    10^{-2}$ and mean $|\alpha \partial L_{\text{aux}} / \partial z|$ at alpha
+    = 0.01 is $2.35 \times 10^{-4}$ — a ratio of **349:1**. The consequence is
+    a step function in the measurements: alpha = 0.01 leaves the load at 1.584
+    bits with 5 dead experts; alpha = 0.1 reaches **2.377** bits with 2 dead;
+    alpha = 0.3 reaches **2.902** with none dead; alpha = 0.5 reaches **2.981**
+    bits with 8 of 8 alive and a maximum share of **0.158**; alpha = 3 reaches
+    **2.994**. The trap is copying a coefficient
+    across model sizes. The right procedure is to log both gradient norms for
+    a hundred steps and pick alpha so the aux term is within an order of
+    magnitude of the task term, then decay it.
+
+    **Parameters scale with E, FLOPs with k, and the gap is the entire point.**
+    At $d = 768$, $d_{ff} = 3072$, a dense block is **7,080,960** parameters.
+    With $E = 8$ and $k = 2$ the same block is **40,111,104** total — 5.66x —
+    and **11,799,552** active — 1.67x, because attention ($4d^2$) and the norms
+    are shared and not replicated. Experts are **94.11%** of the MoE block;
+    attention is 5.88%. Scale it up to a Mixtral shape ($d = 4096$,
+    $d_{ff} = 14336$, 32 layers, $V = 32000$): **47.38B** total, **13.55B**
+    active, an active share of **0.286**. The trap is the name: "8x7B" is not
+    56B, because the 7B in the name includes an attention stack that exists
+    once, not eight times.
+
+    **Every expert is resident, so eight times the parameters costs eight times
+    the memory for twice the arithmetic.** 47.38B parameters in fp16 is
+    **94.75 GB** of weights against **27.11 GB** for the active set, a factor
+    of 3.50 — and 6.77x a 7B dense model's 14.0 GB. You cannot page experts per
+    token: one Mixtral expert is 3 x 4096 x 14336 x 2 bytes = **352.3 MB**,
+    so fetching one expert over PCIe 4.0 x16 (25 GB/s) costs **14.1 ms**, and a
+    batch-1 decode step needs $k \cdot L = 64$ of those per token, which is
+    **22.5 GB and 0.90 seconds per token**. Even from HBM at 3.35 TB/s one
+    expert is 105 microseconds. The trap is treating MoE as a compute
+    optimisation: it is a memory-for-quality trade, and the quality is bought
+    at roughly 6.8x the VRAM of a dense model with the same FLOPs.
+
+    **Capacity factor turns a ragged computation into a dense matmul, and the
+    price is dropping tokens.** $C = \lfloor \mathrm{CF} \cdot kT / E \rfloor$
+    per expert, allocated whether or not it is used. Measured on the collapsed
+    load `[0, 0, 167, 0, 0, 181, 164, 0]` with $T = 512$, $E = 8$: CF = 1.0
+    (capacity 64) discards **62.5%** of assignments, CF = 1.25 (capacity 80)
+    discards **53.1%**, and CF = 2.0 (capacity 128) still discards **25.0%**.
+    On the balanced load from the alpha = 0.5 run the same three settings
+    discard **6.4%**, **0.2%** and **0.0%**. The closed form is
+    $\mathrm{CF} \ge E \cdot s$ where $s$ is the maximum share: 0.354 x 8 =
+    2.83 for the collapsed router, 0.158 x 8 = 1.26 for the balanced one. The
+    trap is raising the capacity factor to stop dropping — it does not, and the
+    buffer is charged whether or not it is filled (80% utilisation at CF = 1.25).
+
+    **A dropped token is not lost; it skips the layer.** With the residual, a
+    token whose assignment overflows capacity computes
+    $x_{l+1} = x_l$ — the block is the identity for that token at that layer,
+    which is why dropping degrades instead of crashing and why it never appears
+    in the loss curve as a spike. But drops are not independent across layers:
+    a token routed to a permanently over-subscribed expert is dropped at every
+    layer. Even under an independence assumption, a 6.4% per-layer drop rate
+    leaves only $0.936^{32} = 12.0\%$ of tokens transformed by all 32 layers.
+    The trap is reporting a mean drop rate; the quantity that reaches the loss
+    is the distribution of per-token drop counts, and its tail.
+
+    **Expert parallelism buys memory and pays in barriers, not bytes.** Each
+    layer does two all-to-all passes, dispatch and combine, moving $2kTdb$
+    bytes: at $T = 8192$, $k = 2$, $d = 4096$, fp16, that is **268.4 MB per
+    layer** and **8.59 GB per forward pass**, which is 9.1% of the 94.75 GB of
+    weights. The arithmetic intensity is $8.39 \times 10^8 / 32768 =
+    \mathbf{25{,}600}$ FLOP/byte at the per-token level, so bandwidth is
+    emphatically not the constraint. What hurts is that there are $2L = 64$
+    collectives per forward pass and each one is a global barrier whose latency
+    is set by the slowest rank — and the slowest rank is the one whose experts
+    drew the most tokens. Imbalance, which was a FLOP problem, becomes a
+    latency problem.
+
+    **The FFN is the only part that can be sparsified without breaking
+    anything, which is why MoE is an FFN trick.** The FFN is 66.64% of a dense
+    block's parameters — the exact 2:1 split derived in *The Full Transformer
+    Block* — and is strictly per-token: no token's FFN output depends
+    on another token, so replacing it with $E$ independent copies changes no
+    shape and no cross-token mathematics. In the $d = 768$ MoE block the
+    experts are 94.11% of parameters and the dense attention you kept is 5.88%.
+    Attention cannot be treated the same way, because every token needs every
+    other token's K and V — a "sparse attention expert" that routes a token to
+    one of $E$ attention modules still has to read the whole sequence, so it
+    saves nothing. The trap is assuming the technique generalises to the
+    sublayer that is actually quadratic in context.
+
+
+  derivations:
+    - title: "The load-balancing loss, its two endpoints, and its gradient"
+      latex: |
+        With $f_i$ the fraction of the $kT$ assignments landing on expert $i$ and
+        $P_i = \frac{1}{T}\sum_t p_{t,i}$ the mean router probability,
+
+        $$L_{\text{aux}} = E \sum_{i=1}^{E} f_i P_i , \qquad
+          \sum_i f_i = 1, \quad \sum_i P_i = 1 .$$
+
+        At a uniform router $f_i = P_i = 1/E$ for every $i$, so
+
+        $$L_{\text{aux}} = E \sum_{i=1}^{E} \frac{1}{E}\cdot\frac{1}{E}
+          = E \cdot \frac{1}{E} = 1 ,$$
+
+        and at total collapse, where every assignment goes to expert $j$ and
+        $p_{t,j} \to 1$,
+
+        $$L_{\text{aux}} = E \cdot 1 \cdot 1 = E .$$
+
+        So the loss is bounded on $[1, E]$: 1.0000 to 8.0000 at eight experts,
+        and the measured 2.349 corresponds to three live experts out of eight.
+
+        The gradient with respect to a router logit, holding the hard assignment
+        fixed, is
+
+        $$\frac{\partial L_{\text{aux}}}{\partial z_{t,j}}
+          = \frac{\alpha E}{T}\, p_{t,j}\left(f_j - \sum_i f_i p_{t,i}\right),$$
+
+        which is negative exactly when $f_j$ is below the load-weighted average
+        probability and positive when it is above. An over-subscribed expert has
+        its logit pushed down by an amount proportional to how far its hard count
+        exceeds its soft share, which is the behaviour the product was chosen
+        for. Note what is missing: $f$ itself is not differentiated. It cannot
+        be — it is built from an argmax.
+      prose: >-
+        The bound is the whole argument for the functional form. Any penalty that
+        vanishes at uniformity and grows with concentration will do; this one is
+        cheap, bounded, and — critically — differentiable through the term that
+        appears in the forward pass. The measured values 1.000, 1.013, 2.349 and
+        the extreme 8.000 are this formula evaluated at four load distributions,
+        and they are the numbers to compare against when you log it.
+
+    - title: "Parameters against FLOPs: what E and k actually buy"
+      latex: |
+        For a bias-free decoder layer with $d_{ff} = r d$ and SwiGLU experts
+        ($3$ matrices each), the total and active parameter counts are
+
+        $$N_{\text{total}} = L\left(4d^2 + E \cdot 3rd^2 + 4d\right) + Vd, \qquad
+          N_{\text{active}} = L\left(4d^2 + k \cdot 3rd^2 + 4d\right) + Vd .$$
+
+        The ratio is not $E/k$, because attention is not replicated:
+
+        $$\frac{N_{\text{total}}}{N_{\text{active}}}
+          \approx \frac{4d^2 + 3Erd^2}{4d^2 + 3krd^2}
+          = \frac{4 + 3Er}{4 + 3kr} .$$
+
+        At $d = 4096$, $r = 3.5$ ($d_{ff} = 14336$), $E = 8$, $k = 2$:
+
+        $$N_{\text{total}} = 47{,}376{,}236{,}544, \qquad
+          N_{\text{active}} = 13{,}553{,}369{,}088, \qquad
+          \frac{N_{\text{total}}}{N_{\text{active}}} = 3.50 .$$
+
+        The same ratio at the block level, $d = 768$ and $r = 4$ with two-matrix
+        experts, is $40{,}111{,}104 / 11{,}799{,}552 = 3.40$. Both are far below
+        $E/k = 4$: the shared attention is what pulls them down, and at large $E$
+        the ratio approaches $E/k$ from below.
+
+        Per-token multiply-adds follow $k$ and not $E$:
+
+        $$\text{MACs/token/layer} = 4d^2 + k \cdot 6rd^2 ,$$
+
+        so doubling $E$ at fixed $k$ changes the compute by exactly zero and the
+        memory by roughly $2\times$.
+      prose: >-
+        This is the only reason to build an MoE: two knobs where a dense model
+        has one. The arithmetic also explains the naming confusion — 8x7B sounds
+        like 56B because the "7B" in the label is a whole dense model, attention
+        included, and only the FFN part of it is replicated eight times. The true
+        count is 8 x 5.64B of experts plus 2.28B of shared dense parameters,
+        47.4B, with 13.55B active per token.
+
+    - title: "Capacity factor, and the condition under which nothing is dropped"
+      latex: |
+        Each expert is given a fixed number of slots,
+
+        $$C = \left\lfloor \mathrm{CF} \cdot \frac{kT}{E} \right\rfloor ,$$
+
+        and an expert receiving $n_i$ assignments loses $\max(0, n_i - C)$ of
+        them. Writing $s = \max_i n_i / (kT)$ for the largest share of the $kT$
+        assignments, nothing is dropped at all iff
+
+        $$C \;\ge\; s\,kT
+          \iff \mathrm{CF} \cdot \frac{kT}{E} \;\ge\; s\,kT
+          \iff \boxed{\mathrm{CF} \;\ge\; E\,s}.$$
+
+        The measured maximum shares give
+
+        $$s = 0.354 \Rightarrow \mathrm{CF} \ge 2.83, \qquad
+          s = 0.158 \Rightarrow \mathrm{CF} \ge 1.26 .$$
+
+        The dropped fraction under a given load is
+
+        $$D(\mathrm{CF}) = \frac{1}{kT}\sum_{i=1}^{E} \max\!\left(0,\;
+          n_i - \left\lfloor \mathrm{CF}\cdot \frac{kT}{E}\right\rfloor\right),$$
+
+        which at the collapsed load and $T = 512$, $E = 8$, $k = 1$ evaluates to
+        0.625 at CF = 1.0, 0.531 at 1.25 and 0.250 at 2.0.
+      prose: >-
+        The inequality is the useful part: the capacity factor needed to avoid
+        dropping is the maximum load share times the number of experts, and it
+        does not depend on the batch size, the model width, or the token count.
+        With a collapsed router that number is 2.83, which is why raising CF from
+        1.0 to 2.0 cuts the drop rate from 62.5% to 25.0% and then stops helping.
+        Capacity factor is a bet that the router is balanced; it is not a
+        substitute for one.
+
+  implementations:
+    - language: python
+      title: "Route, collapse, measure: a 600-step MoE with and without a load-balancing loss"
+      note: >-
+        Correct, and verified: the analytic gradient was checked against central
+        finite differences on the router matrix (max relative error 4.0e-9). It
+        is correct for the model it implements, which is deliberately the smallest
+        one that shows the phenomenon: linear experts, a linear router, top-1
+        routing, one batch of 512 tokens, and a task that every expert could in
+        principle solve. What it is not is a transformer — there is no attention,
+        no layernorm, and no depth, so the absolute numbers are a property of this
+        configuration, not of MoE in general. The shape of the result is what
+        transfers: entropy falls in tens of steps, five experts reach exactly
+        zero, and alpha = 0.01 does not stop it. Read `train` bottom-up — the
+        ordering of the two gradient terms is the part that is easy to get wrong,
+        and getting it wrong is what made my first version conclude, incorrectly,
+        that the aux loss never works at any coefficient.
+      code: |
+        import numpy as np
+
+        D, D_OUT, E, T, STEPS, LR = 32, 8, 8, 512, 600, 1.0
+
+
+        def softmax(z):
+            z = z - z.max(1, keepdims=True)
+            e = np.exp(z)
+            return e / e.sum(1, keepdims=True)
+
+
+        def load_entropy(counts):
+            f = np.asarray(counts, float)
+            f = f[f > 0] / f.sum()
+            return float(-(f * np.log2(f)).sum())
+
+
+        def train(alpha, kind="switch", steps=STEPS, seed=0):
+            """Top-1 MoE: linear router, E linear experts, analytic gradients."""
+            r = np.random.default_rng(seed)
+            Wg = r.standard_normal((E, D)) * 0.02          # logits ~ N(0, 0.113^2)
+            We = r.standard_normal((E, D_OUT, D)) / np.sqrt(D)
+            Wt = r.standard_normal((D_OUT, D)) / np.sqrt(D)  # the task: y = Wt x
+            rows = np.arange(T)
+            hist = []
+
+            for step in range(steps):
+                x = r.standard_normal((T, D))
+                y = x @ Wt.T
+
+                p = softmax(x @ Wg.T)                  # (T, E) routing probabilities
+                a = p.argmax(1)                        # hard top-1 selection
+                F = np.einsum("ti,tji->tj", x, We[a])   # selected expert's output
+                g = p[rows, a]                          # its gate value
+                yhat = g[:, None] * F
+                delta = (yhat - y) * (2.0 / D_OUT)
+
+                dWe = np.zeros_like(We)
+                for e in range(E):
+                    m = a == e
+                    if m.any():
+                        dWe[e] = (g[m, None] * delta[m]).T @ x[m]
+
+                # dL/dz through the gate only: argmax is piecewise constant.
+                dg = (delta * F).sum(1)
+                dz = -dg[:, None] * (g[:, None] * p)
+                dz[rows, a] += dg * g
+
+                counts = np.bincount(a, minlength=E).astype(float)
+                frac = counts / T
+                P = p.mean(0)
+                if kind == "switch" and alpha:
+                    aux = E * float((frac * P).sum())
+                    d = np.broadcast_to(E * frac, (T, E))
+                    dz += alpha * p * (d - (p * d).sum(1, keepdims=True))
+                else:
+                    aux = E * float((frac * frac).sum())
+
+                Wg -= LR * (dz.T @ x) / T
+                We -= LR * dWe / T
+                if step % 50 == 0 or step == steps - 1:
+                    hist.append((step, load_entropy(counts), counts.max() / T,
+                                 float(-(p * np.log2(np.maximum(p, 1e-12))).sum(1).mean()),
+                                 aux))
+
+            counts = np.bincount(a, minlength=E).astype(float)
+            return counts, hist, aux
+
+
+        for alpha, kind in ((0.0, "none"), (0.01, "switch"), (0.5, "switch")):
+            counts, hist, aux = train(alpha, kind)
+            print("alpha=%-4s counts=%-30s max %.3f  H_load %.3f  H_token %.3f  aux %.3f  dead %d"
+                  % (alpha, counts.astype(int).tolist(), counts.max() / T,
+                     load_entropy(counts), hist[-1][3], aux, int((counts == 0).sum())))
+
+        counts, _, _ = train(0.0)
+        print("collapsed, dropped fraction by CF:",
+              [(cf, int(np.maximum(counts - int(cf * T / E), 0).sum()) / T)
+               for cf in (1.0, 1.25, 2.0)])
+        counts, _, _ = train(0.5)
+        print("balanced,  dropped fraction by CF:",
+              [(cf, int(np.maximum(counts - int(cf * T / E), 0).sum()) / T)
+               for cf in (1.0, 1.25, 2.0)])
+
+        # alpha=0.0  counts=[0, 0, 167, 0, 0, 181, 164, 0] max 0.354  H_load 1.584  H_token 0.865  aux 2.672  dead 5
+        # alpha=0.01 counts=[0, 0, 175, 0, 0, 176, 161, 0] max 0.344  H_load 1.584  H_token 0.898  aux 2.349  dead 5
+        # alpha=0.5  counts=[81, 64, 56, 58, 68, 45, 71, 69] max 0.158  H_load 2.981  H_token 1.624  aux 1.013  dead 0
+        # collapsed, dropped fraction by CF: [(1.0, 0.625), (1.25, 0.53125), (2.0, 0.25)]
+        # balanced,  dropped fraction by CF: [(1.0, 0.064453125), (1.25, 0.001953125), (2.0, 0.0)]
+
+    - language: python
+      title: "Two routing bugs that do not raise — numerically WRONG"
+      note: >-
+        Both functions are wrong, and both run. `aux_from_counts` computes
+        $E\sum_i f_i^2$ from the argmax counts: it returns 1.138 on the 64-token
+        demo below and 2.672 at collapse in the 8-expert run above, so it *looks*
+        like a load-balancing loss with the right endpoints — but $f$ is a
+        function of `argmax`, which is piecewise constant, so its derivative with
+        respect to `Wg` is exactly zero (printed as 0.0e+00 by central
+        differences). Training with it is bit-identical to training with no aux
+        loss at all: same counts `[0, 0, 167, 0, 0, 181, 164, 0]`, same 1.584
+        bits, same five dead experts. `capacity_no_cf` drops the capacity factor
+        and the ceiling, so it allocates `T // E` slots — measured, that discards
+        6.4% of tokens under a balanced router and 62.5% under a collapsed one,
+        and the loss curve looks like a learning-rate problem rather than a
+        routing problem. The tell for the first bug is that the aux loss value
+        falls while the load gets worse; the tell for the second is that a model
+        with no capacity pressure still loses tokens.
+      code: |
+        import numpy as np
+
+
+        def aux_from_counts(a, E):
+            # WRONG: f comes from argmax, so d(aux)/d(Wg) == 0 exactly.
+            f = np.bincount(a, minlength=E) / len(a)
+            return E * float((f * f).sum())
+
+
+        def capacity_no_cf(T, E, k=1):
+            # WRONG: no capacity factor, no floor, no slack. CF = 1.0 by fiat.
+            return T // E
+
+
+        def drop_rate(counts, C):
+            return float(np.maximum(np.asarray(counts) - C, 0).sum() / np.sum(counts))
+
+
+        collapsed = np.array([0, 0, 167, 0, 0, 181, 164, 0])
+        balanced = np.array([81, 64, 56, 58, 68, 45, 71, 69])
+        C = capacity_no_cf(512, 8)
+        print("C =", C, " collapsed drop %.4f  balanced drop %.4f"
+              % (drop_rate(collapsed, C), drop_rate(balanced, C)))
+
+        # finite-difference the aux loss in the router matrix: 0.0 everywhere
+        r = np.random.default_rng(0)
+        x = r.standard_normal((64, 4))
+        Wg = r.standard_normal((3, 4)) * 0.5
+
+        def aux_of(Wg):
+            p = np.exp(x @ Wg.T)
+            p /= p.sum(1, keepdims=True)
+            return aux_from_counts(p.argmax(1), 3)
+
+        base = aux_of(Wg)
+        print("aux value %.6f ; d(aux)/dWg[0,0] by central difference = %.1e"
+              % (base, (aux_of(Wg + 1e-6 * np.eye(3, 4)) - aux_of(Wg - 1e-6 * np.eye(3, 4))) / 2e-6))
+
+        # C = 64  collapsed drop 0.6250  balanced drop 0.0645
+        # aux value 1.138184 ; d(aux)/dWg[0,0] by central difference = 0.0e+00
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        The load-balancing loss multiplies the hard assignment fraction $f_i$ by
+        the soft mean probability $P_i$. Why is the product necessary — what
+        breaks if you penalise $f_i$ alone, and what breaks if you penalise
+        $P_i$ alone?
+      answerKind: short_text
+      hint: >-
+        Ask which of the two quantities you can differentiate with respect to the
+        router weights, and which of the two you actually want to be uniform.
+      solution: >-
+        $f_i$ is what you want to control and has zero gradient: it is built from
+        an argmax, so perturbing $W_g$ by a tiny amount changes no assignment
+        almost everywhere. $P_i$ is smooth in $W_g$ and is not what you want to
+        control — a router can have uniform mean probabilities while sending 90%
+        of its tokens to one expert, because the mean is over all tokens rather
+        than over the argmax. Their product is the cheapest function that (a)
+        depends on the thing you want and (b) is differentiable through the thing
+        you have. Measured, penalising $f$ alone — $E\sum_i f_i^2$ — leaves the
+        final load bit-identical to no aux loss: `[0, 0, 167, 0, 0, 181, 164, 0]`,
+        1.584 bits, five dead experts. Penalising $P$ alone would push the
+        router's average distribution toward uniform while leaving the actual
+        dispatch free to concentrate.
+    - id: cp-2
+      question: >-
+        An "8x7B" model. How many parameters does it have, how many are active
+        per token, and what does it cost in fp16? Say why the answer is not 56B,
+        and compute the memory ratio against a 7B dense model.
+      answerKind: short_text
+      hint: >-
+        The 7B in the name is a whole dense model: attention, embeddings, and one
+        FFN. Only the FFN gets replicated.
+      solution: >-
+        At $d = 4096$, $d_{ff} = 14336$, 32 layers, $V = 32000$: attention is
+        $4d^2 = 67{,}108{,}864$ per layer, replicated never — 2.15B in total.
+        Each expert is $3 \times 4096 \times 14336 = 176{,}160{,}768$ parameters,
+        eight per layer, 32 layers: 45.10B. Plus 0.13B of embeddings and 0.5M of
+        norms: 47.38B total, of which $k = 2$ experts per layer are active,
+        giving 13.55B. So the parameter count is 47.4B, not $8 \times 7 = 56$B,
+        because the shared attention and embeddings are counted once. In fp16
+        that is 94.75 GB of weights against 27.11 GB for the active set — 3.50x
+        — and 6.77x the 14.0 GB of a 7B dense model, for 2x its FFN arithmetic.
+    - id: cp-3
+      question: >-
+        Your router's maximum load share is 0.354 with 8 experts. What capacity
+        factor guarantees no token is dropped, and what happens to the drop rate
+        as you raise CF from 1.0 to 2.0?
+      answerKind: short_text
+      hint: >-
+        Write the capacity formula, set it equal to the largest expert's token
+        count, and cancel the token count.
+      solution: >-
+        Capacity is $C = \lfloor \mathrm{CF} \cdot kT/E \rfloor$ and the largest
+        expert receives $s \cdot kT = 0.354 \cdot kT$ assignments. No dropping
+        requires $C \ge s\,kT$, i.e. $\mathrm{CF} \ge E\,s = 0.354 \times 8 =
+        2.83$. Measured drop rates at the collapsed load: CF = 1.0 (capacity 64)
+        drops 62.5%, CF = 1.25 (capacity 80) drops 53.1%, CF = 2.0 (capacity 128)
+        drops 25.0%. Doubling the capacity factor cuts the drop rate by a factor
+        of 2.5 and does not eliminate it, because the excess is structural: at
+        capacity 128 the three live experts overflow by 39, 53 and 36 tokens,
+        which is 128 tokens and exactly 25% of the batch. And the slack is
+        charged whether or not it is used: at CF = 1.25 the buffers are 80%
+        utilised even under a perfectly balanced load. The fix is the router,
+        not the capacity factor.
+    - id: cp-4
+      question: >-
+        Top-1 routing uses an argmax, whose derivative is zero. Why does the
+        router learn at all, and what exactly does it learn?
+      answerKind: short_text
+      hint: >-
+        The layer does not compute $f_a(x)$. Write down what it actually computes
+        and differentiate that.
+      solution: >-
+        The layer computes $y = p_a \, f_a(x)$, not $f_a(x)$. The selection $a$
+        is piecewise constant, but the gate scalar $p_a$ is not, so
+        $\partial y / \partial p_a = f_a(x)$ and gradient flows into $W_g$
+        through $p_a$: $\partial L/\partial z_j = g_a p_a (\delta_{aj} - p_j)$
+        with $g_a = \delta \cdot f_a$. The router therefore learns to raise the
+        probability of the expert whose output reduced the loss — a
+        multiplicative credit assignment, not a comparison of experts. Two
+        consequences: it can only reinforce an expert it already chose (the
+        rich-get-richer loop behind collapse), and it never receives a signal
+        about the experts it did not choose. That is precisely the gap the load
+        balancing loss fills, and it is why the aux loss has to be an explicit
+        term rather than something the task loss could discover on its own.
+    - id: cp-5
+      question: >-
+        You move an 8-expert model from one GPU to eight with expert
+        parallelism. The weights shard perfectly and the arithmetic is identical,
+        yet throughput falls. Where did the time go, and why is it not a
+        bandwidth problem?
+      answerKind: short_text
+      hint: >-
+        Count the collectives per forward pass, then compute the arithmetic
+        intensity of the traffic you added.
+      solution: >-
+        Each layer needs two all-to-all passes — dispatch and combine — so a
+        32-layer model has 64 global barriers per forward pass. The volume is
+        $2kTdb$ per layer: 268.4 MB at 8,192 tokens, 8.59 GB per forward, which
+        is 9.1% of the 94.75 GB of weights and runs at 25,600 FLOP/byte against
+        a 295 FLOP/byte ridge point. So there is no bandwidth case against it.
+        What costs time is that every collective waits for its slowest
+        participant, and the slowest participant is the rank whose experts drew
+        the most tokens. That couples routing imbalance to latency: a router with
+        a maximum share of 0.35 makes one rank do 2.8x the average expert work
+        while seven ranks idle at the barrier. Fixing it is a routing problem
+        (better balance, smaller experts, redundant experts) rather than a
+        networking one.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A dense block spends the same arithmetic on every token. An MoE spends a
+        different amount: a small network looks at the token, picks a few of many
+        FFNs, and runs only those. That is conditional computation, and it is the
+        only way to have a model whose parameter count and whose per-token cost
+        are separate numbers.
+
+        The separation is the prize and the problem. Because the choice is made
+        per token and is hard, the model has a component whose output is a
+        decision rather than a value — and decisions do not have derivatives.
+        Everything difficult about MoE follows from that one fact: the router
+        learns through a side channel, it has no view of the load it is creating,
+        and the system has to impose balance from outside with a penalty term.
+      blocks:
+        - kind: checklist
+          body: |
+            - One FFN becomes E FFNs; a router picks k of them per token
+            - Parameters scale with E; per-token FLOPs scale with k
+            - The router's choice has no gradient; its probabilities do
+            - A router optimising only the task loss concentrates the load
+            - Balance is imposed by an auxiliary loss, not discovered
+            - All E experts are resident in memory whether used or not
+            - Capacity factor makes the computation dense; overflow is dropped
+      checkpoint: >-
+        Before reading on: if the router has no gradient with respect to its own
+        decision, what is the only path by which it can learn anything? Write
+        down the layer's output expression and see which symbol the router
+        appears in twice.
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Separate the topic into four questions with four different units, and do
+        not let them mix.
+
+        *Capacity* is counted in parameters: how many numbers does the model
+        store? Multiply the expert count by the per-expert FFN and add the shared
+        parts. *Cost* is counted in multiply-adds per token: multiply by k, not
+        by E. *Memory* is counted in bytes resident: the whole parameter count,
+        always, because inference does not know which experts next token wants.
+        *Balance* is counted in bits of entropy over the assignment distribution,
+        and it is the only one of the four that is a property of training rather
+        than of the architecture.
+
+        When a question asks "what does this cost", decide first which of the
+        four it is asking, because the answer differs by a factor of E in three
+        of them and by a factor of k in the fourth.
+      blocks:
+        - kind: checklist
+          body: |
+            - Parameters: E x expert FFN + shared attention + embeddings
+            - FLOPs per token: k x expert FFN + shared attention
+            - Memory: the whole parameter count, in bytes, resident
+            - Balance: entropy of the assignment distribution, in bits
+            - Dropping: a capacity question, measured against the max share
+            - Communication: two all-to-all per layer, counted in barriers
+      checkpoint: >-
+        Which of those four quantities changes if you double the number of
+        experts and halve each expert's hidden width? Parameters stay roughly
+        flat, FLOPs stay flat, memory stays flat — and balance gets harder,
+        because there are twice as many ways to be unbalanced.
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Write the layer as five lines before any matrix, then annotate each line
+        with what it costs and what it can destroy.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # the layer, per token
+            p    = softmax(x @ Wg.T)             # (E,)      router probabilities
+            idx  = topk(p, k)                    # k indices, NO gradient
+            gate = p[idx]                        # k scalars, gradient flows here
+            y    = sum(gate[i] * expert[i](x) for i in idx)
+            out  = x + y                         # residual; dropped -> out = x
+
+            # the objective
+            f[i] = count(idx == i) / (T * k)     # hard load, no gradient
+            P[i] = mean(p[:, i])                 # soft load, gradient
+            loss = task_loss + alpha * E * sum(f * P)
+
+            # the shape
+            C = floor(CF * k * T / E)            # slots per expert
+            keep the first C assignments per expert; drop the rest
+
+            # the bill
+            params_total  = L * (4*d*d + E * 3*d*ff + 4*d) + V*d
+            params_active = L * (4*d*d + k * 3*d*ff + 4*d) + V*d
+            bytes_comm    = 2 * k * T * d * 2    # per layer, fp16
+            CF_needed     = E * max_share        # to drop nothing at all
+      checkpoint: >-
+        In that pseudocode, `f` and `P` are the same shape and are multiplied
+        together. Which one would you have written if you only cared about the
+        value of the loss, and why does that version train nothing?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three results: the bounds and gradient of the aux loss, the two parameter
+        counts, and the capacity condition.
+      blocks:
+        - kind: math
+          body: |
+            Aux loss. With $\sum_i f_i = \sum_i P_i = 1$,
+
+            $$L_{\text{aux}} = E\sum_i f_i P_i \in [1, E],$$
+
+            with equality at 1 for $f = P = 1/E$ and at $E$ for $f = P = e_j$.
+            At eight experts the interval is 1.0000 to 8.0000, and the measured
+            2.349 sits at three live experts.
+
+            Its gradient, with the hard assignment held fixed,
+
+            $$\frac{\partial L_{\text{aux}}}{\partial z_{t,j}}
+              = \frac{\alpha E}{T} p_{t,j}\Big(f_j - \sum_i f_i p_{t,i}\Big),$$
+
+            pushes down every expert whose hard share exceeds its soft share.
+
+            Parameters.
+
+            $$N_{\text{total}} = L(4d^2 + 3Erd^2 + 4d) + Vd, \qquad
+              N_{\text{active}} = L(4d^2 + 3krd^2 + 4d) + Vd,$$
+
+            so $N_{\text{total}}/N_{\text{active}} \to E/k$ from below as $E$
+            grows, and equals 3.50 at $E=8$, $k=2$, $r=3.5$. At the block level
+            with $d=768$, $r=4$ and two-matrix experts: 40,111,104 against
+            11,799,552, a ratio of 3.40.
+
+            Capacity. Nothing is dropped iff
+
+            $$C = \Big\lfloor \mathrm{CF}\cdot\frac{kT}{E}\Big\rfloor \ge s\,kT
+              \iff \mathrm{CF} \ge E\,s,$$
+
+            which is 2.83 at the measured max share 0.354 and 1.26 at 0.158.
+      checkpoint: >-
+        The capacity condition has no $T$ in it. Why not — and what does that
+        imply about the common practice of raising the batch size to "average
+        out" an imbalanced router?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A working MoE is four measurements and one calibrated constant: load
+        entropy per layer, the two gradient norms, the maximum load share, and
+        the per-token drop-count distribution. The constant is alpha, and it is
+        derived from the second measurement rather than copied from a paper.
+      blocks:
+        - kind: warning
+          body: >-
+            The failure modes here do not raise. A collapsed router trains
+            happily and produces a smaller model than you paid for. A
+            zero-gradient aux loss trains happily and does nothing. A capacity
+            factor that is too small trains happily and silently drops a third of
+            your tokens. All three are invisible in the loss curve and all three
+            are visible in one line of logging: assignments per expert, per
+            layer, per few hundred steps.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def route(x, Wg, k):
+                z = x @ Wg.T
+                z = z - z.max(1, keepdims=True)
+                p = np.exp(z) / np.exp(z).sum(1, keepdims=True)
+                idx = np.argsort(-p, axis=1, kind="stable")[:, :k]
+                return p, idx
+
+            def aux_loss(p, idx, E):
+                T, k = idx.shape
+                f = np.bincount(idx.ravel(), minlength=E) / (T * k)
+                return E * float((f * p.mean(0)).sum()), f
+
+            def dispatch(x, We, p, idx, cf):
+                T, k = idx.shape
+                E = We.shape[0]
+                C = int(np.floor(cf * k * T / E))
+                out = np.zeros((T, We.shape[1]))
+                dropped = np.zeros(T, dtype=int)
+                for e in range(E):
+                    hit = [t for t in range(T) if e in idx[t]]
+                    kept, lost = hit[:C], hit[C:]
+                    if kept:
+                        g = p[kept, e][:, None]
+                        out[kept] += g * (x[kept] @ We[e].T)
+                    dropped[lost] += 1
+                return out, C, dropped
+
+            def capacity_needed(max_share, E):
+                return E * max_share
+
+            def entropy(counts):
+                f = np.asarray(counts, float)
+                f = f[f > 0] / f.sum()
+                return float(-(f * np.log2(f)).sum())
+      checkpoint: >-
+        `dispatch` returns `dropped` as a per-token count, not a rate. What do
+        you do with that array that you cannot do with its mean, and which
+        quantity in the loss does it predict?
+
+  problems:
+    - id: p-moe-params
+      title: "Total against active parameters"
+      difficulty: easy
+      prompt: >-
+        Implement `moe_params(d_model, d_ff, n_experts, top_k, n_layers, vocab,
+        n_shared=0, glu=True)` returning a dict with exactly the keys `total`,
+        `active`, `active_share` and `expert_share`.
+
+        Attention in one layer is four `d_model x d_model` matrices, or
+        `4 * d_model ** 2` parameters. Every expert is a full FFN: three
+        matrices of shape `d_ff x d_model`, `d_ff x d_model`, `d_model x d_ff`
+        when `glu` is true (SwiGLU's gate), two when it is false, so
+        `glu = True` costs `3 * d_model * d_ff` per expert. There are two
+        LayerNorms per layer, `4 * d_model` parameters. The embedding and
+        unembedding are tied: `vocab * d_model`.
+
+        `total` counts every expert, including the `n_shared` shared ones.
+        `active` counts only `top_k` routed experts per token, plus all
+        `n_shared` shared experts, plus the dense parts. `active_share` is
+        `active / total` and `expert_share` is the fraction of `total` that
+        lives in experts (routed plus shared). Everything except the two
+        shares must be an integer.
+      starter: |
+        def moe_params(d_model, d_ff, n_experts, top_k, n_layers, vocab, n_shared=0, glu=True):
+            # your implementation here
+            pass
+      language: python
+      entry: moe_params
+      testCases:
+        - input: '[4096,14336,8,2,32,32000,0,true]'
+          expected: '{"total":47376236544,"active":13553369088,"active_share":0.28607947943295375,"expert_share":0.9518940274227283}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[768,3072,8,2,12,50257,0,false]'
+          expected: '{"total":519930624,"active":180192000,"active_share":0.3465693146014804,"expert_share":0.8712409138646928}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[7168,2048,64,6,61,129280,2,true]'
+          expected: '{"total":190771015680,"active":34956816384,"active_share":0.18323966174524484,"expert_share":0.9294169366347214}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[512,2048,4,1,4,1000,0,true]'
+          expected: '{"total":55046144,"active":17297408,"active_share":0.3142346900811072,"expert_share":0.9143537465585238}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[4096,14336,8,1,32,32000,0,true]'
+          expected: '{"total":47376236544,"active":7916224512,"active_share":0.1670927260051127,"expert_share":0.9518940274227283}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def moe_params(d_model, d_ff, n_experts, top_k, n_layers, vocab, n_shared=0, glu=True):
+            d, ff = int(d_model), int(d_ff)
+            E, k, L, V, S = int(n_experts), int(top_k), int(n_layers), int(vocab), int(n_shared)
+            attn = 4 * d * d
+            per_expert = (3 if glu else 2) * d * ff
+            norms = 4 * d
+            dense = attn + norms
+            total = L * (dense + (E + S) * per_expert) + V * d
+            active = L * (dense + (k + S) * per_expert) + V * d
+            return {"total": total, "active": active,
+                    "active_share": active / total,
+                    "expert_share": L * (E + S) * per_expert / total}
+      solutionExplanation: >-
+        The first two cases are the same expert count with and without a gate,
+        and they differ in `total` by exactly `L * E * d * d_ff`
+        (32 * 8 * 4096 * 14336 = 15,032,385,536), which is the gate's third
+        matrix. The fourth case is the point of the whole exercise: 4 experts
+        at 512 wide with top-1 routing gives 55,046,144 total and 17,297,408
+        active, a share of 0.314 — you own three times the parameters you use.
+        The third case is a fine-grained configuration: 64 routed experts of
+        hidden width 2048 at 7168 wide, top-6 plus 2 shared, which is the
+        DeepSeekMoE shape and lands at 0.183 active share. The fifth case is
+        the same model as the first with `top_k = 1`: identical `total` to the
+        digit, because the parameter count does not know how many experts a
+        token visits. If your `total` changes when `top_k` changes, you have
+        put `top_k` in the wrong expression.
+      complexity: "O(1) time and space"
+      tags: [parameters, active-parameters, moe, swiglu, capacity]
+
+    - id: p-routing-stats
+      title: "Load entropy, aux loss, and capacity from router logits"
+      difficulty: medium
+      prompt: >-
+        Implement `routing_stats(logits, top_k, capacity_factor)` returning a
+        dict with exactly the keys `load_entropy`, `token_entropy`,
+        `aux_loss`, `max_share`, `capacity` and `drop_fraction`.
+
+        `logits` is `(T, E)`; each row is the unnormalised router output for
+        one token. Take `p = softmax(logits)` per row. Select the top `k`
+        experts per token by `p`, breaking exact ties toward the lower expert
+        index (a stable sort on `-p` does this).
+
+        Then, with `counts[i]` the number of assignments expert `i` received
+        out of `T * k` total (one token can contribute to several experts):
+        `f = counts / (T * k)`; `load_entropy` is
+        `-sum(f_i * log2(f_i))` over the non-zero entries, in bits;
+        `token_entropy` is the mean over tokens of
+        `-sum_j p_tj * log2(p_tj)`; `aux_loss` is the Switch load-balancing
+        loss `E * sum(f_i * mean_t(p_ti))`; `max_share` is
+        `counts.max() / (T * k)`. Capacity is
+        `capacity = floor(capacity_factor * k * T / E)` as an integer, and
+        `drop_fraction` is `sum(max(0, counts_i - capacity)) / (T * k)`.
+
+        Values are floats except `capacity`, which is an int.
+      starter: |
+        import numpy as np
+
+        def routing_stats(logits, top_k, capacity_factor):
+            # your implementation here
+            pass
+      language: python
+      entry: routing_stats
+      testCases:
+        - input: '{"logits":[[0.0003419276725318417,0.013597475403099617,0.012247210785859323,-0.005103070767876675],[-0.002979695111064471,-0.005273841930334252,0.0056972635757196015,-0.000560644390456176],[0.00746885616256544,-0.018473247989741096,0.015665487746995208,-0.0009643216015562055],[0.006803784532741461,-0.0013656633397682773,-0.003790985670748533,0.004631101585975868],[0.00824513527530113,-0.0020252987069345153,-0.0015278617857019709,0.00685698610809258],[-0.008703406419471713,-0.015143835037313955,0.0039498186274953,-0.006705658236878794],[-0.019203405901180286,-0.008140536639453595,-0.00467597558892747,-0.011932024774322612],[-0.014924638840630338,0.0003663782694480509,0.008972492567277475,-0.0023313207796045684]],"top_k":2,"capacity_factor":1.25}'
+          expected: '{"load_entropy":1.936278124459133,"token_entropy":1.9999613566281336,"aux_loss":1.001036213139703,"max_share":0.375,"capacity":5,"drop_fraction":0.0625}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits":[[6.1227573641555475,-7.666995093942545,1.2542965401773365,-1.7033088183837894],[-1.3579478763313375,-0.6467914892692976,-6.059958387441753,-0.6957971329325684],[-2.595639228824825,9.968998549934648,0.6773598396837652,-1.0578923830247862],[-0.8438622544540512,-2.0041390383268505,-3.165451653615364,-1.1724029317039641],[1.4458361655203575,-0.7156608197201001,2.873276108879292,-0.5994063871997399],[0.07277869522999386,4.637462553638436,1.6353165680629336,-1.5156862068420542],[-0.5485169237932047,1.6215753952644063,5.805264102296558,-0.8088609820257404],[-0.7306760372373137,3.0069408038270735,-2.659379829481761,-0.875160697319592],[2.6476169023694514,1.7410500485726974,0.2745501098470566,2.0103130644854383],[-8.484486920531289,3.0639204525002395,-2.878934279424425,-5.005859527967909],[0.8293372785629989,2.1016346560481702,-1.3343023670483523,-3.2292175203024227],[0.07837450060210087,-0.15824192472863782,4.216794498054277,2.242223962438051],[0.58144693879386,3.3348996156719766,-0.6165691497173774,-2.777698720945104],[1.752174933075744,1.7476152559670703,-0.6444867333805674,-2.3484257338918986],[0.6874617156397876,-7.481682835373972,2.070374310488436,1.4741047822349735],[-4.916571431671465,0.18406052951451476,-2.892298990623721,2.2716631342744513]],"top_k":1,"capacity_factor":1.0}'
+          expected: '{"load_entropy":1.771782221599798,"token_entropy":0.7584097936588434,"aux_loss":1.2156347547987612,"max_share":0.4375,"capacity":4,"drop_fraction":0.1875}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits":[[-1.017083636721714,-0.45724726899729434,0.35478999387103377,0.5782005242160785,-1.079002690063104,-0.24901992237565168,0.16401004627128848,-0.3046080689749353],[0.7953201156615719,-0.5956133408088904,0.177265973143463,-0.5242027592722556,0.7029814715674426,-0.010825614527779184,-0.18612528200030795,-0.8590924748663082],[0.8409127725333403,0.3763892963486938,0.376781918754681,0.5689406294588907,0.17461328906151466,-0.3196233052882106,-0.4001206135150509,-0.4000999896805025],[0.6850361706668558,-0.7301906005977064,-0.2981847558853944,-0.16062195964309778,0.11230951267454707,0.28767469425390446,-0.6245485045477713,-0.865006725636261],[-0.0022071163109837434,0.6067819126430408,0.3785290296482621,0.10782539184998022,-0.1585778220086776,0.1466168479001123,-0.12166754287108783,0.4086032902462975],[-0.39722366944344095,0.06711997354316941,-0.05539006805579702,0.2716796947650762,0.11231926182468846,1.275017318153953,0.7493273790677415,0.7483685827592553],[-1.0197519187973212,-0.17015831235118864,-0.30430530795646493,0.2663607999445196,-1.1395132445276634,0.5872493395045938,0.5334916554476571,-0.6510354291228974],[-0.48927426431070636,-0.4005860053905908,0.021647950141572492,0.32048553234473554,1.0239430276786663,-0.09872271494383547,0.38375127945180976,0.07770890502971733],[0.8799631419541268,0.3710789306057844,0.6842752254372397,-0.5388375948917313,-0.09612035576297552,-0.40688621092102023,0.7524737020041536,0.3288199519088864],[-0.15257221288875805,-0.2262339435352007,0.24233243910335076,-0.35074776508977673,-0.46529443810607773,0.24063724613576615,1.231566016052613,-0.12306677703240664],[-0.27793289039677727,-0.5855784170127715,-0.6675054787796914,0.262491617282113,0.42540151638927626,0.0045873604412451,0.1662879943381042,0.05795828875355198],[0.06932742302361042,-0.7630795262914237,-0.22905913652461057,0.055739653794973865,-0.3915833902818427,-0.23821487192990873,-0.40956009016386724,-0.16674833709922066]],"top_k":2,"capacity_factor":1.0}'
+          expected: '{"load_entropy":2.804585169337799,"token_entropy":2.8374569063534643,"aux_loss":1.0594137764006177,"max_share":0.20833333333333334,"capacity":3,"drop_fraction":0.20833333333333334}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits":[[5.0,0.0,0.0],[5.0,0.0,0.0],[0.0,5.0,0.0]],"top_k":1,"capacity_factor":1.0}'
+          expected: '{"load_entropy":0.9182958340544896,"token_entropy":0.11522725439868026,"aux_loss":1.653369957708935,"max_share":0.6666666666666666,"capacity":1,"drop_fraction":0.3333333333333333}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+
+        def routing_stats(logits, top_k, capacity_factor):
+            z = np.asarray(logits, dtype=np.float64)
+            T, E = z.shape
+            k = int(top_k)
+            shift = z - z.max(axis=1, keepdims=True)
+            p = np.exp(shift)
+            p /= p.sum(axis=1, keepdims=True)
+
+            # stable sort: equal probabilities are broken by lower expert index
+            idx = np.argsort(-p, axis=1, kind="stable")[:, :k]
+            counts = np.bincount(idx.ravel(), minlength=E).astype(np.float64)
+
+            f = counts / (T * k)
+            P = p.mean(axis=0)
+            nz = f[f > 0]
+            C = int(np.floor(float(capacity_factor) * k * T / E))
+            return {
+                "load_entropy": float(-(nz * np.log2(nz)).sum()),
+                "token_entropy": float(-(p * np.log2(np.maximum(p, 1e-300))).sum(axis=1).mean()),
+                "aux_loss": float(E * (f * P).sum()),
+                "max_share": float(counts.max() / (T * k)),
+                "capacity": C,
+                "drop_fraction": float(np.maximum(counts - C, 0.0).sum() / (T * k)),
+            }
+      solutionExplanation: >-
+        The first case has near-zero logits, so `token_entropy` is 1.99996 —
+        the ceiling `log2(4) = 2` to four decimal places — and `aux_loss` is
+        1.0010, the minimum of the load-balancing loss plus the noise. Note
+        that `load_entropy` is 1.936 and not 2.000: with eight tokens and four
+        experts, two experts inevitably get two tokens and two get one, so the
+        assignment distribution cannot be uniform even when the router has no
+        opinion. That is a property of the discrete count, not of the router,
+        and it is why `aux_loss` at initialisation is near 1.0 rather than
+        exactly 1.0 on a real batch.
+
+        The third case is the one with k = 2 on 8 experts: 24 assignments over
+        8 experts, `load_entropy` 2.805 against a ceiling of 3.000, and
+        `capacity = floor(1.0 * 2 * 12 / 8) = 3`, which drops a fifth of the
+        assignments even though the router is only mildly concentrated
+        (`max_share` 0.208). That pairing — a healthy-looking 2.8 bits and a
+        20.8% drop rate — is the most common capacity surprise.
+
+        The fourth case is hand-checkable: logits `[5, 0, 0]` twice and
+        `[0, 5, 0]` once. Counts are `[2, 1, 0]`, so `f = [2/3, 1/3, 0]` and
+        `load_entropy = 0.9183` bits — not the 1.0 you get from a uniform
+        three-way split. `aux_loss` is 1.6534: the dead expert contributes
+        nothing to the sum but still consumes `P_2` of probability mass, which
+        is exactly why the loss is not zero when an expert is unused. The
+        tie-breaking rule matters in the second case: several rows have two
+        near-equal logits and the stable sort decides which expert gets the
+        assignment.
+      complexity: "O(T E log E) time, O(T E) space"
+      tags: [routing, load-balancing, entropy, capacity-factor, token-dropping]
+
+    - id: p-moe-layer
+      title: "A full MoE layer with capacity and dropping"
+      difficulty: hard
+      prompt: >-
+        Implement `moe_layer(X, Wg, We, top_k, capacity_factor)` returning the
+        layer's *update* — the thing that gets added to the residual — as a
+        `(T, d_out)` nested list.
+
+        `X` is `(T, d)`; `Wg` is `(E, d)` and produces one logit per expert
+        per token; `We` is `(E, d_out, d)` and expert `e` computes
+        `x @ We[e].T`. Route with `p = softmax(X @ Wg.T)` per row, select the
+        top `k` experts per token (stable sort on `-p`, so ties go to the
+        lower index), and add `p[t, e] * (X[t] @ We[e].T)` to the output.
+
+        Capacity is `C = floor(capacity_factor * k * T / E)` slots per
+        expert. For each expert, the tokens that selected it are considered
+        in ascending token order and only the first `C` are computed; the
+        rest are dropped silently and contribute nothing. A token that loses
+        one of its `k` experts still gets the others; a token that loses all
+        of them contributes nothing at all, which is the identity case.
+      starter: |
+        import numpy as np
+
+        def moe_layer(X, Wg, We, top_k, capacity_factor):
+            # your implementation here
+            pass
+      language: python
+      entry: moe_layer
+      testCases:
+        - input: '[[[1.0,0.0,0.0,0.0],[2.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[1.0,1.0,1.0,1.0]],[[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0]],[[[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[0.0,0.0,0.0,1.0]],[[2.0,0.0,0.0,0.0],[0.0,2.0,0.0,0.0],[0.0,0.0,2.0,0.0],[0.0,0.0,0.0,2.0]],[[0.0,1.0,0.0,0.0],[1.0,0.0,0.0,0.0],[0.0,0.0,0.0,1.0],[0.0,0.0,1.0,0.0]]],1,2.0]'
+          expected: '[[0.5761168847658291,0.0,0.0,0.0],[1.5739720843231968,0.0,0.0,0.0],[0.0,1.1522337695316582,0.0,0.0],[0.0,0.0,0.0,0.5761168847658291],[0.3333333333333333,0.3333333333333333,0.3333333333333333,0.3333333333333333]]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0,0.0,0.0,0.0],[2.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[1.0,1.0,1.0,1.0]],[[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0]],[[[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[0.0,0.0,0.0,1.0]],[[2.0,0.0,0.0,0.0],[0.0,2.0,0.0,0.0],[0.0,0.0,2.0,0.0],[0.0,0.0,0.0,2.0]],[[0.0,1.0,0.0,0.0],[1.0,0.0,0.0,0.0],[0.0,0.0,0.0,1.0],[0.0,0.0,1.0,0.0]]],1,1.0]'
+          expected: '[[0.5761168847658291,0.0,0.0,0.0],[0.0,0.0,0.0,0.0],[0.0,1.1522337695316582,0.0,0.0],[0.0,0.0,0.0,0.5761168847658291],[0.0,0.0,0.0,0.0]]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0,0.0,0.0,0.0],[2.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[1.0,1.0,1.0,1.0]],[[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0]],[[[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[0.0,0.0,0.0,1.0]],[[2.0,0.0,0.0,0.0],[0.0,2.0,0.0,0.0],[0.0,0.0,2.0,0.0],[0.0,0.0,0.0,2.0]],[[0.0,1.0,0.0,0.0],[1.0,0.0,0.0,0.0],[0.0,0.0,0.0,1.0],[0.0,0.0,1.0,0.0]]],2,2.0]'
+          expected: '[[1.0,0.0,0.0,0.0],[1.9999999999999998,0.0,0.0,0.0],[0.0,1.3641753271487436,0.0,0.0],[0.0,0.0,0.21194155761708544,0.5761168847658291],[1.0,1.0,1.0,1.0]]'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+
+        def moe_layer(X, Wg, We, top_k, capacity_factor):
+            X = np.asarray(X, dtype=np.float64)
+            Wg = np.asarray(Wg, dtype=np.float64)
+            We = np.asarray(We, dtype=np.float64)
+            T, d = X.shape
+            E = Wg.shape[0]
+            k = int(top_k)
+
+            z = X @ Wg.T
+            z = z - z.max(axis=1, keepdims=True)
+            p = np.exp(z)
+            p /= p.sum(axis=1, keepdims=True)
+            # stable sort: ties go to the lower expert index
+            idx = np.argsort(-p, axis=1, kind="stable")[:, :k]
+
+            C = int(np.floor(float(capacity_factor) * k * T / E))
+            out = np.zeros((T, We.shape[1]))
+            for e in range(E):
+                chosen = [t for t in range(T) if e in idx[t]]
+                kept = chosen[:C]                      # overflow is dropped, in token order
+                if not kept:
+                    continue
+                g = p[kept, e][:, None]
+                out[kept] += g * (X[kept] @ We[e].T)
+            return out.tolist()
+      solutionExplanation: >-
+        The three cases differ only in `top_k` and `capacity_factor`, and they
+        separate the two things that can go wrong. In the first, `k = 1` with
+        `capacity_factor = 2.0` gives `C = floor(2 * 5 / 3) = 3`, expert 0 has
+        exactly three candidates (tokens 0, 1 and 4), and nothing is dropped:
+        the output is `p_a` times the selected expert applied to `x`.
+
+        The second case is the same input at `capacity_factor = 1.0`, so
+        `C = 1`. Expert 0 is selected by tokens 0, 1 and 4, and only token 0
+        survives; rows 1 and 4 come back as exact zeros. That is the whole
+        point of the case: the output is not an error and not a NaN, it is a
+        layer that did nothing for two of five tokens, and the residual would
+        carry them through unchanged. If your rows 1 and 4 are non-zero you
+        applied capacity per token instead of per expert, or you dropped by
+        router probability instead of by token order.
+
+        The third case turns on the tie rule. Token 2 has probabilities
+        `[0.211942, 0.576117, 0.211942]`; the top two are expert 1 and then
+        either expert 0 or expert 2, which are exactly equal. The stable sort
+        picks expert 0, so the answer is `[0, 1.364175, 0, 0]` — expert 1's
+        contribution of 1.152234 in the second component plus expert 0's
+        0.211942 in the same component. Picking expert 2 instead gives
+        `[0.211942, 1.152234, 0, 0]`, which differs in the first component and
+        is the wrong answer. Token 4 has three exactly equal logits and ties
+        into experts 0 and 1, which is why its output is `[1, 1, 1, 1]`: the
+        identity expert times 1/3 plus the doubling expert times 1/3.
+      complexity: "O(T E d + T k d d_out) time, O(T E) space for the routing"
+      tags: [moe-forward, top-k, capacity-factor, token-dropping, dispatch]
+
+  visualizers:
+    - id: vs-moe-load
+      kind: computation_graph
+      title: "Routing, load, and capacity in one picture"
+      description: >-
+        Move the expert count, k, the capacity factor and the router's
+        concentration and watch four numbers move independently: total
+        parameters as E times the FFN, active parameters as k times it, load
+        entropy as bits against a log2(E) ceiling, and the drop rate against the
+        capacity condition CF >= E times the maximum share.
+      params:
+        d_model: 768
+        d_ff: 3072
+        n_experts: 8
+        top_k: 2
+        n_layers: 12
+        capacity_factor: 1.25
+    - id: vs-moe-expert-usage
+      kind: shape_flow
+      title: "Where 512 tokens go, step by step"
+      description: >-
+        Replay the measured assignment counts from the 600-step run. Without an
+        aux loss the distribution reaches [0, 0, 167, 0, 0, 181, 164, 0] within
+        100 steps and five experts never receive another token; at alpha = 0.5 it
+        settles at [81, 64, 56, 58, 68, 45, 71, 69] with 2.981 bits of load
+        entropy.
+      params:
+        tokens: 512
+        n_experts: 8
+        top_k: 1
+        steps: 600
+
+
+  try_it: >-
+    Run eight experts with top-1 routing and no auxiliary loss for 100 steps on a 512-token
+    batch, recording the load entropy each step. It should fall from 2.950 bits to 1.572 and
+    never recover, with five of the eight experts never seeing another token.
+  interview_questions:
+    - question: 'Why does the router need a load-balancing loss at all?'
+      level: mid
+      key_points:
+        - 'TopK is a piecewise-constant selection, so no gradient flows through the choice itself; only the softmax weights carry gradient.'
+        - 'Nothing in the task loss penalises imbalance, so the router is free to collapse and does.'
+        - 'The auxiliary loss L_aux = alpha * E * sum_i f_i P_i is a differentiable proxy built from the assignment fraction f_i and the mean probability P_i.'
+        - 'It evaluates to exactly 1 at uniform load, so it is a relative measure of collapse rather than an absolute penalty.'
+    - question: 'You replicate the FFN eight times, get more VRAM, unchanged throughput and a smaller gain than a width bump. What did you actually buy?'
+      level: senior
+      key_points:
+        - 'Parameters scale with E, FLOPs with k: at d = 768 and d_ff = 3072 the dense block is 7,080,960 parameters, the E = 8 k = 2 block is 40,111,104 total and 11,799,552 active.'
+        - 'That is 5.66x the parameters for 1.67x the arithmetic, because attention and the norms are replicated too.'
+        - 'Every expert stays resident, so 47.38B parameters in fp16 is 94.75 GB of weights against 27.11 GB of active set, a factor of 3.50.'
+        - 'You bought capacity, not throughput, and the question is whether your loss was parameter-limited or compute-limited.'
+      follow_up: 'Why is the parameter-to-active ratio 3.50 rather than 8, and what does the difference tell you about where the non-expert parameters are?'
+    - question: 'What does a capacity factor do, and what happens to a token that does not fit?'
+      level: mid
+      key_points:
+        - 'C = floor(CF * k * T / E) positions per expert, allocated whether or not the router fills them, which is what turns a ragged computation into a dense matmul.'
+        - 'On the collapsed load [0, 0, 167, 0, 0, 181, 164, 0] with T = 512 and E = 8, a capacity factor of 1.0 caps each expert far below what the hot ones received.'
+        - 'A dropped token is not lost: with the residual it computes x_{l+1} = x_l, so the block is the identity for that token at that layer.'
+        - 'That is why dropping degrades quietly instead of crashing and never appears in the loss curve as a spike.'
+      follow_up: 'If a dropped token skips the layer entirely, why does the loss not show a step change when the drop rate rises?'
+  common_mistakes:
+    - 'Copying alpha = 0.01 from a paper without checking it against the task gradient, where the measured ratio made it 349x too weak.'
+    - 'Reading a better loss after adding experts as evidence of more compute, when per-token FLOPs grew 1.67x while resident memory grew 8x.'
+    - 'Moving to eight GPUs with expert parallelism and expecting a speedup, when each layer adds two all-to-all passes and 64 global barriers per forward.'
+  further_reading:
+    - label: "Shazeer, Mirhoseini, Maziarz, Davis, Le, Hinton & Dean, Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer (ICLR 2017)"
+    - label: "Fedus, Zoph & Shazeer, Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity (JMLR 2022)"

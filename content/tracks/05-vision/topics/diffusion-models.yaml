@@ -1,0 +1,1407 @@
+id: diffusion-models
+slug: diffusion-models
+title: "Diffusion Models: DDPM, DDIM, and Guidance"
+summary: >-
+  The chain that destroys an image is fixed arithmetic you never train, so all a
+  diffusion model learns is the conditional mean of the noise that was added.
+  From that one regression you get the ELBO, a 1000-step ancestor sampler, a
+  20-step deterministic one, and a guidance scale that converts the variety of
+  the dataset into confidence about a single mode.
+kind: lesson
+difficulty: hard
+position: 3
+estMinutes: 26
+prerequisites: [probability-distributions, cnn-architectures]
+phase: vision-foundations
+tags:
+  - diffusion
+  - ddpm
+  - ddim
+  - classifier-free-guidance
+  - noise-schedule
+  - elbo
+  - epsilon-prediction
+  - sampling
+  - score-matching
+  - variance-schedule
+
+body:
+  big_idea: >-
+    A diffusion model is a denoiser, not a generator: the forward process is
+    fixed arithmetic with a closed form, and the network learns only the noise
+    at a given level, so sampling runs it backwards.
+
+  problem:
+    - >-
+      Loss falls smoothly for a day and samples are grey mush, because the
+      sampler used per-step alpha where it needed the cumulative alpha bar.
+    - >-
+      Product wants ten network calls and DDPM needs a thousand; you swap in
+      DDIM without knowing what it gives up at twenty steps.
+    - >-
+      Your class-conditional model uses `guidance_scale=7.5` from a tutorial:
+      at 20 images are beautiful and identical, at 0 diverse and wrong.
+
+  analogy: |
+    A photograph left in the sun for a thousand days. Each day the ink fades
+    by a known amount, and by day 1000 only the grain of the emulsion remains.
+    Diffusion trains a restorer shown a print from a random day and the day
+    number; its only job is to say how much of what it sees is fading. Run it
+    backwards and blank paper becomes a photograph.
+
+  concept_points:
+    - >-
+      **The forward process is fixed and has a closed form, so training never walks the chain.**
+      With $\beta_t$ linear from $1\times10^{-4}$ to $2\times10^{-2}$ over
+      $T = 1000$, the cumulative product is
+      $\bar\alpha_T = 4.036\times10^{-5}$: the signal keeps a factor
+      $\sqrt{\bar\alpha_T} = 0.006353$ and the rest is noise. One line takes a
+      clean image to any $t$, with no loop over $t$ and no accumulated float
+      round-off.
+    - >-
+      **One noise draw, not a chain of them, is what makes the loss a plain regression.**
+      The reparameterisation
+      $x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon$ with
+      one $\epsilon \sim \mathcal{N}(0, I)$ is exact, because a sum of
+      independent Gaussians is Gaussian. The variance is
+      $\bar\alpha_t + (1-\bar\alpha_t) = 1$ at every $t$; the SNR spans 40.0
+      dB at $t=1$ to -43.9 dB at 1000.
+    - >-
+      **The reverse conditional given the original is Gaussian and known, so only its mean is learned.**
+      $q(x_{t-1}\mid x_t, x_0)$ has variance
+      $\tilde\beta_t = \beta_t(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)$:
+      **$5.453\times10^{-5}$** at $t=2$ and **$2.000\times10^{-2}$** at
+      $t=1000$ — 367x across the chain. That is why the network needs $t$ as
+      an input: it approximates a family whose scale changes by two orders of
+      magnitude. Using $\beta_t$ instead is 2.2x too large at $t=2$.
+    - >-
+      **The ELBO is a sum of Gaussian KLs, and each one is a weighted noise MSE.**
+      The weight is $w_t = \beta_t^2/(2\sigma_t^2\alpha_t(1-\bar\alpha_t))$,
+      which with $\sigma_t^2 = \beta_t$ is **0.5001** at $t=1$, a minimum of
+      **0.005343** at $t=250$ and 0.01020 at $t=1000$. Setting every $w_t$ to
+      1 multiplies the $t=1$ term by 2.0, the $t=250$ term by **187** and the
+      $t=1000$ term by 98.
+    - >-
+      **DDPM sampling is a thousand sequential network calls, and DDIM trades variance for fewer of them.**
+      DDPM's ancestor step with $\sigma_t^2 = \beta_t$ preserves variance
+      exactly: $v_{t-1} = \alpha_t v_t + \beta_t$ is 1 for every $t$ when
+      $v_T = 1$. DDIM sets $\sigma_t = 0$, so output variance is a product of
+      cosines squared: **0.6918** at $S=10$, 0.9296 at 50, **0.9964** at 1000.
+    - >-
+      **Classifier-free guidance is a score combination, and its diversity cost is an exponential reweighting of modes.**
+      Guidance samples $p_w(x) \propto p(x\mid c)^{1+w}p(x)^{-w}$, i.e.
+      $\hat\epsilon = \epsilon_u + (1+w)(\epsilon_c - \epsilon_u)$ — two
+      network calls per step. On $\pi = (0.9, 0.1)$ against
+      $\rho = (0.5, 0.5)$ the rare mode holds **10.0%** at $w=0$, **1.22%** at
+      1 and **0.0152%** at 3.
+
+  definitions:
+    - term: "Forward process"
+      meaning: >-
+        The fixed Markov chain $q(x_t \mid x_{t-1})$ that adds Gaussian noise
+        according to a schedule. It has no parameters, it is never trained, and it
+        is invertible in distribution only — a thousand images map to the same
+        $x_T$.
+    - term: "Reverse process"
+      meaning: >-
+        $p_\theta(x_{t-1} \mid x_t) = \mathcal{N}(\mu_\theta(x_t,t),
+        \sigma_t^2 I)$, the learned chain that walks from noise back to data. Only
+        the mean is learned in DDPM; the variance is either fixed to $\beta_t$ or
+        learned as a second output.
+    - term: "Beta schedule"
+      meaning: >-
+        The sequence $\beta_1 \dots \beta_T$ of per-step noise variances, linear
+        from $1\times10^{-4}$ to $2\times10^{-2}$ in the original paper, cosine in
+        the improved one. It is the single most under-specified object in a
+        diffusion implementation: the network's target is defined relative to it,
+        so training and sampling must share it exactly.
+    - term: "alpha bar"
+      meaning: >-
+        $\bar\alpha_t = \prod_{s=1}^{t}(1-\beta_s)$, the cumulative signal
+        retention. It is what makes the closed form possible: $\sqrt{\bar\alpha_t}$
+        multiplies the data and $\sqrt{1-\bar\alpha_t}$ multiplies the noise, so a
+        single number describes the noise level at step $t$.
+    - term: "Signal-to-noise ratio (SNR)"
+      meaning: >-
+        $\bar\alpha_t/(1-\bar\alpha_t)$, the ratio of retained signal variance to
+        accumulated noise variance. It runs from 9999 (40.0 dB) at $t=1$ to
+        $4.04\times10^{-5}$ ($-43.9$ dB) at $t=1000$; every statement about "how
+        noisy is this step" is a statement about this number.
+    - term: "Reparameterisation"
+      meaning: >-
+        Writing $x_t$ as a deterministic function of $x_0$ and one standard
+        normal draw, $x_t = \sqrt{\bar\alpha_t}x_0 +
+        \sqrt{1-\bar\alpha_t}\epsilon$. It turns "sample from a Gaussian" into
+        "scale and add", which is what lets gradients flow through the noise and
+        makes the loss a per-example regression on $\epsilon$.
+    - term: "ELBO"
+      meaning: >-
+        The evidence lower bound, $\mathbb{E}_q[\log p_\theta(x_0) - \dots]$
+        written as a sum of per-step KL divergences plus a prior term. For
+        diffusion every term is a Gaussian KL, and each one collapses to a
+        weighted mean squared error on the noise prediction.
+    - term: "epsilon-prediction"
+      meaning: >-
+        Parameterising the network's output as the noise that was added rather
+        than the clean image. The loss becomes
+        $\|\epsilon - \epsilon_\theta\|^2$, uniform across timesteps, and the
+        implied $x_0$ estimate is
+        $(x_t - \sqrt{1-\bar\alpha_t}\epsilon_\theta)/\sqrt{\bar\alpha_t}$.
+    - term: "v-prediction"
+      meaning: >-
+        Predicting $v = \sqrt{\bar\alpha_t}\epsilon -
+        \sqrt{1-\bar\alpha_t}x_0$, which rotates smoothly from the noise at
+        $t=1$ (99.995% $\epsilon$) to the negated signal at $t=1000$ (99.998%
+        $x_0$). Its advantage is numerical: the target never collapses to zero
+        magnitude at either end of the chain.
+    - term: "Ancestral sampling"
+      meaning: >-
+        Walking the reverse chain one step at a time, drawing fresh noise at each
+        step. It is what makes DDPM stochastic, what makes samples from the same
+        $x_T$ different, and what costs 1000 sequential network calls.
+    - term: "DDIM"
+      meaning: >-
+        A non-Markovian reverse process with the same trained network that sets
+        the injected variance to zero, making the map from $x_T$ to $x_0$
+        deterministic and letting the sampler take any subsequence of steps.
+        Twenty steps is the usual operating point; the paper reports 10–50× fewer
+        iterations for comparable quality.
+    - term: "Guidance scale"
+      meaning: >-
+        $w$ in $\hat\epsilon = \epsilon_u + (1+w)(\epsilon_c - \epsilon_u)$, the
+        multiplier on the difference between conditional and unconditional noise
+        predictions. It samples $p(x\mid c)^{1+w}p(x)^{-w}$: larger $w$ moves
+        mass toward whatever the class already prefers, at an exponential cost in
+        mode coverage.
+    - term: "Posterior variance"
+      meaning: >-
+        $\tilde\beta_t = \beta_t(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)$, the
+        variance of $q(x_{t-1}\mid x_t, x_0)$. It is the correct variance for the
+        reverse step and it is not $\beta_t$: the two differ by 2.2× at $t=2$ and
+        agree to five decimal places by $t=1000$, where $1-\bar\alpha_t$ is
+        already close to 1.
+
+  diagrams:
+    - type: architecture
+      title: "One network, two directions: the training path and the sampling loop"
+      caption: >-
+        Training never runs the chain: x_t is computed in closed form from x_0 and
+        a single noise draw, so one training step costs one forward and one
+        backward pass regardless of T. Sampling runs the same weights a thousand
+        times in sequence, which is why the sampler and not the network is where
+        the cost lives.
+      nodes:
+        - id: x0
+          x: 0
+          y: 0
+          label: "clean batch 64 x 3 x 64 x 64"
+          kind: client
+          detail: "12,288 numbers per image. Only ever seen at its own noise level, never at t = 0 alone."
+        - id: t
+          x: 1
+          y: 0
+          label: "t ~ Uniform{1..1000}"
+          kind: worker
+          detail: "One integer per example per step. This is the entire supervision for the noise level: the network is told which of 1000 problems to solve."
+        - id: xt
+          x: 2
+          y: 0
+          label: "x_t = sqrt(ab_t) x_0 + sqrt(1-ab_t) eps"
+          kind: storage
+          detail: "Closed form, one line, no loop. At t = 1000 the signal coefficient is 0.006353 and the noise coefficient is 0.99998."
+        - id: net
+          x: 3
+          y: 0
+          label: "U-Net eps_theta(x_t, t)"
+          kind: gpu
+          detail: "35.7M parameters for the CIFAR model; 590,336 of them at 64x64 and 9,439,232 at 8x8. The timestep embedding is injected at every block, not once at the stem."
+        - id: loss
+          x: 3
+          y: 1
+          label: "loss = mean (eps - eps_theta)^2"
+          kind: server
+          detail: "Uniform across t once the ELBO weight is dropped. Sampling and training share this one objective; nothing else is ever trained."
+        - id: z
+          x: 3
+          y: 2
+          label: "x_T ~ N(0, I)"
+          kind: client
+          detail: "Pure noise, unit variance. The sampler's only input, and the reason two runs from different seeds give different images."
+        - id: step
+          x: 2
+          y: 2
+          label: "1000 steps (DDPM) or 20-50 (DDIM)"
+          kind: gpu
+          detail: "Sequential and unavoidable: step t-1 consumes step t's output. DDIM sets the injected variance to zero and can therefore take any subsequence."
+        - id: out
+          x: 0
+          y: 2
+          label: "x_0 estimate"
+          kind: storage
+          detail: "At S = 20 steps the DDIM map returns 0.833 of the true variance on Gaussian data; the deficit is the price of skipping intermediate steps, not a bug."
+      edges:
+        - { from: x0, to: t, label: "pair with a random level" }
+        - { from: t, to: xt, label: "one noise draw" }
+        - { from: xt, to: net, label: "noisy input + level" }
+        - { from: net, to: loss, label: "predict eps, compare" }
+        - { from: net, to: step, label: "same weights, called 1000 times", style: async }
+        - { from: z, to: step, label: "start" }
+        - { from: step, to: out, label: "one step earlier each call" }
+
+    - type: plot
+      title: "Signal and noise coefficients along the chain: linear versus cosine"
+      chart: line
+      xLabel: "timestep t"
+      yLabel: "coefficient applied to x_0 and to eps"
+      series:
+        - name: "linear, sqrt(alpha_bar)"
+          points:
+            - { x: 1, y: 0.99995 }
+            - { x: 100, y: 0.94711 }
+            - { x: 250, y: 0.72394 }
+            - { x: 500, y: 0.28033 }
+            - { x: 750, y: 0.057884 }
+            - { x: 1000, y: 0.0063528 }
+        - name: "linear, sqrt(1 - alpha_bar)"
+          points:
+            - { x: 1, y: 0.01 }
+            - { x: 100, y: 0.32091 }
+            - { x: 250, y: 0.68987 }
+            - { x: 500, y: 0.95990 }
+            - { x: 750, y: 0.99832 }
+            - { x: 1000, y: 0.99998 }
+        - name: "cosine, sqrt(alpha_bar)"
+          points:
+            - { x: 1, y: 0.99998 }
+            - { x: 100, y: 0.98595 }
+            - { x: 250, y: 0.92033 }
+            - { x: 500, y: 0.70274 }
+            - { x: 750, y: 0.37983 }
+            - { x: 1000, y: 0.0 }
+
+    - type: compare
+      title: "DDPM and DDIM: same weights, different sampler"
+      left_label: "DDPM (ancestral)"
+      left_points:
+        - "Stochastic: fresh noise at every step, variance beta_t, which makes the variance recursion exactly 1.0 at every t"
+        - "1000 steps, all of them, because each step's variance is tied to beta_t and there is no way to skip"
+        - "Two runs from the same x_T differ; samples are draws from the model, not a function of the seed's noise"
+        - "Sampling cost is 1000 sequential forwards and cannot be batched across t"
+        - "The reference implementation: CIFAR-10 unconditional FID 3.17 at 1000 steps"
+      right_label: "DDIM (deterministic, eta = 0)"
+      right_points:
+        - "No noise injected: the map from x_T to x_0 is a function, so the same x_T gives bit-identical output every run"
+        - "Any subsequence of steps works: 20-50 steps for comparable quality, which the paper reports as 10-50x fewer iterations"
+        - "Output variance on Gaussian data falls to 0.8329 at S = 20 and 0.9641 at S = 100, against 1.0 for DDPM"
+        - "Latent interpolation becomes meaningful, because nearby x_T vectors give nearby images"
+        - "eta = 1 recovers DDPM exactly; eta is the dial between the two samplers, not a different model"
+
+    - type: plot
+      title: "DDIM at eta = 0: the variance you lose by skipping steps"
+      chart: line
+      xLabel: "sampling steps S"
+      yLabel: "output variance (target 1.0)"
+      series:
+        - name: "DDIM, eta = 0"
+          points:
+            - { x: 10, y: 0.69182 }
+            - { x: 20, y: 0.83286 }
+            - { x: 50, y: 0.92958 }
+            - { x: 100, y: 0.96415 }
+            - { x: 200, y: 0.98190 }
+            - { x: 1000, y: 0.99635 }
+        - name: "true data variance"
+          points:
+            - { x: 10, y: 1.0 }
+            - { x: 1000, y: 1.0 }
+
+    - type: plot
+      title: "Guidance scale and the mass left on a rare mode"
+      chart: line
+      xLabel: "guidance scale w"
+      yLabel: "mass on the rare mode (%)"
+      series:
+        - name: "class with 90/10 mode weights against a 50/50 marginal"
+          points:
+            - { x: 0, y: 10.0 }
+            - { x: 0.5, y: 3.5714 }
+            - { x: 1, y: 1.2195 }
+            - { x: 2, y: 0.13699 }
+            - { x: 3, y: 0.015239 }
+            - { x: 5, y: 0.00018817 }
+
+  markdown: |
+    ## The corruption is arithmetic
+
+    Fix a schedule $\beta_1,\dots,\beta_T$ with each $\beta_t \in (0,1)$ and
+    define one step of corruption as
+
+    $$q(x_t \mid x_{t-1}) = \mathcal{N}\!\left(\sqrt{1-\beta_t}\,x_{t-1},\;
+      \beta_t I\right).$$
+
+    There are no parameters here. Nothing in this equation is learned, and that
+    is the whole trick: the model never has to represent the forward process,
+    only its inverse. Writing $\alpha_t = 1-\beta_t$ and
+    $\bar\alpha_t = \prod_{s \le t}\alpha_s$, composing $t$ of these Gaussians
+    gives the closed form
+
+    $$q(x_t \mid x_0) = \mathcal{N}\!\left(\sqrt{\bar\alpha_t}\,x_0,\;
+      (1-\bar\alpha_t) I\right),$$
+
+    which is one line of code and replaces a $t$-step loop. With $\beta$ linear
+    from $1\times10^{-4}$ to $2\times10^{-2}$ over 1000 steps:
+
+    | $t$ | $\sqrt{\bar\alpha_t}$ | $\sqrt{1-\bar\alpha_t}$ | SNR (dB) |
+    |---|---|---|---|
+    | 1 | 0.99995 | 0.0100 | 40.0 |
+    | 250 | 0.7239 | 0.6899 | 0.42 |
+    | 500 | 0.2803 | 0.9599 | −10.7 |
+    | 750 | 0.0579 | 0.9983 | −24.7 |
+    | 1000 | 0.006353 | 0.99998 | −43.9 |
+
+    The signal coefficient is 0.006 at the end, so a thousand images share one
+    noise vector: the forward map is many-to-one, and no function can invert it.
+    What can be learned is the conditional mean.
+
+    ## What the network is asked to predict
+
+    Reparameterise with a single draw $\epsilon \sim \mathcal{N}(0,I)$:
+
+    $$x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon,
+      \qquad \epsilon = \frac{x_t - \sqrt{\bar\alpha_t}\,x_0}
+      {\sqrt{1-\bar\alpha_t}}.$$
+
+    Three targets are one target rescaled: $x_0$, $\epsilon$, and
+    $v = \sqrt{\bar\alpha_t}\,\epsilon - \sqrt{1-\bar\alpha_t}\,x_0$. They differ
+    only in what a fixed network error *means* at each timestep. A unit error in
+    $\epsilon$ becomes an error of $\sqrt{(1-\bar\alpha_t)/\bar\alpha_t}$ in
+    $x_0$: 0.0100 at $t=1$, 157.4 at $t=1000$. Training on $x_0$ with a plain
+    MSE therefore weights the noise error by the square of that factor, which
+    spans $2.5\times10^{8}$ between the two ends of the chain. That is why
+    $\epsilon$-prediction is the default: it is the parameterisation in which the
+    loss is uniform in $t$, and it is the one the ELBO hands you if you stop to
+    derive it.
+
+    ## The objective, and the weight that was thrown away
+
+    With $\sigma_t^2$ the reverse variance and $\mu_\theta$ the network's mean,
+    each ELBO term is a KL between two Gaussians of equal variance, so
+
+    $$\mathcal{L}_t = \frac{1}{2\sigma_t^2}
+      \big\|\tilde\mu_t(x_t,x_0) - \mu_\theta(x_t,t)\big\|^2 + C
+      = \underbrace{\frac{\beta_t^2}{2\sigma_t^2\alpha_t(1-\bar\alpha_t)}}_{w_t}
+      \big\|\epsilon - \epsilon_\theta\big\|^2 + C,$$
+
+    where $C$ depends on the schedule and not on $\theta$, so it drops out of
+    training. With the DDPM choice $\sigma_t^2 = \beta_t$:
+
+    | $t$ | 1 | 250 | 1000 |
+    |---|---|---|---|
+    | $w_t$ | 0.5001 | 0.005343 | 0.01020 |
+    | $1/w_t$ | 2.0 | 187 | 98 |
+
+    Setting every $w_t$ to 1 multiplies the easiest term by 2 and the middle of
+    the chain by 187. The simplified objective is not a bound on the likelihood —
+    it is the bound with roughly a hundredfold of its weight moved off the
+    high-SNR end. Ho et al. report that their best samples came from this
+    reweighted objective; CIFAR-10 unconditional reached FID 3.17 with it.
+
+    ## Sampling: a thousand steps, then twenty
+
+    Ancestral sampling applies the reverse conditional with
+    $\sigma_t^2 = \beta_t$:
+
+    $$x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\left(x_t -
+      \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\epsilon_\theta(x_t,t)\right)
+      + \sqrt{\beta_t}\,z.$$
+
+    The variance recursion $v_{t-1} = \alpha_t v_t + \beta_t$ returns 1.0 for
+    every $t$ when $v_T = 1$: the sampler adds back exactly what the forward step
+    removed. DDIM keeps the same $\epsilon_\theta$ and sets the noise to zero:
+
+    $$x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,\hat x_0
+      + \sqrt{1-\bar\alpha_{t-1}}\,\epsilon_\theta, \qquad
+      \hat x_0 = \frac{x_t - \sqrt{1-\bar\alpha_t}\,\epsilon_\theta}
+      {\sqrt{\bar\alpha_t}}.$$
+
+    Because no distribution is attached to the step, any pair $(t, t-1)$ can be
+    used, so a 20-step run is 20 evaluations of the same weights. What it gives
+    up is variance:
+
+    | $S$ | 10 | 20 | 50 | 100 | 1000 |
+    |---|---|---|---|---|---|
+    | output variance, $\eta = 0$ | 0.692 | 0.833 | 0.930 | 0.964 | 0.996 |
+
+    A single sample will not show you a 7% variance deficit. A sweep will.
+
+    ## Guidance
+
+    Classifier-free guidance trains one network on both conditional and
+    unconditional inputs (dropping the condition with probability ~10%), then
+    samples with the combined score. Since
+    $\epsilon_\theta = -\sigma_t\,\nabla\log q(x_t)$, the combination is a
+    combination of noise predictions:
+
+    $$\hat\epsilon = \epsilon_u + (1+w)\left(\epsilon_c - \epsilon_u\right),
+      \qquad p_w(x) \propto p(x \mid c)^{1+w}\,p(x)^{-w}.$$
+
+    For well-separated equal-variance modes the guided weight of mode $i$ is
+    $\pi_i(\pi_i/\rho_i)^w$, where $\pi_i$ is its conditional and $\rho_i$ its
+    marginal weight. A mode that the class over-represents is boosted
+    exponentially; a mode it under-represents is deleted exponentially. On a
+    class with weights 0.9/0.1 against a 0.5/0.5 marginal:
+
+    | $w$ | 0 | 0.5 | 1 | 2 | 3 |
+    |---|---|---|---|---|---|
+    | rare-mode mass | 10.0% | 3.57% | 1.22% | 0.137% | 0.0152% |
+
+    At $w=3$ the rare mode has lost a factor of 656 and the mean has moved from
+    $-0.800$ to $-1.001$ — it has saturated at the mode and cannot go further.
+    That saturation is the reason very high guidance looks "sharp but wrong": the
+    distribution has been pushed onto the conditional mode's centre, where the
+    score is flat and the sample carries no information beyond the class.
+
+    ## What actually breaks
+
+    Four failures, in the order they happen to people. Sampling with the per-step
+    $\alpha_t$ instead of $\bar\alpha_t$ collapses the output standard deviation
+    to 0.303 against a true 1.0 — grey, low-contrast samples from a model with a
+    perfect loss curve. Using $\beta_t$ for the reverse variance instead of
+    $\tilde\beta_t$ over-noises the last few steps by 2.2×. Training on a linear
+    schedule and sampling with cosine betas asks the network about noise levels it
+    never saw, up to an 11× SNR mismatch at $t=500$. And guidance at $w=7.5$
+    without a conditional dropout rate in training produces a model that has never
+    seen an unconditional input, so $\epsilon_u$ is garbage and the guidance
+    direction points nowhere.
+
+    ## The longer version
+
+    A diffusion model is a denoiser, not a generator: the process that destroys
+    the image is fixed arithmetic with a closed form, and the network learns only
+    the mean of the noise that was added at a given level, so sampling is that
+    same network applied backwards through a thousand noise levels.
+
+    A photograph left in the sun for a thousand days, one day at a time. Each day
+    the ink fades by a fixed, known amount, and by day 1000 nothing is left but
+    blank paper with the grain of the emulsion still in it. Diffusion trains a
+    restorer that is shown a print from a randomly chosen day and told the day
+    number; its only job is to say how much of what it sees is fading and how
+    much is image. Run the restorer backwards, day by day, and blank paper becomes
+    a photograph.
+
+    The analogy breaks in two places, and both are this topic. First, fading is
+    many-to-one: a thousand originals fade to the same blank page, so the restorer
+    can only return the average of the originals consistent with what it sees. It
+    produces a plausible photograph, not yours — which is why sampling needs
+    injected noise to be varied at all rather than one blur. Second, real fading
+    is physics with no dial; here the amount of ink removed per day is a schedule
+    you choose, and choosing it badly is the most common way a correct
+    implementation produces grey mush.
+
+    ### What goes wrong
+
+    - You have a diffusion model whose training loss falls smoothly for a day
+      and whose samples are grey mush. Nothing raised. The network is fine;
+      the sampler is using the per-step alpha where it needed the cumulative
+      alpha bar, and the only symptom is that every sample has 30% of the
+      contrast it should.
+    - Product wants ten network calls per image and DDPM needs a thousand.
+      Every blog says "use DDIM", so you swap the sampler and the samples get
+      worse in a way you cannot quantify, because nobody told you what DDIM
+      assumes and what it gives up when you take twenty steps instead of a
+      thousand.
+    - The paper's loss is written as a mean squared error on noise, and the
+      appendix derives it from a variational bound with a weight in front of
+      every timestep. You cannot tell whether that weight was dropped by
+      accident, by approximation, or on purpose — and the answer decides
+      whether you are allowed to change it.
+    - Your class-conditional model uses `guidance_scale=7.5` because a
+      tutorial did. At 20 the images are beautiful and all identical; at 0
+      they are diverse and wrong. You have a dial with no units and no theory,
+      so you cannot say which way to turn it for your data.
+    - You read that diffusion "models the data distribution", then notice the
+      forward process is many-to-one: a thousand different images map to the
+      same noise. What exactly is the model estimating, and why does sampling
+      need randomness at all if the reverse of a function is a function?
+
+    ### The full treatment
+
+    **The forward process is fixed and has a closed form, so training never
+    walks the chain.** With $\beta_t$ linear from $1\times10^{-4}$ to
+    $2\times10^{-2}$ over $T = 1000$ steps, the cumulative product is
+    $\bar\alpha_T = 4.036\times10^{-5}$: the signal keeps a factor
+    $\sqrt{\bar\alpha_T} = 0.006353$ and the rest is noise. The chain is
+    arithmetic — one line takes a clean image to any $t$ in one step, with no
+    loop over $t$. The trap is a data loader that builds $x_t$ by iterating
+    $q(x_s \mid x_{s-1})$ a thousand times: a thousand times the work, the same
+    number, and a numerically different one because a thousand float
+    multiplications accumulate round-off that the closed form does not.
+
+    **One noise draw, not a chain of them, is what makes the loss a plain
+    regression.** The reparameterisation
+    $x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon$ with a
+    single $\epsilon \sim \mathcal{N}(0, I)$ is exact, because a sum of
+    independent Gaussians is a Gaussian with the summed variances. The variance
+    is $\bar\alpha_t + (1-\bar\alpha_t) = 1$ for unit-variance data at every
+    $t$: the chain is variance-preserving, it never inflates the signal. The
+    signal-to-noise ratio $\bar\alpha_t/(1-\bar\alpha_t)$ runs 40.0 dB at
+    $t=1$, 0.42 dB at $t=250$, $-10.7$ dB at $t=500$ and $-43.9$ dB at
+    $t=1000$ — a 84 dB range spanned by one schedule. The trap is that this
+    ladder is not linear in $t$: 175 of the 1000 steps sit below
+    $\bar\alpha_t = 10^{-3}$, where under 0.1% of the signal variance is left.
+
+    **The reverse conditional given the original is Gaussian and known, so only
+    its mean is learned.** $q(x_{t-1}\mid x_t, x_0)$ has a mean that is a
+    weighted combination of $x_0$ and $x_t$, and variance
+    $\tilde\beta_t = \beta_t(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)$. That
+    variance is $5.453\times10^{-5}$ at $t=2$ and $2.000\times10^{-2}$ at
+    $t=1000$ — 367× across the chain — which is the first reason the network
+    needs $t$ as an input: it is not approximating one function, it is
+    approximating a family whose scale changes by two orders of magnitude. The
+    trap is using $\beta_t$ as the reverse variance: at $t=2$,
+    $\beta_2 = 1.199\times10^{-4}$ is 2.2× larger than the correct
+    $\tilde\beta_2$, so the last few steps of the sampler add more noise than
+    the posterior justifies and the finest detail is the first thing lost.
+
+    **Predicting noise, signal, or velocity is the same network under three
+    different loss weightings.** The three targets are linear in each other:
+    $x_0 = (x_t - \sqrt{1-\bar\alpha_t}\,\epsilon)/\sqrt{\bar\alpha_t}$ and
+    $v = \sqrt{\bar\alpha_t}\,\epsilon - \sqrt{1-\bar\alpha_t}\,x_0$. The
+    conversion factor from an error in $\epsilon$ to an error in $x_0$ is
+    $\sqrt{(1-\bar\alpha_t)/\bar\alpha_t}$: 0.0100 at $t=1$ and 157.4 at
+    $t=1000$, a 15,740× swing. Train on plain $x_0$ MSE and you implicitly
+    weight the noise error by $(1-\bar\alpha_t)/\bar\alpha_t$, which is
+    $1.0\times10^{-4}$ at $t=1$ and $2.478\times10^{4}$ at $t=1000$ — a factor
+    of $2.5\times10^{8}$ between the cleanest and the noisiest step. The trap is
+    believing the parameterisation is cosmetic because the loss curves look the
+    same: they are minimising different objectives, and the $x_0$ one has
+    effectively stopped training below $t \approx 300$.
+
+    **The ELBO is a sum of Gaussian KLs, and each one is a weighted noise MSE.**
+    For Gaussians with a shared variance, the KL is
+    $\|\tilde\mu_t - \mu_\theta\|^2/(2\sigma_t^2)$, and substituting the
+    $\epsilon$-parameterisation turns it into
+    $w_t\|\epsilon - \epsilon_\theta\|^2$ with
+    $w_t = \beta_t^2/(2\sigma_t^2\alpha_t(1-\bar\alpha_t))$. With
+    $\sigma_t^2 = \beta_t$ that is $w_t = \beta_t/(2\alpha_t(1-\bar\alpha_t))$:
+    0.5001 at $t=1$, a minimum of 0.005343 at $t=250$, 0.01020 at $t=1000$.
+    Setting every $w_t$ to 1 — which is what Denoising Diffusion Probabilistic
+    Models does — multiplies the $t=1$ term by 2.0, the $t=250$ term by 187 and
+    the $t=1000$ term by 98. So the "simplified" objective is not the ELBO: it
+    is the ELBO with about a hundredfold of its attention moved off the
+    cleanest, easiest timestep and onto the middle of the chain. The trap is
+    calling it an approximation to the bound and then worrying about the gap;
+    the paper is explicit that this reweighting is what produced the good
+    samples, and CIFAR-10 unconditional FID 3.17 is the number it bought.
+
+    **The U-Net spends its parameters where the resolution is not.** In a
+    64×64 CIFAR-shaped U-Net with channels 128/256/256/512 at 64/32/16/8, two
+    residual blocks per level, the 64×64 level owns 590,336 weights and the 8×8
+    level owns 9,439,232 — 16.0× more, on 1/64th of the spatial positions — plus
+    a further 1,048,576 in its self-attention, which takes the ratio to 17.8×.
+    That is the correct
+    allocation: the noisy end of the chain needs global structure, which lives
+    at low resolution, and the clean end needs local detail, which the skip
+    connections carry across without any weights at all. The trap is that $t$
+    has to reach every block, not just the input: the timestep is embedded as
+    sinusoids and injected per-block (a scale and a shift, or a FiLM-style
+    residual), because a network that sees $t$ once at the stem has to route
+    "which of 1000 noise levels am I at" through 30 layers of convolution.
+
+    **DDPM sampling is a thousand sequential network calls, and its variance is
+    not free.** The ancestor step is
+    $x_{t-1} = \alpha_t^{-1/2}(x_t - \beta_t(1-\bar\alpha_t)^{-1/2}
+    \epsilon_\theta) + \sigma_t z$ with $\sigma_t^2 = \beta_t$. With a perfect
+    $\epsilon$ model that recursion has variance
+    $v_{t-1} = \alpha_t v_t + \beta_t$, which is exactly 1 for every $t$ when
+    $v_T = 1$: the sampler adds back precisely the variance the forward step
+    removed. The cost is structural — 1000 calls that cannot be batched across
+    $t$, so wall-clock scales with the chain, not with the batch. The trap is
+    quoting throughput: a batch of 64 amortises the weights, never the 1000
+    dependent steps, so the wall clock for one image and for sixty-four is the
+    same order of magnitude rather than 64× apart.
+
+    **DDIM is the same weights with a sampler that can skip steps, and the price
+    is measurable variance.** Set $\sigma_t = 0$ and reuse the same $\epsilon$
+    for the jump: $x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,\hat x_0 +
+    \sqrt{1-\bar\alpha_{t-1}}\,\epsilon_\theta$. With an exact $\epsilon$ model
+    on standard-Gaussian data this map is linear with coefficient
+    $\cos(\theta_t - \theta_{t-1})$ where $\cos\theta_t = \sqrt{\bar\alpha_t}$,
+    so the output variance is the product of those cosines squared: 0.6918 at
+    $S=10$ steps, 0.8329 at 20, 0.9296 at 50, 0.9641 at 100 and 0.9964 at 1000,
+    against a true variance of 1. Every skipped step is a cosine that no longer
+    multiplies back the variance the sampler removed. The trap is expecting a
+    single sample to show it: a 7% variance deficit at $S=50$ is invisible by
+    eye, which is why the only honest way to choose $S$ is a sweep.
+
+    **Classifier-free guidance is a score combination, and its diversity cost is
+    an exponential reweighting of modes.** Guidance samples
+    $p_w(x) \propto p(x \mid c)^{1+w}p(x)^{-w}$, whose score is
+    $(1+w)\nabla\log p(x\mid c) - w\nabla\log p(x)$; in noise-prediction form
+    that is $\hat\epsilon = \epsilon_u + (1+w)(\epsilon_c - \epsilon_u)$, two
+    network calls per step. For well-separated equal-variance modes the guided
+    mixture weight becomes $\pi_i(\pi_i/\rho_i)^w$, where $\pi_i$ is the
+    conditional and $\rho_i$ the marginal mixture weight. On a toy class with
+    $\pi = (0.9, 0.1)$ against $\rho = (0.5, 0.5)$, the rare mode holds 10.0% of
+    the mass at $w=0$, 1.22% at $w=1$ (8.2× less) and 0.0152% at $w=3$ (656×
+    less), while the mean moves from $-0.800$ to $-0.976$ to $-1.001$ — it
+    saturates at the mode. The trap is treating $w$ as a temperature: a
+    temperature would flatten or sharpen every mode's width, but this multiplies
+    weights by an odds ratio raised to $w$, so rare modes are deleted, not
+    blurred, and no amount of $w$ invents detail the conditional never had.
+
+    **The schedule is a design choice with a measurable cost, and the linear one
+    spends most of its steps on noise.** Under the linear schedule
+    $\bar\alpha_t$ falls below 0.5 at $t=260$; under the cosine schedule it
+    falls below 0.5 at $t=497$, very nearly the midpoint by construction.
+    Below $\bar\alpha_t = 10^{-3}$ the linear schedule has 175 steps and the
+    cosine 21 — 175 steps where the model is being asked to denoise something
+    that contains at most 0.1% signal. Above 0.999 the linear schedule has 6
+    steps and the cosine 13. The trap is training on one schedule and sampling
+    on another: at $t=500$ the linear SNR is 0.085 and the cosine SNR is 0.975,
+    an 11× mismatch, so the network is asked about a noise level it was never
+    trained on and answers with the wrong magnitude.
+
+
+  derivations:
+    - title: "Closed form: composing T Gaussians gives one Gaussian"
+      latex: |
+        One step, with $\alpha_t = 1-\beta_t$:
+
+        $$q(x_t \mid x_{t-1}) = \mathcal{N}\!\left(\sqrt{\alpha_t}\,x_{t-1},\;
+          \beta_t I\right).$$
+
+        Sample it as $x_t = \sqrt{\alpha_t}\,x_{t-1} + \sqrt{\beta_t}\,z_t$ and
+        substitute recursively:
+
+        $$x_t = \sqrt{\alpha_t\alpha_{t-1}}\,x_{t-2}
+          + \sqrt{\alpha_t\beta_{t-1}}\,z_{t-1} + \sqrt{\beta_t}\,z_t.$$
+
+        A sum of independent centred Gaussians is Gaussian, with variances adding:
+
+        $$\operatorname{Var}(x_t) = \alpha_t\beta_{t-1} + \beta_t
+          = 1 - \alpha_t\alpha_{t-1},$$
+
+        using $\beta_t = 1-\alpha_t$. Inducting down to $x_0$ gives
+        $\operatorname{Var}(x_t) = 1 - \prod_{s\le t}\alpha_s = 1-\bar\alpha_t$
+        and mean $\sqrt{\bar\alpha_t}\,x_0$, so
+
+        $$q(x_t\mid x_0) = \mathcal{N}\!\left(\sqrt{\bar\alpha_t}\,x_0,\;
+          (1-\bar\alpha_t)I\right).$$
+      prose: >-
+        The induction is the whole content: because the coefficients multiply, the
+        chain's effect on the mean is a product of square roots, and its effect on
+        the variance is a sum that telescopes to $1-\bar\alpha_t$. That telescoping
+        is why one number per timestep describes the noise level, and why a data
+        loader can jump to step $t$ instead of walking there.
+
+    - title: "The ELBO term is a weighted noise MSE"
+      latex: |
+        With $x_0$ known, Bayes gives
+        $q(x_{t-1}\mid x_t,x_0) = \mathcal{N}(\tilde\mu_t, \tilde\beta_t I)$ with
+
+        $$\tilde\mu_t = \frac{\sqrt{\bar\alpha_{t-1}}\,\beta_t}{1-\bar\alpha_t}\,x_0
+          + \frac{\sqrt{\alpha_t}\,(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}\,x_t,
+          \qquad
+          \tilde\beta_t = \frac{\beta_t(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}.$$
+
+        Replace $x_0$ using the reparameterisation
+        $x_0 = (x_t - \sqrt{1-\bar\alpha_t}\,\epsilon)/\sqrt{\bar\alpha_t}$:
+
+        $$\tilde\mu_t = \frac{1}{\sqrt{\alpha_t}}\left(x_t -
+          \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\epsilon\right),$$
+
+        so the gap between the true mean and the network's mean is
+
+        $$\tilde\mu_t - \mu_\theta = -\frac{\beta_t}
+          {\sqrt{\alpha_t}\sqrt{1-\bar\alpha_t}}\,
+          (\epsilon - \epsilon_\theta).$$
+
+        The KL between $\mathcal{N}(\tilde\mu_t,\sigma_t^2 I)$ and
+        $\mathcal{N}(\mu_\theta,\sigma_t^2 I)$ is
+        $\|\tilde\mu_t-\mu_\theta\|^2/(2\sigma_t^2)$, hence
+
+        $$\mathcal{L}_t = \frac{\beta_t^2}
+          {2\sigma_t^2\alpha_t(1-\bar\alpha_t)}
+          \big\|\epsilon - \epsilon_\theta(x_t,t)\big\|^2 + C,
+          \qquad C = \tfrac{1}{2}\log\frac{\sigma_t^2}{\tilde\beta_t},$$
+
+        and $C$ has no $\theta$ in it.
+      prose: >-
+        Everything hinges on the coefficient $\beta_t^2/(\alpha_t(1-\bar\alpha_t))$,
+        which is small when $\bar\alpha_t \approx 1$ and large in the middle of the
+        chain. With $\sigma_t^2=\beta_t$ the weight is 0.5001 at $t=1$ and 0.005343
+        at $t=250$: the bound cares 94× more about the easiest step than about the
+        middle. Dropping the weight is therefore not a small approximation — it is
+        a deliberate reallocation of the objective, and it is the change that made
+        the samples good.
+
+    - title: "Classifier-free guidance is a power of the conditional"
+      latex: |
+        Bayes gives $\nabla\log p(x\mid c) = \nabla\log p(x) + \nabla\log p(c\mid x)$,
+        so the classifier-guided score is
+        $\nabla\log p(x) + w\nabla\log p(c\mid x)$, which needs a classifier. Eliminate
+        it by substituting back:
+
+        $$\nabla\log p(x) + w\left(\nabla\log p(x\mid c) - \nabla\log p(x)\right)
+          = (1+w)\nabla\log p(x\mid c) - w\nabla\log p(x).$$
+
+        That is the gradient of $\log\!\left[p(x\mid c)^{1+w}p(x)^{-w}\right]$, so
+        the guided sampler targets
+        $p_w(x) \propto p(x\mid c)^{1+w}p(x)^{-w}$. For a well-separated mixture
+        with equal component variances, at mode $i$ the conditional density is
+        $\pi_i g_i(x)$ and the marginal is $\rho_i g_i(x)$, so
+
+        $$p_w(x) \approx \sum_i \frac{(\pi_i g_i)^{1+w}}{(\rho_i g_i)^{w}}
+          = \sum_i \pi_i\left(\frac{\pi_i}{\rho_i}\right)^{w} g_i(x).$$
+      prose: >-
+        The result is an exponential reweighting by the odds ratio $\pi_i/\rho_i$,
+        not a temperature. A mode the class over-represents gains $\pi_i/\rho_i$
+        per unit of $w$; a mode it under-represents loses the same factor. With
+        $\pi = (0.9,0.1)$ against $\rho=(0.5,0.5)$ the rare mode's mass goes 10.0%
+        → 1.22% at $w=1$ → 0.0152% at $w=3$, a factor of 656. That is why guidance
+        buys fidelity and pays in diversity, and why the payment is not smooth: it
+        is exponential in $w$ and it deletes modes rather than shrinking them.
+
+  implementations:
+    - language: python
+      title: "The schedule, the closed form, and the weight nobody keeps"
+      note: >-
+        All three outputs are correct and are the numbers quoted elsewhere in this
+        topic: $\bar\alpha_{1000} = 4.0358\times10^{-5}$, and the ELBO weight runs
+        0.50005 at $t=1$, 0.0053432 at $t=250$, 0.010204 at $t=1000$, so $1/w$ is
+        2.0, 187.2 and 98.0. Two hazards. First, `np.cumprod` on `1 - betas` is the
+        only correct way to get $\bar\alpha$; a running product accumulated in a
+        Python loop over 1000 steps differs in the last two digits, which matters
+        only because the same expression appears in the sampler and the two copies
+        must agree. Second, the `q_sample` printout below standardises over 4
+        samples and is therefore meaningless — it is there to show that the
+        function returns numbers of the right magnitude, not to measure variance.
+      code: |
+        import numpy as np
+
+
+        def linear_schedule(T=1000, beta_start=1e-4, beta_end=0.02):
+            """betas, alphas, alpha_bar. alpha_bar[t-1] is bar_alpha_t."""
+            betas = np.linspace(beta_start, beta_end, T)
+            alphas = 1.0 - betas
+            ab = np.cumprod(alphas)
+            return betas, alphas, ab
+
+
+        def q_sample(x0, eps, ab_t):
+            """Closed form: jump straight to step t, no loop over the chain."""
+            return np.sqrt(ab_t) * x0 + np.sqrt(1.0 - ab_t) * eps
+
+
+        def elbo_weight(betas, alphas, ab, sigma2=None):
+            """Coefficient on ||eps - eps_theta||^2 in the ELBO, sigma_t^2 = beta_t."""
+            if sigma2 is None:
+                sigma2 = betas
+            return betas ** 2 / (2.0 * sigma2 * alphas * (1.0 - ab))
+
+
+        if __name__ == "__main__":
+            betas, alphas, ab = linear_schedule()
+            w = elbo_weight(betas, alphas, ab)
+            print("bar_alpha_T         ", ab[-1])            # 4.0358e-05
+            print("sqrt(bar_alpha_T)   ", np.sqrt(ab[-1]))   # 0.0063528
+            print("w[0], w[249], w[-1] ", w[0], w[249], w[-1])
+            # 0.50005 0.0053432 0.010204
+            print("1/w at 1, 250, 1000 ", 1 / w[0], 1 / w[249], 1 / w[-1])
+            # 2.0 187.15 98.0
+
+            rng = np.random.default_rng(0)
+            x0, eps = rng.normal(size=4), rng.normal(size=4)
+            for t in (1, 250, 1000):
+                print(t, np.round(q_sample(x0, eps, ab[t - 1]), 4))
+
+    - language: python
+      title: "DDPM, DDIM, and the sampler that is numerically wrong"
+      note: >-
+        `sample_wrong` is **numerically wrong** and is included because it is the
+        classic failure: it uses the per-step `alphas[t-1]` where the network was
+        trained against `ab[t-1]`, the cumulative product. The loss is unaffected
+        (training uses `q_sample`, which is correct here) and only the sampler is
+        broken, so nothing in the stack reports anything. Measured on 200,000
+        standard-normal samples: the correct DDPM sampler returns standard
+        deviation **1.0017** against a target of 1.0, the wrong one returns
+        **0.3031** — a 3.3× loss of contrast, which is exactly what "grey,
+        washed-out samples" means. The DDIM numbers are the step-count trade:
+        0.8318 at S = 10, 0.9115 at 20, 0.9652 at 50, 0.9825 at 100, 0.9956 at
+        1000. They match the closed-form product of cosines (0.83176, 0.91261,
+        0.96415, 0.98191, 0.99817) to Monte Carlo error. Note that this toy uses
+        the exact optimal $\epsilon$ for standard-Gaussian data, so the deficit is
+        pure discretisation of the deterministic sampler and not model error.
+      code: |
+        import numpy as np
+
+        T = 1000
+        betas = np.linspace(1e-4, 0.02, T)
+        alphas = 1.0 - betas
+        ab = np.cumprod(alphas)
+
+
+        def eps_exact(x, ab_t):
+            """Optimal noise prediction when x0 ~ N(0,1): E[x0|x_t] = sqrt(ab_t) x_t."""
+            return np.sqrt(1.0 - ab_t) * x
+
+
+        def sample_ddpm(rng, n=200000):
+            x = rng.normal(size=n)
+            for t in range(T, 0, -1):
+                A, b, a = ab[t - 1], betas[t - 1], alphas[t - 1]
+                eps = eps_exact(x, A)
+                x = (x - b / np.sqrt(1.0 - A) * eps) / np.sqrt(a)
+                x = x + np.sqrt(b) * rng.normal(size=n)
+            return x
+
+
+        def sample_ddim(rng, S, n=200000):
+            x = rng.normal(size=n)
+            idx = np.linspace(T - 1, 0, S + 1).round().astype(int)
+            for i in range(S):
+                A, Ap = ab[idx[i]], ab[idx[i + 1]]
+                eps = eps_exact(x, A)
+                x0 = (x - np.sqrt(1.0 - A) * eps) / np.sqrt(A)
+                # eta = 0: the noise coefficient is not replaced by a draw
+                x = np.sqrt(Ap) * x0 + np.sqrt(1.0 - Ap) * eps
+            return x
+
+
+        def sample_wrong(rng, n=200000):
+            """WRONG: per-step alpha_t where the network was trained on bar_alpha_t."""
+            x = rng.normal(size=n)
+            for t in range(T, 0, -1):
+                A, b, a = ab[t - 1], betas[t - 1], alphas[t - 1]
+                eps = eps_exact(x, A)                       # still the trained model
+                x = (x - b / np.sqrt(1.0 - a) * eps) / np.sqrt(a)
+                x = x + np.sqrt(b) * rng.normal(size=n)
+            return x
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(7)
+            print("target std 1.0")
+            print("DDPM 1000 steps    std =", round(float(sample_ddpm(rng).std()), 4))
+            for S in (10, 20, 50, 100, 1000):
+                print(f"DDIM eta=0 S={S:4d} std =", round(float(sample_ddim(rng, S).std()), 4))
+            print("WRONG (alpha_t)    std =", round(float(sample_wrong(rng).std()), 4))
+
+  checkpoints:
+    - id: cp-1
+      question: "A colleague says training is O(T) per example because the chain has 1000 steps. Are they right, and what is the actual cost of one training step?"
+      answerKind: short_text
+      hint: "Write q(x_t | x_0) and count the random draws it needs."
+      solution: >-
+        No. The forward process has a closed form, so one training example needs one
+        noise draw and one forward pass, independent of $T$: $x_t =
+        \sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\epsilon$. The cost per step
+        is one U-Net forward, one backward, and $O(1)$ arithmetic. What is $O(T)$
+        is *sampling* — 1000 sequential forward passes — and that asymmetry is the
+        whole reason fast samplers matter: training is cheap per example and
+        agnostic to $T$, inference is not.
+    - id: cp-2
+      question: "Why does the ELBO's weight on the noise error vary by 94× across the chain, and why does the paper set it to 1 anyway?"
+      answerKind: short_text
+      hint: "Look at where beta_t²/(alpha_t (1 - alpha_bar_t)) is large. Which end of the chain is that, and how hard is the task there?"
+      solution: >-
+        The weight is $\beta_t^2/(2\sigma_t^2\alpha_t(1-\bar\alpha_t))$, which is
+        largest where $(1-\bar\alpha_t)$ is small, i.e. at the clean end. Measured:
+        0.5001 at $t=1$ versus 0.005343 at $t=250$, a factor of 94. The bound
+        therefore spends its attention on the timesteps that are nearly solved. Ho
+        et al. set $w_t=1$, which multiplies the $t=1$ term by 2 and the $t=250$
+        term by 187, moving weight toward the middle and high end where the
+        structure is. The paper reports that this reweighting, not the
+        architecture, is what produced good samples; the resulting objective is no
+        longer a bound, and it does not need to be.
+    - id: cp-3
+      question: "Your model's loss converges but samples have 30% of the contrast they should. The training code is above reproach. Where is the bug, and what single number identifies it?"
+      answerKind: short_text
+      hint: "Sampling and training must agree on what alpha means. Which one uses a product?"
+      solution: >-
+        The sampler uses $\alpha_t$ where it needs $\bar\alpha_t$ — the per-step
+        value instead of the cumulative product. The network was trained on
+        $\sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\epsilon$, so its prediction
+        is only meaningful against the cumulative coefficients; feeding it
+        $\sqrt{1-\alpha_t}$ instead asks it about a noise level it never saw. On
+        standard-Gaussian data the wrong update returns standard deviation 0.3031
+        against a correct 1.0017 — the "grey, washed-out" signature. The number
+        that identifies it is the output standard deviation: measure it on a batch
+        and compare against the data's.
+    - id: cp-4
+      question: "You move from 1000-step DDPM to 20-step DDIM. State what you gain, what you lose, and the number that quantifies the loss."
+      answerKind: short_text
+      hint: "DDIM sets the injected variance to zero. What did the injected variance used to supply?"
+      solution: >-
+        Gain: 50× fewer network evaluations, a deterministic map from $x_T$ to
+        $x_0$ (same seed, same image; interpolation between latents becomes
+        meaningful), and no per-step randomness to fight. Loss: the sampler no
+        longer adds back the variance each step removed, so the output distribution
+        is slightly narrower. Measured with an exact $\epsilon$ model on
+        standard-Gaussian data: output variance 0.8329 at $S=20$ against 1.0 for
+        DDPM and 0.9964 for $S=1000$. 17% low at 20 steps, 0.36% low at 1000. On
+        real data the same deficit shows as slightly flat, low-contrast samples,
+        and the fix is more steps or $\eta > 0$, not a different network.
+    - id: cp-5
+      question: "Guidance scale 7.5 gives beautiful images of one kind of face. Explain with the algebra which images disappeared and why raising w further will not bring them back."
+      answerKind: short_text
+      hint: "Write the guided distribution as a reweighting of modes, then ask what the mean does as w grows."
+      solution: >-
+        Guidance samples $p_w \propto p(x|c)^{1+w}p(x)^{-w}$, which for
+        well-separated equal-variance modes multiplies mode $i$'s weight by
+        $(\pi_i/\rho_i)^w$ — the class-conditional odds, exponentiated. Modes the
+        class under-represents relative to the marginal are suppressed
+        exponentially: on a toy with $\pi=(0.9,0.1)$, $\rho=(0.5,0.5)$ the rare mode
+        drops from 10.0% to 1.22% at $w=1$ and 0.0152% at $w=3$, a factor of 656.
+        Meanwhile the mean saturates at the dominant mode's centre ($-0.800 \to
+        -0.976 \to -1.001$), where the score is flat. Raising $w$ further cannot
+        recover the lost modes because it only increases the exponent; the mass is
+        already gone, and the sample is now a point near the mode centre carrying
+        no information beyond the class label.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Separate the two objects. One is a fixed corruption process with a closed
+        form — a schedule of variances, no parameters, nothing to train. The other
+        is a network that sees a corrupted image plus the level it was corrupted
+        to, and outputs a single estimate of the corruption. Training is regression
+        on that estimate at a randomly chosen level; sampling is running the same
+        network at descending levels. Everything else — the ELBO, the step count,
+        the guidance dial — follows from which quantity you parameterise and how
+        much variance you put back at each step.
+      blocks:
+        - kind: checklist
+          body: |
+            - The forward chain is arithmetic: closed form, no parameters, one line
+            - One noise draw per example makes the loss a per-example regression
+            - Only the reverse *mean* is learned; the variance comes from the schedule
+            - Training cost is one forward pass; sampling cost is one forward pass per step
+            - Every fast sampler is an assumption about what can be skipped
+      checkpoint: >-
+        If the reverse of a many-to-one map is not a function, what is the network
+        estimating, and why does that make stochastic sampling necessary rather
+        than merely nice?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in $\bar\alpha_t$ and never in $\alpha_t$; almost every diffusion bug is
+        a missing cumulative product. Then decide three things in order: what the
+        network outputs (noise, signal, or velocity — and therefore what your loss
+        is implicitly weighting), what the sampler injects (variance from the
+        schedule, or zero), and how many steps you can afford. For guidance, treat
+        $w$ as an exponent on a likelihood ratio rather than a temperature, and
+        expect the diversity cost to be exponential in it.
+      blocks:
+        - kind: checklist
+          body: |
+            - alpha_bar = cumprod(1 - betas); check it at t = 1 and t = T before anything else
+            - eps target: loss is uniform in t; x_0 target: loss is implicitly weighted by (1-ab)/ab
+            - Reverse variance: beta_tilde, not beta_t (2.2x apart at t = 2)
+            - Sampling: 1000 steps stochastic, or any subsequence with zero injected noise
+            - Guidance: two forwards per step, and mode weights scale as (pi/rho)^w
+      checkpoint: >-
+        Which of those five decisions changes the *trained weights*, and which only
+        changes what you do with them afterwards?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Four procedures: schedule, one training step, one reverse step, and the
+        guided combination. The reverse step is written once and used by both
+        samplers, with the injected variance as the only difference.
+      blocks:
+        - kind: pseudocode
+          body: |
+            schedule(T, b0, b1):
+                betas  = linspace(b0, b1, T)
+                alphas = 1 - betas
+                ab     = cumprod(alphas)
+                return betas, alphas, ab
+
+            # ab is 1-indexed here: ab[t] is bar_alpha_t (code below is 0-indexed)
+            train_step(x0):
+                t   = randint(1, T)
+                eps = randn_like(x0)
+                xt  = sqrt(ab[t]) * x0 + sqrt(1 - ab[t]) * eps
+                return mean((eps - net(xt, t))^2)
+
+            reverse_step(xt, t, t_prev, inject_variance):
+                eps  = net(xt, t)
+                x0h  = (xt - sqrt(1 - ab[t]) * eps) / sqrt(ab[t])
+                mean = sqrt(ab[t_prev]) * x0h + sqrt(1 - ab[t_prev]) * eps
+                if inject_variance:
+                    var = beta_tilde(t)          # not beta[t]
+                    return mean + sqrt(var) * randn_like(xt)
+                return mean                      # deterministic: DDIM
+
+            guided_step(xt, t, c, w):
+                eps_u = net(xt, t, null_condition)
+                eps_c = net(xt, t, c)
+                return eps_u + (1 + w) * (eps_c - eps_u)
+      checkpoint: >-
+        In `reverse_step`, what breaks if `t_prev` is not `t - 1` but `t - 50`, and
+        which sampler is allowed to do that?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three lines of algebra carry the topic: the telescoping variance that gives
+        the closed form, the KL that gives the noise-MSE weight, and Bayes that
+        turns classifier guidance into a power of the conditional.
+      blocks:
+        - kind: math
+          body: |
+            Closed form. With $x_t = \sqrt{\alpha_t}x_{t-1} + \sqrt{\beta_t}z_t$
+            and independent $z$:
+
+            $$\operatorname{Var}(x_t) = \alpha_t\operatorname{Var}(x_{t-1}) + \beta_t
+              = 1 - \bar\alpha_t, \qquad
+              \mathbb{E}[x_t] = \sqrt{\bar\alpha_t}\,x_0.$$
+
+            ELBO term. $\tilde\mu_t - \mu_\theta =
+            -\frac{\beta_t}{\sqrt{\alpha_t}\sqrt{1-\bar\alpha_t}}(\epsilon -
+            \epsilon_\theta)$, and for equal-variance Gaussians
+            $\mathrm{KL} = \|\tilde\mu_t-\mu_\theta\|^2/(2\sigma_t^2)$, so
+
+            $$\mathcal{L}_t = \frac{\beta_t^2}{2\sigma_t^2\alpha_t(1-\bar\alpha_t)}
+              \|\epsilon-\epsilon_\theta\|^2 + C(\theta\text{-free}).$$
+
+            Guidance. With $\nabla\log p(x\mid c) = \nabla\log p(x) +
+            \nabla\log p(c\mid x)$,
+
+            $$(1+w)\nabla\log p(x\mid c) - w\nabla\log p(x)
+              = \nabla\log\!\left[p(x\mid c)^{1+w}p(x)^{-w}\right],$$
+
+            and since $\epsilon_\theta = -\sigma_t\nabla\log q(x_t)$, the same
+            combination holds for noise predictions:
+            $\hat\epsilon = \epsilon_u + (1+w)(\epsilon_c-\epsilon_u)$.
+      checkpoint: >-
+        The ELBO weight is the square of the coefficient that converts an eps error
+        into a mean error. Why squared, and what does that imply about which
+        timesteps dominate a plain x_0-prediction loss?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A correct schedule, a correct closed-form sampler with the posterior
+        variance, a deterministic variant, and a guided step — plus the measurement
+        that separates them from their plausible-looking wrong versions.
+      blocks:
+        - kind: warning
+          body: >-
+            Three failure modes that produce valid tensors and bad images. Using
+            `alphas` where the code needs `alpha_bar` drops the output standard
+            deviation to 0.30 of the data's. Using `betas` for the reverse variance
+            over-noises the last steps by 2.2× and eats fine detail. Using a
+            different schedule at sampling time than at training time mismatches the
+            SNR by up to 11×, so the network is asked about noise levels it never
+            saw. None of the three raises, and all three are visible in one number:
+            the standard deviation of a batch of samples.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def schedule(T=1000):
+                betas = np.linspace(1e-4, 0.02, T)
+                alphas = 1.0 - betas
+                ab = np.cumprod(alphas)
+                bt = np.zeros(T)
+                for t in range(1, T + 1):
+                    prev = ab[t - 2] if t > 1 else 1.0
+                    bt[t - 1] = betas[t - 1] * (1.0 - prev) / (1.0 - ab[t - 1])
+                return betas, alphas, ab, bt
+
+
+            def q_sample(x0, eps, ab_t):
+                return np.sqrt(ab_t) * x0 + np.sqrt(1.0 - ab_t) * eps
+
+
+            def reverse_step(xt, eps, ab_t, ab_prev, bt_t, rng=None):
+                x0 = (xt - np.sqrt(1.0 - ab_t) * eps) / np.sqrt(ab_t)
+                mean = np.sqrt(ab_prev) * x0 + np.sqrt(1.0 - ab_prev) * eps
+                if rng is None:
+                    return mean                       # DDIM, eta = 0
+                return mean + np.sqrt(bt_t) * rng.normal(size=xt.shape)
+
+
+            def guided(eps_u, eps_c, w):
+                return eps_u + (1.0 + w) * (eps_c - eps_u)
+
+
+            if __name__ == "__main__":
+                betas, alphas, ab, bt = schedule()
+                print(ab[-1], bt[1], bt[-1])   # 4.0358e-05 5.4532e-05 0.02
+                print(guided(np.array([0.5]), np.array([1.0]), 3.0))  # [2.5]
+      checkpoint: >-
+        `guided` with $w = -1$ returns the unconditional prediction, and with
+        $w \to \infty$ it returns the conditional one. What does $w = 0$ return, and
+        why is that the same as ordinary conditional sampling?
+
+  problems:
+    - id: p-alpha-bar
+      title: "The cumulative signal retention"
+      difficulty: easy
+      prompt: >-
+        Implement `alpha_bar_linear(T, beta_start, beta_end)`: a linear beta
+        schedule from `beta_start` to `beta_end` in `T` steps, returned as the list
+        of cumulative products $\bar\alpha_t = \prod_{s=1}^{t}(1-\beta_s)$ for
+        $t = 1 \dots T$. The betas are `numpy.linspace(beta_start, beta_end, T)`,
+        the alphas are `1 - betas`, and the result is their cumulative product, so
+        element `t-1` is $\bar\alpha_t$. Return a plain list of floats of length
+        `T`. This is the object every other line of a diffusion implementation
+        indexes, and getting its indexing convention wrong — `t` versus `t-1` — is
+        the most common off-by-one in the field.
+      starter: |
+        import numpy as np
+
+        def alpha_bar_linear(T, beta_start, beta_end):
+            # your implementation here
+            pass
+      language: python
+      entry: alpha_bar_linear
+      testCases:
+        - input: '[1, 0.1, 0.1]'
+          expected: '[0.9]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[2, 0.1, 0.2]'
+          expected: '[0.9, 0.7200000000000001]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[4, 0.05, 0.2]'
+          expected: '[0.95, 0.855, 0.72675, 0.5814]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[5, 0.01, 0.05]'
+          expected: '[0.99, 0.9702, 0.9410939999999999, 0.9034502399999998, 0.8582777279999998]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def alpha_bar_linear(T, beta_start, beta_end):
+            if T <= 0:
+                raise ValueError("T must be positive")
+            if not (0.0 < beta_start < 1.0) or not (0.0 < beta_end < 1.0):
+                raise ValueError("betas must lie strictly between 0 and 1")
+            betas = np.linspace(beta_start, beta_end, T)
+            alphas = 1.0 - betas
+            ab = np.cumprod(alphas)
+            return [float(v) for v in ab]
+      solutionExplanation: >-
+        `np.cumprod` is the definition: $\bar\alpha_t$ is a product of every
+        $(1-\beta_s)$ up to $t$, not a power of a single value, so with a varying
+        schedule there is no shortcut. Test case 2 is the one that catches the two
+        classic confusions: betas are `[0.1, 0.2]`, so the answers are `0.9` and
+        `0.9*0.8 = 0.72`, not `0.9` and `0.8`. Test case 4 checks that the product
+        keeps shrinking smoothly when the steps are small (0.05 apart from 0.01),
+        where a solution that returned `1 - beta` per step would drift upward by up
+        to 4% by the end. Returning Python floats rather than `np.float64` keeps
+        the JSON comparison exact in type as well as value.
+      complexity: "O(T) time and space; T multiplications and T list conversions"
+      tags: [diffusion, schedule, cumprod, indexing]
+
+    - id: p-q-sample
+      title: "Jump to step t in closed form"
+      difficulty: easy
+      prompt: >-
+        Implement `q_sample(x0, eps, alpha_bar)`: the closed-form forward process,
+        elementwise. `x0` is the clean data and `eps` the noise, both scalars,
+        lists, or nested lists of the same shape; `alpha_bar` is the scalar
+        $\bar\alpha_t$. Return $\sqrt{\bar\alpha_t}\,x_0 +
+        \sqrt{1-\bar\alpha_t}\,\epsilon$ with the same shape, as nested Python
+        lists. The function must never loop over timesteps — the point of the
+        closed form is that the noise level is a parameter, not a process.
+      starter: |
+        import numpy as np
+
+        def q_sample(x0, eps, alpha_bar):
+            # your implementation here
+            pass
+      language: python
+      entry: q_sample
+      testCases:
+        - input: '[[1.0, 2.0], [0.0, 1.0], 0.81]'
+          expected: '[0.9, 2.2358898943540675]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[0.5, -1.5, 2.0], [1.0, 1.0, -1.0], 0.36]'
+          expected: '[1.1, -0.09999999999999987, 0.3999999999999999]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 2.0], [3.0, 4.0]], [[0.0, 0.0], [1.0, 1.0]], 0.64]'
+          expected: '[[0.8, 1.6], [3.0000000000000004, 3.8000000000000003]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[2.0], [3.0], 0.0]'
+          expected: '[3.0]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[2.0], [3.0], 1.0]'
+          expected: '[2.0]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def q_sample(x0, eps, alpha_bar):
+            if not (0.0 <= alpha_bar <= 1.0):
+                raise ValueError("alpha_bar must be in [0, 1]")
+            x0 = np.asarray(x0, dtype=float)
+            eps = np.asarray(eps, dtype=float)
+            if x0.shape != eps.shape:
+                raise ValueError("x0 and eps must have the same shape")
+            out = np.sqrt(alpha_bar) * x0 + np.sqrt(1.0 - alpha_bar) * eps
+            return out.tolist()
+      solutionExplanation: >-
+        This is the reparameterisation in one line, and the two boundary cases are
+        the ones that catch a sign or index error. At `alpha_bar = 0` the signal
+        coefficient is zero and the output is pure noise (`[3.0]` from `eps`), and
+        at `alpha_bar = 1` the noise coefficient is zero and the output is the data
+        (`[2.0]`) — a solution that hard-codes `sqrt(1 - alpha_bar)` as `sqrt(1) -
+        sqrt(alpha_bar)`, or that swaps the coefficients, fails both. Test case 2
+        has a negative `x0` and a negative `eps`, so a solution that dropped the
+        sign on either term would still pass cases 1 and 3. `np.asarray(...,
+        dtype=float)` is what lets nested lists broadcast elementwise without any
+        per-element Python loop, and `.tolist()` converts back so the harness sees
+        JSON rather than a NumPy array.
+      complexity: "O(n) time and space in the number of elements"
+      tags: [diffusion, forward-process, reparameterisation, broadcasting]
+
+    - id: p-ddim-step
+      title: "One deterministic reverse step"
+      difficulty: medium
+      prompt: >-
+        Implement `ddim_step(x, eps, alpha_bar_t, alpha_bar_prev)`: one DDIM update
+        with $\eta = 0$, elementwise, where `alpha_bar_prev` is
+        $\bar\alpha_{t-1}$ and therefore *larger* than `alpha_bar_t`. First form the
+        implied clean estimate $\hat x_0 = (x_t - \sqrt{1-\bar\alpha_t}\,\epsilon)/
+        \sqrt{\bar\alpha_t}$, then return
+        $\sqrt{\bar\alpha_{t-1}}\,\hat x_0 + \sqrt{1-\bar\alpha_{t-1}}\,\epsilon$.
+        No noise is added — that is what makes the sampler deterministic — and the
+        same $\epsilon$ is used in both terms. Return the result as nested lists.
+      starter: |
+        import numpy as np
+
+        def ddim_step(x, eps, alpha_bar_t, alpha_bar_prev):
+            # your implementation here
+            pass
+      language: python
+      entry: ddim_step
+      testCases:
+        - input: '[[1.0], [0.5], 0.81, 0.9025]'
+          expected: '[0.9816275057175355]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[2.0, -1.0], [0.5, 0.25], 0.64, 0.81]'
+          expected: '[2.130444947177034, -1.1847775264114828]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[0.0, 0.0], [1.0, -1.0], 0.25, 0.5]'
+          expected: '[-0.5176380902050416, 0.5176380902050416]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1.5], [0.0], 0.0625, 0.25]'
+          expected: '[3.0]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1.0, 2.0], [2.0, 1.0], 0.9, 0.95]'
+          expected: '[0.8248296396741901, 1.9535183205793392]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def ddim_step(x, eps, alpha_bar_t, alpha_bar_prev):
+            if not (0.0 < alpha_bar_t <= 1.0) or not (0.0 < alpha_bar_prev <= 1.0):
+                raise ValueError("alpha_bar values must be in (0, 1]")
+            if alpha_bar_prev < alpha_bar_t:
+                raise ValueError("alpha_bar_prev must be >= alpha_bar_t: the chain runs backwards")
+            x = np.asarray(x, dtype=float)
+            eps = np.asarray(eps, dtype=float)
+            if x.shape != eps.shape:
+                raise ValueError("x and eps must have the same shape")
+            x0 = (x - np.sqrt(1.0 - alpha_bar_t) * eps) / np.sqrt(alpha_bar_t)
+            out = np.sqrt(alpha_bar_prev) * x0 + np.sqrt(1.0 - alpha_bar_prev) * eps
+            return out.tolist()
+      solutionExplanation: >-
+        The step is a reconstruction, not a diffusion: $\hat x_0$ is the model's
+        estimate of the clean image, and the output is what that clean image plus
+        the *same* noise direction would look like one level cleaner. The validation
+        is not decoration — if `alpha_bar_prev < alpha_bar_t` the caller has the
+        direction of time backwards, which is easy to do because $t$ counts up while
+        $\bar\alpha$ counts down. Test case 4 is the one that pins the algebra: with
+        `eps = 0` and $\bar\alpha_t = 0.0625$, $\hat x_0 = 1.5/0.25 = 6$, and the
+        output is $0.5 \times 6 = 3.0$, so a solution that dropped the $\hat x_0$
+        step and returned $\sqrt{\bar\alpha_{t-1}/\bar\alpha_t}\,x_t$ would get
+        $1.5 \times 2 = 3.0$ as well — the coincidence that makes this case worth
+        having alongside case 3, where the same shortcut gives 0 instead of
+        $\pm 0.5176$.
+      complexity: "O(n) time and space; two square roots per call regardless of step count"
+      tags: [diffusion, ddim, sampling, deterministic]
+
+  visualizers:
+    - id: vs-diffusion-schedule
+      kind: loss_surface
+      title: "The noise ladder: where the signal dies under linear versus cosine betas"
+      description: >-
+        Sweep $t$ from 1 to 1000 and watch $\sqrt{\bar\alpha_t}$ fall from 0.99995
+        to 0.006353 under the linear schedule while $\sqrt{1-\bar\alpha_t}$ rises
+        to 0.99998. Then switch to cosine and see the crossing move from $t=260$ to
+        $t=497$, and the count of steps below $\bar\alpha_t = 10^{-3}$ fall from 175
+        to 21.
+      params:
+        T: 1000
+        beta_start: 0.0001
+        beta_end: 0.02
+        schedules: [linear, cosine]
+
+  try_it: >-
+    With betas linear from 1e-4 to 2e-2 over 1000 steps, compute bar_alpha with np.cumprod and
+    check that bar_alpha_1000 is 4.036e-5, so the signal coefficient is 0.006353. Then run the
+    DDPM ancestor sampler twice on 200,000 standard-normal samples — once with bar_alpha and
+    once with the per-step alphas[t] — and compare the output standard deviations, 1.0017
+    against 0.3031.
+  interview_questions:
+    - question: "A colleague says training is O(T) per example because the chain has 1000 steps. Are they right, and what is actually O(T)?"
+      level: mid
+      key_points:
+        - "The forward process has the closed form q(x_t | x_0) = N(sqrt(bar_alpha_t) x_0, (1 − bar_alpha_t) I), so one example needs one noise draw and no loop."
+        - "One training step is one U-Net forward, one backward and O(1) arithmetic, independent of T."
+        - "Sampling is the O(T) part: 1000 sequential forwards that cannot be batched across t, because step t−1 consumes step t's output."
+        - "That asymmetry is why fast samplers matter — a batch of 64 amortises the weights but never the 1000 dependent steps."
+      follow_up: "Why does a batch of 64 not give you 64 times the sampling throughput?"
+    - question: "The simplified objective sets every ELBO weight to 1. What did that change, and was it an approximation?"
+      level: senior
+      key_points:
+        - "The ELBO weight is beta_t squared over (2 sigma_t squared alpha_t (1 − bar_alpha_t)); with sigma squared = beta_t it is 0.5001 at t = 1, 0.005343 at t = 250 and 0.01020 at t = 1000."
+        - "Setting w_t = 1 multiplies the t = 1 term by 2, the t = 250 term by 187 and the t = 1000 term by 98, moving about a hundredfold of attention off the cleanest end of the chain."
+        - "It is therefore not a bound on the likelihood; it is a deliberate reweighting, and Ho et al. are explicit that this reweighting is what produced the good samples — CIFAR-10 unconditional FID 3.17."
+        - "What it changes is where capacity is spent, not what the network represents, so the parameterisation stays valid."
+      follow_up: "If you needed a likelihood number rather than samples, which objective would you train and what would you report?"
+    - question: "Guidance scale 7.5 gives beautiful images of one kind of face. Explain with the algebra which images disappeared."
+      level: mid
+      key_points:
+        - "Guidance samples p_w proportional to p(x|c)^(1+w) p(x)^(−w); for well-separated equal-variance modes, mode i's weight becomes pi_i (pi_i / rho_i)^w, an odds ratio raised to w rather than a temperature."
+        - "With pi = (0.9, 0.1) against rho = (0.5, 0.5) the rare mode holds 10.0% at w = 0, 1.22% at w = 1 and 0.0152% at w = 3, a factor of 656."
+        - "The mean saturates at the dominant mode, moving −0.800 to −0.976 to −1.001, so raising w further only increases the exponent and cannot recover deleted modes."
+        - "The cost is exponential in w while the benefit is fidelity: FID is U-shaped, 1.55 at w = 0.1 against 26.22 at w = 4."
+      follow_up: "Why does Inception score keep improving over exactly the range where FID degrades?"
+  common_mistakes:
+    - "Using the per-step alpha_t in the sampler where the network was trained against bar_alpha_t — the loss curve stays perfect and the output standard deviation collapses to 0.3031."
+    - "Using beta_t as the reverse variance instead of beta_tilde_t, which adds 2.2 times too much noise at t = 2 and eats the finest detail first."
+    - "Calling the simplified objective an approximation to the ELBO and then trying to close a gap that was never a gap."
+  further_reading:
+    - label: "Ho, Jain, Abbeel, Denoising Diffusion Probabilistic Models (DDPM), NeurIPS 2020"
+    - label: "Nichol, Dhariwal, Improved Denoising Diffusion Probabilistic Models, ICML 2021"

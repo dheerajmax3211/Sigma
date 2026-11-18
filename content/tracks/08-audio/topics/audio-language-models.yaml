@@ -1,0 +1,625 @@
+id: audio-language-models
+slug: audio-language-models
+title: "Audio Language Models: One Vocabulary for Speech and Text"
+summary: >-
+  Put codec tokens and text tokens in the same sequence, with the same embedding
+  table and the same output head, and a transformer can listen, transcribe and
+  answer in one pass — but audio arrives at 100 to 600 tokens per second against
+  text's 3.25, so a 1M-token window is 28 minutes of speech rather than 85 hours of
+  words, and the KV cache costs 19 GB per minute at the high rate.
+kind: lesson
+difficulty: expert
+position: 5
+estMinutes: 21
+prerequisites: [voice-agents-streaming]
+
+body:
+  big_idea: >-
+    An audio language model is a transformer whose vocabulary holds text and
+    codec tokens in one sequence — and audio's 600 tokens per second turn the
+    context window into a duration budget.
+  problem:
+    - "You extend a text model's vocabulary with 8,192 audio codes and text ability degrades: 99% of tokens in an audio batch are audio."
+    - "You quote a 1M-token context, then find it holds 28 minutes of speech and 85 hours of text: the same window is 185x different."
+    - "You serve the model and the KV cache eats the GPU: 600 tokens per second is 315 MB per second, 18.9 GB per minute."
+  analogy: >-
+    A bilingual note-taker writing everything in one notebook, in one
+    shorthand. Because the shorthand is shared, a sentence heard in one
+    language can be continued in the other without translation: the same page
+    holds the sound and the sense. But a notebook with fixed pages holds 28
+    minutes of speech and 85 hours of writing.
+  concept_points:
+    - "**Sharing a vocabulary means sharing an embedding matrix and an output head.** A codec contributes $N_q \\times K$ rows — 8 x 1,024 = 8,192 for EnCodec or Mimi — and in a mixed sequence audio occupies 6-25% of the embedding rows but more than 99% of the tokens: at 600 audio tokens/s against 3.25 text tokens/s, $600/(600+3.25) = 99.46\\%$ of the sequence is audio."
+    - "**Interleaving is what buys cross-modal conditioning.** One sequence of the form text, audio, text lets causal attention condition the second text on the audio without any adapter, because the audio tokens are simply earlier in the same context. A dual-encoder or adapter architecture has to learn a mapping between two representation spaces; a shared sequence has only positions to attend to."
+    - "**The token rate is the whole design constraint, and it is a multiplication.** A 12.5 Hz codec with 8 books is 100 tokens per second; a 75 Hz codec with 8 books is 600. A duplex conversation has two streams, so 200 tokens/s at the low rate. Text at 150 words per minute and 1.3 tokens per word is 3.25 tokens per second."
+    - "**A context window is a duration budget, and the conversion is division.** At 600 tokens/s, 1M tokens is 27.8 minutes; at 100 tokens/s it is 2.78 hours; at the duplex 200 tokens/s, 83.3 minutes. For text at 3.25 tokens/s it is 85.5 hours. The ratio is 185, the same as the token-rate ratio, because the window is fixed."
+    - "**The KV cache scales with the same number, and it is the real serving cost.** Per token, a 32-layer, width-4,096 model in fp16 stores $32 \\times 2 \\times 4{,}096 \\times 2 = 524{,}288$ bytes. At 600 tokens/s that is 315 MB per second — 18.9 GB per minute of audio, against 102 MB for the same minute of text. Context is memory bandwidth per second of conversation."
+    - "**Multi-codebook structure has to be modelled explicitly.** Flattening eight books into one 8,192-way softmax costs $600 \\times 8{,}192 = 4.9$ million logits per second; per-book heads cost **614,400**, an 8x saving, but then the model must decide how books depend on each other. A delay pattern shifts book $i$ by $i-1$ frames; an RQ-Transformer runs a coarse transformer over frames and a fine one over books."
+  definitions:
+    - term: "Audio token"
+      meaning: >-
+        A discrete symbol produced by a neural codec, one per codebook per frame. A
+        75 Hz, eight-book codec produces 600 tokens per second; a 12.5 Hz,
+        eight-book codec produces 100.
+    - term: "Semantic token"
+      meaning: >-
+        A token from a self-supervised model trained to predict masked units
+        (HuBERT, w2v-BERT). It carries linguistic content at a low rate and little
+        speaker or channel information, which makes it cheap in context but
+        insufficient for high-fidelity reconstruction on its own.
+    - term: "Acoustic token"
+      meaning: >-
+        A token from a reconstruction codec. It carries speaker, prosody and channel
+        as well as content, costs 8 books per frame, and is what a speech-to-speech
+        model needs to produce audio rather than a transcript.
+    - term: "Interleaving"
+      meaning: >-
+        Placing tokens of different modalities in one sequence — text, then audio,
+        then text — so that causal attention can condition each on what came
+        before. It is what removes the need for a cross-modal adapter.
+    - term: "Shared vocabulary"
+      meaning: >-
+        One embedding table and one output head covering both text and audio
+        tokens. It enables interleaving and transfer, and it makes the output
+        distribution a mixture whose balance depends on the training mixture.
+    - term: "Delay pattern"
+      meaning: >-
+        A schedule that shifts codebook $i$ by $i-1$ frames so that each
+        autoregressive step predicts exactly one codebook for one frame. It avoids
+        a joint $K^{N_q}$-way factorisation at the cost of $N_q-1$ frames of
+        latency.
+    - term: "RQ-Transformer"
+      meaning: >-
+        A two-level architecture for multi-codebook audio: a coarse transformer
+        models the frame sequence and a fine transformer models the books within a
+        frame. It is an alternative to flattening and to delay patterns.
+    - term: "Duplex stream"
+      meaning: >-
+        One of two audio token streams in a speech-to-speech model — the user's and
+        the agent's. Two streams at 100 tokens/s each is 200 tokens/s, which halves
+        the conversation duration a fixed window can hold.
+    - term: "Context window"
+      meaning: >-
+        The number of tokens the model can attend over. For audio it is more useful
+        to convert it to minutes: 1M tokens is 27.8 minutes at 600 tokens/s, 83.3
+        minutes for a duplex model at 200, and 85.5 hours of text at 3.25.
+    - term: "KV cache"
+      meaning: >-
+        The stored keys and values for every token in context, per layer.
+        524,288 bytes per token for a 32-layer, width-4,096 model in fp16, which is
+        315 MB per second of 600-token/s audio.
+    - term: "Context rot"
+      meaning: >-
+        Degradation of recall and instruction-following as context grows, even
+        before the window is full. Audio suffers earlier than text because its
+        tokens are numerous and locally redundant.
+    - term: "Modality-balanced sampling"
+      meaning: >-
+        Sampling training batches so that text and audio contribute comparable
+        gradient mass, rather than sampling by token count, which would make audio
+        dominate by two orders of magnitude.
+
+  diagrams:
+    - type: architecture
+      title: "One sequence, two modalities, one head"
+      caption: >-
+        The audio tokens sit in the same context as the text tokens, so causal
+        attention conditions the answer on the sound without an adapter. The cost
+        is visible in the counts: 100 to 600 audio tokens per second against 3.25
+        text tokens.
+      nodes:
+        - id: sys
+          x: 0
+          y: 0
+          label: "system text"
+          kind: client
+          detail: "A few hundred text tokens. Cheap, and disproportionately important: it is the instruction the model must still recall 30,000 audio tokens later."
+        - id: aud
+          x: 1
+          y: 0
+          label: "audio tokens, 100-600/s"
+          kind: storage
+          detail: "8 codebooks per 12.5 ms or 13.33 ms frame. One minute is 6,000 tokens at 100/s and 36,000 at 600/s."
+        - id: emb
+          x: 2
+          y: 0
+          label: "shared embedding table"
+          kind: model
+          detail: "Text rows plus 8 x 1,024 audio rows. Audio is 6-25% of the rows and 99.5% of the tokens in an audio-heavy batch."
+        - id: tr
+          x: 3
+          y: 0
+          label: "causal transformer"
+          kind: gpu
+          detail: "32 layers, width 4,096. KV cache is 524,288 bytes per token in fp16, so 315 MB per second at 600 tokens/s."
+        - id: head
+          x: 4
+          y: 0
+          label: "shared output head"
+          kind: server
+          detail: "One softmax over text and audio codes. Per-book heads cost 614,400 logits per second; a flattened 8,192-way head costs 4.9 million."
+        - id: txt
+          x: 5
+          y: 0
+          label: "text answer"
+          kind: client
+          detail: "The same objective that predicts the next audio frame also predicts the next word; that is the transfer the shared vocabulary is for."
+        - id: audout
+          x: 5
+          y: 1
+          label: "audio answer"
+          kind: client
+          detail: "In a duplex model this is a second stream, doubling the token rate to 200/s and halving the conversation length a window holds."
+      edges:
+        - { from: sys, to: aud, label: "instruction" }
+        - { from: aud, to: emb, label: "indices" }
+        - { from: emb, to: tr, label: "one sequence" }
+        - { from: tr, to: head, label: "next-token" }
+        - { from: head, to: txt, label: "text tokens" }
+        - { from: head, to: audout, label: "audio codes", style: async }
+
+    - type: plot
+      title: "A 1M-token window measured in minutes of audio"
+      chart: bar
+      xLabel: "token rate (tokens per second)"
+      yLabel: "minutes that fit in 1,000,000 tokens"
+      series:
+        - name: "duration"
+          points:
+            - { x: 3.25, y: 5128.2 }
+            - { x: 100, y: 166.7 }
+            - { x: 200, y: 83.3 }
+            - { x: 400, y: 41.7 }
+            - { x: 600, y: 27.8 }
+
+    - type: compare
+      title: "Separate encoders versus one shared vocabulary"
+      left_label: "Adapter or dual-encoder stack"
+      left_points:
+        - "Text and audio keep separate embedding spaces; a small adapter maps one into the other"
+        - "Text ability is protected, because the text head never sees audio codes"
+        - "Cross-modal conditioning is learned through the adapter, which is a bottleneck and a place for information to be lost"
+        - "Simpler to train: each modality can be pretrained separately and frozen"
+        - "Interleaved tasks (listen, then answer in speech) need a hand-off between modules"
+      right_label: "Shared vocabulary (AudioPaLM, Moshi class)"
+      right_points:
+        - "One sequence, one embedding table, one output head; cross-modal conditioning is just attention over earlier positions"
+        - "A single next-token objective trains transcription, translation and generation together"
+        - "The output distribution is a mixture, and its balance follows the training mixture: audio-heavy batches cost text fluency"
+        - "Audio codes occupy 8,192 rows and 99.5% of the tokens in an audio-heavy sequence"
+        - "Long context becomes a duration budget: 27.8 minutes at 600 tokens/s, 85.5 hours of text"
+
+    - type: mermaid
+      title: "A delay pattern: eight books, one prediction per step"
+      code: |
+        flowchart LR
+          F0["frame t: book 1"] --> F1["frame t: book 2"]
+          F1 --> F2["frame t: book 3"]
+          F2 --> D["... book 8"]
+          D --> G0["frame t+1: book 1"]
+          G0 --> G1["frame t+1: book 2"]
+          note["Each step predicts one book for one frame, so the head stays 1,024-way. The cost is 7 frames of latency before the first frame is complete."]
+
+  markdown: |
+    ## What makes it an audio *language* model
+
+    A speech pipeline is a chain of specialists: ASR, then a text LLM, then TTS.
+    An audio language model replaces the chain with one autoregressive transformer
+    over a vocabulary that contains both text tokens and audio tokens, in one
+    sequence. Transcription is text tokens conditioned on audio tokens; synthesis
+    is audio tokens conditioned on text tokens; a conversation is both, interleaved.
+
+    The reason to do it is conditioning. In a shared sequence, the audio tokens are
+    simply earlier positions, so causal attention can condition on them with no
+    adapter, no separate encoder, and no representation-mapping loss. The reason
+    it is hard is arithmetic: the two modalities have token rates that differ by
+    two orders of magnitude.
+
+    ## The token rates
+
+    | stream | rate | tokens per minute |
+    |---|---|---|
+    | text, 150 wpm, 1.3 tokens/word | 3.25/s | 195 |
+    | 12.5 Hz codec, 8 books | 100/s | 6,000 |
+    | 75 Hz codec, 8 books | 600/s | 36,000 |
+    | duplex (user + agent at 12.5 Hz) | 200/s | 12,000 |
+
+    The multiplication is always the same: frame rate times codebooks. A 12.5 Hz
+    codec with eight books is 100 tokens per second; a 75 Hz codec with eight
+    books is 600. Duplex doubles it because there are two streams, one for the
+    user and one for the agent.
+
+    ## A context window is a duration budget
+
+    Dividing a window by a token rate is the most useful arithmetic in this topic:
+
+    $$T_{\text{audio}} = \frac{C}{f_r N_q}.$$
+
+    | window | text (3.25/s) | 100/s | 200/s | 600/s |
+    |---|---|---|---|---|
+    | 128k | 10.9 h | 21.3 min | 10.7 min | 3.6 min |
+    | 1M | 85.5 h | 2.78 h | 83.3 min | 27.8 min |
+
+    A 30-minute call at 600 tokens per second is 1,080,000 tokens — 8% over a 1M
+    window before the system prompt, the retrieved documents, or the agent's own
+    replies. The same call at 100 tokens per second is 180,000 tokens, which fits
+    comfortably with room for a long prompt.
+
+    That is the real reason low-frame-rate codecs matter for conversational models.
+    Mimi's 12.5 Hz, eight-book configuration is 100 tokens per second and 1.0 kbps
+    by the same multiplication, and it is what makes a duplex conversation fit in a
+    window that a 75 Hz codec would fill in under half an hour.
+
+    ## The KV cache is the bill
+
+    Context length is usually discussed as a capability. It is better discussed as
+    memory. Per token, a 32-layer model of width 4,096 in fp16 stores
+
+    $$32 \times 2 \times 4{,}096 \times 2\ \text{B} = 524{,}288\ \text{B}$$
+
+    across keys and values. Multiply by the token rate:
+
+    | stream | bytes per second | bytes per minute |
+    |---|---|---|
+    | text (3.25/s) | 1.7 MB | 102 MB |
+    | 100/s audio | 52.4 MB | 3.15 GB |
+    | 200/s duplex | 104.9 MB | 6.29 GB |
+    | 600/s audio | 314.6 MB | 18.9 GB |
+
+    Eighteen point nine gigabytes per minute of audio, per conversation. A serving
+    stack that can hold ten concurrent 600-token/s conversations for five minutes
+    needs 944 GB of KV cache — which is why audio models are served with sliding
+    windows, compressed memory, or a much lower token rate, and why "1M context"
+    on an audio model is a statement about memory bandwidth as much as about
+    attention.
+
+    ## Multi-codebook structure
+
+    Eight books per frame is not eight independent symbols. The books are residuals
+    of each other, so book 2 is a correction to book 1, and a model that predicts
+    them independently produces a frame whose books disagree.
+
+    Three ways to model the dependence:
+
+    - **Flatten.** One 8,192-way softmax per frame. Simple, and it costs
+      $600 \times 8{,}192 = 4.9$ million logits per second of audio.
+    - **Delay pattern.** Shift book $i$ by $i-1$ frames, so each step predicts one
+      book for one frame with a 1,024-way head — 614,400 logits per second, an 8×
+      saving. Cost: seven frames of latency before the first frame is complete, and
+      a model that must learn the shift as a positional pattern.
+    - **RQ-Transformer.** A coarse transformer over frames and a fine transformer
+      over books within a frame. More parameters, cleaner factorisation, and no
+      latency penalty.
+
+    ## The shared-softmax problem
+
+    A shared vocabulary means one output head produces both text and audio
+    distributions. In an audio-heavy batch, 99.5% of the tokens are audio, so
+    almost all of the head's gradient is spent on audio codes. Text fluency
+    degrades — not because the model forgot how to write, but because the head that
+    writes has been specialised for something else.
+
+    The fixes are all partial retreats. A modality-balanced sampler makes each
+    batch contribute comparable gradient mass, which is a data decision rather than
+    an architectural one. Separate loss weights do the same more bluntly. A small
+    adapter that maps audio tokens into the text embedding space protects the text
+    head entirely — and gives up the clean interleaving that motivated the shared
+    vocabulary in the first place. Every audio language model in production sits
+    somewhere on that line.
+
+    ## Long context degrades before it overflows
+
+    Even inside the window, attention over tens of thousands of locally redundant
+    acoustic frames dilutes the few frames that carry the instruction. The symptom
+    is familiar from text — lost-in-the-middle — but it arrives earlier for audio
+    because the tokens are more numerous and more self-similar.
+
+    The architectures that work are not "bigger window". They are sliding windows
+    with a compressed memory: semantic tokens at 12.5 Hz instead of acoustic tokens
+    at 75 Hz, a running summary every N seconds, or a two-level model that keeps a
+    text transcript as the long-term memory and audio tokens only for the recent
+    past. The transcript is 185× cheaper, and it is the right place to store what
+    was said.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    An audio language model is an ordinary autoregressive transformer whose vocabulary contains both text tokens and codec tokens, interleaved in one sequence, so that attention can condition either modality on the other and a single next-token objective trains transcription, understanding and generation — and the price of that unification is that audio's token rate, 100 to 600 per second against text's 3.25, turns the context window into a duration budget measured in minutes.
+
+    ### The analogy, in full
+
+    A bilingual note-taker who writes everything in one notebook, in one shorthand. Because the shorthand is shared, a sentence heard in one language can be continued in the other without a translation step: the same page holds the sound and the sense. That is the appeal of a shared vocabulary — no interface, no lossy hand-off, one model of what is being said. The analogy breaks on volume. Spoken language arrives about 185 times faster than written language in shorthand units, so a notebook with a fixed number of pages holds 28 minutes of speech but 85 hours of writing. And the shorthand is not symmetric: the symbols for sound are far more numerous than the symbols for words, so a page full of speech has almost no room left for the notes that explain it.
+
+    ### Failure modes, in full
+
+    - You extend a text model's vocabulary with 8,192 audio codes and train on mixed data. The loss falls, the model transcribes well, and its text ability degrades — because 99% of the tokens in an audio-heavy batch are audio, and the shared output head is being pulled by a distribution that text barely contributes to.
+    - You quote a 1M-token context as if it were a general capability, then discover it holds 28 minutes of 600-token/s speech and 85 hours of text. The same window is a different product depending on the modality, and the difference is a factor of 185.
+    - You plan a 30-minute call summarisation feature on a 1M window and the arithmetic says 1.08 million tokens before any prompt, system message or retrieved document.
+    - You serve the model and the KV cache eats the GPU: 600 tokens per second at 32 layers and width 4,096 in fp16 is 315 MB per second of audio, 18.9 GB per minute, per conversation.
+
+    ### The mechanisms, in full
+
+    - **Sharing a vocabulary means sharing an embedding matrix and an output head.** Text contributes a BPE vocabulary of tens of thousands of rows; a codec contributes $N_q \times K$ rows — 8 × 1,024 = 8,192 for EnCodec-style eight-book codecs, or the same 8,192 for Mimi's eight books. In a sequence that mixes modalities, audio occupies 6-25% of the embedding rows but more than 99% of the tokens: at 600 audio tokens/s against 3.25 text tokens/s, $600/(600+3.25) = 99.46\%$ of the sequence is audio.
+    - **Interleaving is what buys cross-modal conditioning.** One sequence of the form text, audio, text lets causal attention condition the second text on the audio without any adapter, because the audio tokens are simply earlier in the same context. A dual-encoder or adapter architecture has to learn a mapping between two representation spaces; a shared sequence has no mapping to learn, only positions to attend to.
+    - **The token rate is the whole design constraint, and it is a multiplication.** A 12.5 Hz codec with 8 books is 100 tokens per second per stream. A 75 Hz codec with 8 books is 600. A duplex conversation has two streams — the user's and the agent's — so 200 tokens per second at the low rate. Text at 150 words per minute and 1.3 tokens per word is 3.25 tokens per second.
+    - **A context window is a duration budget, and the conversion is division.** At 600 tokens/s, 1M tokens is $1{,}000{,}000/600 = 1{,}666.7$ seconds, or 27.8 minutes. At 100 tokens/s it is 10,000 seconds, or 2.78 hours. At the duplex 200 tokens/s it is 83.3 minutes. For text at 3.25 tokens/s it is $1{,}000{,}000/3.25 = 307{,}692$ seconds, or 85.5 hours. The ratio between the speech and text answers is 185, and it is the same 185 as the token-rate ratio because the window is fixed.
+    - **The KV cache scales with the same number, and it is the real serving cost.** Per token, a 32-layer, width-4,096 model in fp16 stores $32 \times 2 \times 4{,}096 \times 2 = 524{,}288$ bytes across K and V. At 600 tokens/s that is 315 MB per second — 18.9 GB per minute of audio. The same minute of text is 102 MB. Context length is not a free capability; it is memory bandwidth per second of conversation.
+    - **Multi-codebook structure has to be modelled explicitly.** Flattening eight books into one 8,192-way softmax costs $600 \times 8{,}192 = 4.9$ million logits per second; per-book heads cost $600 \times 1{,}024 = 614{,}400$, an 8× saving, but then the model must decide how the books depend on each other. A delay pattern shifts book $i$ by $i-1$ frames so each step predicts one book; an RQ-Transformer uses a coarse transformer over frames and a fine one over books within a frame. Both are ways of avoiding a joint 8,192-way factorisation.
+    - **The shared softmax is dominated by whichever modality dominates the batch.** A model trained mostly on audio spends its output-head gradient on audio codes and loses text fluency; a model trained mostly on text underfits the audio codes. The usual mitigations are a modality-balanced sampler, separate loss weights, or a small adapter that maps audio tokens into the text embedding space so the text head is untouched — which is a partial retreat from the shared vocabulary the architecture was built on.
+    - **Long audio contexts degrade before they overflow.** Even inside the window, attention over tens of thousands of near-duplicate acoustic frames dilutes the signal from the few frames that matter, and the model's recall of an early instruction falls. The practical architecture is a sliding window with a compressed memory — a summary every N seconds, or semantic tokens at 12.5 Hz instead of acoustic tokens at 75 Hz — rather than a single growing context.
+    - **Speech-to-speech models are audio language models with two streams.** Moshi-style duplex models run a user stream and an agent stream, each at the codec's frame rate, and the model predicts the agent's next frame while consuming the user's. That doubles the token rate and halves the duration a window holds, and it is why duplex models are sold with a conversation length rather than a context length.
+  derivations:
+    - title: "Context as a duration budget"
+      latex: |
+        With window $C$ tokens and an audio token rate $f_r N_q$:
+
+        $$T_{\max} = \frac{C}{f_r N_q}\ \text{seconds}.$$
+
+        At $C = 1{,}000{,}000$, $f_r = 75$, $N_q = 8$:
+
+        $$T_{\max} = \frac{1{,}000{,}000}{600}
+          = 1{,}666.7\ \text{s} = 27.8\ \text{min}.$$
+
+        At $f_r = 12.5$, $N_q = 8$: $100$ tokens/s and
+        $T_{\max} = 10{,}000$ s $= 2.78$ h. Duplex doubles the rate, so
+        $T_{\max} = 5{,}000$ s $= 83.3$ min. For text at 3.25 tokens/s,
+        $T_{\max} = 307{,}692$ s $= 85.5$ h.
+      prose: >-
+        The ratio between the text and 600-token/s answers is exactly the ratio of
+        the token rates, 185, because the window is the same. Nothing about the
+        model's intelligence changes between those two numbers; only the units
+        change. That is why a context-length claim without a modality is not a
+        claim at all, and why an audio product should quote conversation minutes
+        rather than tokens.
+
+    - title: "KV cache per minute of audio"
+      latex: |
+        For $L$ layers, model width $d$, and $b$ bytes per element, the cache per
+        token is
+
+        $$k = L \times 2 \times d \times b\ \text{bytes},$$
+
+        where the 2 counts keys and values. With $L = 32$, $d = 4{,}096$,
+        $b = 2$:
+
+        $$k = 32 \times 2 \times 4{,}096 \times 2 = 524{,}288\ \text{B}.$$
+
+        At 600 tokens/s, per minute:
+
+        $$600 \times 60 \times k = 18{,}874{,}368{,}000\ \text{B}
+          \approx 18.9\ \text{GB}.$$
+      prose: >-
+        The same arithmetic at 100 tokens/s gives 3.15 GB per minute, and at text's
+        3.25 tokens/s it gives 102 MB per minute. The cache, not the weights, is
+        what limits concurrency for a long-context audio service: weights are shared
+        across requests, cache is not. A 32-layer 7B model is 14 GB of weights in
+        fp16 and can be replicated on one device; ten concurrent five-minute
+        conversations at 600 tokens/s is 944 GB of cache and cannot.
+
+  implementations:
+    - language: python
+      title: "Duration budget and cache cost, for any codec"
+      note: >-
+        Both functions are exact and both are used in the text: the 1M window holds
+        27.8 minutes at 600 tokens/s, 83.3 minutes duplex at 200, and 85.5 hours of
+        text at 3.25. The cache figure assumes fp16 and counts keys and values
+        separately — the common off-by-two in capacity planning is to forget that
+        factor, which halves the estimate and doubles the number of conversations
+        that fit before the server falls over.
+      code: |
+        def budget(window, frame_rate, books, streams=1):
+            rate = frame_rate * books * streams
+            seconds = window / rate
+            return rate, seconds, seconds / 60
+
+
+        def kv_per_minute(tokens_per_s, layers=32, width=4096, bytes_per=2):
+            per_token = layers * 2 * width * bytes_per
+            return tokens_per_s * 60 * per_token / 1e9      # GB
+
+
+        if __name__ == "__main__":
+            for fr, books, streams in [(75, 8, 1), (12.5, 8, 1), (12.5, 8, 2)]:
+                rate, s, m = budget(1_000_000, fr, books, streams)
+                print(f"{fr} Hz x {books} x {streams}: {rate:.0f} tok/s, "
+                      f"{m:.1f} min, {kv_per_minute(rate):.2f} GB/min")
+            # 75.0 x 8 x 1: 600 tok/s, 27.8 min, 18.87 GB/min
+            # 12.5 x 8 x 1: 100 tok/s, 166.7 min, 3.15 GB/min
+            # 12.5 x 8 x 2: 200 tok/s, 83.3 min, 6.29 GB/min
+            print(f"text: {1_000_000 / 3.25 / 3600:.1f} h, "
+                  f"{kv_per_minute(3.25):.3f} GB/min")   # 85.5 h, 0.102 GB/min
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A 1M-token window, a 12.5 Hz codec with eight books, and a duplex
+        conversation. How many minutes fit?
+      answerKind: short_text
+      hint: "Two streams, each 12.5 x 8 tokens per second."
+      solution: >-
+        $12.5 \times 8 = 100$ tokens/s per stream; duplex is 200/s. Then
+        $1{,}000{,}000/200 = 5{,}000$ seconds, or 83.3 minutes. A single-stream
+        model with the same codec would fit 166.7 minutes, and a 75 Hz codec would
+        fit 27.8 — the codec's frame rate is the product's conversation length.
+
+    - id: cp-2
+      question: >-
+        Why does sharing a vocabulary between audio and text damage text ability,
+        and what are the two standard mitigations?
+      answerKind: short_text
+      hint: "Count the tokens, not the rows."
+      solution: >-
+        Audio codes are 8,192 of the embedding rows but 99.5% of the tokens in an
+        audio-heavy sequence ($600/(600+3.25)$), so the shared output head spends
+        almost all of its gradient on audio codes and text fluency degrades. The
+        mitigations are modality-balanced sampling (or loss weights), which
+        equalises gradient mass, and an adapter that maps audio tokens into the text
+        embedding space, which protects the text head at the cost of clean
+        interleaving.
+
+    - id: cp-3
+      question: >-
+        A colleague proposes a 30-minute call summariser on a 600-token/s codec with
+        a 1M window. What is the first arithmetic you do, and what do you find?
+      answerKind: short_text
+      hint: "Convert minutes to tokens before counting prompt space."
+      solution: >-
+        $30 \times 60 \times 600 = 1{,}080{,}000$ tokens — 8% over the window
+        before any system prompt, retrieved document or agent reply. The options are
+        a lower-rate codec (100/s gives 180,000 tokens), a summarised memory, or
+        semantic tokens for the long term with acoustic tokens only for the recent
+        past.
+
+  try_it: >-
+    Take your own codec's frame rate and book count and compute three numbers: the
+    tokens per minute, the minutes a 128k window holds, and the KV cache in GB per
+    minute at 32 layers and width 4,096 in fp16. Then compute the same three for
+    text at 3.25 tokens per second and write down the ratio.
+
+  interview_questions:
+    - question: "Why would you put audio tokens and text tokens in the same vocabulary instead of using a separate audio encoder?"
+      level: senior
+      key_points:
+        - "A shared sequence makes cross-modal conditioning ordinary causal attention over earlier positions, with no adapter and no representation-mapping loss."
+        - "One next-token objective trains transcription, translation and generation together, so paired and unpaired data both contribute."
+        - "The cost is a mixture output distribution: audio is 8,192 rows but 99.5% of tokens in an audio-heavy batch, so text fluency degrades without balanced sampling."
+        - "Interleaving also gives a natural place for tool calls and captions — text tokens inside an audio conversation."
+      follow_up: "What would you do if text fluency degraded after adding audio, and what would that cost you architecturally?"
+    - question: "A 1M-token context is announced. What does that mean for an audio product, and what would you check before believing it?"
+      level: senior
+      key_points:
+        - "Convert to duration: 1M/600 is 27.8 minutes at 75 Hz eight books, 83.3 minutes duplex at 12.5 Hz, and 85.5 hours of text."
+        - "Check the KV cache: 524,288 bytes per token in fp16 at 32 layers and width 4,096, so 18.9 GB per minute at 600 tokens/s."
+        - "Check whether quality holds across the window: attention over redundant acoustic frames degrades before the limit, so effective context is shorter."
+        - "Check the codec: the same window is a different product at 100 tokens/s than at 600, and the frame rate is a design choice."
+      follow_up: "How would you serve ten concurrent five-minute conversations at 600 tokens/s, and what would you change first?"
+    - question: "Why does a duplex speech model halve the conversation length a window can hold?"
+      level: mid
+      key_points:
+        - "Two streams — the user's and the agent's — each at the codec's token rate, so 100 tokens/s becomes 200."
+        - "The window is fixed, so doubling the rate halves the duration: 166.7 minutes becomes 83.3 at 12.5 Hz and eight books."
+        - "The KV cache doubles with it, from 3.15 to 6.29 GB per minute, which is the serving constraint rather than the context limit."
+        - "The mitigation is a lower frame rate, semantic tokens for memory, or a sliding window with a summary."
+      follow_up: "What would you lose by dropping from eight codebooks to four in the duplex setting?"
+
+  common_mistakes:
+    - "Quoting a context window in tokens for an audio product instead of minutes — 1M tokens is 27.8 minutes at 600 tokens/s, not 85 hours."
+    - "Forgetting that the KV cache counts keys and values separately, halving the capacity estimate and doubling the concurrency you think you can serve."
+    - "Flattening eight codebooks into one 8,192-way softmax and then wondering why the output head dominates decode time."
+    - "Balancing a training mixture by number of examples rather than by tokens, so audio contributes 99% of the gradient in every batch."
+
+  further_reading:
+    - label: "Rubenstein et al., AudioPaLM: A Large Language Model That Can Speak and Listen (2023)"
+    - label: "Défossez, Mazaré, Orsini & Royer, Moshi: a Speech-Text Foundation Model for Real-Time Dialogue (2024)"
+    - label: "Borsos et al., AudioLM: a Language Modeling Approach to Audio Generation (2022)"
+    - label: "Wang et al., Neural Codec Language Models are Zero-Shot Text to Speech Synthesizers (VALL-E, 2023)"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        One sequence, two modalities, one head. The architecture is ordinary; what
+        is unusual is the arithmetic. Before anything else, convert every claim
+        about context into minutes of audio, and every claim about tokens into
+        bytes of cache.
+      blocks:
+        - kind: checklist
+          body: |
+            - tokens/s = frame rate x books x streams
+            - minutes in a window = tokens / (rate x 60)
+            - KV bytes per token = layers x 2 x width x bytes
+            - audio is 8,192 embedding rows and 99.5% of the tokens
+      checkpoint: >-
+        Which of those four quantities changes if you switch from 75 Hz to 12.5 Hz,
+        and which stays the same?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Choose the token rate first, because it sets the product: 600 tokens/s is a
+        28-minute window and 19 GB per minute of cache; 100 tokens/s is nearly three
+        hours and 3 GB. Then choose how the books are modelled — flatten, delay, or
+        RQ — and only then worry about the vocabulary balance.
+      blocks:
+        - kind: checklist
+          body: |
+            - 75 Hz x 8 books: 600/s, 27.8 min, 18.9 GB/min
+            - 12.5 Hz x 8 books: 100/s, 166.7 min, 3.15 GB/min
+            - duplex x 2 streams: 200/s, 83.3 min, 6.29 GB/min
+            - text at 3.25/s: 85.5 h, 0.10 GB/min
+      checkpoint: >-
+        If a product needs 45-minute calls with duplex audio, what token rate does
+        that force, and is any standard codec low enough?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Building the interleaved sequence, and the two costs you must compute
+        before committing to a context length.
+      blocks:
+        - kind: pseudocode
+          body: |
+            seq = system_text_tokens
+                + audio_tokens(user_audio)      # 100 or 600 per second
+                + text_tokens(transcript)
+                + audio_tokens(agent_audio)
+
+            rate = frame_rate * books * streams
+            minutes = window / (rate * 60)
+            cache_gb_per_min = rate * 60 * layers * 2 * width * 2 / 1e9
+
+            if minutes < product_call_length:
+                lower_frame_rate() or summarise_old_audio()
+      checkpoint: >-
+        Which line would you change to keep a 45-minute call inside the window
+        without changing the codec?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Duration and cache, both from the token rate.
+      blocks:
+        - kind: math
+          body: |
+            $$T_{\max} = \frac{C}{f_r N_q s}, \qquad
+              k = L \cdot 2 \cdot d \cdot b.$$
+
+            At $C = 10^6$, $f_r = 75$, $N_q = 8$, $s = 1$:
+            $600$ tokens/s, $T_{\max} = 1{,}666.7$ s $= 27.8$ min.
+
+            At $L = 32$, $d = 4{,}096$, $b = 2$: $k = 524{,}288$ B, so
+            $600 \times 60 \times k = 18.87$ GB per minute.
+      checkpoint: >-
+        Why does the text answer (85.5 hours) differ from the audio answer by
+        exactly the ratio of token rates?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The two functions, and the table they produce.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            def budget(C=1_000_000, fr=75, books=8, streams=1):
+                rate = fr * books * streams
+                return rate, C / rate / 60
+
+            def cache_gb_min(rate, L=32, d=4096, b=2):
+                return rate * 60 * L * 2 * d * b / 1e9
+
+            for args in [(75, 8, 1), (12.5, 8, 1), (12.5, 8, 2)]:
+                rate, minutes = budget(1_000_000, *args)
+                print(args, round(rate), round(minutes, 1), round(cache_gb_min(rate), 2))
+            # (75, 8, 1)   600  27.8  18.87
+            # (12.5, 8, 1) 100 166.7   3.15
+            # (12.5, 8, 2) 200  83.3   6.29
+      checkpoint: >-
+        What does the cache column become if the model is served in int8, and which
+        term of the formula changes?

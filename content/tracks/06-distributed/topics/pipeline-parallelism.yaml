@@ -1,0 +1,1330 @@
+id: pipeline-parallelism
+slug: pipeline-parallelism
+title: "Pipeline Parallelism and Bubbles"
+summary: >-
+  Split a model's layers across devices in sequence and you buy capacity with
+  idle time: at eight stages and thirty-two micro-batches the step loses 17.95%
+  to the pipeline bubble — 190.25 ms of 1060 ms — and runs 61,828 tokens/s
+  against an ideal 75,352. GPipe and 1F1B have the same bubble and completely
+  different memory: one slot per micro-batch against one slot per stage.
+kind: lesson
+difficulty: expert
+position: 4
+estMinutes: 25
+prerequisites: [fsdp-zero]
+phase: distributed-training
+tags:
+  [pipeline-parallelism, gpipe, 1f1b, interleaving, micro-batch, bubble, activation-memory, point-to-point, scheduling, distributed-training]
+
+body:
+  big_idea: >-
+    Pipeline parallelism converts capacity into latency, not bandwidth: split
+    the layers into p stages and every step pays a fixed (p-1) stage-times of
+    idle, so the micro-batch count decides whether the split was worth it.
+  problem:
+    - "A 32-layer model cut into eight stages runs at 82.05% of what fully-fed stages give, and the point-to-point sends are 0.169% of the step."
+    - "You add micro-batches to shrink the bubble and the job OOMs: GPipe holds a slot per in-flight micro-batch, 79.03 GB becoming 136.41 GB."
+    - "Eight GPUs give 6.56x, not 8x: a computable 190.25 ms per step that shrinks only when the pipeline is made wider, never longer."
+  analogy: >-
+    Eight workstations build one car at a time, each adding an eighth. Nothing
+    finishes until the last station sees it, so the first seven beats fill the
+    line and the last seven drain it: fourteen beats a shift produce nothing,
+    and hiring more workers does not shorten them, because station seven still
+    waits for station one.
+  concept_points:
+    - "**The bubble is a fixed number of stage-times, not a percentage.** With p stages a step begins with p - 1 stages waiting for a micro-batch and ends with p - 1 waiting for a gradient: exactly (p - 1) stage-times of idle, independent of m. At p = 8 that is 190.25 ms of a 1,060 ms step, 17.95%, and the sends themselves are 0.169%."
+    - "**$(p-1)/(m+p-1)$ is exact, not a bound.** Simulating p x m passes over unit-time stages: at p = 8 the measured utilisation is **0.533333 at m = 8, 0.820513 at m = 32, 0.948148 at m = 128**, each identical to $m/(m+p-1)$ to the last digit — for p = 2 and 4 as well, and whether the backward costs one tick or two."
+    - "**Measured throughput at m = 32 and 2,048 tokens per micro-batch: 18,267, 34,447 and 61,828 tokens/s** for p = 2, 4, 8 against ideals of 18,838, 37,676 and 75,352 — efficiencies 0.970, 0.914, 0.821, and speedups of **1.94x, 3.66x, 6.56x**. The degradation is not the network: (p - 1) grew from 1 to 7 while m stayed at 32."
+    - "**m below p is not a pipeline, it is a queue.** At p = 8, m = 4 leaves 63.64% of the machine idle and m = 1 leaves 87.50%. The two numbers worth memorising: 80% utilisation needs $m = 4(p-1)$, which is 28 at p = 8, and 90% needs $m = 9(p-1)$, which is 63."
+    - "**GPipe's activation bill is m slots per stage, and it is what actually chooses m.** A stage of 4 of 32 layers at 2,048 tokens keeps 956.301 MB per layer, **3.825205 GB per micro-batch**, so m = 32 is 122.41 GB of activations plus 14 GB of state — 136.41 GB on an 80 GB card. 1F1B holds p slots instead, **44.60 GB**, for a bit-identical schedule."
+    - "**Interleaving buys bubble with messages, not memory.** With v chunks per device the bubble is $(p-1)/(m \\cdot v + p - 1)$: at p = 8, m = 32 that is 17.95%, 9.86% and 5.19% at v = 1, 2, 4, while memory stays at 30.60 GB. Message count goes 448 to 896 to 1,792 and the latency bill 3.584 to 14.336 ms."
+  definitions:
+    - term: "Pipeline parallelism"
+      meaning: >-
+        Splitting a model's layers into p contiguous groups, one per device, so
+        that a micro-batch flows stage by stage through the whole model. It is
+        the only parallelism that reduces per-device parameter memory without
+        any collective communication: a stage talks only to its two neighbours,
+        by point-to-point send, and never to the whole world.
+    - term: "Micro-batch"
+      meaning: >-
+        One slice of the global batch, sized so that its activations fit on a
+        stage. The step is one pass of all m micro-batches through all p stages,
+        followed by a single optimizer update. m is the only free variable that
+        reduces the bubble without a schedule change, and it is bounded above by
+        activation memory.
+    - term: "Pipeline bubble"
+      meaning: >-
+        The device-ticks in a step during which a stage has nothing to run,
+        because the micro-batch it needs has not arrived or the gradient it needs
+        has not come back. Its size is (p - 1) stage-times per step and its
+        fraction is (p - 1)/(m + p - 1). It is idle time, not slow time: the
+        hardware is fine and there is no work to give it.
+    - term: "Stage"
+      meaning: >-
+        One device's contiguous slice of layers. A stage's work per micro-batch
+        is 6 x (parameters in the stage) x tokens flops for the forward and
+        backward together, so equal-depth stages are equal-time only if the
+        layers are homogeneous — an embedding or a loss head makes one stage the
+        straggler and the bubble becomes (p - 1) times the slowest stage.
+    - term: "GPipe schedule"
+      meaning: >-
+        All m forwards through all p stages, then all m backwards in reverse
+        order. The simplest schedule, the easiest to reason about, and the one
+        with the worst memory: no backward can start until every forward has
+        finished, so every stage holds m activation slots and the buffer grows
+        linearly with the micro-batch count you were told to increase.
+    - term: "1F1B schedule"
+      meaning: >-
+        Warm up p - 1 forwards, then alternate one backward with one forward so
+        that at most p micro-batches are ever in flight, then drain. Same
+        makespan as GPipe to the tick, because the dependency graph is identical;
+        the difference is entirely in how many activation slots a stage has to
+        keep, which is p rather than m.
+    - term: "Interleaved pipeline stage"
+      meaning: >-
+        Giving each device v non-contiguous chunks of layers instead of one
+        contiguous block, so a device can work on chunk 4 of micro-batch i while
+        chunk 0 of micro-batch i+1 is still in flight. The bubble falls to
+        (p - 1)/(m·v + p - 1) — a factor v — at the cost of v times as many
+        point-to-point messages and a scheduler that has to track chunk order.
+    - term: "Activation slot"
+      meaning: >-
+        The stored forward activations of one micro-batch on one stage, which the
+        backward pass needs and therefore cannot be freed. 3.825205 GB for four
+        7B-class layers at 2048 tokens without recomputation, 0.067109 GB with
+        only the layer inputs kept. It is the unit in which pipeline memory is
+        measured, and the difference between m slots and p slots is the whole
+        GPipe-versus-1F1B story.
+    - term: "Fill and drain"
+      meaning: >-
+        The two ends of a pipeline step. The fill is (p - 1) forwards during
+        which stages 1 to p - 1 have nothing to do; the drain is (p - 1)
+        backwards during which stages 0 to p - 2 have nothing to do. Together
+        they are (p - 1) full stage-times, and they are why a pipeline's cost is
+        proportional to depth rather than to bytes.
+    - term: "Point-to-point send"
+      meaning: >-
+        The only communication a pipeline stage performs: an activation tensor
+        forward to stage s + 1 and a gradient tensor back to stage s - 1. 16.777
+        MB each way at 2048 tokens and 4096 hidden, with no reduction and no
+        dependence on the world size — which is why pipeline parallelism scales
+        to slower interconnects than tensor parallelism does.
+    - term: "Bubble-free claim"
+      meaning: >-
+        The frequently repeated idea that a large enough micro-batch count makes
+        the bubble negligible. It is arithmetically true, 7/135 = 5.19% at
+        p = 8 and m = 128, and it is unusable in practice because m is capped by
+        activation memory: under GPipe the cap is 17 on an 80 GB card, which
+        pins the bubble at 30.43% no matter what the formula promises.
+
+  diagrams:
+    - type: architecture
+      title: "One micro-batch on a four-stage pipeline, and what crosses each boundary"
+      nodes:
+        - id: s0
+          x: 0
+          y: 0
+          label: "stage 0, layers 0-7"
+          kind: gpu
+          detail: "875 million parameters, so 14 GB of weights and optimizer state on the device. This stage has nothing to do for the first (p - 1) stage-times of every step, and nothing to do at the end either, because its backward finishes before the last stage's."
+        - id: s1
+          x: 1
+          y: 0
+          label: "stage 1, layers 8-15"
+          kind: gpu
+          detail: "Receives 16.777 MB of activations per micro-batch and returns 16.777 MB of gradient. The send is asynchronous and overlaps the next layer's compute, which is why the wire is never the problem."
+        - id: s2
+          x: 2
+          y: 0
+          label: "stage 2, layers 16-23"
+          kind: gpu
+          detail: "Holds eight activation slots at p = 8 under 1F1B and thirty-two under GPipe at m = 32. Same device, same arithmetic, 30.60 GB against 122.41 GB of buffer."
+        - id: s3
+          x: 3
+          y: 0
+          label: "stage 3, layers 24-31 and the loss"
+          kind: gpu
+          detail: "The only stage that computes the loss, which is why the loss must be normalised by the micro-batch count m here and not by the stage count p. Getting that backwards scales every gradient by m/p."
+      edges:
+        - { from: s0, to: s1, label: "16.78 MB activations" }
+        - { from: s1, to: s2, label: "16.78 MB" }
+        - { from: s2, to: s3, label: "16.78 MB" }
+        - { from: s1, to: s0, label: "dA back", style: async }
+        - { from: s2, to: s1, label: "dA back", style: async }
+        - { from: s3, to: s2, label: "dA back", style: async }
+      caption: "Four stages of eight layers each. Forward activations flow right at 16.777 MB per micro-batch, gradients flow left, and no stage ever needs a collective. The idle is structural: stage 3 cannot start micro-batch 0 until stage 0 has finished it."
+
+    - type: plot
+      title: "Measured utilisation against micro-batch count, three pipeline depths"
+      chart: line
+      xLabel: "micro-batches (m)"
+      yLabel: "fraction of device-ticks busy"
+      series:
+        - name: "p = 2"
+          points:
+            - { x: 1, y: 0.5 }
+            - { x: 2, y: 0.666667 }
+            - { x: 4, y: 0.8 }
+            - { x: 8, y: 0.888889 }
+            - { x: 16, y: 0.941176 }
+            - { x: 32, y: 0.969697 }
+            - { x: 64, y: 0.984615 }
+            - { x: 128, y: 0.992248 }
+        - name: "p = 4"
+          points:
+            - { x: 1, y: 0.25 }
+            - { x: 2, y: 0.4 }
+            - { x: 4, y: 0.571429 }
+            - { x: 8, y: 0.727273 }
+            - { x: 16, y: 0.842105 }
+            - { x: 32, y: 0.914286 }
+            - { x: 64, y: 0.955224 }
+            - { x: 128, y: 0.977099 }
+        - name: "p = 8"
+          points:
+            - { x: 1, y: 0.125 }
+            - { x: 2, y: 0.222222 }
+            - { x: 4, y: 0.363636 }
+            - { x: 8, y: 0.533333 }
+            - { x: 16, y: 0.695652 }
+            - { x: 32, y: 0.820513 }
+            - { x: 64, y: 0.901408 }
+            - { x: 128, y: 0.948148 }
+
+    - type: compare
+      title: "GPipe and 1F1B on the same 8 x 80 GB job, m = 32"
+      left_label: "GPipe, all forwards then all backwards"
+      left_points:
+        - "Makespan 117 ticks, utilisation 0.820513, 61,828 tokens/s"
+        - "Peak activation slots per stage: 32, which is m"
+        - "3.825205 GB per slot, so 122.41 GB of activations"
+        - "Plus 14 GB of state: 136.41 GB on an 80 GB card"
+        - "Feasible m on that card is 17, giving a 30.43% bubble and 53,375 tokens/s"
+        - "No backward can start until every forward is done, so nothing can ever be freed early"
+      right_label: "1F1B, one backward per forward after warmup"
+      right_points:
+        - "Makespan 117 ticks, utilisation 0.820513, 61,828 tokens/s"
+        - "Peak activation slots per stage: 8, which is p"
+        - "3.825205 GB per slot, so 30.60 GB of activations"
+        - "Plus 14 GB of state: 44.60 GB, 35 GB of headroom left"
+        - "m is now unlimited, so m = 128 gives a 5.19% bubble in the same 44.60 GB"
+        - "The schedule is different, the dependency graph is not"
+
+    - type: sequence
+      title: "One 1F1B step at four stages and eight micro-batches"
+      items:
+        - "Ticks 0, 1, 2: stage 0 runs the forwards of micro-batches 0, 1 and 2 while stages 1, 2 and 3 join one per tick. This is the fill, p - 1 = 3 ticks, and nothing can shorten it."
+        - "Tick 3: four micro-batches are in flight, one per stage, and every device is busy for the first time."
+        - "Steady state: stage 0 alternates a backward for micro-batch i with a forward for micro-batch i + 3, so each device holds exactly four activation slots. That cap is what 1F1B means."
+        - "The forwards run out and the pipeline drains in reverse: nothing new enters at stage 0, and each stage works through the backwards it already has."
+        - "Total 22 ticks for 8 micro-batches. Each device does 16 ticks of real work and idles for 6, so utilisation is 8/11 = 0.727273, which is exactly m/(m + p - 1)."
+        - "Run GPipe instead and the makespan is still 22 ticks. The peak slot count goes from 4 to 8, which is the only number that moved."
+
+    - type: pipeline
+      title: "Interleaved chunks: p = 4 devices, v = 2 chunks each"
+      nodes:
+        - label: "chunk 0, device 0"
+          note: "layers 0-3"
+          detail: "First quarter of the model. Device 0 owns this and chunk 4, so after finishing chunk 0 for micro-batch i it can start chunk 0 for micro-batch i+1 rather than waiting for the whole depth."
+        - label: "chunk 1, device 1"
+          note: "layers 4-7"
+        - label: "chunk 2, device 2"
+          note: "layers 8-11"
+        - label: "chunk 3, device 3"
+          note: "layers 12-15"
+        - label: "chunk 4, device 0"
+          note: "layers 16-19"
+          detail: "The second chunk on device 0. Because it is not contiguous with chunk 0, the fill is (p - 1) chunk-times rather than (p - 1) stage-times, and a chunk is half a stage. The bubble halves; the message count doubles."
+        - label: "chunk 5, device 1"
+          note: "layers 20-23"
+        - label: "chunk 6, device 2"
+          note: "layers 24-27"
+        - label: "chunk 7, device 3"
+          note: "layers 28-31"
+
+  markdown: |
+    ## The only parallelism that costs time instead of bytes
+
+    Data parallelism replicates the model and splits the batch. Tensor
+    parallelism splits a matrix and pays an all-reduce inside every layer. Both
+    of them move bytes. Pipeline parallelism splits the *layers* — stage s owns
+    layers $[sL/p, (s+1)L/p)$ — and moves almost nothing: one activation tensor
+    forward, one gradient tensor back, 16.777 MB each way per micro-batch. What
+    it costs instead is idle time.
+
+    That trade is the whole topic. A stage cannot start micro-batch $i$'s
+    forward until stage $s-1$ has finished it, and cannot start its backward
+    until stage $s+1$ has produced the gradient. So the step has a fill and a
+    drain, and neither can be scheduled away.
+
+    ## The bubble
+
+    Let $t_s$ be the time one stage spends on one micro-batch, forward and
+    backward together. A step of $m$ micro-batches over $p$ stages gives each
+    device $m\,t_s$ of work, plus $(p-1)$ forwards of fill and $(p-1)$ backwards
+    of drain — which is exactly $(p-1)\,t_s$ more:
+
+    $$T_{\text{step}} = m\,t_s + (p-1)\,t_s = (m + p - 1)\,t_s$$
+
+    $$U = \frac{p\,m\,t_s}{p\,(m+p-1)\,t_s} = \frac{m}{m+p-1},
+      \qquad B = 1 - U = \frac{p-1}{m+p-1}$$
+
+    Two things follow that the formula hides. First, **the bubble is
+    $(p-1)\,t_s$ in wall clock and does not depend on $m$ at all** — at
+    $p = 8$ and 27.179 ms per stage it is 190.25 ms per step whether you run 8
+    micro-batches or 128. Adding micro-batches lengthens the step around a fixed
+    cost; it does not shorten the cost. Second, $B \approx (p-1)/m$ for
+    $m \gg p$, so the depth enters linearly and the micro-batch count enters
+    inversely — which is why deep pipelines need wide steps.
+
+    Measured, by scheduling the actual dependency graph and counting occupied
+    device-ticks:
+
+    | p | m = 8 | m = 32 | m = 64 | m = 128 |
+    |---|---|---|---|---|
+    | 2 | 0.888889 | 0.969697 | 0.984615 | 0.992248 |
+    | 4 | 0.727273 | 0.914286 | 0.955224 | 0.977099 |
+    | 8 | 0.533333 | 0.820513 | 0.901408 | 0.948148 |
+
+    Every entry equals $m/(m+p-1)$ to six decimals. The model is not an
+    approximation of the schedule; it *is* the schedule.
+
+    ## GPipe: the buffer grows with the micro-batch count
+
+    GPipe runs all $m$ forwards through all $p$ stages, then all $m$ backwards in
+    reverse. It is the obvious schedule and it has the same bubble, because the
+    dependency graph is the same. What it also has is a memory problem: no
+    backward can start until every forward has finished, so every stage holds
+    all $m$ micro-batches' activations simultaneously.
+
+    $$M_{\text{GPipe}} = W + m\,a$$
+
+    where $W$ is weights plus optimizer state on the stage and $a$ is one
+    activation slot. For four 7B-class layers at 2048 tokens and 4096 hidden,
+    without recomputation,
+
+    $$a = 32\left(34\,s\,b\,h + 5\,n_{h}\,s^2 b\right)
+       = 32 \times 956.301\ \text{MB} = 3.825205\ \text{GB}$$
+
+    with $n_h$ the number of attention heads. At $p = 8$, $W = 14$ GB and
+    $m = 32$ that is $14 + 32 \times 3.825205 =
+    136.40656$ GB. The card has 80. The largest $m$ that fits is 17, and at
+    $m = 17$ the bubble is $7/23 = 30.43\%$. **The formula told you to raise
+    $m$; the memory told you that you could not.** That contradiction is what
+    1F1B was invented to resolve.
+
+    ## 1F1B: the same bubble, a bounded buffer
+
+    1F1B warms up $p-1$ forwards, then alternates one backward with one forward,
+    then drains. At most $p$ micro-batches are ever in flight, so
+
+    $$M_{\text{1F1B}} = W + p\,a = 14 + 8 \times 3.825205 = 44.60164\ \text{GB}$$
+
+    and $m$ disappears from the memory model entirely. Measured, the makespan is
+    the same 117 ticks and the utilisation the same 0.820513 — 1F1B is not a
+    better schedule, it is the same schedule with a smaller buffer. What it buys
+    is that $m$ is now free: $m = 128$ costs the same 44.60 GB and gives a 5.19%
+    bubble and 71,445 tokens/s.
+
+    | | GPipe | 1F1B |
+    |---|---|---|
+    | makespan, $p=8$, $m=32$ | 117 ticks | 117 ticks |
+    | utilisation | 0.820513 | 0.820513 |
+    | peak slots per stage | 32 ($= m$) | 8 ($= p$) |
+    | memory at $m=32$ | 136.41 GB | 44.60 GB |
+    | largest $m$ on 80 GB | 17 | unbounded |
+    | bubble at the largest $m$ | 30.43% | 5.19% at $m=128$ |
+
+    ## Interleaving: shrink the fill, not the step
+
+    The fill is $(p-1)$ stage-times because a stage is the unit of granularity.
+    Make the unit smaller: give each device $v$ non-contiguous chunks of $1/v$ a
+    stage each, and the fill becomes $(p-1)$ *chunk*-times, which is
+    $(p-1)/v$ stage-times.
+
+    $$T_{\text{step}} = m\,t_s + \frac{(p-1)\,t_s}{v},
+      \qquad B_v = \frac{p-1}{m\,v + p - 1}$$
+
+    At $p = 8$, $m = 32$: 17.95% at $v = 1$, 9.86% at $v = 2$, 5.19% at $v = 4$.
+    Memory does not move — each micro-batch holds $v$ chunks of $1/v$ the size,
+    so the slot count per stage is still $p \times a$ — and the price is paid in
+    messages: $2v(p-1)$ per micro-batch instead of $2(p-1)$, so 448 becomes 896
+    becomes 1792 per step, and 3.584 ms of launch latency becomes 7.168 and
+    14.336. That is a bargain at $p = 8$ and a trap on a 400 Gb/s fabric with
+    small chunks.
+
+    ## What the wire costs
+
+    Almost nothing, which is the point. A middle stage moves 16.777 MB per
+    micro-batch each way; at $m = 32$ that is 0.537 GB per step each way, and at
+    300 GB/s it takes 1.79 ms of a 1060 ms step — **0.169%**. The data-parallel
+    all-reduce on the same job moves 23.45 GB per rank. Pipeline parallelism is
+    therefore the parallelism you reach for when the interconnect is the
+    constraint and the batch is large enough to fill a deep pipeline, and tensor
+    parallelism is the one you reach for when it is not.
+
+    ## Choosing p and m
+
+    Work backwards from the memory, not forwards from the formula. Fix $p$ by
+    how many layers you must put on each device to fit $W$; compute
+    $m_{\max} = \lfloor (M - W)/a \rfloor$ for GPipe or note that it is unbounded
+    for 1F1B; then read the bubble off $(p-1)/(m+p-1)$ at the $m$ you can
+    actually afford. If that bubble is unacceptable, the levers in order of cost
+    are: switch to 1F1B (free), raise $m$ (memory), interleave (latency), and
+    finally reduce $p$ — because a pipeline that is 30% idle is worse than two
+    pipelines that are 12% idle, and much worse than the same model on fewer,
+    fatter stages.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Pipeline parallelism is the only parallelism that converts capacity into latency rather than into bandwidth: split the layers into p stages and every step pays a fixed (p - 1) stage-times of idle, which is why the micro-batch count rather than the link speed is the number that decides whether the split was worth it.
+
+    ### The analogy, in full
+
+    Eight workstations in a row, each building one eighth of a car, with one car at a time moving down the line. Nothing is finished until the last station has seen it, so for the first seven beats of every shift the line is filling and for the last seven it is draining. Fourteen beats per shift produce nothing, and hiring more workers does not shorten them, because the seventh station still cannot start until the first has finished. The mapping is exact. A station is a GPU holding four of the thirty-two layers; a car is a micro-batch of 2048 tokens; the parking space between station four and five is the activation tensor, 16.78 MB of it per car; and the fourteen dead beats are the bubble. Three places the analogy breaks, and each one is load-bearing. A real line keeps its half-built cars on the factory floor and the floor is free — here the parking space is HBM, and under GPipe every car of the shift is kept until the shift ends: 32 cars at 3.83 GB each. A real line ramps once per shift, but a training step is one shift and happens fifty thousand times, so the ramp is not a one-off. And a real line's stations are all the same speed, while these are not: a backward pass is twice a forward, so the drain is twice the fill and the bubble is (p - 1) full stage-times rather than 2(p - 1) half ones.
+
+    ### Failure modes, in full
+
+    - Your 32-layer model has to be cut into eight stages because nothing else fits, and the step runs at 82.05% of what eight fully-fed stages would give. The instinct is to blame the point-to-point sends; they are 0.169% of the step. The other 17.78 points are a schedule with nothing to run on the last stage until the first stage has finished.
+    - You add micro-batches to shrink the bubble, exactly as the formula says, and the job OOMs. The formula was right and the memory model was missing: under GPipe every stage holds one activation slot per in-flight micro-batch, so going from m = 17 to m = 32 on an 80 GB card takes you from 79.03 GB to 136.41 GB.
+    - Finance asks why eight GPUs give 6.56x and not 8x. The answer is not "overhead" — it is a computable 190.25 ms per step that does not shrink when you make the step longer, only when you make it wider.
+    - A colleague swaps GPipe for 1F1B, gets a throughput number identical to four decimal places, and watches per-device memory fall from 136.41 GB to 44.60 GB. Nothing improved in the maths, because 1F1B is not a better schedule — it is the same schedule with a smaller buffer.
+    - You interleave to halve the bubble, the step gets slower, and the reason is 896 eight-megabyte messages where there used to be 448 sixteen-megabyte ones. The bytes did not change; the launches doubled.
+    - Someone "fixes" the loss normalisation in the pipeline stage to divide by the pipeline depth instead of the micro-batch count. Training converges — to a different model, 2.54 relative units away from the one you meant to train, with a lower training loss, which is why nobody noticed.
+
+    ### The mechanisms, in full
+
+    - **The bubble is a fixed number of stage-times, not a percentage.** With p stages, every step begins with p - 1 stages waiting for a micro-batch to arrive and ends with p - 1 stages waiting for a gradient to come back. That is exactly (p - 1) stage-times of idle per step, independent of m. At p = 8 and a 27.179 ms stage that is 190.25 ms of a 1060 ms step — 17.95%. Adding micro-batches does not shorten those 190 ms; it lengthens the step around them, which is a completely different lever and the reason the formula has m in the denominator only.
+    - **(p - 1)/(m + p - 1) is exact, not a bound, and a week of simulation says so.** Schedule p x m forward and backward passes over unit-time stages and count occupied device-ticks: at p = 8 the measured utilisation is 0.533333 at m = 8, 0.820513 at m = 32 and 0.948148 at m = 128, each identical to m/(m + p - 1) to the last printed digit. It holds for p = 2 and p = 4 as well, and it holds whether the backward costs one tick or two, because the fill is (p - 1) forwards and the drain is (p - 1) backwards and the ratio cancels either way. A pipeline that measures worse than this formula is not paying a bubble, it is paying a scheduling bug.
+    - **Measured throughput, p = 2, 4, 8 at m = 32 and 2048 tokens per micro-batch: 18,267, 34,447 and 61,828 tokens/s.** The ideals at 40% MFU on 989 TFLOP/s parts are 18,838, 37,676 and 75,352, so the efficiencies are 0.970, 0.914 and 0.821 — speedups of 1.94x, 3.66x and 6.56x on 8 GPUs. The degradation with p is not the network: it is that (p - 1) grew from 1 to 7 while m stayed at 32.
+    - **m below p is not a pipeline, it is a queue.** Utilisation is m/(m + p - 1), so at p = 8 an m of 4 leaves 63.64% of the machine idle and an m of 1 leaves 87.50% — you would have been faster on one device. The two numbers worth memorising: 80% utilisation needs m = 4(p - 1), which is 28 at p = 8, and 90% needs m = 9(p - 1), which is 63. Below that, every micro-batch you add is worth more than the last.
+    - **GPipe's activation bill is m slots per stage, and it is what actually chooses m.** A stage holding 4 of 32 transformer layers at 2048 tokens and 4096 hidden keeps 34·s·b·h + 5·a·s^2·b = 956.301 MB per layer, so 3.825205 GB per micro-batch. Measured peak slots are 8, 32 and 128 for m = 8, 32 and 128 — exactly m, with no cap. At m = 32 that is 122.40656 GB of activations plus 14 GB of weights and optimizer state: 136.40656 GB on an 80 GB card, which is why the job dies.
+    - **1F1B holds p slots and produces a bit-identical schedule.** Run the same op graph with at most p micro-batches in flight and the makespan is the same 45, 117 and 405 ticks, the utilisation is the same 0.533333, 0.820513 and 0.948148, and the peak slot count is 8 at p = 8 for m = 32, m = 64 and m = 128. Memory becomes 14 + 8 x 3.825205 = 44.60164 GB and stops depending on m at all. That constant, not the bubble, is what 1F1B actually bought.
+    - **The crossover is lopsided: 1F1B at m = 32 beats GPipe's best feasible m = 17 by 15.8% at 56% of the memory.** GPipe on 80 GB can afford floor((80 - 14)/3.825205) = 17 micro-batches, giving 79.03 GB and a 30.43% bubble — 53,375 tokens/s. 1F1B runs m = 32 in 44.60 GB for 61,828 tokens/s, and m = 128 in the same 44.60 GB for 71,445. There is no configuration in which GPipe is the right answer once 1F1B exists.
+    - **Interleaving buys bubble with messages, not with memory.** Give each device v non-contiguous chunks instead of one and the fill becomes (p - 1) chunk-times, so the bubble is (p - 1)/(m·v + p - 1): at p = 8, m = 32 that is 17.95% at v = 1, 9.86% at v = 2 and 5.19% at v = 4. Memory does not move, because each micro-batch holds v chunks of 1/v the size: still p x 3.825205 = 30.60 GB. What moves is the message count, 448 to 896 to 1792 per step, and with it the latency bill, 3.584 to 7.168 to 14.336 ms.
+    - **The pipeline's own traffic is 0.169% of the step, so bandwidth is never the reason a pipeline is slow.** A middle stage at p = 8 and m = 32 sends 2048 x 4096 x 2 = 16.777 MB of activations and receives the same again per micro-batch: 0.537 GB per step each way, 1.79 ms at 300 GB/s, in a 1060 ms step. The data-parallel all-reduce on the same job moves 23.45 GB per rank, so pipeline communication is 2.3% of what data parallelism already spends — and it is on the critical path, which the all-reduce is not.
+    - **Recompute changes the constant, not the shape.** Keeping only each layer's input is 2·s·b·h = 16.777 MB, so 0.067109 GB per stage per micro-batch — 57x less than 3.825205 GB. GPipe then puts 32 of those on the device, 2.147 GB, and 1F1B puts 8, 0.537 GB. The ratio is still m against p; the recompute bought you the ability to survive either one, not the right to ignore the difference.
+  derivations:
+    - title: "The bubble fraction, from the schedule rather than from a picture"
+      latex: |
+        One stage, one micro-batch, forward and backward together, costs $t_s$.
+        A step has $m$ micro-batches to push through $p$ stages.
+
+        The useful work is $m\,t_s$ per device: every micro-batch visits every
+        stage exactly once.
+
+        The idle is two ramps. At the start, stages $1 \ldots p-1$ wait for
+        micro-batch 0 to arrive, which takes $(p-1)$ forwards. At the end,
+        stages $0 \ldots p-2$ wait for the gradient of micro-batch $m-1$ to come
+        back, which takes $(p-1)$ backwards. Forwards and backwards together are
+        exactly $t_s$, so the idle is
+
+        $$(p-1)\,t_f + (p-1)\,t_b = (p-1)\,t_s .$$
+
+        Hence
+
+        $$T_{\text{step}} = m\,t_s + (p-1)\,t_s = (m+p-1)\,t_s,$$
+
+        $$U = \frac{m\,t_s}{(m+p-1)\,t_s} = \frac{m}{m+p-1},
+          \qquad B = \frac{p-1}{m+p-1}.$$
+
+        The ratio $t_b/t_f$ cancels, which is why the formula holds whether a
+        backward costs the same as a forward or twice as much — and it does cost
+        twice as much, four flops per parameter per token against two. What does
+        not cancel is $(p-1)$: it is a count of stages, not of bytes.
+
+        At $p = 8$, $m = 32$: $U = 32/39 = 0.820513$, so 17.95% of an
+        $8 \times 39$ device-tick budget is idle, and at $t_s = 27.179$ ms that
+        is 190.25 ms of a 1060 ms step.
+      prose: >-
+        The cancellation is the useful part. People expect a pipeline with a 2:1
+        backward-to-forward ratio to have a different bubble, and it does not:
+        the fill is (p - 1) forwards and the drain is (p - 1) backwards, so
+        whatever the ratio, the two ramps together are exactly (p - 1) stage
+        times. That is also why the simulator that models the backward as one
+        tick and the one that models it as two produce identical utilisation
+        numbers.
+
+    - title: "Interleaving, and what it costs"
+      latex: |
+        Split each device's layers into $v$ non-contiguous chunks of $1/v$ a
+        stage each. A chunk costs
+
+        $$t_c = \frac{t_s}{v}.$$
+
+        The dependency chain is unchanged in structure — a micro-batch still
+        visits $p$ devices — but the granularity of the fill is now a chunk
+        rather than a stage:
+
+        $$T_{\text{step}} = m\,t_s + (p-1)\,t_c
+          = m\,t_s + \frac{(p-1)\,t_s}{v},$$
+
+        $$U_v = \frac{m}{m + (p-1)/v} = \frac{m\,v}{m\,v + p - 1},
+          \qquad B_v = \frac{p-1}{m\,v + p - 1}.$$
+
+        At $p = 8$, $m = 32$: $B_1 = 7/39 = 17.95\%$, $B_2 = 7/71 = 9.86\%$,
+        $B_4 = 7/135 = 5.19\%$. Note that $B_2$ at $m = 32$ is exactly $B_1$ at
+        $m = 64$ — interleaving buys the bubble of a doubled micro-batch count
+        without the doubled buffer.
+
+        The bill is in messages. Each micro-batch now crosses each boundary $v$
+        times in each direction:
+
+        $$N_{\text{msg}} = 2\,v\,(p-1)\,m,$$
+
+        which at $p = 8$, $m = 32$ is 448, 896 and 1792 for $v = 1, 2, 4$, and at
+        8 microseconds of launch latency per message is 3.584, 7.168 and 14.336
+        ms. Interleaving converts idle time into latency, at an exchange rate set
+        by how small a chunk you can send efficiently.
+      prose: >-
+        The identity B_v(m) = B_1(m*v) is the cleanest way to hold the trade in
+        your head: interleaving is a way of pretending you have more
+        micro-batches than your memory allows. It is worth it exactly when the
+        bubble you are removing costs more than the extra messages cost to send,
+        and the crossover moves against you as the chunk size falls, because
+        latency is per message and does not care how big the message is.
+
+    - title: "The memory ceiling, and the bubble it forces"
+      latex: |
+        Weights plus optimizer state on a stage, $W$, and one activation slot,
+        $a$, both scale as $1/p$, so a deeper pipeline makes each term smaller.
+        What does not scale is the number of slots.
+
+        Under GPipe a stage holds every micro-batch's activations from the start
+        of the forward phase until the end of the backward phase:
+
+        $$M_{\text{GPipe}} = W + m\,a \le M_{\text{card}}
+          \quad\Longrightarrow\quad
+          m \le \left\lfloor \frac{M_{\text{card}} - W}{a} \right\rfloor .$$
+
+        Substituting the largest feasible $m$ into the bubble:
+
+        $$B_{\min} = \frac{p-1}{\left\lfloor (M_{\text{card}} - W)/a \right\rfloor + p - 1}.$$
+
+        For $p = 8$, $W = 14$ GB, $a = 3.825205$ GB, $M_{\text{card}} = 80$ GB:
+
+        $$m_{\max} = \left\lfloor \frac{66}{3.825205} \right\rfloor = 17,
+          \qquad B_{\min} = \frac{7}{23} = 30.43\%.$$
+
+        1F1B holds only the $p$ micro-batches that are in flight:
+
+        $$M_{\text{1F1B}} = W + p\,a = 14 + 8 \times 3.825205 = 44.60164\ \text{GB},$$
+
+        which contains no $m$ at all, so the constraint vanishes and $m$ is set
+        by the batch size you wanted rather than the memory you had. At
+        $m = 128$, $B = 7/135 = 5.19\%$ in the same 44.60 GB.
+      prose: >-
+        This is why the topic is not "how do I reduce the bubble" but "which
+        schedule lets me choose m". GPipe makes the micro-batch count a memory
+        decision and therefore pins the bubble at whatever 30% the card allows;
+        1F1B makes it a throughput decision. Note also that raising p helps
+        twice — W and a both fall as 1/p — and hurts once, because (p - 1) grows,
+        which is the tension the next topic in this track resolves with tensor
+        parallelism.
+
+  implementations:
+    - language: python
+      title: "A scheduler that measures the bubble instead of assuming it, and the buffer that goes with it"
+      note: >-
+        Correct, and the reconciliation is the point: `util_meas` and
+        `util_form` agree to every printed digit at every (p, m) pair, including
+        the ones where the answer is embarrassing — 0.125 at p = 8, m = 1. The
+        simulator schedules the real dependency graph (a forward for micro-batch
+        i on stage s needs the forward of i on s-1; a backward needs the forward
+        of the same micro-batch and the backward of s+1) and counts occupied
+        device-ticks, so the utilisation is measured rather than computed. The
+        two modes are the two schedules: `gpipe` releases no backward until every
+        forward is done, `1f1b` caps the in-flight micro-batch count at p. The
+        makespan is identical between them — 45, 117 and 405 ticks — and only
+        `peak_slots` moves, 8/32/128 against 8/8/8. That is the entire result of
+        the topic, visible in one column. The caveat: a tick is a forward of one
+        micro-batch through one stage, so this measures the schedule and never
+        the hardware. It cannot tell you that your stages are unbalanced, that
+        your p2p sends are latency-bound, or that your backward is 2.3x rather
+        than 2x the forward.
+      code: |
+        import numpy as np
+
+
+        def run(p, m, mode="1f1b"):
+            """Return (makespan_ticks, busy_ticks, peak_activation_slots)."""
+            D = {"F": 1, "B": 2}
+            dev = [(ph, i, s) for i in range(m) for s in range(p) for ph in "FB"]
+            pred = {}
+            for i in range(m):
+                for s in range(p):
+                    pred[("F", i, s)] = [] if s == 0 else [("F", i, s - 1)]
+                    pred[("B", i, s)] = [("F", i, s)] + ([] if s == p - 1
+                                                        else [("B", i, s + 1)])
+            free, done, launch = [0] * p, set(), {}
+            slots, peak, live = [set() for _ in range(p)], 0, set()
+            cap = m if mode == "gpipe" else p
+            busy, t, total = 0, 0, 2 * m * p
+            while len(done) < total:
+                for op, fin in list(launch.items()):
+                    if fin <= t:
+                        done.add(op)
+                        del launch[op]
+                avail = [o for o in dev if o not in done and o not in launch]
+                if mode == "gpipe":
+                    fwd = any(o[0] == "F" for o in avail)
+                    cand = [o for o in avail if (o[0] == "F") == fwd]
+                    cand.sort(key=lambda o: (o[1], o[2]) if fwd else (-o[1], -o[2]))
+                else:
+                    cand = sorted(avail, key=lambda o: (o[1], 0, o[2]) if o[0] == "F"
+                                  else (max(0, o[1] - p + 1), 1, -o[2]))
+                used = set()
+                for op in cand:
+                    d = op[2]
+                    if d in used or free[d] > t:
+                        continue
+                    if not all(q in done for q in pred[op]):
+                        continue
+                    if op[0] == "F" and op[2] == 0 and len(live) >= cap:
+                        continue
+                    used.add(d)
+                    if op[0] == "B":
+                        slots[d].discard(op[1])
+                        if op[2] == 0:
+                            live.discard(op[1])
+                    launch[op] = t + D[op[0]]
+                    free[d] = t + D[op[0]]
+                    busy += D[op[0]]
+                    if op[0] == "F":
+                        slots[d].add(op[1])
+                        peak = max(peak, len(slots[d]))
+                        if op[2] == 0:
+                            live.add(op[1])
+                t += 1
+            return t - 1, busy, peak
+
+
+        if __name__ == "__main__":
+            print(" p    m   mode    makespan  util_meas  util_form  peak_slots")
+            for p in (2, 4, 8):
+                for m in (8, 32, 128):
+                    for mode in ("gpipe", "1f1b"):
+                        mk, busy, pk = run(p, m, mode)
+                        print("%2d %4d   %-5s   %6d   %.6f   %.6f    %3d"
+                              % (p, m, mode, mk, busy / (p * mk),
+                                 m / (m + p - 1), pk))
+
+        #  p    m   mode    makespan  util_meas  util_form  peak_slots
+        #  2    8   gpipe       27   0.888889   0.888889      8
+        #  2    8   1f1b        27   0.888889   0.888889      2
+        #  2   32   gpipe       99   0.969697   0.969697     32
+        #  2   32   1f1b        99   0.969697   0.969697      2
+        #  2  128   gpipe      387   0.992248   0.992248    128
+        #  2  128   1f1b       387   0.992248   0.992248      2
+        #  4    8   gpipe       33   0.727273   0.727273      8
+        #  4    8   1f1b        33   0.727273   0.727273      4
+        #  4   32   gpipe      105   0.914286   0.914286     32
+        #  4   32   1f1b      105   0.914286   0.914286      4
+        #  4  128   gpipe      393   0.977099   0.977099    128
+        #  4  128   1f1b       393   0.977099   0.977099      4
+        #  8    8   gpipe       45   0.533333   0.533333      8
+        #  8    8   1f1b        45   0.533333   0.533333      8
+        #  8   32   gpipe      117   0.820513   0.820513     32
+        #  8   32   1f1b       117   0.820513   0.820513      8
+        #  8  128   gpipe      405   0.948148   0.948148    128
+        #  8  128   1f1b       405   0.948148   0.948148      8
+
+    - language: python
+      title: "Two pipeline fixes that train fine — numerically WRONG"
+      note: >-
+        Both of these ship, because both make the training loss go **down**. The
+        first is a loss-normalisation bug: the pipeline stage divides each
+        micro-batch's gradient by the stage count p instead of the micro-batch
+        count m, so the accumulated gradient is m/p = 32/8 = **4.0x** too large.
+        With SGD that is a 4x learning rate; after 20 steps at lr = 0.5 the
+        parameters are **8.940276e-01 max absolute, 2.535710e+00 relative** away
+        from the correct run, and the training loss is **0.524031 against
+        0.639221** — lower, so the curve looks better and the bug survives
+        review. It would be almost invisible under Adam, which normalises the
+        gradient magnitude, and fatal the moment anyone changes m or p, because
+        the effective learning rate silently tracks m/p. The second is worse: an
+        optimizer step per micro-batch instead of one per step. That is 160
+        updates where 20 were intended, parameters **4.711115e+00 max absolute,
+        1.370442e+01 relative** away, loss **0.257127** — the best-looking curve
+        in the room and a completely different model. Neither raises, neither
+        changes a shape, and both are caught only by comparing against a
+        single-device reference on the same batch.
+      code: |
+        import numpy as np
+
+        rng = np.random.default_rng(11)
+        d, n, m, p = 32, 256, 32, 8
+        X = rng.standard_normal((n, d)) / np.sqrt(d)
+        y = (X @ (rng.standard_normal(d) / np.sqrt(d)) > 0).astype(float)
+        lr, steps, bs = 0.5, 20, n // m
+
+
+        def grad(w, xa, ya):
+            q = 1.0 / (1.0 + np.exp(-(xa @ w)))
+            return xa.T @ (q - ya) / len(ya)
+
+
+        def step(w, mode):
+            if mode == "div_p":                 # BUG 1: divide by the stage count
+                g = sum(grad(w, X[i * bs:(i + 1) * bs], y[i * bs:(i + 1) * bs])
+                        for i in range(m)) / p
+                return w - lr * g
+            if mode == "per_mb":                # BUG 2: a step per micro-batch
+                for i in range(m):
+                    w = w - lr * grad(w, X[i * bs:(i + 1) * bs],
+                                      y[i * bs:(i + 1) * bs])
+                return w
+            g = sum(grad(w, X[i * bs:(i + 1) * bs], y[i * bs:(i + 1) * bs])
+                    for i in range(m)) / m
+            return w - lr * g
+
+
+        def loss(w):
+            q = 1.0 / (1.0 + np.exp(-(X @ w)))
+            return -np.mean(y * np.log(q + 1e-12) + (1 - y) * np.log(1 - q + 1e-12))
+
+
+        w0 = np.zeros(d)
+        ref = w0.copy()
+        for _ in range(steps):
+            ref = step(ref, "correct")
+        print("correct        loss %.6f" % loss(ref))
+        for mode in ("div_p", "per_mb"):
+            w = w0.copy()
+            for _ in range(steps):
+                w = step(w, mode)
+            print("%-6s max|dw| %.6e  rel %.6e  loss %.6f"
+                  % (mode, np.max(np.abs(w - ref)),
+                     np.linalg.norm(w - ref) / np.linalg.norm(ref), loss(w)))
+        print("gradient scale of div_p: m/p = %d/%d = %.1f" % (m, p, m / p))
+
+        # correct        loss 0.639221
+        # div_p  max|dw| 8.940276e-01  rel 2.535710e+00  loss 0.524031
+        # per_mb max|dw| 4.711115e+00  rel 1.370442e+01  loss 0.257127
+        # gradient scale of div_p: m/p = 32/8 = 4.0
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A colleague argues that the pipeline bubble must shrink to zero as you
+        add micro-batches, because "at some point the stages are never starved".
+        At p = 8, how many micro-batches does it take for the bubble to fall
+        below 1%, and why is that number not achievable on an 80 GB card under
+        GPipe?
+      answerKind: short_text
+      hint: >-
+        Solve (p - 1)/(m + p - 1) < 0.01 for m, then ask what GPipe has to store
+        for each of those micro-batches.
+      solution: >-
+        $7/(m+7) < 0.01$ needs $m > 693$, so 694 micro-batches. The stage holds
+        one activation slot per micro-batch under GPipe, at 3.825205 GB each, so
+        694 slots is 2655 GB of activations on a card with 80. The largest
+        feasible $m$ is 17, giving a 30.43% bubble. The argument is correct
+        arithmetic and an impossible schedule, which is why the topic never
+        treats the bubble as something you can delete by raising $m$ — you can
+        only trade it against memory, and the trade is bad enough that 1F1B's
+        constant $p$-slot buffer is the only configuration that lets $m$ be a
+        throughput decision.
+    - id: cp-2
+      question: >-
+        GPipe and 1F1B give the same makespan and the same utilisation, yet
+        1F1B is universally preferred. State precisely what changed, and what it
+        would take for GPipe to be the right choice again.
+      answerKind: short_text
+      hint: >-
+        The dependency graph is identical, so the critical path is identical.
+        Only one number in the model differs — which one?
+      solution: >-
+        Only the peak activation slot count: $m$ for GPipe against $p$ for
+        1F1B. Measured at $p = 8$, the makespan is 117 ticks and the utilisation
+        0.820513 in both cases, while peak slots are 32 against 8 and memory
+        136.41 GB against 44.60 GB. Nothing about the arithmetic, the
+        communication or the critical path changed — 1F1B simply releases each
+        micro-batch's activations as soon as its backward has consumed them,
+        which GPipe cannot do because it has not started any backward yet. GPipe
+        would be right again only if activation memory were free and the extra
+        buffer bought something else, and it does not: the only thing a larger
+        buffer buys here is scheduling simplicity, which is a real but small
+        benefit compared with being able to choose $m = 128$ instead of $m = 17$.
+    - id: cp-3
+      question: >-
+        You have 8 x 80 GB cards, a 32-layer model at 2048 tokens, 3.825205 GB
+        of activations per micro-batch per stage and 14 GB of weights plus
+        optimizer state per stage. Work out the best bubble you can reach under
+        GPipe, then under 1F1B, and say what the throughput difference is.
+      answerKind: short_text
+      hint: >-
+        GPipe: m is capped by (M - W)/a. 1F1B: m is not capped at all, so pick
+        the m that reaches the utilisation you want.
+      solution: >-
+        GPipe: $m_{\max} = \lfloor(80-14)/3.825205\rfloor = 17$, so maximum
+        memory 79.03 GB, bubble $7/23 = 30.43\%$, utilisation 0.708333 and
+        53,375 tokens/s. 1F1B: memory is $14 + 8 \times 3.825205 = 44.60$ GB
+        whatever $m$ is, so $m = 32$ costs nothing extra and gives 0.820513 and
+        61,828 tokens/s; $m = 128$ still costs 44.60 GB and gives 0.948148 and
+        71,445 tokens/s. The 1F1B run at $m = 32$ is 15.8% faster in 56% of the
+        memory, and at $m = 128$ it is 33.9% faster in the same memory. This is
+        the single most lopsided comparison in the track.
+    - id: cp-4
+      question: >-
+        Interleaving with v = 2 halves the bubble at p = 8, m = 32, from 17.95%
+        to 9.86%. Give two configurations in which you would not take it, and
+        the number that decides.
+      answerKind: short_text
+      hint: >-
+        The bubble goes from 190.25 ms to 95.13 ms of the step. What did you add
+        to get that, and what does it cost per unit?
+      solution: >-
+        The bubble falls from 190.25 ms to 95.13 ms — a saving of 95.1 ms — and
+        you paid 448 more point-to-point messages per step, each about 8.39 MB
+        instead of 16.78 MB, for 3.584 ms of extra launch latency. That is a 26x
+        margin, so the two places it stops being cheap are: (a) small chunks on a
+        high-latency fabric, where the per-message 8 microseconds stops being
+        amortised — a 1 MB chunk and 20 microseconds of latency turns the added
+        messages into more than the 95 ms you saved; and (b) stages that cannot
+        be split evenly, where v must divide the layer count and the last chunk is
+        a straggler the bubble formula does not model at all. The deciding number
+        is messages times latency against (p-1) x t_s x (1 - 1/v), and it flips
+        against you as the chunk shrinks, because latency is per message and is
+        blind to message size.
+    - id: cp-5
+      question: >-
+        A pipeline stage normalises its micro-batch losses by the number of
+        stages rather than the number of micro-batches, and training converges
+        to a lower loss than the single-device baseline. Explain why the lower
+        loss is not evidence that the pipeline is fine.
+      answerKind: short_text
+      hint: >-
+        What does dividing by p instead of m do to the gradient magnitude, and
+        what does that do to the distance travelled per step?
+      solution: >-
+        Dividing by $p$ instead of $m$ scales the accumulated gradient by
+        $m/p$ — 4.0x at $m = 32$, $p = 8$ — which is a 4x learning rate under
+        SGD. A larger step on a convex-ish problem reaches a lower training loss
+        faster and then sits somewhere different, which is exactly what the
+        measurement shows: 0.524031 against 0.639221, with parameters 2.535710
+        relative units away from the run that computed the gradient it meant to.
+        The lower loss is a symptom of a different optimisation trajectory, not
+        of a better model. Worse, the scale factor depends on both $m$ and $p$,
+        so the effective learning rate changes silently whenever anyone
+        re-tunes the pipeline — which is why the only acceptable test is
+        comparing parameters, not losses, against a single-device reference on
+        the same batch.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Data parallelism splits the batch and replicates the model; tensor
+        parallelism splits a matrix inside every layer and pays a collective.
+        Pipeline parallelism splits the layers and pays neither — a stage talks
+        only to its two neighbours, 16.777 MB per micro-batch each way. What it
+        pays instead is time.
+
+        A stage cannot run micro-batch $i$'s forward before its upstream
+        neighbour has, and cannot run the backward before its downstream
+        neighbour has. So each step begins with a ramp-up and ends with a
+        ramp-down, and during those ramps most of the machine has nothing to do.
+        That idle is the bubble, and unlike every other cost in this track it is
+        not measured in bytes.
+      blocks:
+        - kind: checklist
+          body: |
+            - Layers split contiguously; stage s owns one p-th of the depth
+            - Communication is point-to-point, not collective
+            - The fill is p - 1 forwards; the drain is p - 1 backwards
+            - Bubble is (p - 1) stage-times per step, independent of m
+            - Fraction is (p - 1)/(m + p - 1)
+            - Memory is one activation slot per in-flight micro-batch
+      checkpoint: >-
+        Before reading on: the bubble is a fixed number of stage-times per step,
+        so why does adding micro-batches reduce its *fraction*? What exactly is
+        growing when you do that, and what runs out first?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Three questions, in this order.
+
+        *How idle is it?* Compute $U = m/(m+p-1)$ from the depth and the
+        micro-batch count. If $U$ is below about 0.8 you do not have a
+        communication problem, you have too few micro-batches, and no amount of
+        interconnect tuning will help.
+
+        *What does the buffer cost?* $W + m\,a$ for GPipe, $W + p\,a$ for 1F1B.
+        Compute the largest $m$ that fits and compare it with the $m$ you wanted.
+        If they differ, the schedule is the problem and the fix is free.
+
+        *Is the wire involved at all?* Compute the p2p bytes per step against the
+        step time. If it is under a few percent — and at these shapes it is
+        0.17% — stop looking at the network.
+      blocks:
+        - kind: checklist
+          body: |
+            - U = m/(m+p-1); below 0.8 means add micro-batches, not bandwidth
+            - 80% needs m = 4(p-1); 90% needs m = 9(p-1)
+            - GPipe buffer = W + m*a; 1F1B buffer = W + p*a
+            - m_max = floor((card - W)/a) under GPipe only
+            - p2p bytes per rank: 16.78 MB each way per micro-batch, 0.54 GB per step
+            - Interleaving divides the bubble by v and multiplies messages by v
+      checkpoint: >-
+        You have p = 8, m = 32, and a measured utilisation of 0.62 where the
+        formula says 0.82. Which of the three questions above would you ask
+        first, and what would a stage-imbalance answer look like?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Two loops for the schedule, four numbers for the memory. Write the memory
+        first: if the configuration is infeasible, the utilisation is fiction.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # the schedule, in ticks where a forward is 1 and a backward is 2
+            for each stage s: free_at[s] = 0
+            while any op is not done:
+                for each stage s with a free device:
+                    op = next op on s whose dependencies are done
+                    if op is a forward of micro-batch 0 and live >= cap: skip
+                    start op at t, finishing at t + duration(op)
+                    if op is a backward: release that activation slot
+                    if op is a forward:  occupy that activation slot
+
+            gpipe: cap = m          # nothing freed until every forward is done
+            1f1b:  cap = p          # one backward per forward after warmup
+
+            # the model
+            U    = m / (m + p - 1)
+            B    = (p - 1) / (m + p - 1)
+            B_v  = (p - 1) / (m * v + p - 1)          # interleaved
+            T    = (m + p - 1) * t_stage
+            mem  = W + (m if gpipe else p) * a
+
+            # feasibility, GPipe only
+            m_max = floor((card_bytes - W) / a)
+            assert m <= m_max or schedule == "1f1b"
+      checkpoint: >-
+        The two schedules differ by a single line — the cap. Why does changing
+        that line from m to p not change the makespan, when it changes the memory
+        by a factor of m/p — four at the running example of m = 32, p = 8?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The bubble, the interleaved bubble, and the memory ceiling.
+      blocks:
+        - kind: math
+          body: |
+            Work per device is $m\,t_s$: every micro-batch visits every stage
+            once. The idle is a fill of $(p-1)$ forwards and a drain of $(p-1)$
+            backwards, which together are $(p-1)\,t_s$.
+
+            $$T_{\text{step}} = (m+p-1)\,t_s, \qquad
+              U = \frac{m}{m+p-1}, \qquad
+              B = \frac{p-1}{m+p-1}.$$
+
+            Interleaving makes the unit of the fill a chunk of $1/v$ a stage:
+
+            $$B_v = \frac{p-1}{m\,v + p - 1},$$
+
+            so $B_v(m) = B_1(m\,v)$ — interleaving is a way of pretending you
+            have more micro-batches than your memory allows, paid for in
+            messages rather than bytes.
+
+            Memory, with $W$ the per-stage weights and optimizer state and $a$
+            one activation slot:
+
+            $$M_{\text{GPipe}} = W + m\,a, \qquad M_{\text{1F1B}} = W + p\,a,$$
+
+            $$m_{\max} = \left\lfloor \frac{M_{\text{card}} - W}{a} \right\rfloor
+              \quad\Longrightarrow\quad
+              B_{\min} = \frac{p-1}{m_{\max} + p - 1}.$$
+
+            At $p = 8$, $W = 14$ GB, $a = 3.825205$ GB, $M_{\text{card}} = 80$ GB:
+            $m_{\max} = 17$ and $B_{\min} = 7/23 = 30.43\%$. Under 1F1B the
+            constraint does not exist and $m = 128$ gives 5.19%.
+      checkpoint: >-
+        Which of those four expressions would you put in a design review, and
+        which one would you compute before submitting a job?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete picture: the schedule, the memory, the interleaving
+        arithmetic, and the two normalisation bugs that make the loss go down.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the failure modes first. Only one of them raises, and it raises
+            as an out-of-memory two hours into the job, which reads like a
+            hardware fault. The other three are silent: a stage imbalance looks
+            like a slow interconnect because the slow stage is the one you
+            measure, a loss normalised by $p$ looks like faster convergence, and
+            an optimizer step per micro-batch looks like much faster
+            convergence. Two of the four make the training loss look *better*
+            than the correct run, which is why none of them is caught by watching
+            the curve.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+
+            def bubble(p, m):
+                return (p - 1) / (m + p - 1)
+
+
+            def step_ms(p, m, stage_ms):
+                return (m + p - 1) * stage_ms
+
+
+            def memory_gb(p, m, a, w, gpipe=True):
+                return w + (m if gpipe else p) * a
+
+
+            def max_m(p, a, w, card):
+                mmax = max(0, math.floor((card - w) / a))
+                return mmax, bubble(p, mmax)
+
+
+            if __name__ == "__main__":
+                p, m, ts, a, w = 8, 32, 27.178969, 3.825205, 14.0
+                print("bubble %.6f  step %.4f ms" % (bubble(p, m), step_ms(p, m, ts)))
+                print("gpipe %.4f GB  1f1b %.4f GB"
+                      % (memory_gb(p, m, a, w), memory_gb(p, m, a, w, False)))
+                print("max m under gpipe on 80 GB:", max_m(p, a, w, 80.0))
+                for v in (1, 2, 4):
+                    print("v=%d bubble %.6f  msgs %d"
+                          % (v, (p - 1) / (m * v + p - 1), 2 * v * (p - 1) * m))
+      checkpoint: >-
+        `max_m(8, 3.825205, 14.0, 80.0)` returns 17, and `bubble(8, 17)` returns
+        0.304348. Which of those two numbers is a property of the model and which
+        is a property of the card you happen to own?
+
+  problems:
+    - id: p-pipe-bubble
+      title: "The bubble, the utilisation, and the micro-batch count you need"
+      difficulty: medium
+      prompt: >-
+        Implement `bubble(p, m, target=0.9)` returning a dict with exactly three
+        keys: `bubble` — the fraction of device-ticks a p-stage pipeline wastes
+        on m micro-batches, $(p-1)/(m+p-1)$; `utilisation` — the complement,
+        $m/(m+p-1)$; and `m_for_target` — the **smallest** integer micro-batch
+        count whose utilisation is at least `target`, i.e. the smallest $m'$
+        with $m'/(m'+p-1) \ge \text{target}$.
+
+        `p` and `m` are positive integers. For `p == 1` there is no bubble and
+        `m_for_target` is 1. Compute `m_for_target` exactly — a floating-point
+        `ceil` of $u(p-1)/(1-u)$ is off by one at values like $u = 0.9$,
+        $p = 8$ where the true answer is exactly 63.
+      starter: |
+        def bubble(p, m, target=0.9):
+            # your implementation here
+            pass
+      language: python
+      entry: bubble
+      testCases:
+        - input: '[8, 32]'
+          expected: '{"bubble": 0.17948717948717952, "utilisation": 0.8205128205128205, "m_for_target": 63}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 32, 0.9]'
+          expected: '{"bubble": 0.17948717948717952, "utilisation": 0.8205128205128205, "m_for_target": 63}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4, 16]'
+          expected: '{"bubble": 0.1578947368421053, "utilisation": 0.8421052631578947, "m_for_target": 27}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[2, 8]'
+          expected: '{"bubble": 0.11111111111111116, "utilisation": 0.8888888888888888, "m_for_target": 9}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 64, 0.95]'
+          expected: '{"bubble": 0.09859154929577463, "utilisation": 0.9014084507042254, "m_for_target": 133}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[1, 4]'
+          expected: '{"bubble": 0.0, "utilisation": 1.0, "m_for_target": 1}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[64, 1, 0.5]'
+          expected: '{"bubble": 0.984375, "utilisation": 0.015625, "m_for_target": 63}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 63]'
+          expected: '{"bubble": 0.09999999999999998, "utilisation": 0.9, "m_for_target": 63}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import math
+
+
+        def bubble(p, m, target=0.9):
+            p, m = int(p), int(m)
+            if m < 1:
+                raise ValueError("m must be at least 1")
+            util = m / (m + p - 1)
+            if p == 1:
+                return {"bubble": 0.0, "utilisation": 1.0, "m_for_target": 1}
+            mt = math.ceil(target * (p - 1) / (1.0 - target))
+            while mt > 1 and (mt - 1) / (mt - 1 + p - 1) >= target:
+                mt -= 1
+            while mt / (mt + p - 1) < target:
+                mt += 1
+            return {"bubble": 1.0 - util, "utilisation": util,
+                    "m_for_target": mt}
+      solutionExplanation: >-
+        Two facts and one trap. The facts: utilisation is $m/(m+p-1)$ and the
+        bubble is its complement, so at $p = 8$, $m = 32$ that is
+        $32/39 = 0.8205128205$ and $7/39 = 0.1794871795$ — 190.25 ms of a
+        1060 ms step at 27.179 ms per stage. The trap is `m_for_target`. Solving
+        $m/(m+p-1) = u$ gives $m = u(p-1)/(1-u)$, which at $u = 0.9$, $p = 8$
+        evaluates to 63.000000000000014 — so a bare `ceil` returns 64 when the
+        answer you want is 63, and it is off by one in the same direction for
+        $p = 4$ (28 instead of 27) and $p = 2$ (10 instead of 9). Compute the
+        candidate, then walk it to the exact boundary with two comparisons,
+        which is what the two `while` loops do. The $p = 1$ case is a genuine
+        special case rather than a guard: a one-stage pipeline has no bubble at
+        all, so `bubble` is 0.0, `utilisation` is 1.0, and no number of
+        micro-batches improves on that. The `[64, 1, 0.5]` case is the one that
+        catches an implementation that forgets $m < p$: 64 stages and one
+        micro-batch wastes 98.4375% of the machine, and the smallest $m$ reaching
+        50% is 63 — because $63/(63+63)$ is exactly $0.5$.
+      complexity: "O(1) time, O(1) space to within the m_for_target search"
+      tags: [pipeline-parallelism, bubble, utilisation, scheduling]
+
+    - id: p-pipe-step
+      title: "Step time and throughput from the stage time"
+      difficulty: medium
+      prompt: >-
+        Implement `pipeline_step(p, m, tokens_per_micro_batch, stage_ms)`
+        returning a dict with exactly four keys, all floats:
+
+        `utilisation` — $m/(m+p-1)$;
+        `bubble_ms` — the idle time per step, $(p-1)\cdot\text{stage\_ms}$;
+        `step_ms` — the wall-clock time of one step,
+        $(m+p-1)\cdot\text{stage\_ms}$;
+        `tokens_per_second` — $m \times \text{tokens\_per\_micro\_batch}$ divided
+        by the step time in seconds.
+
+        `stage_ms` is the time one stage spends on one micro-batch with the
+        forward and the backward together, so no separate backward term is
+        needed. All four values are per pipeline, not per device.
+      starter: |
+        def pipeline_step(p, m, tokens_per_micro_batch, stage_ms):
+            # your implementation here
+            pass
+      language: python
+      entry: pipeline_step
+      testCases:
+        - input: '[8, 32, 2048, 27.178969]'
+          expected: '{"utilisation": 0.8205128205128205, "bubble_ms": 190.252783, "step_ms": 1059.979791, "tokens_per_second": 61827.59384324904}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4, 32, 2048, 54.357937]'
+          expected: '{"utilisation": 0.9142857142857143, "bubble_ms": 163.073811, "step_ms": 1902.527795, "tokens_per_second": 34446.80291779916}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[2, 32, 2048, 108.715875]'
+          expected: '{"utilisation": 0.9696969696969697, "bubble_ms": 108.715875, "step_ms": 3587.6238749999998, "tokens_per_second": 18267.24380353278}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 1, 2048, 27.178969]'
+          expected: '{"utilisation": 0.125, "bubble_ms": 190.252783, "step_ms": 217.431752, "tokens_per_second": 9419.047499557471}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 17, 2048, 27.178969]'
+          expected: '{"utilisation": 0.7083333333333334, "bubble_ms": 190.252783, "step_ms": 652.295256, "tokens_per_second": 53374.60249749233}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 128, 2048, 27.178969]'
+          expected: '{"utilisation": 0.9481481481481482, "bubble_ms": 190.252783, "step_ms": 3669.1608149999997, "tokens_per_second": 71445.21955219889}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[16, 64, 1024, 13.5]'
+          expected: '{"utilisation": 0.810126582278481, "bubble_ms": 202.5, "step_ms": 1066.5, "tokens_per_second": 61449.601500234414}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        def pipeline_step(p, m, tokens_per_micro_batch, stage_ms):
+            p, m = int(p), int(m)
+            stage_ms = float(stage_ms)
+            step = (m + p - 1) * stage_ms
+            return {
+                "utilisation": m / (m + p - 1),
+                "bubble_ms": (p - 1) * stage_ms,
+                "step_ms": step,
+                "tokens_per_second": (m * float(tokens_per_micro_batch)
+                                      / (step / 1000.0)),
+            }
+      solutionExplanation: >-
+        The whole problem is one multiplication and one division, and the point
+        is which multiplication. `bubble_ms` uses $(p-1)$, not $m$: at $p = 8$
+        and a 27.179 ms stage it is 190.25 ms whether you run 1 micro-batch or
+        128, which is why the first case and the sixth case report the same
+        190.252783 ms and different throughputs. `step_ms` uses $(m+p-1)$: 39
+        stage-times at $m = 32$, 1060 ms, of which 870 ms is work. The
+        throughput follows from that and reproduces the measured table — 18,267,
+        34,447 and 61,828 tokens/s at $p = 2, 4, 8$ with $m = 32$, against
+        ideals of 18,838, 37,676 and 75,352. The $m = 1$ case is the sanity
+        check that the model is not flattering itself: one micro-batch on eight
+        stages uses 12.5% of the machine and delivers exactly the single-device
+        throughput of 9,419 tokens/s, so a pipeline with too few micro-batches
+        is not slow by a little, it is a no-op. Note the last case — sixteen
+        stages at 13.5 ms is a *worse* configuration than eight at 27.179 ms,
+        because the depth doubled and the micro-batch count did not.
+      complexity: "O(1) time and space"
+      tags: [pipeline-parallelism, throughput, bubble, scheduling]
+
+    - id: p-pipe-memory
+      title: "The activation budget that decides the micro-batch count"
+      difficulty: hard
+      prompt: >-
+        Implement `pipeline_memory(p, m, activation_gb, weight_gb, card_gb)`
+        returning a dict with exactly four keys:
+
+        `gpipe_gb` — per-device memory under GPipe, `weight_gb + m *
+        activation_gb`;
+        `one_f_one_b_gb` — per-device memory under 1F1B, `weight_gb + p *
+        activation_gb`;
+        `max_m_gpipe` — the largest integer micro-batch count that fits on the
+        card under GPipe, `floor((card_gb - weight_gb) / activation_gb)`, floored
+        at 0 when the weights alone do not fit;
+        `bubble_at_max_m` — the GPipe bubble fraction at that count,
+        `(p - 1) / (max_m_gpipe + p - 1)`, and 0.0 when `p == 1`.
+
+        `activation_gb` is one activation slot, i.e. one micro-batch's worth on
+        one stage. It is always positive.
+      starter: |
+        def pipeline_memory(p, m, activation_gb, weight_gb, card_gb):
+            # your implementation here
+            pass
+      language: python
+      entry: pipeline_memory
+      testCases:
+        - input: '[8, 32, 3.825205, 14.0, 80.0]'
+          expected: '{"gpipe_gb": 136.40656, "one_f_one_b_gb": 44.60164, "max_m_gpipe": 17, "bubble_at_max_m": 0.2916666666666667}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 32, 3.825205, 14.0, 160.0]'
+          expected: '{"gpipe_gb": 136.40656, "one_f_one_b_gb": 44.60164, "max_m_gpipe": 38, "bubble_at_max_m": 0.15555555555555556}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4, 16, 7.65041, 25.0, 80.0]'
+          expected: '{"gpipe_gb": 147.40656, "one_f_one_b_gb": 55.60164, "max_m_gpipe": 7, "bubble_at_max_m": 0.3}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[2, 8, 0.067109, 12.0, 40.0]'
+          expected: '{"gpipe_gb": 12.536872, "one_f_one_b_gb": 12.134218, "max_m_gpipe": 417, "bubble_at_max_m": 0.0023923444976076554}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[1, 4, 3.0, 10.0, 80.0]'
+          expected: '{"gpipe_gb": 22.0, "one_f_one_b_gb": 13.0, "max_m_gpipe": 23, "bubble_at_max_m": 0.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 32, 3.825205, 90.0, 80.0]'
+          expected: '{"gpipe_gb": 212.40656, "one_f_one_b_gb": 120.60164, "max_m_gpipe": 0, "bubble_at_max_m": 1.0}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import math
+
+
+        def pipeline_memory(p, m, activation_gb, weight_gb, card_gb):
+            p, m = int(p), int(m)
+            a, w, c = float(activation_gb), float(weight_gb), float(card_gb)
+            mmax = max(0, int(math.floor((c - w) / a))) if a > 0 else 0
+            return {
+                "gpipe_gb": w + m * a,
+                "one_f_one_b_gb": w + p * a,
+                "max_m_gpipe": mmax,
+                "bubble_at_max_m": ((p - 1) / (mmax + p - 1)) if p > 1 else 0.0,
+            }
+      solutionExplanation: >-
+        The two memory expressions differ only in what multiplies $a$: $m$ for
+        GPipe, $p$ for 1F1B. At $p = 8$, $a = 3.825205$ GB and $W = 14$ GB,
+        $m = 32$ gives 136.40656 GB against 44.60164 GB — the same schedule, a
+        3.06x difference in buffer. The interesting column is `max_m_gpipe`,
+        because it is what turns the bubble formula from a lever into a
+        constraint: $\lfloor 66/3.825205 \rfloor = 17$ on an 80 GB card, and at
+        $m = 17$ the bubble is $7/23 = 0.291667$, which no amount of wanting
+        $m = 32$ will change. Double the card to 160 GB and the ceiling moves to
+        38 and the bubble to 0.155556 — a memory purchase, not a scheduling
+        improvement. The `[4, 16, 7.65041, 25.0, 80.0]` case is the trap for
+        anyone who divides by $p$: a 4-stage pipeline holds *more* per stage, not
+        less, so the ceiling falls to 7 and the bubble rises to 0.3. The last
+        case is the one that must not raise: $W = 90$ GB on an 80 GB card means
+        nothing fits, `max_m_gpipe` is 0, and the bubble at zero micro-batches is
+        1.0 — total idleness, which is the honest answer to an impossible
+        configuration. The `[2, 8, 0.067109, ...]` case is the checkpointed
+        regime, where the slot is 57x smaller and the ceiling becomes 417: the
+        point being that recompute does not change the ratio of $m$ to $p$, only
+        how large both are allowed to be.
+      complexity: "O(1) time and space"
+      tags: [pipeline-parallelism, activation-memory, gpipe, 1f1b, capacity]
+
+  visualizers:
+    - id: vs-pipe-bubble
+      kind: computation_graph
+      title: "Depth, width, and the idle between them"
+      description: >-
+        Move the stage count and the micro-batch count and watch the two numbers
+        move in opposite directions. At p = 8, m = 32 the pipeline is 17.95%
+        idle and 61,828 tokens/s against an ideal 75,352; at m = 128 it is 5.19%
+        idle and 71,445, but GPipe's buffer has gone from 122.41 GB to 489.63 GB
+        while 1F1B's has stayed at 30.60 GB. Drop to p = 4 and the bubble
+        improves at the same m but each stage now holds twice the layers, so the
+        per-stage weights and activations both double.
+      params:
+        stages: [1, 2, 4, 8, 16]
+        micro_batches: [1, 2, 4, 8, 16, 32, 64, 128]
+        activation_gb: 3.825205
+        weight_gb: 14.0
+        card_gb: 80.0
+        schedules: [gpipe, 1f1b]
+
+  try_it: >-
+    With p = 8 stages and a 27.179 ms stage, compute the bubble for m = 8, 32 and 128 from
+    (p − 1)/(m + p − 1): 46.7%, 17.95% and 5.19%. Then invert it — how many micro-batches do you
+    need for 80% utilisation, and for 90%?
+  interview_questions:
+    - question: "Your pipeline runs at 82% efficiency with eight stages and 32 micro-batches. Is that a bandwidth problem?"
+      level: mid
+      key_points:
+        - "No: the pipeline's own point-to-point traffic is 0.169% of the step — 1.79 ms of a 1,060 ms step — so there is nothing on the wire to fix."
+        - "The loss is the bubble, (p − 1)/(m + p − 1) = 7/39 = 17.95%, which is a property of the schedule and not of the link."
+        - "Simulated and measured utilisation match m/(m + p − 1) exactly: 0.533333 at m = 8, 0.820513 at 32 and 0.948148 at 128."
+        - "The levers are more micro-batches, interleaving, or fewer stages, in that order of cost."
+      follow_up: "What does interleaving cost, and what does it buy at p = 8, m = 32?"
+    - question: "GPipe and 1F1B give bit-identical throughput. Why would anyone choose one over the other?"
+      level: senior
+      key_points:
+        - "1F1B holds at most p micro-batches in flight, so peak activation slots fall from m to p: 44.60 GB against 136.41 GB at m = 32."
+        - "The makespan is identical — 45, 117 and 405 ticks with the same utilisation — because it is the same operations in the same order with a smaller buffer."
+        - "The memory saving is what lets you run larger m, and larger m is where the throughput comes from: GPipe on 80 GB caps at m = 17 for 79.03 GB and 53,375 tokens/s, while 1F1B runs m = 32 at 44.60 GB for 61,828 tokens/s."
+        - "So the choice is a memory-for-micro-batches trade, not a scheduling improvement."
+      follow_up: "If 1F1B dominates on memory, why do codebases still implement GPipe?"
+    - question: "You raise the micro-batch count to shrink the bubble and the job OOMs. What did the bubble formula leave out?"
+      level: senior
+      key_points:
+        - "The formula is about time; the constraint you hit is memory, because under GPipe each stage holds one activation slot per in-flight micro-batch."
+        - "A stage of 4 of 32 layers at 2048 tokens and 4096 hidden costs 3.825205 GB per micro-batch, so m = 17 is 79.03 GB and m = 32 is 136.41 GB."
+        - "1F1B caps the slot count at p instead of m, and recompute cuts the per-slot cost 57× — 3.825205 GB down to 0.067109 GB."
+        - "The real choice of m is the largest one that fits, which is why the memory model and the bubble formula have to be solved together."
+      follow_up: "With recompute and 1F1B, what is the largest feasible m on an 80 GB card?"
+  common_mistakes:
+    - "Blaming the point-to-point sends for pipeline inefficiency when they are 0.169% of the step and the cost is a schedule bubble."
+    - "Raising m to shrink the bubble without the activation model — the same change that takes the bubble from 30.43% to 17.95% takes memory from 79.03 GB to 136.41 GB."
+    - "Normalising the loss by pipeline depth instead of micro-batch count, which converges to a different model 2.54 relative units away with a lower training loss."
+  further_reading:
+    - label: "Huang et al., GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism, NeurIPS 2019"
+    - label: "Narayanan et al., Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM, SC 2021"

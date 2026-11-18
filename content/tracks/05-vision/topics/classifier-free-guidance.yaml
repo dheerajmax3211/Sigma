@@ -1,0 +1,1385 @@
+id: classifier-free-guidance
+slug: classifier-free-guidance
+title: "Classifier-Free Guidance"
+summary: >-
+  One network trained with its label dropped ten percent of the time can score
+  both the conditional and the unconditional distribution, and the difference
+  between those two scores is a direction with a coefficient. You derive what
+  that coefficient samples, measure how fast mode coverage dies as you raise
+  it, and price the second forward pass it costs per step.
+kind: lesson
+difficulty: hard
+position: 6
+estMinutes: 27
+prerequisites: [diffusion-models, ddim-fast-sampling]
+phase: vision-foundations
+tags:
+  - classifier-free-guidance
+  - cfg
+  - label-dropout
+  - guidance-scale
+  - score-extrapolation
+  - mode-coverage
+  - precision-recall
+  - saturation
+  - guidance-rescaling
+  - inference-cost
+
+body:
+  big_idea: >-
+    Guidance is one subtraction: train a single network that sometimes sees no
+    label, then extrapolate away from its unconditional prediction — a dial
+    converting class coverage into fidelity.
+
+  problem:
+    - >-
+      Your samples are plausible and slightly wrong, someone says "set
+      guidance_scale to 7.5", and nothing says why that number over another.
+    - >-
+      You budget two models and two forward passes, then find one checkpoint
+      and 1.6× latency, and cannot tell whether the saving is real.
+    - >-
+      A tutorial sets the unconditional probability to 0.5 and your
+      conditional samples get worse: it only touches the branch you are not
+      improving.
+
+  analogy: |
+    A mixing desk with one fader per instrument, and you want the soloist
+    alone. You do not have a solo recording, but you have the full mix and the
+    orchestra without the soloist, so you subtract: solo = mix − orchestra.
+    Turn that subtraction up and the soloist gets louder than the mix ever
+    was, because the amplified difference has no headroom left.
+
+  concept_points:
+    - >-
+      **The training change is a probability, and it is the only change.**
+      With probability $p_{\text{uncond}}$ the label is replaced by a null
+      token and the same network denoises anyway; loss, architecture and
+      parameter count are untouched. At $p_{\text{uncond}} = 0.1$ and 1000
+      classes, **15.8% of classes get no conditional example at all** in a
+      batch of 2048.
+    - >-
+      **One set of weights holds both scores, and the null token is the whole mechanism.**
+      The unconditional branch is the same network queried with $\varnothing$
+      instead of $c$; the extra parameters are one embedding row — 768 numbers
+      against DiT-XL's 675M, a factor of $1.1\times10^{-6}$. Hence 0.1 and 0.2
+      are about equally good and 0.5 is worse.
+    - >-
+      **At inference the combination is an extrapolation, not an average.**
+      With $\tilde\epsilon = \epsilon_u + s(\epsilon_c - \epsilon_u)$ and
+      $s = 1 + w$, $s = 0$ is the unconditional model, $s = 1$ the conditional
+      one, and everything useful lives at $s > 1$. With modes at $\pm 1$ and
+      $\sigma = 0.35$ the guided mean runs **-0.799** at $w=0$ to **-1.008**
+      at 6.5 while the width stays 0.35.
+    - >-
+      **What it samples is a geometric reweighting, $p_w \propto p(x\mid c)^{1+w}p(x)^{-w}$, whose mode weights are an odds ratio raised to $w$.**
+      The guided weight of mode $i$ is $\pi_i(\pi_i/\rho_i)^w$, so modes below
+      their marginal share are deleted exponentially in $w$. On
+      $\pi = (0.9, 0.1)$ against $\rho = (0.5, 0.5)$ the rare mode holds
+      **10.2% at $w=0$ and 0.0009% at 6.5**.
+    - >-
+      **The published sweep is U-shaped in FID and monotone in Inception score.**
+      Ho and Salimans, ImageNet 64×64: FID **1.80** at $w=0$,
+      **1.55 at $w=0.1$** (the minimum), 2.04 at 0.2, 3.03 at 0.3, 5.74 at
+      0.5, 12.60 at 1.0, 21.03 at 2.0 and **26.22** at 4.0, while IS climbs
+      53.71 → 66.11 → 170.10 → 260.20. From the optimum to $w=4$, FID degrades
+      **16.9x** while IS improves **3.9x**.
+    - >-
+      **The exchange rate is precision for recall, and it is roughly constant.**
+      ADM's classifier-guidance sweep on ImageNet 256×256, scale 1.0 against
+      10.0: FID **4.59 → 9.11**, precision **0.82 → 0.88**, recall
+      **0.52 → 0.32**. Six points of precision cost twenty points of recall —
+      a 38% relative loss — and FID doubles. A sweep judged by FID or IS alone
+      always picks the largest scale.
+
+  definitions:
+    - term: "Classifier-free guidance (CFG)"
+      meaning: >-
+        Sampling from a combination of one network's conditional and
+        unconditional score estimates, $\tilde\epsilon = (1+w)\epsilon_c - w
+        \epsilon_u$, which requires no classifier and no second set of weights
+        because the unconditional model is the same network queried with a null
+        token.
+    - term: "Label dropout / unconditional training probability"
+      meaning: >-
+        $p_{\text{uncond}}$, the probability with which a training example's
+        label is replaced by the null token. 0.1 in the original paper; it is
+        the only training-time hyperparameter guidance introduces, and it
+        simultaneously removes that fraction of examples from the conditional
+        model.
+    - term: "Null token"
+      meaning: >-
+        The learned placeholder $\varnothing$ that stands in for a missing
+        condition. One embedding row, or one learned modulation vector; it must
+        be the object training used, because it is the only thing that makes
+        $\epsilon_\theta(x_t, t, \varnothing)$ an estimate of the marginal score.
+    - term: "Conditional score"
+      meaning: >-
+        $\epsilon_c = \epsilon_\theta(x_t, t, c)$, the network's noise
+        prediction given the class or prompt. Up to the sign and the noise level
+        it is $\nabla \log p_t(x \mid c)$: $\epsilon = -\sigma_t \nabla \log p_t$.
+    - term: "Unconditional score"
+      meaning: >-
+        $\epsilon_u = \epsilon_\theta(x_t, t, \varnothing)$, the same network
+        with the condition removed — an estimate of $\nabla \log p_t(x)$, the
+        score of the whole dataset rather than of one class.
+    - term: "Guidance weight w"
+      meaning: >-
+        The coefficient on the difference in the paper's form,
+        $\tilde\epsilon = (1+w)\epsilon_c - w\epsilon_u$. Zero is the
+        conditional model, and the quantity that actually enters the mode-weight
+        formula as an exponent.
+    - term: "Guidance scale s"
+      meaning: >-
+        The coefficient in the form most libraries expose,
+        $\hat\epsilon = \epsilon_u + s(\epsilon_c - \epsilon_u)$, so $s = 1 + w$.
+        Stable Diffusion's default is 7.5, which is $w = 6.5$; a paper reporting
+        $w = 0.1$ is reporting $s = 1.1$.
+    - term: "Guided score"
+      meaning: >-
+        $\tilde\epsilon$, the linear combination that the sampler steps with.
+        It is a gradient of $(1+w)\log p_c - w\log p$ when the two predictions
+        are exact scores, which is what makes it a sampling distribution at all.
+    - term: "Geometric reweighting"
+      meaning: >-
+        $p_w \propto p(x \mid c)^{1+w} p(x)^{-w}$ — the density whose score is
+        the guided score. It is the conditional tilted toward whatever the
+        conditional already prefers relative to the marginal, and it is not a
+        tempered version of the conditional.
+    - term: "Mode coverage (recall)"
+      meaning: >-
+        The fraction of the data distribution a sampler reaches. Guidance
+        lowers it monotonically: ADM measured recall 0.52 → 0.32 between
+        classifier-guidance scales 1 and 10, a 38% relative loss for six points
+        of precision.
+    - term: "Fidelity (precision)"
+      meaning: >-
+        The fraction of samples that look like the data. It rises with guidance
+        and saturates; ADM measured 0.82 → 0.88 over the same sweep. A metric
+        that only measures fidelity will always choose the largest guidance you
+        tried.
+    - term: "Effective sample size (ESS)"
+      meaning: >-
+        $1/\sum_i w_i^2$ for normalised weights, the number of equally-weighted
+        samples the reweighted mixture is worth. On the two-mode toy it falls
+        1.2195 → 1.0247 → 1.0003 as $w$ goes 0 → 1 → 3: by $w = 3$ the mixture is
+        one mode.
+    - term: "Guidance rescaling"
+      meaning: >-
+        Imagen's correction: divide the guided prediction by the ratio of its
+        standard deviation to the conditional's, then blend with factor $\phi$
+        (0.7 in the paper). It reduces saturation — 59.4% of pixels clipped
+        becomes 47.1% at $s = 7.5$ — by renormalising magnitude, and it changes
+        nothing about which modes survive.
+    - term: "Guidance interval"
+      meaning: >-
+        Applying guidance only on a contiguous window of the sampling schedule
+        rather than every step. It trades a little adherence for a proportional
+        cut in the extra forward passes: guiding 20 of 50 steps costs 1.40× the
+        unguided sampler instead of 2.00×.
+    - term: "Saturation"
+      meaning: >-
+        Pixels whose guided $x_0$ estimate leaves the valid range and is
+        clipped, destroying texture in exactly the regions the class is most
+        confident about. It is arithmetic, not aesthetics: the deviation is
+        multiplied by $s$, and 59.4% of pixels exceed the range at $s = 7.5$
+        with deviations of standard deviation 0.25.
+
+  diagrams:
+    - type: architecture
+      title: "Two scores, one forward pass"
+      caption: >-
+        The training path only differs by the null token. At inference the two
+        branches are one batch of 2B, which is why the cost is 1.58× rather than
+        2.06× on the machine measured here.
+      nodes:
+        - id: lat
+          x: 0
+          y: 0
+          label: "x_t and t, B samples"
+          kind: client
+          detail: "The same latents are used for both branches; only the conditioning differs, so the two rows of the batch are the same tensor."
+        - id: lab
+          x: 0
+          y: 1
+          label: "label c, or the null token"
+          kind: storage
+          detail: "One learned row. Passing zeros invented at inference instead of the trained row is the silent version of this bug."
+        - id: cat
+          x: 1
+          y: 0
+          label: "concatenate: 2B rows"
+          kind: queue
+          detail: "One call with batch 2B. The code must remember whether the conditional half is the first B rows or interleaved; getting it wrong swaps the guidance direction for half the batch."
+        - id: fwd
+          x: 2
+          y: 0
+          label: "one forward pass, batch 2B"
+          kind: gpu
+          detail: "Measured 48.0 ms against 30.4 ms for one sample and 62.7 ms for two separate calls on a 12-block, 768-wide, 196-token stack."
+        - id: split
+          x: 3
+          y: 0
+          label: "split into eps_c and eps_u"
+          kind: worker
+          detail: "Two halves of the batch, same shape as the input."
+        - id: comb
+          x: 3
+          y: 1
+          label: "eps_u + s (eps_c - eps_u)"
+          kind: model
+          detail: "At s = 1 this returns eps_c exactly. If it returns eps_c for every s, the unconditional branch was not unconditional."
+      edges:
+        - { from: lat, to: cat, label: "duplicate the batch" }
+        - { from: lab, to: cat, label: "c and the null row" }
+        - { from: cat, to: fwd, label: "2B rows, one kernel launch per layer" }
+        - { from: fwd, to: split, label: "2B predictions" }
+        - { from: split, to: comb, label: "combine, then step the sampler" }
+
+    - type: compare
+      title: "Guidance reweights modes; temperature reshapes them"
+      left_label: "Guidance (reweight)"
+      left_points:
+        - "Mode weights change by the odds ratio raised to w, not by a smooth temperature"
+        - "Within-mode width is untouched: measured standard deviation 0.35 at every w from 0 to 6.5"
+        - "Rare mode 10.2% at w = 0 falls to 1.31% at w = 1 and 0.029% at w = 3"
+        - "Costs a second forward pass per guided step: 1.58× measured when the two branches share a batch"
+        - "Support never grows: a mode the conditional does not contain cannot appear"
+      right_label: "Temperature (reshape)"
+      right_points:
+        - "Mode weights stay at pi: the 0.9 / 0.1 split is unchanged at any temperature"
+        - "Width scales with tau: measured 0.35 to 0.175 at tau = 0.5, a factor of two in sigma"
+        - "Rare mode stays at 10.2% at tau = 0.5, because shrinking every mode does not change their shares"
+        - "Costs nothing: one model, one pass, no second branch"
+        - "Blurs every mode, deletes none: the opposite failure from guidance"
+
+    - type: plot
+      title: "FID against guidance weight, ImageNet 64x64"
+      chart: line
+      xLabel: "guidance weight w (s = 1 + w)"
+      yLabel: "FID (lower is better)"
+      series:
+        - name: "p_uncond = 0.1, 50k samples per point"
+          points:
+            - { x: 0.0, y: 1.80 }
+            - { x: 0.1, y: 1.55 }
+            - { x: 0.2, y: 2.04 }
+            - { x: 0.3, y: 3.03 }
+            - { x: 0.4, y: 4.30 }
+            - { x: 0.5, y: 5.74 }
+            - { x: 1.0, y: 12.60 }
+            - { x: 2.0, y: 21.03 }
+            - { x: 4.0, y: 26.22 }
+
+    - type: plot
+      title: "Pixels pushed outside the valid range, with and without rescaling"
+      chart: line
+      xLabel: "guidance scale s"
+      yLabel: "percent of pixels clipped"
+      series:
+        - name: "no rescale"
+          points:
+            - { x: 2.0, y: 4.55 }
+            - { x: 3.0, y: 18.24 }
+            - { x: 5.0, y: 42.37 }
+            - { x: 7.5, y: 59.38 }
+            - { x: 10.0, y: 68.92 }
+        - name: "rescale, phi = 0.7"
+          points:
+            - { x: 2.0, y: 1.86 }
+            - { x: 3.0, y: 9.56 }
+            - { x: 5.0, y: 29.23 }
+            - { x: 7.5, y: 47.07 }
+            - { x: 10.0, y: 58.34 }
+
+    - type: plot
+      title: "Per-sample cost of one transformer block against batch size"
+      chart: line
+      xLabel: "batch size"
+      yLabel: "milliseconds per sample"
+      series:
+        - name: "12-block, d = 768, 196 tokens, CPU"
+          points:
+            - { x: 1.0, y: 2.598 }
+            - { x: 2.0, y: 2.026 }
+            - { x: 4.0, y: 1.822 }
+            - { x: 8.0, y: 1.627 }
+            - { x: 16.0, y: 1.628 }
+            - { x: 32.0, y: 1.579 }
+
+  markdown: |
+    ## The training change is one line
+
+    Guidance needs a model that can answer two questions about the same noisy
+    image: what noise is here, given this class, and what noise is here, given
+    nothing. Two networks would double the parameters and the checkpoints.
+    Instead, with probability $p_{\text{uncond}}$ the label is replaced by a null
+    token $\varnothing$ and the network is asked anyway:
+
+    $$\mathcal{L} = \mathbb{E}_{t,\,x_0,\,\epsilon}\left[\left\|\epsilon -
+      \epsilon_\theta\left(x_t, t,\, c \text{ or } \varnothing\right)\right\|^2\right],
+      \qquad c \leftarrow \varnothing \text{ with probability } p_{\text{uncond}}.$$
+
+    One set of weights, two conditional distributions, and no classifier
+    anywhere. The cost is that a fraction $p_{\text{uncond}}$ of every batch is
+    spent on the marginal instead of the class: at $p_{\text{uncond}} = 0.1$ and
+    batch 2048 that is 204.8 examples, and with 1000 classes 15.8% of classes
+    receive no conditional example in a given batch.
+
+    ## Two scores, one subtraction
+
+    A diffusion model's noise prediction is a score up to scale:
+    $\epsilon_\theta(x_t, t) = -\sigma_t \nabla \log p_t(x_t)$. So the two
+    predictions are two score fields, and their difference is a direction:
+    the direction in which the conditional distribution differs from the
+    marginal. Guidance takes a step along it and keeps going:
+
+    $$\tilde\epsilon_\theta(x_t, c) = \epsilon_\theta(x_t, \varnothing)
+      + s\left(\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \varnothing)\right),
+      \qquad s = 1 + w.$$
+
+    At $s = 1$ this is the conditional model. At $s = 0$ it is the
+    unconditional one. At $s = 7.5$ — the Stable Diffusion default — it is an
+    extrapolation seven and a half times past the conditional prediction, and
+    the word *past* is the whole topic.
+
+    ## What distribution it samples
+
+    A linear combination of score fields is a score field, and integrating it
+    gives the density the sampler walks toward:
+
+    $$p_w(x \mid c) \propto p(x \mid c)^{1+w}\, p(x)^{-w}.$$
+
+    This is a geometric mean, not a tempered conditional: it upweights whatever the
+    class prefers relative to the dataset. For separated equal-variance modes the
+    guided weight of mode $i$ is
+    $\pi_i (\pi_i/\rho_i)^w$, where $\pi_i$ is its conditional share and
+    $\rho_i$ its share of the marginal. Modes that are over-represented in the
+    class survive; modes that are under-represented are deleted exponentially.
+
+    | $w$ | $s$ | rare-mode share | effective sample size | mean |
+    |---|---|---|---|---|
+    | 0 | 1.0 | 10.20% | 1.2243 | −0.799 |
+    | 0.5 | 1.5 | 3.71% | 1.0770 | −0.930 |
+    | 1 | 2.0 | 1.31% | 1.0265 | −0.978 |
+    | 3 | 4.0 | 0.029% | 1.0006 | −1.005 |
+    | 6.5 | 7.5 | 0.0009% | 1.00002 | −1.008 |
+
+    The table is quadrature on a two-mode Gaussian toy: modes at $\pm 1$,
+    $\sigma = 0.35$, conditional weights $(0.9, 0.1)$, marginal $(0.5, 0.5)$ — the
+    smallest model in which "rare class" means anything. By $w = 6.5$ one sample
+    in 111,000 comes from the rare mode, and the mean has parked on the common
+    mode's centre.
+
+    The closed form is an approximation: it assumes each mode's neighbourhood is
+    dominated by its own component. At $w = 1$, quadrature gives a rare share of
+    9.61% at $2\sigma$ separation against 1.22% predicted — 7.9× too aggressive —
+    2.16% at $4\sigma$, and 1.27% at $6\sigma$, within 4%. Push $w$ to 6.5 and
+    even $6\sigma$ is not enough: the true share is $5.7 \times 10^{-6}$ against
+    $7.0 \times 10^{-8}$ predicted, because at strong guidance the rare region is
+    fed by the common mode's tail.
+
+    ## What the sweep measures
+
+    Ho and Salimans swept $w \in \{0, 0.1, \dots, 4\}$ on ImageNet 64×64 with
+    50,000 samples per point. FID bottoms out at $w = 0.1$ with 1.55 — better
+    than the unguided model's 1.80 — and then climbs to 26.22 at $w = 4$, while
+    Inception score rises monotonically from 53.71 to 260.20. Between the
+    optimum and $w = 4$ you pay 16.9× FID for 3.9× IS.
+
+    | $w$ | 0 | 0.1 | 0.2 | 0.3 | 0.5 | 1.0 | 2.0 | 4.0 |
+    |---|---|---|---|---|---|---|---|---|
+    | FID | 1.80 | **1.55** | 2.04 | 3.03 | 5.74 | 12.60 | 21.03 | 26.22 |
+    | IS | 53.71 | 66.11 | 78.91 | 92.80 | 119.30 | 170.10 | 225.50 | 260.20 |
+
+    The two metrics measure different halves of the trade: FID penalises missing
+    modes, IS asks whether each sample is confidently one class. ADM's
+    classifier-guidance sweep makes the exchange explicit: precision 0.82 → 0.88
+    while recall 0.52 → 0.32, and FID 4.59 → 9.11. Six points of precision for
+    twenty points of coverage is the price list.
+
+    ## Units
+
+    The same dial is reported four ways. The paper's $w = 0.1$ is $s = 1.1$.
+    DiT-XL/2's optimum on ImageNet 256 is $s = 1.5$, FID 2.27. Stable
+    Diffusion's default is $s = 7.5$. ADM's "scale 10" is a classifier gradient
+    scale, a different object. All four are correct for their models: a text
+    prompt pins down more than a 1000-way class label, so it needs a larger
+    extrapolation.
+
+    The response is linear in $w$, not in $s$: going from $s = 7.5$ to $s = 8$
+    is a 7.7% increase in the extrapolation, while $s = 1.1$ to $s = 1.6$ is a
+    factor of six.
+
+    ## Why the images go chalky
+
+    Since $x_0 = (x_t - \sigma_t \epsilon)/\alpha_t$ is affine in $\epsilon$,
+    guidance commutes with the reparameterisation exactly:
+
+    $$x_{0,w} = x_{0,u} + s\left(x_{0,c} - x_{0,u}\right).$$
+
+    Every pixel's deviation from the unconditional prediction is multiplied by
+    $s$. With deviations of standard deviation 0.25 on a $[-1,1]$ range, the
+    fraction of pixels outside the range is $2\Phi(-1/(0.25s))$: 4.6% at
+    $s = 2$, 18.2% at 3, 42.4% at 5, 59.4% at 7.5. Clipped pixels lose their
+    texture, and the clipping concentrates where the class is most confident, which
+    is why the whites blow out first. Imagen's rescale
+    ($\phi = 0.7$) divides by the standard-deviation ratio and pulls 59.4% down
+    to 47.1%. Useful, not a fix: it rescales magnitude and cannot bring back a
+    mode that was deleted.
+
+    ## What it costs
+
+    Two forward passes per guided step, or one pass on a batch of $2B$ — not the
+    same thing: measured on a 12-block, 768-wide, 196-token stack, one sample
+    takes 30.4 ms, a fused batch of two 48.0 ms, and two separate calls 62.7 ms.
+    The second sample costs 17.6 ms inside the batch against 32.3 ms as a
+    separate call — 45% cheaper — because the per-call fixed cost, 0.98 ms
+    against 1.55 ms per sample, is paid once either way. The saving shrinks as
+    the batch grows, and at batch 32 the per-sample cost has flattened at
+    1.58 ms.
+
+    If that is still too much, the cheaper lever is the guidance interval: 20 of
+    50 steps costs 70 passes instead of 100 — 1.40× instead of 2.00×.
+
+    ## What it cannot do
+
+    Guidance reweights; it does not create. The support of $p_w$ is the support
+    of the conditional, so a prompt the model cannot render does not become
+    renderable — it becomes confident. And because the two branches share
+    weights, the unconditional score is only as good as the 10% of training the
+    dropout spent on it. The dial spends coverage you have for fidelity you want,
+    at a rate you can measure before you ship.
+
+    ## The longer version
+
+    Guidance is one subtraction: train a single network that sometimes sees no
+    label, then at sampling time extrapolate away from what it predicts without
+    one, and the strength of that extrapolation is a dial that converts class
+    coverage into image fidelity at a measurable exchange rate.
+
+    A mixing desk with one fader per instrument, and you want the soloist alone.
+    You do not have a solo recording, but you do have the full mix and you have
+    the orchestra without the soloist, so you subtract: solo = mix - orchestra.
+    Turn that subtraction up and the soloist gets louder than the mix ever was,
+    because the difference you are amplifying has no headroom left — the peaks
+    clip and the sound distorts.
+
+    The analogy maps exactly onto the arithmetic. The mix is the conditional
+    model, the orchestra is the unconditional model, and the subtraction is the
+    linear combination. It breaks in three places, and all three are this topic.
+    First, the orchestra recording is an estimate: at inference the "unconditional"
+    score comes from a network that only saw labels dropped ten percent of the
+    time, so the difference is not a clean isolated solo but a direction that is
+    mostly the class and partly noise. Second, where the class and the marginal
+    agree the difference is exactly zero, and no amount of gain turns zero into
+    signal — guidance amplifies a direction, it never invents one. Third, a real
+    mixing desk distorts gracefully; a diffusion model clips at the ends of its
+    output range, which is where the flat whites come from.
+
+    ### What goes wrong
+
+    - Your samples are plausible and slightly wrong — the class is there but
+      diluted, the fur is soft, the composition is generic. Someone says "set
+      guidance_scale to 7.5". At 1 the model ignores the class entirely, at 20
+      every sample is the same over-saturated poster, and nothing in between
+      comes with a reason to pick one number over another.
+    - You budget two models, two checkpoints and two forward passes for
+      "classifier-free" guidance, then find one checkpoint and a measured 1.6×
+      latency rather than 2×. You cannot tell whether the saving is real,
+      where it comes from, or whether your serving path is quietly wrong.
+    - A tutorial sets the unconditional training probability to 0.5 "so the
+      unconditional model is good", and your conditional samples get worse.
+      The hyperparameter only touches the branch you are not trying to
+      improve, and you have no model of why it costs you anything at all.
+    - Three papers give three guidance numbers — 1.1, 1.5, 7.5 — and a fourth
+      says 10. All four are correct for their own model, because two of them
+      are measuring different quantities with the same letter and a third is
+      using a scale that starts at one instead of zero.
+    - At high guidance the images go flat and chalky: white backgrounds,
+      clipped highlights, one composition repeated. You call it mode collapse
+      and go looking for a bug in the sampler. Nothing is broken — the guided
+      score is doing exactly what you asked — and the fix is in the arithmetic
+      of the pixel range, not in the code.
+
+    ### The full treatment
+
+    **The training change is a probability, and it is the only change.** With
+    probability $p_{\text{uncond}}$ the label is replaced by a null token and
+    the same network is asked to denoise anyway; the loss, the architecture
+    and the parameter count are untouched. Ho and Salimans used
+    $p_{\text{uncond}} = 0.1$: at batch 2048 that is 204.8 unconditional
+    examples against 1843.2 conditional ones (standard deviation 13.6 on the
+    unconditional count), and with 1000 classes **15.8% of classes get no
+    conditional example at all in a given batch** — the conditional model is
+    trained on 90% of the batch, which is the actual price of the trick. The
+    trap is implementing the draw per batch instead of per sample: `rand(1)`
+    instead of `rand(B)` makes 10% of *steps* fully unconditional, so the two
+    branches are trained on disjoint steps and the guided combination mixes
+    two differently-trained functions.
+
+    **One set of weights holds both scores, and the null token is the whole
+    mechanism.** The unconditional branch is not a second model; it is the
+    same network queried with $\varnothing$ instead of $c$. The extra
+    parameters are one embedding row — 768 numbers against DiT-XL's 675M, a
+    factor of $1.1\times10^{-6}$ — which is why joint training costs nothing
+    in capacity and why the paper's ablation found 0.1 and 0.2 about equally
+    good and 0.5 worse. The trap is inventing the null embedding at inference:
+    a zero vector that training never used gives an off-distribution answer,
+    and $\epsilon_u$ stops being a score of the marginal. It must be the same
+    learned row (or the same learned adaLN modulation) that dropout exposed
+    during training.
+
+    **At inference the combination is an extrapolation, not an average.** With
+    $\tilde\epsilon = \epsilon_u + s(\epsilon_c - \epsilon_u)$ and
+    $s = 1 + w$, the value $s = 0$ is the unconditional model, $s = 1$ is the
+    conditional one, and everything useful lives at $s > 1$ — outside the
+    segment between the two predictions. In the equal-variance Gaussian case
+    this moves the mean and leaves the width alone: with modes at $\pm 1$,
+    $\sigma = 0.35$, the guided mean runs $-0.799$ at $w = 0$, $-0.978$ at
+    $w = 1$, $-1.005$ at $w = 3$ and $-1.008$ at $w = 6.5$, while the
+    within-mode standard deviation stays 0.35 throughout. It is a translation
+    of the conditional, which is exactly why it saturates the pixel range
+    instead of sharpening anything.
+
+    **What it samples is a geometric reweighting, $p_w \propto p(x \mid c)^{1+w}
+    p(x)^{-w}$, and its mode weights are an odds ratio raised to $w$.** For
+    well-separated equal-variance modes the guided weight of mode $i$ is
+    $\pi_i(\pi_i/\rho_i)^w$, where $\pi$ is the conditional and $\rho$ the
+    marginal mixture weight — so guidance deletes modes whose conditional
+    share is below their marginal share, and the deletion is exponential in
+    $w$. On a two-mode toy with $\pi = (0.9, 0.1)$ against $\rho = (0.5, 0.5)$,
+    quadrature gives the rare mode **10.2% at $w = 0$, 1.31% at $w = 1$,
+    0.029% at $w = 3$ and 0.0009% at $w = 6.5$** — one sample in 111,000 —
+    while the effective sample size of those weights falls from **1.2243 to
+    1.0265 to 1.0006**. The trap is reading this as a temperature: a
+    temperature would rescale each mode's width and leave the weights at
+    $\pi$; this leaves the widths and moves the weights.
+
+    **The closed form is a saddle-point approximation, and its error is
+    measurable.** It assumes each mode's neighbourhood is dominated by its own
+    component. Quadrature on the same two-mode toy at $w = 1$ gives a rare-mode
+    share of **9.61% at $2\sigma$ separation against 1.22% predicted (7.9× too
+    aggressive), 2.16% at $4\sigma$ (1.8×), and 1.27% at $6\sigma$ (4% — the
+    approximation has arrived)**. It leaves again at high $w$: at $6\sigma$
+    and $w = 6.5$ the true share is $5.7\times10^{-6}$ against $7.0\times10^{-8}$
+    predicted, 82× too aggressive, because at strong guidance the mass in the
+    rare region is carried by the common mode's tail, where $p_c/p \approx 1$,
+    not by the prior ratio at the mode centre. Trust the direction of the
+    formula; do not trust its exponent at high $w$.
+
+    **The published sweep is U-shaped in FID and monotone in Inception
+    score.** Ho and Salimans, ImageNet 64×64, $p_{\text{uncond}} = 0.1$: FID
+    1.80 at $w = 0$, **1.55 at $w = 0.1$** (the minimum), 2.04 at 0.2, 3.03 at
+    0.3, 5.74 at 0.5, 12.60 at 1.0, 21.03 at 2.0 and 26.22 at 4.0, while
+    Inception score climbs 53.71 → 66.11 → 170.10 → 260.20 over the same range.
+    From the FID optimum at $w = 0.1$ to $w = 4$, FID degrades **16.9×**
+    (1.55 → 26.22) while IS improves **3.9×** (66.11 → 260.20). Both numbers
+    are correct: FID rewards covering the distribution
+    and IS rewards being confidently one thing, and guidance moves you along
+    that axis rather than up it.
+
+    **The exchange rate is precision for recall, and it is roughly constant.**
+    ADM's classifier-guidance sweep on ImageNet 256×256, scale 1.0 against
+    scale 10.0: FID 4.59 → 9.11, precision 0.82 → 0.88, recall 0.52 → 0.32.
+    Six points of precision cost **twenty points of recall, a 38% relative
+    loss**, and FID doubles. This is the measured form of what people call mode
+    collapse: not a broken sampler, a purchase. The trap is evaluating a guided
+    model with a fidelity metric only — precision and IS both improve
+    monotonically, so a sweep judged by them will always pick the largest
+    scale you tried.
+
+    **The scale is $s = 1 + w$, and the numbers are not portable.** The same
+    quantity appears as $w = 0.1$ (the FID optimum above, $s = 1.1$),
+    $s = 1.5$ (DiT-XL/2 on ImageNet 256, FID 2.27), $s = 7.5$ (the Stable
+    Diffusion default, $w = 6.5$) and 10 (ADM's *classifier* gradient scale,
+    a different object entirely — a derivative of a classifier, not a
+    difference of two scores). Implementing $w$ where $s$ belongs is a
+    **13.3% weaker shift at $s = 7.5$** (6.5 against 7.5), invisible in one
+    image and systematic across a sweep. The trap is copying a number from a
+    paper whose combination formula you did not read: $w$ and $s$ differ by
+    exactly one, and 1.1 against 7.5 is a factor of 65 in $w$.
+
+    **High guidance saturates because the pixel deviation is multiplied by
+    $s$.** Since $x_0 = (x_t - \sigma_t\epsilon)/\alpha_t$ is affine in
+    $\epsilon$, the guided estimate is exactly
+    $x_{0,w} = x_{0,u} + s(x_{0,c} - x_{0,u})$: every pixel's deviation from
+    the unconditional prediction is scaled by $s$. With deviations of standard
+    deviation 0.25 on a $[-1, 1]$ range, the fraction of pixels pushed outside
+    the valid range is **0.006% at $s = 1$, 4.6% at 2, 18.2% at 3, 42.4% at 5,
+    59.4% at 7.5 and 68.9% at 10**. Clipping is where the flat whites and
+    chalky highlights come from. Imagen's rescale, $\phi = 0.7$, brings the
+    $s = 7.5$ figure down to **47.1%** and the deviation standard deviation
+    from 1.874 to 1.387 — a 26% improvement, not a cure, because it
+    renormalises magnitude and cannot restore the modes guidance deleted.
+
+    **It costs a second forward pass per guided step, and batching the two
+    branches is worth less than the arithmetic suggests.** Measured here on a
+    12-block, $d = 768$, 196-token stack: one sample 30.4 ms, a fused batch of
+    two 48.0 ms (**1.58×**), two separate calls 62.7 ms (**2.06×**), so
+    throughput falls 32.9 → 20.8 samples/s. The reason the fused form is not
+    2× is a fixed per-call cost of 0.98 ms against 1.55 ms per sample, which
+    batching amortises: per-sample block time falls from 2.598 ms at batch 1 to
+    1.579 ms at batch 32 and then stops. The real lever is the guidance
+    interval: guiding 20 of 50 steps costs 70 passes instead of 100 — **1.40×
+    instead of 2.00×, a 30% saving** — and 10 of 50 gives 1.20×.
+
+
+  derivations:
+    - title: "From a score combination to a density"
+      latex: |
+        A diffusion model's noise prediction is the negative scaled score,
+
+        $$\epsilon_\theta(x_t, t) = -\sigma_t \nabla_{x_t} \log p_t(x_t),
+          \qquad \sigma_t = \sqrt{1 - \bar\alpha_t}.$$
+
+        The guided prediction is a linear combination of two such fields,
+
+        $$\tilde\epsilon = (1+w)\epsilon_c - w\epsilon_u
+          = -\sigma_t\left[(1+w)\nabla\log p_c - w\nabla\log p\right],$$
+
+        and a linear combination of gradients is the gradient of a linear
+        combination, so
+
+        $$\nabla \log p_w = (1+w)\nabla\log p_c - w\nabla\log p.$$
+
+        Integrating and fixing the constant by normalisation,
+
+        $$p_w(x \mid c) = \frac{p(x \mid c)^{1+w}\,p(x)^{-w}}
+          {\int p(x' \mid c)^{1+w}\,p(x')^{-w}\,dx'}.$$
+
+        The exponent on the conditional is $1+w$, not $w$: that is the whole
+        reason $s = 1+w$ rather than $s = w$.
+      prose: >-
+        The step that matters is the third line — a combination of gradients is
+        a gradient, so the guided field is conservative and therefore is the
+        score of *some* density. That is what licenses calling the sampler's
+        output a sample from $p_w$. It also tells you where the argument is
+        weakest: a trained network's $\epsilon_\theta$ is not exactly a score,
+        so $\tilde\epsilon$ is only approximately conservative, and the density
+        is a description of the ideal case rather than a guarantee about your
+        checkpoint.
+
+    - title: "Mode weights, and why the exponent is an odds ratio"
+      latex: |
+        Take a mixture of $K$ well-separated modes with equal variance, a
+        conditional mixture $\pi$ and a marginal mixture $\rho$ over the same
+        components. Near the centre of mode $i$ the other components contribute
+        nothing, so
+
+        $$p_c(x) \approx \pi_i\,\mathcal{N}_i(x), \qquad
+          p(x) \approx \rho_i\,\mathcal{N}_i(x).$$
+
+        Substituting into the guided density,
+
+        $$p_w(x) \propto \left(\pi_i \mathcal{N}_i\right)^{1+w}
+          \left(\rho_i \mathcal{N}_i\right)^{-w}
+          = \pi_i^{1+w}\rho_i^{-w}\,\mathcal{N}_i
+          = \pi_i\left(\frac{\pi_i}{\rho_i}\right)^{w}\mathcal{N}_i.$$
+
+        So the guided mixture weight is
+
+        $$w_i = \frac{\pi_i(\pi_i/\rho_i)^w}{\sum_j \pi_j(\pi_j/\rho_j)^w},
+          \qquad \mathrm{ESS} = \frac{1}{\sum_i w_i^2}.$$
+
+        For $\pi = (0.9, 0.1)$ and $\rho = (0.5, 0.5)$ the rare mode runs
+        10.0% → 1.22% → 0.0152% at $w = 0, 1, 3$, and the ESS runs
+        1.2195 → 1.0247 → 1.0003.
+      prose: >-
+        The odds ratio is the mechanism in one symbol: a mode survives guidance
+        only if the class over-represents it relative to the dataset. This is
+        also why guidance is not a temperature — a temperature would multiply
+        every $\mathcal{N}_i$ by the same factor and leave $\pi$ alone, whereas
+        the exponent here differentiates between modes and does nothing to their
+        widths. The approximation in the first line is what the fourth concept
+        point measures: it needs both separation and moderate $w$, and it fails
+        by 7.9× at $2\sigma$ and by 82× at $6\sigma$ with $w = 6.5$.
+
+    - title: "Guidance in x0 space, and the clipping bound"
+      latex: |
+        The sampler's estimate of the clean image is affine in the noise
+        prediction,
+
+        $$x_0(x_t) = \frac{x_t - \sigma_t\,\epsilon_\theta(x_t)}{\alpha_t},
+          \qquad \alpha_t = \sqrt{\bar\alpha_t}.$$
+
+        Apply the same affine map to the guided prediction:
+
+        $$x_{0,w} = \frac{x_t - \sigma_t\left[\epsilon_u + s(\epsilon_c -
+          \epsilon_u)\right]}{\alpha_t}
+          = x_{0,u} + s\left(x_{0,c} - x_{0,u}\right).$$
+
+        So guiding in $\epsilon$ space and guiding in $x_0$ space are the same
+        operation, and each pixel's deviation $d = x_{0,c} - x_{0,u}$ is
+        multiplied by $s$. If $d$ is Gaussian with standard deviation
+        $\sigma_d$ and the valid range is $[-1, 1]$ with $x_{0,u} \approx 0$,
+        the clipped fraction is
+
+        $$P_{\text{clip}}(s) = 2\,\Phi\!\left(-\frac{1}{s\,\sigma_d}\right).$$
+
+        With $\sigma_d = 0.25$: 4.6% at $s = 2$, 18.2% at 3, 42.4% at 5, 59.4%
+        at 7.5, 68.9% at 10.
+      prose: >-
+        This is the arithmetic behind "over-saturated". The quantity that
+        leaves the range is not the image but the deviation, and guidance
+        multiplies the deviation. It also explains why guidance rescaling helps
+        only partly: dividing by the standard-deviation ratio scales $d$ back
+        down uniformly, which reduces the clipped fraction, but it does so by
+        shrinking the signal that guidance was applied to produce — the
+        adherence and the saturation are the same number.
+
+  implementations:
+    - language: python
+      title: "Guided weights, effective sample size, and the clipping bound"
+      note: >-
+        Numerically correct, and it computes three things you cannot get from
+        the sampler directly: the closed-form mode weights, the ESS they imply,
+        and the clipped fraction. `exact_rare_weight` integrates the guided
+        density on a grid so the closed form can be checked rather than
+        trusted — it agrees to four decimals at $6\sigma$ separation and is
+        wrong by 7.9× at $2\sigma$, which is the point of having it. The weights
+        it prints are the closed form, so its ESS at $w = 0$ is 1.2195 against
+        the quadrature table's 1.2243 — the 0.4% is the same approximation
+        error, seen from the other side. One caveat: the grid integration is
+        $O(n)$ over a fixed window and silently truncates if a mode sits outside
+        $[-30, 30]$; for the toy that is generous, for a real density it is not.
+      code: |
+        import numpy as np
+
+
+        def guided_weights(pi, rho, w):
+            """Normalised mode weights of p_c^(1+w) / p^w for separated modes."""
+            pi = np.asarray(pi, dtype=float)
+            rho = np.asarray(rho, dtype=float)
+            logits = np.log(pi) + w * (np.log(pi) - np.log(rho))
+            logits -= logits.max()
+            out = np.exp(logits)
+            return out / out.sum()
+
+
+        def ess(weights):
+            """Effective sample size of a normalised weight vector."""
+            return 1.0 / np.sum(np.asarray(weights, dtype=float) ** 2)
+
+
+        def clip_fraction(s, sigma_d, bound=1.0):
+            """Two-sided P(|s * d| > bound) for d ~ N(0, sigma_d^2)."""
+            from math import erf, sqrt
+            z = bound / (s * sigma_d)
+            return 1.0 - erf(z / sqrt(2.0))
+
+
+        def exact_rare_weight(delta, sigma, pi, rho, w, n=400001):
+            """Integrate p_c^(1+w) p^-w over the half-space x > 0."""
+            x = np.linspace(-30.0, 30.0, n)
+
+            def logmix(wts):
+                a = np.log(wts[0]) - 0.5 * ((x + delta / 2) / sigma) ** 2
+                b = np.log(wts[1]) - 0.5 * ((x - delta / 2) / sigma) ** 2
+                m = np.maximum(a, b)
+                return m + np.log(np.exp(a - m) + np.exp(b - m))
+
+            g = (1.0 + w) * logmix(pi) - w * logmix(rho)
+            g -= g.max()
+            y = np.exp(g)
+            total = y.sum()
+            return float(y[x > 0].sum() / total)
+
+
+        if __name__ == "__main__":
+            pi, rho = [0.9, 0.1], [0.5, 0.5]
+            for w in [0.0, 1.0, 3.0, 6.5]:
+                wt = guided_weights(pi, rho, w)
+                print(f"w={w:4.1f}  rare={wt[1]:.3e}  ess={ess(wt):.7f}")
+
+            # w=0.0  rare=1.000e-01  ess=1.2195122
+            # w=1.0  rare=1.220e-02  ess=1.0246876
+            # w=3.0  rare=1.524e-04  ess=1.0003048
+            # w=6.5  rare=6.969e-08  ess=1.0000001
+
+            print(clip_fraction(7.5, 0.25))       # 0.5938
+            print(clip_fraction(2.0, 0.25))       # 0.0455
+
+            print(exact_rare_weight(2.0, 1.0, pi, rho, 1.0))   # 0.0961
+            print(exact_rare_weight(6.0, 1.0, pi, rho, 1.0))   # 0.0127
+
+    - language: python
+      title: "Guidance rescaling computed per tensor: numerically WRONG"
+      note: >-
+        `rescale_wrong` is **numerically wrong**. It takes the standard
+        deviation over the whole batch instead of per sample, so a sample's
+        output depends on the other samples in the batch. With per-sample
+        factors of 2.5 and 0.5 the shared factor is 0.730: sample 0 comes back
+        at 0.184 instead of 0.290, a shortfall of 0.106 on a sample whose own
+        standard deviation is 0.2 — 53% of its signal, and it changes again when
+        you re-batch. Nothing raises, shapes are correct, and the only symptom
+        is that the same seed produces a different image at batch 1 and batch 8.
+        Imagen's rescale is per sample; the corrected function is three lines
+        away at the bottom.
+      code: |
+        import numpy as np
+
+
+        def rescale_wrong(eps_guided, eps_cond, phi):
+            """WRONG: one standard deviation for the whole batch."""
+            g = np.asarray(eps_guided, dtype=float)
+            c = np.asarray(eps_cond, dtype=float)
+            factor = c.std() / g.std()
+            return phi * g + (1.0 - phi) * factor * g
+
+
+        def rescale_correct(eps_guided, eps_cond, phi):
+            """Per sample, over that sample's own elements."""
+            g = np.asarray(eps_guided, dtype=float)
+            c = np.asarray(eps_cond, dtype=float)
+            factor = c.reshape(len(c), -1).std(axis=1)
+            factor = factor / g.reshape(len(g), -1).std(axis=1)
+            factor = factor.reshape((-1,) + (1,) * (g.ndim - 1))
+            return phi * g + (1.0 - phi) * factor * g
+
+
+        if __name__ == "__main__":
+            g = np.array([[0.2, -0.2, 0.2, -0.2],
+                          [0.9, -0.9, 0.9, -0.9]])
+            c = np.array([[0.5, -0.5, 0.5, -0.5],
+                          [0.45, -0.45, 0.45, -0.45]])
+
+            print(rescale_correct(g, c, 0.7)[0, 0])   # 0.290
+            print(rescale_wrong(g, c, 0.7)[0, 0])     # 0.184
+
+            # The tell: sample 0 moves when only sample 1 changes.
+            c2 = c.copy()
+            c2[1] *= 0.2
+            print(rescale_wrong(g, c2, 0.7)[0, 0])    # 0.173
+            print(rescale_correct(g, c2, 0.7)[0, 0])  # 0.290
+
+  checkpoints:
+    - id: cp-1
+      question: "Why does classifier-free guidance require the model to have been trained with label dropout, rather than just running an extra pass with the label zeroed at inference?"
+      answerKind: short_text
+      hint: "What distribution is the network being asked about when the condition is something it never saw in training?"
+      solution: >-
+        Because $\epsilon_u$ has to be an estimate of the marginal score for the
+        subtraction to mean anything. Dropout makes
+        $\epsilon_\theta(x_t, t, \varnothing)$ a trained query — 10% of every
+        batch is spent on it — so it estimates $\nabla\log p_t(x)$. Feed a
+        zeroed or out-of-vocabulary condition instead and the network answers
+        off-distribution: the difference $\epsilon_c - \epsilon_u$ is then a
+        direction with no interpretation, and the sampler chases it. It still
+        produces images, which is why the failure is so expensive to find.
+    - id: cp-2
+      question: "Your guided output is bit-identical at `guidance_scale=1` and `guidance_scale=20`. What is the bug, and what would you check first?"
+      answerKind: short_text
+      hint: "Write the combination with s = 20 and s = 1 and ask when both reduce to the same expression."
+      solution: >-
+        The unconditional branch is not unconditional: $\epsilon_u = \epsilon_c$,
+        so $\tilde\epsilon = \epsilon_u + s(\epsilon_c - \epsilon_u) =
+        \epsilon_c$ for every $s$. The usual causes are a null token that was
+        never applied (the label is passed to both halves of the batch), a
+        `p_uncond` of 0 at training, or a conditional embedding table that
+        silently maps the null index to the same row as the class. The tell is
+        exactly the one in the question — identical output at two very different
+        scales, to the last digit, is never a coincidence.
+    - id: cp-3
+      question: "Going from guidance scale 7.5 to 8 changes nothing visible; going from 1.1 to 1.6 changes the image completely. Both are the same arithmetic step of 0.5. Why?"
+      answerKind: short_text
+      hint: "The formula has s in it, but the exponent that sets the mode weights is not s."
+      solution: >-
+        Because the physics is linear in $w = s - 1$, not in $s$. On a two-mode
+        toy the rare mode holds 10.2% at $w = 0$, 3.71% at $w = 0.5$, 1.31% at
+        $w = 1$: the first half-unit of $w$ removes 64% of the coverage, the
+        next removes 65% of what is left, and by $w = 6.5$ the share is
+        0.0009%. So 1.1 → 1.6 is 0.1 → 0.6, a sixfold increase in the exponent,
+        while 7.5 → 8 is 6.5 → 7, a 7.7% increase on a quantity that has already
+        saturated. Sweep in $w$, and remember that the dial's useful range is
+        compressed near the bottom.
+    - id: cp-4
+      question: "A colleague tunes guidance by FID alone and lands on 7.5. Their images are flat, repetitive, and over-saturated. Is the model broken?"
+      answerKind: short_text
+      hint: "Which half of the precision-recall trade does FID weight, and what happens to pixels whose guided x0 leaves the valid range?"
+      solution: >-
+        Not broken — mis-measured. FID compares distributions, and on a
+        well-separated class it can prefer a sharp, low-coverage sample set: ADM
+        measured precision 0.82 → 0.88 while recall 0.52 → 0.32 between
+        classifier-guidance scales 1 and 10, with FID rising 4.59 → 9.11.
+        Separately, the chalkiness is arithmetic: the guided $x_0$ multiplies
+        each pixel's deviation by $s$, so at $s = 7.5$ with deviations of
+        standard deviation 0.25 on a $[-1,1]$ range, 59.4% of pixels are clipped.
+        Read precision, recall and FID together, and check the clipped fraction
+        before blaming the sampler.
+    - id: cp-5
+      question: "Your service generates a batch of 8 and sample 0 differs depending on which other 7 prompts share the batch. The seed and the prompt are unchanged. Where do you look?"
+      answerKind: short_text
+      hint: "Which operation in the pipeline reduces over an axis that spans the batch?"
+      solution: >-
+        At guidance rescaling. Imagen's correction divides by
+        $\mathrm{std}(\hat\epsilon)/\mathrm{std}(\epsilon_c)$, and both standard
+        deviations are per-sample quantities — one scalar for each image, over
+        its own channels and spatial positions. Reduce over the whole tensor
+        instead and every sample is scaled by a factor that includes its
+        neighbours: with per-sample factors of 2.5 and 0.5 the shared factor is
+        0.767, and sample 0 comes back at 0.186 where it should be 0.290. The
+        same bug appears in any per-image normalisation written with a bare
+        `.std()` on a batched tensor.
+    - id: cp-6
+      question: "You have 40 ms per request and a 50-step sampler. Unguided you are at 18 ms. What are the options, in order of how much they buy?"
+      answerKind: short_text
+      hint: "Count network calls, not FLOPs: the guidance cost is a per-step multiplier."
+      solution: >-
+        Full guidance doubles the calls — 100 passes instead of 50 — so 36 ms if
+        perfectly linear, and 1.58× rather than 2× if the two branches share a
+        batch (measured here), which lands around 28 ms. The bigger lever is the
+        guidance interval: guiding 20 of 50 steps costs 70 passes, 1.40× of
+        unguided, about 25 ms, and guiding 10 of 50 costs 60 passes, 1.20×.
+        Fewer sampler steps and a distilled student are the other two levers,
+        and they belong to the sampler and distillation topics rather than this
+        one. What you should not do is fuse the branches and call it a 2× win:
+        measured, it is 1.58×, and the second pass is still there.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        The model can be asked two questions about the same noisy image: what
+        noise is here given this class, and what noise is here given nothing.
+        The difference between those answers is the only direction in which the
+        class changes the prediction, so it is the direction worth amplifying.
+        Amplifying it does not sharpen the class — it reweights how much of the
+        distribution you visit, which is why the images get more typical and
+        less varied at the same time.
+      blocks:
+        - kind: checklist
+          body: |
+            - One network, two queries: the label, or a learned null token
+            - The combination is eps_u + s (eps_c - eps_u), with s = 1 + w
+            - s > 1 leaves the segment between the predictions: it is extrapolation
+            - What it samples is p_c^(1+w) / p^w, a geometric reweighting
+            - Modes with a conditional share below their marginal share are deleted exponentially in w
+            - The cost is one extra forward pass per guided step
+      checkpoint: >-
+        Before reading on: if the class-conditional and the marginal predictions
+        are identical at some pixel, what does guidance do there, at any scale?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in three quantities and never in adjectives. The exponent: $w = s -
+        1$, which is what actually enters every formula, so a move from 1.1 to
+        1.6 is six times larger than a move from 7.5 to 8. The reweighting: the
+        mode share $\pi_i(\pi_i/\rho_i)^w$, which tells you which modes you are
+        about to lose and how fast. The deviation: $x_{0,w} = x_{0,u} +
+        s(x_{0,c} - x_{0,u})$, which tells you what fraction of pixels leaves
+        the valid range. When a run looks wrong, compute those three before
+        touching the sampler.
+      blocks:
+        - kind: checklist
+          body: |
+            - Convert the dial to w = s - 1 before comparing anything to a paper
+            - Predict the mode shares from pi and rho; if the rare mode matters, w is small
+            - Predict the clipped fraction 2 Phi(-1 / (s sigma_d)) before rendering
+            - Count forward passes: S unguided, S + G guided, G = guided steps
+            - Measure precision and recall, not FID alone
+      checkpoint: >-
+        Which of those five quantities changes when you switch from 50 steps to
+        20, and which does not change at all?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Four procedures cover the topic. The only subtle part is the batching:
+        the two branches must be the same latents with different conditioning,
+        and the split afterwards must know which half is which.
+      blocks:
+        - kind: pseudocode
+          body: |
+            def train_step(x0, c):
+                if rand() < p_uncond:          # per sample, never per batch
+                    c = NULL
+                t = randint(1, T)
+                eps = randn_like(x0)
+                xt = sqrt(abar[t]) * x0 + sqrt(1 - abar[t]) * eps
+                return mse(eps, model(xt, t, c))
+
+            def guided_step(xt, t, c, s):
+                batch = cat([xt, xt])                  # 2B rows
+                cond = cat([c, NULL * ones_like(c)])   # B labels, B nulls
+                out = model(batch, cat([t, t]), cond)  # one call
+                eps_c, eps_u = split(out)              # first B, last B
+                return eps_u + s * (eps_c - eps_u)
+
+            def guided_weights(pi, rho, w):
+                logits = log(pi) + w * (log(pi) - log(rho))
+                return softmax(logits)
+
+            def rescale(eps_hat, eps_c, phi):
+                per_sample_std_over_pixels()           # not over the batch
+      checkpoint: >-
+        Why must the dropout draw be per sample and not per batch, given that
+        the loss is a mean over the batch either way?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three lines of algebra produce the density, the mode weights and the
+        clipping bound. The one that is easy to get wrong is the exponent:
+        $(1+w)$ on the conditional and $-w$ on the marginal, which is where
+        $s = 1+w$ comes from.
+      blocks:
+        - kind: math
+          body: |
+            Score form and the guided field:
+
+            $$\epsilon = -\sigma_t \nabla \log p_t, \qquad
+              \tilde\epsilon = (1+w)\epsilon_c - w\epsilon_u
+              \;\Longrightarrow\;
+              \nabla\log p_w = (1+w)\nabla\log p_c - w\nabla\log p,$$
+
+            $$p_w \propto p_c^{1+w}\,p^{-w}.$$
+
+            Mode weights near a separated component:
+
+            $$p_c \approx \pi_i\mathcal{N}_i,\quad p \approx
+              \rho_i\mathcal{N}_i
+              \;\Longrightarrow\;
+              p_w \propto \pi_i\left(\frac{\pi_i}{\rho_i}\right)^{w}
+              \mathcal{N}_i.$$
+
+            In $x_0$ space, with $x_0 = (x_t - \sigma_t\epsilon)/\alpha_t$:
+
+            $$x_{0,w} = x_{0,u} + s\left(x_{0,c} - x_{0,u}\right),
+              \qquad P_{\text{clip}} = 2\Phi\!\left(-\frac{1}{s\sigma_d}\right).$$
+      checkpoint: >-
+        If the conditional and the marginal had exactly the same mixture
+        weights, what would guidance do, and what does that say about when it is
+        useful?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete guided step, the weight arithmetic that predicts what it will
+        do, and the two failure modes worth memorising: a null branch that is
+        not null, and a standard deviation reduced over the wrong axis.
+      blocks:
+        - kind: warning
+          body: >-
+            Three failures that raise nothing. A `p_uncond` of zero makes
+            $\epsilon_u = \epsilon_c$ and the guided output identical at every
+            scale. A per-tensor `.std()` in the rescale makes a sample's output
+            depend on its batch neighbours. And a guidance scale written where
+            $w$ belongs is a 13.3% weaker shift at $s = 7.5$ — invisible on one
+            image, systematic across a sweep.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def guided_epsilon(eps_cond, eps_uncond, scale):
+                """scale is s = 1 + w, as libraries expose it."""
+                return eps_uncond + scale * (eps_cond - eps_uncond)
+
+
+            def guided_weights(pi, rho, w):
+                pi = np.asarray(pi, float)
+                rho = np.asarray(rho, float)
+                logits = np.log(pi) + w * (np.log(pi) - np.log(rho))
+                logits -= logits.max()
+                p = np.exp(logits)
+                return p / p.sum()
+
+
+            def guided_mode_share(pi, rho, w, i):
+                return float(guided_weights(pi, rho, w)[i])
+
+
+            if __name__ == "__main__":
+                pi, rho = [0.9, 0.1], [0.5, 0.5]
+                print(round(guided_mode_share(pi, rho, 1.0, 1), 5))   # 0.0122
+                print(round(guided_mode_share(pi, rho, 3.0, 1), 5))   # 0.00015
+                e_c = np.array([0.4, -0.2])
+                e_u = np.array([0.1, -0.1])
+                print(guided_epsilon(e_c, e_u, 1.0))   # [0.4 -0.2], the conditional
+                print(guided_epsilon(e_c, e_u, 7.5))   # [2.35 -0.85]
+      checkpoint: >-
+        In `guided_epsilon`, what happens to the output as `scale` goes to zero,
+        and why is that the right limit rather than a coincidence?
+
+  problems:
+    - id: p-guided-weights
+      title: "The mode weights of the guided distribution"
+      difficulty: easy
+      prompt: >-
+        Implement `guided_weights(pi, rho, w)`. `pi` is the conditional mixture
+        weight of each mode and `rho` its weight in the marginal, both lists of
+        positive floats of the same length. Return the normalised guided weights
+        as a list of floats, using the well-separated-mode result
+        $w_i \propto \pi_i(\pi_i/\rho_i)^w$. Work in log space so that a large
+        `w` and a small `rho` do not underflow, and make the output sum to one
+        to floating-point precision.
+      starter: |
+        import numpy as np
+
+        def guided_weights(pi, rho, w):
+            # your implementation here
+            pass
+      language: python
+      entry: guided_weights
+      testCases:
+        - input: '{"pi": [0.9, 0.1], "rho": [0.5, 0.5], "w": 0.0}'
+          expected: "[0.9, 0.1]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"pi": [0.9, 0.1], "rho": [0.5, 0.5], "w": 1.0}'
+          expected: "[0.9878048780487805, 0.012195121951219518]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"pi": [0.9, 0.1], "rho": [0.5, 0.5], "w": 6.5}'
+          expected: "[0.9999999303082856, 6.969171451932115e-08]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"pi": [0.6, 0.3, 0.1], "rho": [0.2, 0.5, 0.3], "w": 2.0}'
+          expected: "[0.9784184248671284, 0.019568368497342562, 0.0020132066355290725]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"pi": [0.5, 0.5], "rho": [0.5, 0.5], "w": 4.0}'
+          expected: "[0.5, 0.5]"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def guided_weights(pi, rho, w):
+            pi = np.asarray(pi, dtype=float)
+            rho = np.asarray(rho, dtype=float)
+            if pi.shape != rho.shape:
+                raise ValueError("pi and rho must have the same length")
+            if np.any(pi <= 0) or np.any(rho <= 0):
+                raise ValueError("all weights must be positive")
+
+            # log(pi) + w * log(pi / rho), which is log of pi^(1+w) rho^(-w)
+            logits = np.log(pi) + w * (np.log(pi) - np.log(rho))
+            logits = logits - logits.max()
+            out = np.exp(logits)
+            return (out / out.sum()).tolist()
+      solutionExplanation: >-
+        The guided weight is $\pi_i^{1+w}\rho_i^{-w} = \pi_i(\pi_i/\rho_i)^w$,
+        so the log-space form is `log(pi) + w * (log(pi) - log(rho))`. Building
+        the powers directly overflows or underflows: at $w = 6.5$ and
+        $\rho = 0.5$ the factor is $1.8^{6.5} = 45.6$ on one mode and
+        $0.2^{6.5} = 2.9\times10^{-5}$ on the other, and at $w = 200$ the raw
+        form is pure inf and nan while the log form is exact. Subtracting the
+        max before exponentiating is what keeps the sum representable; the
+        normalisation at the end removes it again. Test case 5 is the
+        consistency check: when the conditional and the marginal have the same
+        weights the odds ratio is one, every power is one, and guidance does
+        nothing at any $w$ — the output must be exactly `[0.5, 0.5]`. Test case
+        3 is the underflow check: the second weight is $7\times10^{-8}$, which a
+        naive `pi ** (1 + w) * rho ** (-w)` would still produce, but only
+        because 6.5 is small enough; at $w = 20$ it would not.
+      complexity: "O(K) time and space for K modes, in log space"
+      tags: [cfg, guidance, mode-weights, log-sum-exp]
+
+    - id: p-guidance-rescale
+      title: "Guidance rescaling, per sample"
+      difficulty: medium
+      prompt: >-
+        Implement `guidance_rescale(eps_guided, eps_cond, phi)`. `eps_guided`
+        and `eps_cond` are nested lists of the same shape `(B, N)`: one row per
+        sample, `N` elements per sample (channels and pixels flattened). For each
+        sample, compute the ratio of that sample's own population standard
+        deviation of `eps_cond` to its own population standard deviation of
+        `eps_guided` (divide by `N`, not `N - 1`), and return
+        `phi * guided + (1 - phi) * ratio * guided`. If a sample's guided
+        standard deviation is exactly zero, return that row unchanged. Do not
+        let one sample's statistics affect another's.
+      starter: |
+        import numpy as np
+
+        def guidance_rescale(eps_guided, eps_cond, phi):
+            # your implementation here
+            pass
+      language: python
+      entry: guidance_rescale
+      testCases:
+        - input: '{"eps_guided": [[0.2, -0.2, 0.2, -0.2]], "eps_cond": [[0.18, -0.18, 0.18, -0.18]], "phi": 0.7}'
+          expected: "[[0.194, -0.194, 0.194, -0.194]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"eps_guided": [[0.2, -0.2, 0.2, -0.2], [0.9, -0.9, 0.9, -0.9]], "eps_cond": [[0.5, -0.5, 0.5, -0.5], [0.45, -0.45, 0.45, -0.45]], "phi": 1.0}'
+          expected: "[[0.2, -0.2, 0.2, -0.2], [0.9, -0.9, 0.9, -0.9]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"eps_guided": [[0.2, -0.2, 0.2, -0.2], [0.9, -0.9, 0.9, -0.9]], "eps_cond": [[0.5, -0.5, 0.5, -0.5], [0.45, -0.45, 0.45, -0.45]], "phi": 0.7}'
+          expected: "[[0.29000000000000004, -0.29000000000000004, 0.29000000000000004, -0.29000000000000004], [0.765, -0.765, 0.765, -0.765]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '{"eps_guided": [[0.3, 0.3, 0.3], [0.1, -0.1, 0.0]], "eps_cond": [[0.2, 0.2, 0.2], [0.05, -0.05, 0.0]], "phi": 0.5}'
+          expected: "[[0.3, 0.3, 0.3], [0.07500000000000001, -0.07500000000000001, 0.0]]"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def guidance_rescale(eps_guided, eps_cond, phi):
+            g = np.asarray(eps_guided, dtype=float)
+            c = np.asarray(eps_cond, dtype=float)
+            if g.shape != c.shape:
+                raise ValueError("eps_guided and eps_cond must have the same shape")
+            if not 0.0 <= phi <= 1.0:
+                raise ValueError("phi must lie in [0, 1]")
+            if g.ndim == 1:
+                g = g[None, :]
+                c = c[None, :]
+
+            out = np.empty_like(g)
+            for i in range(g.shape[0]):
+                sg = g[i].std()          # population std, over this sample only
+                sc = c[i].std()
+                if sg == 0.0:
+                    out[i] = g[i]
+                    continue
+                out[i] = phi * g[i] + (1.0 - phi) * (sc / sg) * g[i]
+            return out.tolist()
+      solutionExplanation: >-
+        The ratio is a per-sample scalar — one number for each image, computed
+        over that image's channels and pixels — and the loop is the clearest way
+        to enforce it. A vectorised version is the same arithmetic with
+        `std(axis=tuple(range(1, g.ndim)), keepdims=True)`, and the axis is
+        exactly where the bug lives: `g.std()` with no axis reduces over the
+        whole batch, so sample 0's output depends on sample 1. Test case 3 is
+        the one that catches it. Sample 0 has guided 0.2 and conditional 0.5
+        (ratio 2.5, output 0.290); sample 1 has guided 0.9 and conditional 0.45
+        (ratio 0.5, output 0.765). A batch-wide reduction gives both samples the
+        factor 0.767 and returns 0.186 for sample 0 — right shape, no exception,
+        wrong image. Test case 2 pins `phi = 1`, where the correction is the
+        identity and the answer must equal the input exactly, which catches a
+        sign error in the blend weights. Test case 4 checks the zero-variance
+        guard on the constant row `[0.3, 0.3, 0.3]`: dividing by a zero standard
+        deviation would produce nan for the whole row.
+      complexity: "O(B·N) time, O(B·N) space; one standard deviation per sample"
+      tags: [cfg, rescaling, batching, standard-deviation]
+
+    - id: p-guided-score
+      title: "The guided score at a point, for a Gaussian mixture"
+      difficulty: hard
+      prompt: >-
+        Implement `guided_score(x, means, variances, pi, rho, w)` for a
+        one-dimensional Gaussian mixture. `means` and `variances` describe the
+        components; `pi` and `rho` are the conditional and marginal mixture
+        weights. Compute the conditional score
+        $\sum_i r_i(x)(\mu_i - x)/v_i$ with responsibilities from `pi`, the
+        unconditional score the same way with `rho`, and return
+        $\epsilon_u + (1+w)(\epsilon_c - \epsilon_u)$ as a float. Compute the
+        responsibilities in log space — a component whose density underflows to
+        zero must not turn the whole sum into nan.
+      starter: |
+        import numpy as np
+
+        def guided_score(x, means, variances, pi, rho, w):
+            # your implementation here
+            pass
+      language: python
+      entry: guided_score
+      testCases:
+        - input: '{"x": 0.0, "means": [-1.0, 1.0], "variances": [0.25, 0.25], "pi": [0.9, 0.1], "rho": [0.5, 0.5], "w": 1.0}'
+          expected: "-6.399999999999999"
+          mode: json
+          tolerance: 1e-09
+        - input: '{"x": 0.4, "means": [-1.0, 1.0], "variances": [0.25, 0.25], "pi": [0.9, 0.1], "rho": [0.5, 0.5], "w": 1.0}'
+          expected: "-1.5810116611037826"
+          mode: json
+          tolerance: 1e-09
+        - input: '{"x": 0.4, "means": [-1.0, 1.0], "variances": [0.25, 0.25], "pi": [0.9, 0.1], "rho": [0.5, 0.5], "w": 0.0}'
+          expected: "0.2528312782610511"
+          mode: json
+          tolerance: 1e-09
+        - input: '{"x": -1.2, "means": [-1.0, 1.0], "variances": [0.25, 0.25], "pi": [0.9, 0.1], "rho": [0.5, 0.5], "w": 3.0}'
+          expected: "0.7986154318822194"
+          mode: json
+          tolerance: 1e-09
+        - input: '{"x": 0.0, "means": [-1.0, 0.0, 2.0], "variances": [0.25, 0.5, 1.0], "pi": [0.5, 0.3, 0.2], "rho": [0.2, 0.5, 0.3], "w": 2.0}'
+          expected: "-2.1538394351707275"
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import numpy as np
+
+        def guided_score(x, means, variances, pi, rho, w):
+            mu = np.asarray(means, dtype=float)
+            var = np.asarray(variances, dtype=float)
+            pi = np.asarray(pi, dtype=float)
+            rho = np.asarray(rho, dtype=float)
+            if not (mu.shape == var.shape == pi.shape == rho.shape):
+                raise ValueError("means, variances, pi and rho must have the same length")
+            if np.any(var <= 0):
+                raise ValueError("variances must be positive")
+
+            def score(wts):
+                logp = (np.log(wts) - 0.5 * np.log(2.0 * np.pi * var)
+                        - 0.5 * (x - mu) ** 2 / var)
+                logp = logp - logp.max()
+                r = np.exp(logp)
+                r = r / r.sum()
+                return float(np.sum(r * (mu - x) / var))
+
+            s_c = score(pi)
+            s_u = score(rho)
+            return s_u + (1.0 + w) * (s_c - s_u)
+      solutionExplanation: >-
+        The responsibility of component $i$ is
+        $r_i = \pi_i \mathcal{N}(x;\mu_i,v_i) / \sum_j \pi_j
+        \mathcal{N}(x;\mu_j,v_j)$, and the mixture score is
+        $\sum_i r_i(\mu_i - x)/v_i$ — note that the score of a component pulls
+        *toward* its mean with a coefficient $1/v_i$, so a tight component moves
+        the score much harder than a wide one. Test case 1 is checkable by hand:
+        at $x = 0$ the two densities are equal, so the responsibilities are
+        exactly the weights; with $\pi = (0.9, 0.1)$, $v = 0.25$ and
+        $\mu = \mp 1$, $s_c = (0.9(-1) + 0.1(1))/0.25 = -3.2$ and
+        $s_u = (0.5(-1) + 0.5(1))/0.25 = 0$, so the guided score is
+        $0 + 2(-3.2) = -6.4$. Test case 3 has $w = 0$, where the guided score
+        must equal the conditional score exactly — a useful check that the two
+        responsibilities are not swapped. If they are, case 3 returns the
+        unconditional score at that point, and cases 1 and 4 change sign. The
+        log-space form matters at $x = -1.2$ with a component at $+2$: the
+        density ratio is $e^{-60}$-ish and the naive form gives 0/0.
+      complexity: "O(K) time and space for K components; two log-sum-exp passes"
+      tags: [cfg, score, gaussian-mixture, log-sum-exp]
+
+  try_it: >-
+    Guided noise is eps_u + s(eps_c − eps_u). Take eps_u = 0.5 and eps_c = 1.0 and compute the
+    output at s = 0, 1, 2 and 7.5, then label each with the w it corresponds to (s = 1 + w).
+    You should get 0.5, 1.0, 1.5 and 4.25 — and notice that s = 7.5 with these two predictions
+    is already extrapolating 7.5 times past the conditional one.
+  interview_questions:
+    - question: "Why is the guidance formula an extrapolation rather than an average, and what do s = 1 and s = 2 mean?"
+      level: mid
+      key_points:
+        - "s = 1 + w, so s = 0 is the unconditional model, s = 1 is the conditional one, and every useful setting lives at s > 1 — outside the segment between the two predictions."
+        - "In the equal-variance Gaussian case it translates the conditional without changing its width: the mean runs −0.799, −0.978, −1.005, −1.008 at w = 0, 1, 3, 6.5 while the within-mode standard deviation stays 0.35."
+        - "Because it moves mass rather than sharpening it, the guided x_0 estimate is exactly x_0,u + s(x_0,c − x_0,u), which is why the image saturates the pixel range instead of gaining detail."
+        - "It costs a second forward pass per guided step — two network calls per step, not two models."
+      follow_up: "If the within-mode width never changes, why do high-guidance images look sharper?"
+    - question: "At high guidance your images have flat whites and clipped highlights. Where does that come from, and what does a rescale actually fix?"
+      level: senior
+      key_points:
+        - "The guided clean estimate is affine in eps, so every pixel's deviation from the unconditional prediction is multiplied by s."
+        - "With deviations of standard deviation 0.25 on a [−1, 1] range, the fraction of pixels pushed outside the valid range is 0.006% at s = 1, 4.6% at 2, 18.2% at 3, 59.4% at 7.5 and 68.9% at 10."
+        - "Clipping is where the chalky whites come from; Imagen's rescale at phi = 0.7 brings the s = 7.5 figure to 47.1% and the deviation standard deviation from 1.874 to 1.387."
+        - "Rescaling renormalises magnitude and cannot restore the modes guidance deleted, so it improves the artefact without recovering diversity."
+      follow_up: "Somebody suggests lowering the scale until nothing clips. What do you lose, and where would you see it?"
+    - question: "A tutorial sets the unconditional training probability to 0.5 so the unconditional branch is good. Why does that make the model worse?"
+      level: mid
+      key_points:
+        - "Label dropout only ever costs the conditional branch: at p = 0.1 the conditional model trains on 90% of the batch, and at p = 0.5 on half of it."
+        - "The paper's ablation found 0.1 and 0.2 about equally good and 0.5 worse, which is the measured answer to the tutorial's reasoning."
+        - "The unconditional branch does not need a dedicated model — it is the same weights queried with the null token, one extra embedding row of 768 numbers against DiT-XL's 675M."
+        - "The null token must be the learned row that dropout exposed during training; a zero vector invented at inference gives an off-distribution answer that is no longer a score of the marginal."
+      follow_up: "At batch 2048 and p = 0.1, how many of 1000 classes get no conditional example in a given batch, and why does that not break training?"
+  common_mistakes:
+    - "Copying a guidance number across papers: w and s differ by exactly one, and ADM's scale of 10 is a classifier gradient, not a difference of two scores — the same digits mean three different things."
+    - "Implementing label dropout per batch instead of per sample, so 10% of whole steps are unconditional and the two branches are trained on disjoint steps."
+    - "Inventing the null embedding as a zero vector at inference rather than using the learned row dropout trained, which makes the unconditional prediction garbage."
+  further_reading:
+    - label: "Ho, Salimans, Classifier-Free Diffusion Guidance"
+    - label: "Dhariwal, Nichol, Diffusion Models Beat GANs on Image Synthesis, NeurIPS 2021"

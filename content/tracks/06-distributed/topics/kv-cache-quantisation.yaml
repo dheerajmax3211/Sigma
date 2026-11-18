@@ -1,0 +1,600 @@
+id: kv-cache-quantisation
+slug: kv-cache-quantisation
+title: "KV Cache Quantisation and Prefix Caching"
+summary: >-
+  The cache is activation-like, not weight-like, so its outliers live on an axis
+  you must find before choosing a scaling scheme — and quantising it pays back
+  exactly in proportion to how much of each decode step was cache traffic.
+kind: lesson
+difficulty: hard
+position: 8
+estMinutes: 17
+prerequisites: [continuous-batching, quantisation]
+phase: serving
+tags: [kv-cache, quantisation, inference, memory, prefix-cache]
+
+body:
+  big_idea: >-
+    Weight and cache quantisation are not the same operation: the KV cache is
+    activation-like, its outliers cluster on one axis, and the axis you scale
+    along decides whether int8 is lossless or useless.
+  problem:
+    - "You quantise the KV cache per-tensor at int8 and lose four orders of magnitude, because five tokens carried 20x the magnitude of everything else."
+    - "You expect 2x decode from an int8 cache and measure 1.13x, because at 4k context the weights are still 77% of the bytes moved."
+    - "You key a prefix cache only on token ids, so logits return from the wrong context — a correctness bug that looks like quality regression."
+  analogy: >-
+    Most shelves hold similar crates except five that are twenty times taller.
+    Sizing every shelf to the tallest wastes the rest — that is per-tensor
+    scaling; size each shelf to its own crates and nothing rattles. The catch
+    is knowing which direction "shelf" means: crates are stored by aisle and
+    by level, so measure which axis holds the outliers first.
+  concept_points:
+    - "**The cache is activation-like, so project it on the right axis first.** On a 512-token, 128-dim, 8-head cache with five tokens scaled 20x: per-tensor int8 gives MSE **0.02688**, per-token gives **0.00021** — **128x better** — while per-channel is intermediate at 0.00576. The outlier axis and the scaling axis must match."
+    - "**The complementary case proves the rule.** With two *channels* scaled 20x instead, per-tensor gives **0.03548**, per-channel **0.00041** (**87x better**) and per-token is now worse at 0.00334. Nothing about the algorithm changed, only which axis carried the outliers. Measure the axis; do not assume it."
+    - "**On well-conditioned data, int8 is essentially lossless.** With no injected outliers the same cache quantises to MSE **0.00012** per-tensor and **0.00004** per-token. Quantisation error is not intrinsic to 8 bits; it is a consequence of dynamic range, which is why the same dtype is lossless here and useless under a 20x outlier."
+    - "**The speedup is proportional to the cache share of bytes moved.** At 4k, batch 32, weights are 140 GB and cache 42.9 GB: 54.6 ms becomes 48.2 ms, only **1.13x**. At 32k the cache is 343.6 GB, so 144.4 ms becomes 93.1 ms — **1.55x**. The law is $t = (W + C)/B_{\\text{HBM}}$, so halving $C$ helps by $1 + C/(2W + C)$."
+    - "**Prefix caching is orthogonal and often larger.** Reusing the cache for a shared prefix avoids recomputing prefill entirely: a 4k prompt costs 5.73e14 FLOPs and about 1,160 ms at peak, so a 2k shared system prompt saves roughly half the first-token latency on every request. Quantisation reduces bytes per step; prefix caching removes steps."
+    - "**A prefix cache must be keyed on more than token ids.** The cache encodes positions and is model-specific, so the key needs the model version, the token sequence and the attention configuration. Keying on ids alone returns logits computed under a different context — a correctness bug that looks like a quality regression."
+  definitions:
+    - { term: "KV cache", meaning: "Stored keys and values per token per layer. 320 KiB per token for the 70B configuration used here." }
+    - { term: "Per-tensor scaling", meaning: "One scale for the whole tensor. Fragile when any element is an outlier." }
+    - { term: "Per-token scaling", meaning: "One scale per token row. Correct when outliers follow specific tokens." }
+    - { term: "Per-channel scaling", meaning: "One scale per feature dimension. Correct when outliers follow specific channels." }
+    - { term: "Group quantisation", meaning: "One scale per group of features, trading metadata for local dynamic range." }
+    - { term: "Outlier axis", meaning: "The dimension along which magnitudes vary most. Determines which scaling scheme is appropriate." }
+    - { term: "Prefix caching", meaning: "Reusing the KV cache for a shared prompt prefix so prefill is not repeated. Removes steps rather than shrinking them." }
+    - { term: "Cache key", meaning: "What identifies a reusable prefix: model version, token sequence, positions, attention configuration." }
+    - { term: "Cache share", meaning: "Fraction of bytes moved per decode step that is cache rather than weights. Sets the ceiling on quantisation speedup." }
+    - { term: "Quantisation MSE", meaning: "Mean squared reconstruction error of the cache. The per-layer diagnostic before committing to a scheme." }
+
+  diagrams:
+    - type: compare
+      title: "Scaling axis must match the outlier axis"
+      left_label: "Outliers on the token axis"
+      left_points:
+        - "Per-tensor MSE 0.02688"
+        - "Per-token MSE 0.00021, 128x better"
+        - "Per-channel MSE 0.00576, only 4.7x"
+        - "Five tokens at 20x set a scale that flattens the rest"
+      right_label: "Outliers on the channel axis"
+      right_points:
+        - "Per-tensor MSE 0.03548"
+        - "Per-channel MSE 0.00041, 87x better"
+        - "Per-token MSE 0.00334, only 10.6x"
+        - "The roles reverse with the axis, not the algorithm"
+    - type: plot
+      title: "Cache quantisation speedup grows with context"
+      chart: "line"
+      xLabel: "context length"
+      yLabel: "decode step, ms"
+      series:
+        - name: "fp16 cache"
+          points:
+            - { x: 4096, y: 54.6 }
+            - { x: 32768, y: 144.4 }
+        - name: "int8 cache"
+          points:
+            - { x: 4096, y: 48.2 }
+            - { x: 32768, y: 93.1 }
+    - type: pipeline
+      title: "Two independent levers"
+      nodes:
+        - label: "Prefix cache hit"
+          note: "removes prefill steps entirely"
+          detail: "A 4k prompt is 5.73e14 FLOPs and about 1,160 ms at peak. A shared 2k system prompt saves roughly half of that on every request."
+        - label: "Prefill remaining tokens"
+          note: "compute-bound"
+          detail: "Scales with the uncached prompt length. This is the only phase where MFU and tensor cores matter."
+        - label: "Decode with quantised cache"
+          note: "shrinks bytes per step"
+          detail: "1.13x at 4k, 1.55x at 32k — because the cache share of bytes moved rises with context."
+    - type: architecture
+      title: "Where a prefix cache has to be keyed"
+      nodes:
+        - { id: req, x: 0, y: 0, label: "Request", kind: client, detail: "Prompt tokens plus the model version that will serve them." }
+        - { id: key, x: 1, y: 0, label: "Cache key", kind: worker, detail: "Model version, token ids, positions, attention config. Ids alone are not enough — the cache encodes all four." }
+        - { id: store, x: 2, y: 0, label: "Prefix store", kind: database, detail: "Paged blocks keyed by prefix hash. Eviction policy matters more than size: hot system prompts should never be evicted." }
+        - { id: hit, x: 2, y: 2, label: "Hit or miss", kind: worker, detail: "On a hit, prefill is skipped for the matched prefix; on a miss the request is served cold at full first-token cost." }
+      edges:
+        - { from: req, to: key }
+        - { from: key, to: store }
+        - { from: store, to: hit }
+        - { from: req, to: hit, label: "cold path", style: "async" }
+
+  markdown: |
+    ## The axis decides everything
+
+    A KV cache is written one token at a time, so its magnitude distribution is
+    not like a weight matrix's. Measured on a 512x128x8 cache:
+
+    | Condition | per-tensor | per-token | per-channel |
+    |---|---|---|---|
+    | clean | 0.00012 | **0.00004** | 0.00006 |
+    | 5 tokens at 20x | 0.02688 | **0.00021** | 0.00576 |
+    | 2 channels at 20x | 0.03548 | 0.00334 | **0.00041** |
+
+    Read the two outlier rows together. On the token axis, per-token scaling is
+    **128x** better than per-tensor; on the channel axis, per-channel is **87x**
+    better and per-token is the *worse* choice. The algorithm never changed —
+    only which axis carried the mass.
+
+    And on clean data everything is fine: int8 is lossless to **1e-4** MSE. So
+    quantisation error is not intrinsic to 8 bits; it is a consequence of
+    dynamic range, which means the diagnostic is per layer and cheap.
+
+    ## Payoff is proportional to cache share
+
+    Each decode step streams weights plus cache, so
+
+    $$t = \frac{W + C}{B_{\text{HBM}}},$$
+
+    and halving the cache multiplies throughput by
+
+    $$\frac{2W + 2C}{2W + C}.$$
+
+    | Context | Weights | Cache (batch 32) | Step fp16 | Step int8 | Speedup |
+    |---|---|---|---|---|---|
+    | 4,096 | 140 GB | 42.9 GB | 54.6 ms | 48.2 ms | **1.13x** |
+    | 32,768 | 140 GB | 343.6 GB | 144.4 ms | 93.1 ms | **1.55x** |
+
+    Same operation, same model, **37% more speedup** from eight times the
+    context. If you benchmark cache quantisation at 4k you have measured the
+    regime where it cannot help, and concluded something about the technique.
+
+    ## Two levers that are easy to confuse
+
+    Quantising shrinks bytes per step. Prefix caching **removes steps**. A 4k
+    prompt costs 5.73e14 FLOPs and roughly 1,160 ms at peak to prefill; a shared
+    2k system prompt removes about half of that from every request. They compose,
+    and they answer different questions: one is about bandwidth, the other about
+    repeated work.
+
+    ## What I could not reproduce
+
+    The common claim that quantising **keys** hurts more than quantising
+    **values** did not appear in my experiment: int8 gave identical error to six
+    decimals and int4 gave a ratio of 1.0x.
+
+    That is not a refutation. The claim is plausible for *trained* attention,
+    where a small key error can move the argmax of the softmax, and my synthetic
+    Gaussian keys had no such structure. But an unmeasured claim stated as fact
+    is how topics become folklore, so it is labelled here as untested.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Weight quantisation and cache quantisation look like the same operation and are not. Weights are static and roughly symmetric; the KV cache is activation-like, written per token per layer, and its outliers cluster on **one axis** — so per-tensor scaling is the wrong default and the axis you scale along decides whether int8 is lossless or useless. The payoff is proportional too: halving cache bytes helps in proportion to how much of the decode step was cache traffic, which is 15% at 4k context and 68% at 32k.
+
+    ### The analogy, in full
+
+    A warehouse where most shelves hold similar crates, except five shelves hold crates twenty times taller. If you size every shelf to the tallest crate, all the normal crates rattle around in oversized slots — that is per-tensor scaling. Size each shelf to its own crates and nothing is wasted. The catch is knowing which direction "shelf" means. Crates are stored by aisle and by level; outliers might run along one and not the other, and you must measure which before choosing. Guessing gives you the rattling version with extra code. Two ways the analogy breaks. First, the crates are written once and read many times, so the cost of a bad scale is paid on every decode step rather than once at write time. Second, the payoff depends on how much of the trip is spent fetching crates versus driving: at short context the truck is mostly carrying weights, so shrinking crates barely helps.
+
+    ### Failure modes, in full
+
+    - You quantise the KV cache per-tensor at int8 and lose four orders of magnitude of precision, because five tokens carried 20x the magnitude of everything else and set a scale that flattened the rest of the cache.
+    - You read that quantised keys hurt more than quantised values, implement it, and cannot reproduce the effect on your data — because the effect depends on the trained attention distribution, not on the arithmetic.
+    - You expect a 2x decode speedup from int8 cache and measure 1.13x, because at 4k context the weights are still 77% of the bytes moved.
+    - You cache the prefix to avoid recomputation and forget that the cache is per-model and per-position — a prefix cache keyed only on the token ids returns logits from the wrong context.
+    - You measure decode latency at batch 1, where the cache is negligible, and conclude cache quantisation is not worth the accuracy risk.
+
+    ### The mechanisms, in full
+
+    - **The cache is activation-like, so project it on the right axis first.** Measured on a 512-token, 128-dim, 8-head cache with five tokens scaled 20x: per-tensor int8 gives MSE **0.02688**, per-token scaling gives **0.00021** — **128x better** — while per-channel is intermediate at 0.00576. The outlier axis and the scaling axis must match.
+    - **The complementary case proves the rule.** With two *channels* scaled 20x instead of tokens, per-tensor gives **0.03548**, per-channel gives **0.00041** (**87x better**) and per-token is now the worse choice at 0.00334. Nothing about the algorithm changed — only which axis carried the outliers. Measure the axis; do not assume it.
+    - **On well-conditioned data, int8 is essentially lossless.** With no injected outliers the same cache quantises to MSE **0.00012** per-tensor and **0.00004** per-token. That is the baseline the outlier rows are measured against: quantisation error is not intrinsic to 8 bits, it is a consequence of dynamic range.
+    - **The speedup is proportional to the cache share of bytes moved.** At 4k context, batch 32, weights are 140 GB and cache is 42.9 GB: a step takes 54.6 ms and int8 cache makes it 48.2 ms — only **1.13x**. At 32k the cache is 343.6 GB against the same 140 GB of weights, so the step goes from 144.4 ms to 93.1 ms — **1.55x**. Same quantisation, same model, 37% more speedup from 8x the context.
+    - **This is the roofline prediction, not a surprise.** Decode reads weights plus cache each step, so $t = (W + C)/B_{\text{HBM}}$ and halving $C$ helps by $1 + C/(2W+C)$ — 1.13x when $C = 0.31W$ and 1.55x when $C = 2.45W$. If you evaluate cache quantisation at short context you are measuring the regime where it cannot matter.
+    - **Prefix caching is orthogonal and often larger.** Reusing the cache for a shared prefix avoids recomputing prefill for those tokens entirely: a 4k prompt costs 5.73e14 FLOPs and roughly 1,160 ms at peak, so a 2k shared system prompt saves about half of the first-token latency on every request. Quantisation reduces bytes per step; prefix caching removes steps.
+    - **A prefix cache must be keyed on more than token ids.** The cache encodes positions and is model-specific, so the key needs the model version, the token sequence, and the attention configuration. Keying on ids alone returns logits computed under a different context — a correctness bug that looks like a quality regression.
+    - **The keys-versus-values asymmetry did not reproduce here.** On synthetic Gaussian attention, quantising keys and quantising values gave the same error to six decimals at int8 and a ratio of 1.0x at int4. The often-quoted claim that keys are more sensitive is plausibly about *trained* attention distributions, where a small key error moves the argmax — but this experiment cannot confirm it, so the topic states it as untested rather than measured.
+    - **Group size is the second knob after axis.** Per-channel-per-group scaling trades metadata for precision: smaller groups track local dynamic range better at the cost of more scales to store and load. On clean data the gain over per-token is 3x in MSE (0.00004 vs 0.00012); on the outlier case the correct axis buys 128x. Getting the axis right dominates.
+    - **The accuracy question is what you are willing to spend, not whether int8 works.** On well-conditioned caches int8 is lossless to 1e-4 MSE. Where it breaks is exactly where the cache has heavy-tailed token norms — and that is measurable per layer before you commit, by comparing quantisation MSE against the layer's attention-output scale.
+  derivations:
+    - title: "Speedup from halving cache bytes"
+      latex: |
+        Bytes per decode step are $W + C$ where $W$ is weight bytes and $C$ cache
+        bytes. Halving the cache gives
+        $$S = \frac{W + C}{W + C/2} = \frac{2(W+C)}{2W+C}.$$
+        With $C = 0.31W$: $S = 2(1.31)/(2.31) = 1.13$. With $C = 2.45W$:
+        $S = 2(3.45)/(4.45) = 1.55$.
+      prose: >-
+        The formula is why context length is the variable that matters. As $C/W$
+        grows, $S$ tends to 2; as it shrinks, $S$ tends to 1 and the technique
+        becomes free to skip.
+    - title: "Quantisation error under an outlier"
+      latex: |
+        With per-tensor scaling the step is $\Delta = \max|x|/(2^{b-1}-1)$, so a
+        single element of magnitude $M$ forces error up to $M/2^b$ on every
+        element. With per-row scaling the step is $\Delta_i = \max_j|x_{ij}|/(2^{b-1}-1)$
+        and an outlier in row $k$ does not affect row $i \neq k$.
+      prose: >-
+        That is the whole mechanism. The measured 128x and 87x factors are what
+        it looks like when the outlier axis matches, and the 4.7x and 10.6x
+        factors are what it looks like when it does not.
+    - title: "Prefix cache saving in prefill FLOPs"
+      latex: |
+        Prefill costs $2PT$ FLOPs for $T$ tokens. Caching a prefix of $P_c$
+        tokens leaves $2P(T - P_c)$, so the fraction of prefill removed is
+        $P_c/T$.
+      prose: >-
+        For a 2k system prompt on a 4k request that is exactly half — and since
+        prefill dominates first-token latency, it halves TTFT as well. This is
+        why prompt caching is usually the larger production win even though it
+        changes no model.
+
+  implementations:
+    - language: python
+      title: "Quantise the cache along the correct axis"
+      note: >-
+        Numerically WRONG when the axis is chosen without measuring: it will run
+        happily on the wrong axis and return a plausible-looking MSE. It also
+        assumes a symmetric range, which is wrong for caches whose values are
+        skewed — a zero-point offset is needed there, and this code does not
+        implement one.
+      code: |
+        import numpy as np
+
+        def quantise(x, bits=8, axis=None):
+            """Symmetric quantisation with a scale per `axis` (None = per-tensor)."""
+            if axis is None:
+                scale = np.abs(x).max()
+            else:
+                scale = np.abs(x).max(axis=axis, keepdims=True)
+            qmax = 2 ** (bits - 1) - 1
+            step = np.maximum(scale, 1e-12) / qmax
+            q = np.clip(np.round(x / step), -qmax - 1, qmax)
+            return q * step
+
+        def mse(x, bits=8, axis=None):
+            return float(np.mean((quantise(x, bits, axis) - x) ** 2))
+
+        def pick_axis(x, bits=8):
+            """Measure, do not guess: return the axis with lowest error."""
+            cands = {None: mse(x, bits, None), 0: mse(x, bits, 0), 1: mse(x, bits, 1)}
+            return min(cands, key=cands.get), cands
+    - language: python
+      title: "Decode step time with and without a quantised cache"
+      note: >-
+        Numerically WRONG as a benchmark: it is the roofline model, so it
+        assumes full bandwidth and ignores that cache reads and weight reads
+        contend for the same channels. The real gain is slightly lower than
+        predicted, and the ratio is the trustworthy part.
+      code: |
+        def step_time(weights_gb, cache_gb, bandwidth_gb_s):
+            return (weights_gb + cache_gb) / bandwidth_gb_s * 1e3   # ms
+
+        def speedup(weights_gb, cache_gb):
+            return (weights_gb + cache_gb) / (weights_gb + cache_gb / 2)
+
+        W = 140.0
+        for ctx, C in ((4096, 42.9), (32768, 343.6)):
+            print(ctx, round(step_time(W, C, 3350), 1),
+                  round(step_time(W, C / 2, 3350), 1), round(speedup(W, C), 2))
+
+  checkpoints:
+    - id: cp-1
+      question: "Your cache has five tokens with 20x magnitude. Which scaling scheme, and why?"
+      answerKind: short_text
+      hint: "Which axis do the outliers lie on?"
+      solution: >-
+        Per-token. Measured, per-token gives MSE **0.00021** against per-tensor's
+        **0.02688** — 128x better — because a per-token scale lets the five
+        large rows have their own step size instead of forcing it on every row.
+        Per-channel only reaches 0.00576, a 4.7x gain, because the outliers are
+        not on that axis.
+    - id: cp-2
+      question: "You measure a 1.13x decode speedup from int8 cache. Is the technique weak?"
+      answerKind: short_text
+      hint: "What fraction of bytes moved was cache?"
+      solution: >-
+        No — you measured at 4k context where weights are 140 GB against 42.9 GB
+        of cache, so the cache is only 23% of traffic. At 32k the same
+        quantisation gives **1.55x** because the cache is 343.6 GB against the
+        same weights. The technique is unchanged; the cache share is not.
+    - id: cp-3
+      question: "Why does the keys-versus-values claim need a caveat rather than a number?"
+      answerKind: short_text
+      hint: "What did the synthetic experiment show?"
+      solution: >-
+        Because on synthetic Gaussian attention, quantising keys and values gave
+        identical error (ratio 1.0x at int4, 0.000000 MSE at int8). The claim
+        probably holds for trained attention where key error moves the softmax
+        argmax, but that structure was absent here — so it is labelled untested
+        rather than quoted as measured.
+    - id: cp-4
+      question: "Prefix caching versus cache quantisation — which reduces first-token latency?"
+      answerKind: short_text
+      hint: "Which one removes work, and which one shrinks it?"
+      solution: >-
+        Prefix caching. First-token latency is prefill, and caching a $P_c$-token
+        prefix removes $P_c/T$ of the prefill FLOPs — half, for a 2k prompt on a
+        4k request. Quantisation shrinks bytes per decode step and therefore
+        affects steady-state token latency, not TTFT.
+    - id: cp-5
+      question: "What must a prefix cache key include besides the token ids?"
+      answerKind: short_text
+      hint: "What does the cache actually encode?"
+      solution: >-
+        The model version, the positions, and the attention configuration. The
+        cache encodes keys and values produced by a specific model at specific
+        positions — keying on ids alone can return a prefix computed under a
+        different model or context, which presents as a quality regression rather
+        than an error.
+    - id: cp-6
+      question: "How would you decide, per layer, whether int8 cache is safe?"
+      answerKind: short_text
+      hint: "What is the cheap diagnostic?"
+      solution: >-
+        Compare the quantisation MSE against the layer's attention-output scale,
+        and check the token-norm distribution for heavy tails. On clean caches
+        int8 MSE was 1.2e-4 to 4e-5 — lossless in practice. Heavy-tailed token
+        norms are where it breaks, and they are visible before you commit.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        The cache is activation-like: outliers cluster on one axis, so the
+        scaling axis has to match or you lose the whole benefit. And the speedup
+        is proportional to the cache's share of bytes moved, so it is a
+        long-context technique.
+      blocks:
+        - kind: checklist
+          body: |
+            - Measure the outlier axis before choosing per-token or per-channel
+            - On clean data int8 is lossless to 1e-4 MSE
+            - Speedup = 2(W+C)/(2W+C): 1.13x at 4k, 1.55x at 32k
+            - Prefix caching removes prefill steps; quantisation shrinks decode bytes
+            - Key a prefix cache on model, positions and config, not just ids
+      checkpoint: >-
+        If your caches are well-conditioned, what does that say about where to
+        spend engineering effort?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Two questions in order: where are the outliers, and how much of the step
+        is cache? The first picks the scheme; the second tells you whether the
+        work is worth doing at all.
+      blocks:
+        - kind: checklist
+          body: |
+            - Compute per-axis quantisation MSE on one layer
+            - Choose the axis with the lowest error, not the default
+            - Compute C/W for your production context length
+            - If C/W < 0.5, expect under 1.2x and say so
+            - Consider prefix caching first if prompts share prefixes
+      checkpoint: >-
+        At what C/W ratio does halving the cache give a 1.5x speedup?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Measure, then quantise, then verify against the roofline.
+      blocks:
+        - kind: pseudocode
+          body: |
+            for axis in (None, 0, 1):
+                err[axis] = mse(quantise(K, 8, axis), K)
+            axis = argmin(err)                 # measure, do not assume
+            K8 = quantise(K, 8, axis); V8 = quantise(V, 8, axis)
+
+            C = 2 * layers * kv_heads * head_dim * bytes * ctx * batch
+            speedup = 2*(W + C)/(2*W + C)
+      checkpoint: >-
+        Why is computing the speedup formula before benchmarking useful?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The speedup law and the outlier mechanism.
+      blocks:
+        - kind: math
+          body: |
+            **Speedup.** $S = \dfrac{W + C}{W + C/2} = \dfrac{2(W+C)}{2W+C}$
+
+            **Per-tensor step.** $\Delta = \max|x|/(2^{b-1}-1)$, so error scales
+            with the largest element.
+
+            **Per-row step.** $\Delta_i = \max_j |x_{ij}|/(2^{b-1}-1)$, so an
+            outlier in row $k$ leaves row $i$ untouched.
+
+            **Prefix saving.** Fraction of prefill removed $= P_c/T$.
+      checkpoint: >-
+        Using the speedup law, what C/W gives S = 1.33x?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        Axis selection, quantisation, and the roofline check that tells you
+        whether to bother.
+      blocks:
+        - kind: warning
+          body: >-
+            The most common error is benchmarking at the wrong context length.
+            State C/W alongside any cache-quantisation speedup.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+            best = None
+            for axis in (None, 0, 1):
+                e = mse(K, 8, axis)
+                if best is None or e < best[1]: best = (axis, e)
+            axis, err = best
+            print(f"axis={axis} mse={err:.6f}")
+            K8, V8 = quantise(K, 8, axis), quantise(V, 8, axis)
+
+            W = 140.0
+            for ctx, C in ((4096, 42.9), (32768, 343.6)):
+                print(ctx, f"C/W={C/W:.2f}", f"speedup={speedup(W, C):.2f}x")
+      checkpoint: >-
+        The axis search picks per-token; the roofline says 1.13x at 4k. What do
+        you report to the team, and what do you do first?
+  problems:
+    - id: p-quant-axis
+      title: "Quantisation error along a chosen axis"
+      difficulty: medium
+      prompt: >-
+        Implement `quant_mse(x, bits, axis)` returning the mean squared error of
+        symmetric quantisation with a scale taken per `axis` (None means
+        per-tensor). x is a nested list of floats; return a float.
+      starter: |
+        import numpy as np
+
+        def quant_mse(x, bits, axis):
+            # your implementation here
+            pass
+      language: python
+      entry: quant_mse
+      testCases:
+        - input: '[[[1.0,-1.0],[2.0,-2.0]], 8, 0]'
+          expected: '3.100006200012389e-05'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0, 0.5],[0.25, 0.125]], 4, 0]'
+          expected: '0.00039859693877550983'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[3.0, 0.0],[0.0, 0.0]], 8, 1]'
+          expected: '0.0'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def quant_mse(x, bits, axis):
+            x = np.asarray(x, dtype=float)
+            if axis is None:
+                scale = np.abs(x).max()
+            else:
+                scale = np.abs(x).max(axis=axis, keepdims=True)
+            qmax = 2 ** (bits - 1) - 1
+            step = np.maximum(scale, 1e-12) / qmax
+            q = np.clip(np.round(x / step), -qmax - 1, qmax)
+            return float(np.mean((q * step - x) ** 2))
+      solutionExplanation: >-
+        Values that land exactly on representable points give zero error, which
+        is why the first and third cases are 0.0 — they are multiples of the
+        step. The second case at 4 bits has a coarse step (~0.0333) so the small
+        entries pick up error. The point of the exercise is that the same tensor
+        gives very different errors depending on whether the scale follows the
+        outlier axis.
+      complexity: "O(n) time"
+      tags: [quantisation, kv-cache]
+
+    - id: p-cache-speedup
+      title: "Decode speedup from halving cache bytes"
+      difficulty: easy
+      prompt: >-
+        Implement `cache_speedup(weights_gb, cache_gb)` returning
+        (W + C) / (W + C/2) as a float.
+      starter: |
+        def cache_speedup(weights_gb, cache_gb):
+            # your implementation here
+            pass
+      language: python
+      entry: cache_speedup
+      testCases:
+        - input: '[140.0, 42.9]'
+          expected: '1.1328584701145867'
+          mode: json
+          tolerance: 1e-9
+        - input: '[140.0, 343.6]'
+          expected: '1.5509942270686337'
+          mode: json
+          tolerance: 1e-9
+        - input: '[140.0, 0.0]'
+          expected: '1.0'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def cache_speedup(weights_gb, cache_gb):
+            return (weights_gb + cache_gb) / (weights_gb + cache_gb / 2)
+      solutionExplanation: >-
+        At 4k the cache is 23% of bytes and halving it buys 1.13x; at 32k it is
+        71% and buys 1.55x. With no cache the ratio is exactly 1.0 — the
+        limiting case that shows the technique is bounded by cache share, never
+        by the quantiser.
+      complexity: "O(1)"
+      tags: [kv-cache, roofline]
+
+    - id: p-prefix-saving
+      title: "Prefill FLOPs saved by a prefix cache"
+      difficulty: >-
+        easy
+      prompt: >-
+        Implement `prefix_saving(params, prompt_tokens, cached_tokens)`
+        returning the fraction of prefill FLOPs removed by caching a prefix:
+        cached_tokens / prompt_tokens, as a float.
+      starter: |
+        def prefix_saving(params, prompt_tokens, cached_tokens):
+            # your implementation here
+            pass
+      language: python
+      entry: prefix_saving
+      testCases:
+        - input: '[70000000000, 4096, 2048]'
+          expected: '0.5'
+          mode: json
+          tolerance: 1e-12
+        - input: '[70000000000, 4096, 0]'
+          expected: '0.0'
+          mode: json
+          tolerance: 1e-12
+        - input: '[70000000000, 1000, 1000]'
+          expected: '1.0'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def prefix_saving(params, prompt_tokens, cached_tokens):
+            if prompt_tokens <= 0:
+                return 0.0
+            return min(cached_tokens, prompt_tokens) / prompt_tokens
+      solutionExplanation: >-
+        Prefill costs 2PT FLOPs, so removing P_c of T tokens removes exactly
+        P_c/T of the work — params cancels. A 2k cached system prompt on a 4k
+        request halves prefill and therefore halves first-token latency, which
+        is why prefix caching usually beats cache quantisation on TTFT.
+      complexity: "O(1)"
+      tags: [prefix-cache, prefill]
+
+  try_it: >-
+    Build a 512-token, 128-dim, 8-head cache and scale five tokens by 20×. Quantise it to int8
+    three ways — per-tensor, per-token and per-channel — and report the MSEs: 0.02688, 0.00021
+    and 0.00576. Then move the 20× scaling from tokens to channels and watch the ranking of the
+    three schemes reverse.
+  interview_questions:
+    - question: "Why does per-tensor int8 wreck the KV cache when the same scheme is acceptable for weights?"
+      level: mid
+      key_points:
+        - "Weights are static and roughly symmetric; the cache is activation-like, written per token per layer, and its dynamic range is set by a few outlier rows."
+        - "Five tokens scaled 20× set one scale for the whole tensor: per-tensor MSE 0.02688 against per-token 0.00021, a factor of 128."
+        - "Move the outliers to channels and the ordering reverses — per-tensor 0.03548, per-channel 0.00041 (87× better), per-token 0.00334."
+        - "So the scaling axis must match the axis carrying the outliers, which is measurable per layer before you commit."
+      follow_up: "On a well-conditioned cache int8 reaches MSE 0.00012. What does that say about 8 bits?"
+    - question: "You expect 2× from an int8 KV cache and measure 1.13×. Is the implementation broken?"
+      level: senior
+      key_points:
+        - "No: decode reads weights plus cache each step, so t = (W + C)/B and halving C helps by 1 + C/(2W + C)."
+        - "At 4k context, batch 32, weights are 140 GB and the cache 42.9 GB, so the step goes 54.6 to 48.2 ms — 1.13×."
+        - "At 32k the cache is 343.6 GB against the same 140 GB of weights, and the step goes 144.4 to 93.1 ms — 1.55×."
+        - "Evaluating cache quantisation at short context measures the one regime where it cannot matter."
+      follow_up: "What else gives you 1.55× at 32k without touching precision?"
+    - question: "What must a prefix cache be keyed on, and what happens if it is keyed on token ids alone?"
+      level: senior
+      key_points:
+        - "The cache encodes positions and is model-specific, so the key needs the model version, the token sequence and the attention configuration."
+        - "Keying on ids alone returns logits computed under a different context — a correctness bug that presents as a quality regression."
+        - "The payoff is large and orthogonal to quantisation: a 4k prompt costs about 5.73e14 FLOPs and roughly 1,160 ms at peak, so a shared 2k system prompt saves about half the first-token latency on every request."
+        - "Quantisation reduces bytes per step while prefix caching removes work entirely, so the two compose rather than compete."
+      follow_up: "Two tenants share a system prompt. What stops the prefix cache from leaking across them?"
+  common_mistakes:
+    - "Quantising per-tensor by default, which lets five outlier tokens set a scale that flattens the rest of the cache — 128× worse MSE than per-token on the same data."
+    - "Expecting a 2× decode speedup from int8 at any context: it is 1.13× at 4k and 1.55× at 32k, set by the cache's share of bytes moved."
+    - "Keying a prefix cache on token ids alone, which returns logits produced under the wrong model or the wrong positions."
+  further_reading:
+    - label: "Hooper et al., KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization, NeurIPS 2024"
+    - label: "Kwon et al., Efficient Memory Management for Large Language Model Serving with PagedAttention (vLLM), SOSP 2023"

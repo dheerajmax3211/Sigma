@@ -1,0 +1,613 @@
+id: build-rag-system
+slug: build-rag-system
+title: "Build a RAG System: Chunking, IVF-PQ, and Cross-Encoder Reranking"
+summary: >-
+  Build the retrieval stack end to end — overlapping chunks, an IVF-PQ index you
+  can size in bytes on paper, top-k search with nprobe, and a reranker that
+  reads the query and the document together — then measure recall@10 against
+  exact search and against a random baseline.
+kind: lesson
+difficulty: hard
+position: 3
+estMinutes: 23
+prerequisites: []
+phase: build-systems
+tags: [rag, retrieval, ivf, product-quantisation, reranking, recall, embeddings]
+
+body:
+  big_idea: >-
+    A RAG system is two recall budgets: the index must put the answer in the
+    candidate pool, and the reranker must move it into the top $k$ — every
+    design choice spends one.
+  problem:
+    - "Your RAG demo answers the three questions you wrote it against and fails the fourth, with no measurement of which stage is at fault."
+    - "You are asked how much memory 10 million chunks need and guess \"a few gigabytes\": it is a formula in $m$, $n_{bits}$ and $n_{list}$."
+    - "A fact spanning a chunk boundary is invisible: neither half is retrievable, and no reranker can recover a document never retrieved."
+  analogy: >-
+    A library with three finding aids. The catalogue drawer is the IVF coarse
+    quantiser: it tells you which shelf to walk to, and opening eight drawers
+    instead of one is `nprobe`. The spine label is the PQ code, enough to rank
+    books on the shelf but not to quote from them. So you pull fifty off the
+    shelf and read their first pages — the exact rerank.
+  concept_points:
+    - "**Chunking is an overlap arithmetic, and the overhead is $size/(size - overlap)$.** With 200-token chunks and 50 tokens of overlap the stride is 150, so a 1,000-token document produces $\\lceil (1000-50)/150 \\rceil = 7$ chunks, the last only 100 tokens long. You store $7 \\times 200 = 1{,}400$ tokens for 1,000 — a **1.4x storage factor**, asymptotically $200/150 = 1.333$."
+    - "**Recall@k is the only metric the first stage should optimise.** Precision at 10 is irrelevant when a reranker will reorder those ten; what matters is whether the gold chunk is in the pool. For $N = 2{,}000$ and $k = 10$, a random retriever puts $10 \\times 10/2000 = 0.05$ correct documents in its top ten — recall **0.005**. Measured over 100 queries: 0.006."
+    - "**IVF trades a full scan for a cell scan, and `nprobe` is the dial.** With $n_{list} = 64$ cells and $n_{probe} = 8$ you visit 12.5% of the cells; on the synthetic corpus that is **318 candidate vectors out of 2,000**, a **6.3x** reduction in distance computations. Cells follow the data, so the scan fraction is not exactly $n_{probe}/n_{list}$. Recall@10 is **0.991-0.997**."
+    - "**PQ compresses the vector, not the corpus, and its codebook has a fixed cost.** Split 128 dimensions into $m = 8$ subspaces of 16 with 256 centroids each: a vector becomes 8 bytes instead of 512, a **64x** compression. But the codebooks are **131,072 bytes**, and at $N = 2{,}000$ the codes are only 24,000 — so the honest ratio is **5.45x**, and the crossover is $N \\approx 13{,}653$."
+    - "**The byte count is a formula you should be able to quote.** $N(m+4) + 2^{n_{bits}} m (d/m) 4 + n_{list} d \\cdot 4$: 24,000 for codes and ids, 131,072 for the PQ codebooks, 32,768 for 64 coarse centroids of 128 float32 — **187,840 bytes**, 5.45x smaller than the 1,024,000 bytes of raw vectors. Doubling $m$ halves the subspace width and doubles the code size."
+    - "**A cross-encoder reads the pair, which is why it wins on rare tokens.** A token appearing once in a 34-token query contributes $1/34$ of the query vector, a rounding error against the shared topical vocabulary. A cross-encoder scores the pair jointly and weights it by IDF — $\\ln(2000) = 7.6$ against $\\ln(40) = 3.7$. Measured: bi-encoder recall@10 **0.83-0.87**, reranked **0.99-1.00**."
+  definitions:
+    - { term: "Chunk overlap", meaning: "The number of tokens shared by consecutive chunks. It bounds the damage from a fact that straddles a boundary, at a storage cost of size/(size − overlap)." }
+    - { term: "IVF (inverted file index)", meaning: "A coarse quantiser that assigns every vector to one of n_list cells; a query scans the n_probe nearest cells instead of the whole corpus." }
+    - { term: "Product quantisation (PQ)", meaning: "Splitting a vector into m subspaces, quantising each to 2^n_bits centroids, and storing one byte per subspace. A 128-d float32 vector becomes 8 bytes." }
+    - { term: "nprobe", meaning: "The number of IVF cells a query scans. It is the recall/latency dial: more cells means more candidates and higher recall." }
+    - { term: "Recall@k", meaning: "The fraction of the true top-k neighbours that appear in the returned top-k. The first stage's only job is to make this high for a k larger than the final answer needs." }
+    - { term: "Cross-encoder", meaning: "A model that scores a query and a document jointly, rather than comparing two independent embeddings. More accurate and O(pool) forward passes more expensive per query." }
+    - { term: "ADC (asymmetric distance computation)", meaning: "Scoring a query against PQ codes with a precomputed lookup table of m × 2^n_bits distances, so a distance costs m table lookups instead of a d-dimensional dot product." }
+
+  diagrams:
+    - type: pipeline
+      title: "Ingest once, query in two stages"
+      nodes:
+        - label: "Chunk"
+          note: "size 200, overlap 50 → stride 150"
+          detail: "A 1,000-token document becomes 7 chunks and 1,400 stored tokens. The last chunk is short; pad or keep it, but know which."
+        - label: "Embed"
+          note: "one vector per chunk, 128-d float32 = 512 B"
+          detail: "The embedding is the model's opinion of the chunk, computed without seeing any query. That independence is what makes it precomputable and what makes it dilute rare tokens."
+        - label: "Coarse quantise"
+          note: "n_list = 64 cells"
+          detail: "k-means on the vectors; each vector gets a 4-byte cell id. The centroid table is 64 × 128 × 4 = 32,768 bytes."
+        - label: "PQ encode"
+          note: "m = 8 bytes per vector"
+          detail: "Eight subspace codebooks of 256 centroids each, 131,072 bytes total. Encoding is one nearest-centroid lookup per subspace."
+        - label: "Retrieve"
+          note: "n_probe = 8, ADC, pool 50"
+          detail: "Scan about 318 candidates, score them with the lookup table, keep the best 50, re-score those exactly. Recall@10 0.991."
+        - label: "Rerank"
+          note: "50 joint scores, keep 10"
+          detail: "The only stage that reads the query and the document together. Recall goes from 0.83–0.87 to 0.99–1.00 on the synthetic corpus."
+        - label: "Generate"
+          note: "10 chunks into the context window"
+          detail: "Ten 200-token chunks is 2,000 tokens of context; at 50 chunks it is 10,000, which is where the cost of a large pool shows up in the prompt bill."
+      caption: "Two recall budgets in series: 0.991 at the index and 1.00 at the reranker multiply to 0.99 end to end. Improve either one alone and the product barely moves."
+
+    - type: architecture
+      title: "What lives in memory, and what lives on disk"
+      nodes:
+        - { id: q, x: 0, y: 0, label: "query", kind: client, detail: "Embedded with the same model as the corpus. A different model, a different normalisation, or a different prompt template silently destroys recall." }
+        - { id: coarse, x: 1, y: 0, label: "coarse centroids (32 KB)", kind: cache, detail: "64 × 128 float32. Small enough to stay in L2; the query is scored against all 64 on every request." }
+        - { id: codes, x: 1, y: 1, label: "PQ codes (24 KB)", kind: storage, detail: "2,000 × 8 bytes plus 2,000 × 4-byte ids. At 10M vectors this is 120 MB and the reason the index fits in RAM." }
+        - { id: books, x: 1, y: 2, label: "codebooks (131 KB)", kind: storage, detail: "Fixed cost, independent of N. At 2,000 vectors it dominates the index; at 10M it is noise." }
+        - { id: rer, x: 2, y: 1, label: "reranker (cross-encoder)", kind: model, detail: "The expensive component: 50 forward passes per query. It reads raw text, so it needs the chunk store, not the index." }
+        - { id: llm, x: 3, y: 1, label: "generator", kind: model, detail: "Receives the top 10 chunks. Its context budget is what caps the pool size, which is what caps recall." }
+      edges:
+        - { from: q, to: coarse, label: "score 64" }
+        - { from: coarse, to: codes, label: "8 cells" }
+        - { from: books, to: codes, label: "LUT" }
+        - { from: codes, to: rer, label: "pool 50" }
+        - { from: rer, to: llm, label: "top 10" }
+      caption: "Everything left of the reranker is precomputed and small; everything right of it is per-query and expensive. The design question is always how few candidates you can hand to the expensive side without losing the answer."
+
+  markdown: |
+    ## What you are building
+
+    A retrieval system over 2,000 text chunks, each embedded as 128 numbers. You will write a chunker, a coarse index, a compressor, a byte accountant, a recall metric, and a reranker. The index scans only part of the corpus, and the compressor stores 8 bytes per vector instead of 512. The corpus and the queries come from a synthetic generator, with one known gold chunk per query, so recall is measured rather than guessed. Swap the generator for a real embedder and the rest of the code is unchanged.
+
+    ## Why this exists
+
+    A model can only answer from text that fits in its context, and retrieval decides what fits. At 128 dimensions in float32 one vector is 512 bytes. Two thousand vectors are 1,024,000 bytes, which is nothing; ten million are 5.1 GB, which is a capacity plan. Between those sizes sit the decisions in this lesson: how to chunk, how far to compress, and how much recall you trade for memory.
+
+    ## Step 1 — Cut documents into overlapping chunks
+
+    An embedding model has a token limit, so a long document must be cut into chunks small enough to embed. Cut without overlap and any sentence on a seam belongs to neither chunk, so no retriever can ever find it. Overlap fixes that and costs storage, in a ratio you can write down.
+
+    $$S = \frac{\text{size}}{\text{size} - \text{overlap}}$$
+
+    > **Say it aloud:** "the storage factor S equals size, over, open bracket, size minus overlap, close bracket."
+
+    Size is tokens per chunk and overlap is tokens shared by neighbouring chunks. At 200 and 50 the stride is 150 and S = 1.333, so a 1,000-token document yields 7 chunks. The starts are 0, 150, 300 through 900, and the last chunk holds only 100 tokens, which is why the real factor is 1,400/1,000 = 1.4. Overlap is pure duplication: the shared tokens are stored twice and scored twice at query time. Chunk size is the unit of retrieval, so it sets a trade: smaller chunks retrieve sharper facts, larger ones carry more context. This corpus uses 61-token chunks because each fact is short, and the arithmetic above does not depend on that choice.
+
+    Chunking by characters instead of tokens breaks the overlap arithmetic silently. Two hundred characters is about 50 English tokens, but about 200 tokens of code, so the same number means different things in different files.
+
+    ```python
+    def chunk(tokens, size=200, overlap=50):
+        stride = size - overlap
+        return [tokens[i:i + size] for i in range(0, len(tokens), stride)
+                if len(tokens) - i > overlap]
+
+    cs = chunk(list(range(1000)))
+    assert len(cs) == 7 and len(cs[-1]) == 100
+    assert cs[0][150:] == cs[1][:50]
+    ```
+
+    > **Check:** Why is the last chunk 100 tokens long, and why is the storage factor 1.4 rather than 1.333?
+
+    ## Step 2 — Embed each chunk and compare with cosine
+
+    An embedding is a fixed-length vector that stands for a piece of text, and similar meanings land near each other. The standard comparison is the cosine of the angle between two vectors, which ignores their lengths and keeps their directions. Normalise every vector to length one at ingest and the cosine becomes a plain dot product.
+
+    $$\cos(q, c) = \frac{q \cdot c}{\lVert q \rVert \, \lVert c \rVert}$$
+
+    > **Say it aloud:** "the cosine of q and c equals q dot c, over, the norm of q, times the norm of c."
+
+    q is the query vector and c is a chunk vector; the dot means multiply elementwise and add. Cosine runs from minus one to one, and for text embeddings it is almost always zero to one. The corpus is a 2,000 by 128 matrix and the query is one row of that width. A query therefore costs 2,000 × 128 = 256,000 multiply-adds. That is survivable here and hopeless at ten million, which is what the next step is for. Comparability has a precondition: corpus and queries must share one model, one normalisation rule and one prompt prefix. Break that and recall collapses with no error anywhere.
+
+    ```python
+    def normalize(X):
+        return X / np.linalg.norm(X, axis=1, keepdims=True)
+
+    X = normalize(embed(chunks))          # (2000, 128), unit length
+    q = normalize(embed([query]))[0]
+    sims = X @ q                          # cosine, because both are unit length
+    top = np.argsort(-sims)[:10]
+    ```
+
+    > **Check:** If both vectors already have length one, what does the cosine formula collapse to?
+
+    ## Step 3 — Visit only part of the corpus with a coarse index
+
+    Scanning 2,000 vectors per query is fine; scanning 10 million is not. IVF, short for inverted file, runs k-means to group vectors into n_list cells and then searches only the n_probe cells nearest the query. The dial is n_probe: more cells means more recall and more work, and the fraction scanned is roughly the fraction of cells opened.
+
+    $$C \approx N \cdot \frac{n_{\text{probe}}}{n_{\text{list}}}$$
+
+    > **Say it aloud:** "C is approximately N times, n sub probe, over n sub list."
+
+    C is the number of candidates scored and N is the corpus size. With 64 cells and 8 probes you open 12.5% of them, so the formula predicts 250 candidates out of 2,000. The measurement is 318, or 15.9%, because cells follow the data and are not equal-sized. That is 6.3× fewer distance computations, and recall@10 against exact search still lands at 0.991 to 0.997. The dial has a known floor and ceiling: n_probe = 1 is the cheap end and n_probe = n_list is a full scan. Cost scales with cells opened rather than with N, which is the only reason ten million vectors is tractable.
+
+    The cells are built once at ingest, and their centroids are the only extra structure the index carries. Search scores candidates exactly for now; step 4 replaces that scoring with 8-byte codes.
+
+    ```python
+    class IVF:
+        def __init__(self, X, nlist=64, seed=0):
+            self.X = normalize(X)
+            self.cent = kmeans(self.X, nlist, seed)         # (nlist, 128)
+            self.cells = [[] for _ in range(nlist)]
+            for i, v in enumerate(self.X):
+                self.cells[int(np.argmin(((self.cent - v) ** 2).sum(1)))].append(i)
+
+        def search(self, q, nprobe=8, pool=50):
+            near = np.argsort(((self.cent - q) ** 2).sum(1))[:nprobe]
+            cand = [i for c in near for i in self.cells[c]]
+            return sorted(cand, key=lambda i: ((self.X[i] - q) ** 2).sum())[:pool]
+    ```
+
+    > **Check:** The formula predicts 250 candidates but the measurement is 318. Where does the gap come from?
+
+    ## Step 4 — Compress each vector with product quantisation
+
+    Storing 512 bytes per vector is what makes a large index expensive. Product quantisation splits a 128-dimension vector into m subvectors of equal width. Each subvector is replaced by the id of its nearest centroid in a 256-entry codebook, and one byte per subvector is exactly enough for 256 choices.
+
+    $$\text{bytes per vector} = \frac{m \cdot n_{\text{bits}}}{8}$$
+
+    > **Say it aloud:** "bytes per vector equals m times n sub bits, over eight."
+
+    m is the number of subvectors and n_bits is the bits per code, where 8 bits gives 256 centroids. With m = 8 and 8 bits a vector becomes 8 bytes instead of 512, a 64× shrink of the codes. The cost is fixed. The codebook is 256 centroids × 8 subspaces × 16 dimensions × 4 bytes = 131,072 bytes, plus one 4-byte id per vector. Scoring stays cheap for the same reason it compressed. Precompute the query's distance to all 256 centroids in each subspace, and a candidate costs eight lookups instead of 128 multiplies. This is called asymmetric distance computation, because the query stays exact while the corpus is quantised.
+
+    ```python
+    def pq_encode(X, cents):
+        codes = np.zeros((len(X), len(cents)), dtype=np.uint8)
+        for m, C in enumerate(cents):                 # one 256x16 codebook each
+            sub = X[:, m * 16:(m + 1) * 16]
+            d = ((sub[:, None, :] - C[None]) ** 2).sum(-1)
+            codes[:, m] = d.argmin(1)
+        return codes                                  # (2000, 8) uint8
+    ```
+
+    > **Check:** Where did the other 504 bytes of a 512-byte vector go?
+
+    ## Step 5 — Add up the bytes before you promise a capacity plan
+
+    An index has three costs, and only the first scales with the number of vectors. Codes and ids are per vector, the PQ codebooks are per subspace, and the coarse centroids are per cell. Write the sum once and a capacity question becomes arithmetic instead of a guess.
+
+    $$B = N(m+4) + 2^{n_{\text{bits}}}\,d \cdot 4 + n_{\text{list}}\,d \cdot 4$$
+
+    > **Say it aloud:** "B equals N times, open bracket, m plus four, close bracket, plus two to the power n sub bits, times d, times four, plus n sub list, times d, times four."
+
+    B is the total in bytes, and the m plus four is one byte per subvector plus a 4-byte id. The middle term is the codebook: two to the n_bits centroids, each d-dimensional, in float32. The last term is 64 coarse centroids of 128 dimensions, also in float32. At N = 2,000 that is 24,000 + 131,072 + 32,768 = 187,840 bytes, against 1,024,000 raw — 5.45×, not the 64× the codes alone suggest. The codebook is 69.8% of this index, and the codes only overtake it at N ≈ 13,653. Never quote a compression ratio without the N it was measured at. Doubling m halves the subspace width and doubles the code size; doubling n_bits doubles the codebook and quarters the error. Those two knobs pull in opposite directions. At ten million vectors the same formula gives 120 MB of codes against 5.12 GB of raw floats.
+
+    ```python
+    def index_bytes(n, m=8, d=128, nbits=8, nlist=64):
+        return n * (m + 4) + (2 ** nbits) * d * 4 + nlist * d * 4
+
+    assert index_bytes(2000) == 187840
+    assert 2000 * 128 * 4 / index_bytes(2000) > 5.4      # 5.45x
+    ```
+
+    > **Check:** At N = 2,000, which of the three terms dominates, and at what N do the codes overtake it?
+
+    ## Step 6 — Measure recall@k against a random floor
+
+    Recall@k asks whether the correct chunk is anywhere in the top k, not whether it came first. With one gold chunk per query, a retriever that returns 10 arbitrary chunks is right 10/2,000 = 0.005 of the time. Any index that fails to beat that by two orders of magnitude is broken.
+
+    $$\text{recall@}k = \frac{\text{queries whose gold chunk is in the top } k}{Q}$$
+
+    > **Say it aloud:** "recall at k equals the number of queries whose gold chunk is in the top k, over Q, the number of queries."
+
+    Q is the number of queries evaluated, 100 here. Recall is the right metric for a first stage, because the reranker reorders whatever it is handed. Precision at 10 is the reranker's job, not the index's. Measured with n_probe = 8 the score is 0.991 to 0.997. Measured with n_probe = 64 it is 1.0, at the cost of scanning all 2,000 vectors. That comparison is the entire argument for having an index. Quote the 0.005 floor next to your number: a broken index that returns the same ten vectors every time scores 0.000. Measure recall at every stage, too: an index recall of 0.99 with a final recall of 0.65 says the loss happened after retrieval.
+
+    ```python
+    def recall_at_k(search, queries, gold, k=10):
+        hits = 0
+        for i, q in enumerate(queries):
+            hits += int(gold[i] in search(q, k=k))
+        return hits / len(queries)
+    ```
+
+    > **Check:** A retriever returns 10 arbitrary chunks. What recall@10 should you expect, and why is that number worth quoting?
+
+    ## Step 7 — Rerank the pool with a model that reads both texts
+
+    The bi-encoder, the two-independent-vectors model from step 2, embeds query and chunk separately. A rare token contributes one term in thirty-four and gets averaged away. A cross-encoder reads the pair together and can weight that token by how rare it is. The cheap stand-in here is IDF-weighted token overlap: rare words count a lot, common words count almost nothing.
+
+    $$\text{idf}(t) = \ln \frac{N}{\text{df}_t}$$
+
+    > **Say it aloud:** "i d f of t equals the natural log of N, over d f sub t."
+
+    N is the corpus size, df sub t is the number of documents containing token t, and ln is the natural logarithm. A serial number in 1 of 2,000 chunks scores ln(2000) = 7.60. A topical word in 50 chunks scores ln(40) = 3.69, so the rare token weighs 2.06× more and can outvote the shared vocabulary. This is the mechanism that lets a reranker fix what the embedding diluted: the vector averaged the rare token away, and a token count does not. Measured over 100 queries: bi-encoder recall@10 of 0.83 to 0.87, reranked 0.99 to 1.00 on the same 50-candidate pool. The reranker never sees the corpus, only those 50, and that is what keeps it affordable: 50 passes per query instead of 2,000. Two stages, two budgets: the index spends recall to save distance computations, and the reranker spends latency to turn that recall into rank.
+
+    ```python
+    def rerank(q_tokens, cand, doc_sets, idf, k=10):
+        def score(c):
+            return sum(idf[t] for t in set(q_tokens) if t in doc_sets[c])
+        return sorted(cand, key=score, reverse=True)[:k]
+    ```
+
+    > **Check:** Why does a word that appears in every document contribute nothing to the ranking?
+
+    ## Putting it together
+
+    Ingest runs steps 1 to 5: chunk, embed and normalise, cluster into cells, encode each vector to 8 bytes, add up the bytes. A query then runs step 2, step 3, step 4 and step 7, with step 6 scoring the result. Normalise it, open the n_probe nearest cells, score candidates from their codes. Keep a pool of 50, rerank that pool, then compare the top 10 against the gold chunk. The pool is the hinge — step 7 can only reorder what step 3 retrieved, so pool recall caps final recall.
+
+    ```python
+    X = normalize(embed(chunks))                   # step 2
+    idx = IVF(X, nlist=64)                         # step 3
+    assert index_bytes(len(chunks)) == 187840      # step 5
+    for i, q in enumerate(queries):
+        pool = idx.search(q, nprobe=8, pool=50)    # steps 3 and 4
+        top = rerank(tokens(q), pool, doc_sets, idf, k=10)   # step 7
+        hits += int(gold[i] in top)                # step 6
+    ```
+
+    ## What breaks
+
+    **Recall collapses to near zero with no error** -> queries used a different embedder -> embed both with one function and assert unit norms.
+
+    **A fact that exists in the corpus is never retrieved** -> it straddles a chunk seam -> raise the overlap; unretrieved chunks cannot be reranked.
+
+    **Reranking costs latency and changes nothing** -> it re-sorts by the same cosine -> score the pair, not the two vectors separately.
+
+    **End-to-end recall sticks at 0.62 while the reranker looks fine** -> pool recall is the ceiling -> measure pool recall first, then widen the pool.
+
+  try_it: >-
+    Build the index, then run three ablations and record the numbers: `nprobe` at
+    1, 8 and 64; `m` at 4, 8 and 16; and the rerank pool at 5, 50 and 2,000.
+    Plot recall against candidates scanned for each. The curve that flattens
+    first is the one you should stop tuning, and the pool ablation tells you
+    whether your bottleneck is the index or the reranker.
+  interview_questions:
+    - question: "Design a RAG index for 10 million 768-dimensional chunks on one 64 GB machine. How much memory, and what do you tune?"
+      level: senior
+      key_points:
+        - "Codes at m=8 and 8 bits: 10M × (8 + 4) = 120 MB, plus codebooks 256×8×96×4 = 786 KB, plus nlist×768×4; the vectors themselves never need to be resident."
+        - "Raw float32 would be 10M × 768 × 4 = 30.7 GB, so PQ is a 256× reduction of the resident set; the raw vectors live on disk for reranking."
+        - "nprobe is the recall/latency dial: it sets the candidate count, and the pool handed to the reranker must be larger than the final k."
+        - "The binding constraint is usually the reranker's latency, not the index: 50 cross-encoder passes per query at 2 ms each is 100 ms."
+      follow_up: "What changes if the queries are multi-lingual and the embedding model is 1,024-dimensional?"
+    - question: "Why does a cross-encoder beat a bi-encoder, and why not use it for the whole corpus?"
+      level: mid
+      key_points:
+        - "The bi-encoder compresses the document into a vector before it has seen the query, so a rare discriminating token is averaged against the document's whole vocabulary."
+        - "The cross-encoder sees the pair, so it can weight a token by IDF — ln(2000) = 7.6 for a unique token against ln(40) = 3.7 for a topical one."
+        - "Cost is O(pool) forward passes per query against O(1) for the bi-encoder; 2,000 documents per query is not a latency budget, 50 is."
+        - "The two-stage design is a recall/precision split: the index maximises recall cheaply, the reranker maximises precision expensively."
+      follow_up: "Your reranker improves nDCG but end-to-end answer accuracy does not move. What would you check?"
+    - question: "Your RAG system answers correctly for 80% of questions and the failures are all 'the answer is not in the retrieved chunks'. How do you debug it?"
+      level: senior
+      key_points:
+        - "Split the metric: is the gold chunk absent from the pool (retrieval), or present but ranked below k (reranking)? The two have different fixes."
+        - "Check chunking first — a fact spanning a boundary is in neither chunk, and overlap is the cheap fix."
+        - "Check the embedding mismatch: query prefix, normalisation, truncation length, and whether the corpus was re-embedded after a model change."
+        - "If the pool recall is fine, raise the pool or add hybrid BM25 retrieval for the lexical queries before buying a bigger reranker."
+      follow_up: "How would you build a 200-question evaluation set without labelling the whole corpus?"
+    - question: "How do you choose chunk size and overlap, and what does the choice cost?"
+      level: mid
+      key_points:
+        - "Chunk size is bounded by the embedder's context and by how much context the generator needs; too large dilutes the embedding, too small loses the answer's surroundings."
+        - "Overlap costs size/(size − overlap) in storage: 200/150 = 1.33× for a 50-token overlap, or 1.4× measured on a 1,000-token document because of the short final chunk."
+        - "Evaluate on questions whose answers straddle boundaries; that is the only set that distinguishes 0 overlap from 50."
+        - "Chunk on structural boundaries (headings, paragraphs) where possible; fixed windows cut sentences and tables in half."
+      follow_up: "What would you change for a corpus of source code, where a 200-token window cuts functions in half?"
+  common_mistakes:
+    - "Quoting 64× PQ compression for a 2,000-vector index when the fixed codebooks make the real ratio 5.45×."
+    - "Measuring end-to-end recall without measuring pool recall, then tuning the reranker when the retrieval stage is the bottleneck."
+    - "Embedding queries with a different normalisation or prompt prefix than the corpus, which silently moves them into a different space."
+    - "Setting the pool equal to k, so the reranker has no room to reorder and can only confirm the first stage's mistakes."
+    - "Chunking by characters while the embedder truncates by tokens, so the last third of every chunk is silently dropped."
+  further_reading:
+    - label: "Johnson, Douze & Jégou, Billion-scale Similarity Search with GPUs (IEEE Trans. Big Data, 2019) — the Faiss IVF-PQ reference"
+    - label: "Karpukhin et al., Dense Passage Retrieval for Open-Domain Question Answering (EMNLP 2020)"
+    - label: "Nogueira & Cho, Passage Re-ranking with BERT (2019)"
+    - label: "Lewis et al., Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks (NeurIPS 2020)"
+
+  implementations:
+    - language: python
+      title: "Reference solution"
+      note: >-
+        The whole stack in about 90 lines, with one simplification worth naming:
+        `rerank` is a lexical cross-encoder stand-in — IDF-weighted token overlap
+        — rather than a transformer. That is deliberate, because the milestone is
+        about the *shape* of the two-stage design, and a real cross-encoder would
+        hide the recall arithmetic behind a model download. Two numerical notes:
+        `pq_lut` drops the $\|q\|^2$ term because it is common to every candidate
+        and cannot change a ranking, and `search` re-scores the 50-candidate pool
+        with exact dot products, which is why its recall is 0.99 rather than the
+        0.7 a pure-PQ ranking would give. k-means is eight iterations of Lloyd's
+        algorithm from a random sample; on 2,000 points that is enough, and on
+        10M you would use a mini-batch variant or the Faiss implementation.
+      code: |
+        import numpy as np
+
+
+        def chunk(tokens, size=200, overlap=50):
+            """Starts every size-overlap tokens; the final chunk may be short."""
+            return [tokens[s:s + size] for s in range(0, max(len(tokens) - overlap, 1), size - overlap)]
+
+
+        def nn(X, C):
+            """Nearest centroid per row: one GEMM, no Python loop over points."""
+            return ((X * X).sum(1)[:, None] - 2 * X @ C.T + (C * C).sum(1)).argmin(1)
+
+
+        def kmeans(X, k, iters=8, seed=0):
+            C = X[np.random.default_rng(seed).choice(len(X), k, replace=False)].copy()
+            for _ in range(iters):
+                a = nn(X, C)
+                C = np.array([X[a == j].mean(0) if (a == j).any() else C[j] for j in range(k)])
+            return C
+
+
+        def train_pq(X, m=8, nbits=8, seed=0):
+            """m codebooks of 2^nbits centroids, one per d/m-dimensional subspace."""
+            sub = X.shape[1] // m
+            return [kmeans(X[:, i * sub:(i + 1) * sub], 2 ** nbits, seed=seed + i) for i in range(m)]
+
+
+        def pq_encode(X, cents):
+            sub = X.shape[1] // len(cents)
+            return np.stack([nn(X[:, i * sub:(i + 1) * sub], C) for i, C in enumerate(cents)], 1).astype(np.uint8)
+
+
+        def pq_lut(q, cents):
+            """(m, 2^nbits) of ||c||^2 - 2 q.c; the ||q||^2 term is common, so dropped."""
+            sub = len(q) // len(cents)
+            return np.stack([(C * C).sum(1) - 2 * C @ q[i * sub:(i + 1) * sub] for i, C in enumerate(cents)])
+
+
+        def index_bytes(n, m=8, d=128, nbits=8, nlist=64):
+            """Codes + 4-byte ids + PQ codebooks + coarse centroids, in bytes."""
+            return n * (m + 4) + (2 ** nbits) * m * (d // m) * 4 + nlist * d * 4
+
+
+        class IVF:
+            def __init__(self, X, nlist=64, m=8, nbits=8, seed=0):
+                self.X, self.m, self.nlist = X, m, nlist
+                self.C = kmeans(X, nlist, seed=seed)
+                self.assign = nn(X, self.C)
+                self.cents = train_pq(X, m, nbits, seed + 1)
+                self.codes = pq_encode(X, self.cents)
+
+            def search(self, q, k=10, nprobe=8, pool=50):
+                cells = np.argsort((self.C * self.C).sum(1) - 2 * self.C @ q)[:nprobe]
+                cand = np.where(np.isin(self.assign, cells))[0]
+                L = pq_lut(q, self.cents)
+                approx = L[np.arange(self.m)[None, :], self.codes[cand]].sum(1)
+                short = cand[np.argsort(approx)[:pool]]
+                return short[np.argsort(-(self.X[short] @ q))][:k], len(cand)
+
+
+        def rerank(q_tokens, cand, doc_sets, idf, k=10):
+            """Cross-encoder stand-in: reads the pair, so a rare shared token wins."""
+            score = np.array([sum(idf[t] for t in q_tokens if t in doc_sets[c]) for c in cand])
+            return cand[np.argsort(-score)[:k]]
+
+
+        def corpus(n=2000, ncl=40, d=128, vocab=2600, seed=0):
+            rng = np.random.default_rng(seed)
+            topic, serial = rng.integers(0, 500, (ncl, 8)), 600 + np.arange(n)
+            E = rng.normal(size=(vocab, d))
+            E /= np.linalg.norm(E, axis=1, keepdims=True)
+            cl = rng.integers(0, ncl, n)
+            docs = [np.concatenate([rng.choice(topic[cl[i]], 55), rng.integers(0, 500, 5), [serial[i]]]) for i in range(n)]
+            emb = lambda t: (lambda v: v / np.linalg.norm(v))(E[np.unique(t)].mean(0))
+            return np.array([emb(t) for t in docs]), docs, E, topic, cl, serial, emb
+
+
+        if __name__ == "__main__":
+            X, docs, E, topic, cl, serial, emb = corpus()
+            ix, sets = IVF(X), [set(d.tolist()) for d in docs]
+            df = np.zeros(E.shape[0])
+            for s in sets:
+                df[list(s)] += 1
+            idf, rng = np.log(len(docs) / (1 + df)), np.random.default_rng(5)
+            ann, bi, pool, re = [], [], [], []
+            for _ in range(100):
+                i = rng.integers(len(docs))
+                q = np.concatenate([rng.choice(topic[cl[i]], 30), rng.integers(0, 500, 3), [serial[i]]])
+                qv = emb(q)
+                truth = set(np.argsort(-(X @ qv))[:10].tolist())
+                got, _ = ix.search(qv)
+                ann.append(len(set(got.tolist()) & truth) / 10)
+                order = np.argsort(-(X @ qv))
+                bi.append(int(i in order[:10]))
+                pool.append(int(i in order[:50]))
+                re.append(int(i in rerank(set(q.tolist()), order[:50], sets, idf)))
+            print(f"ann {np.mean(ann):.3f}  bi {np.mean(bi):.3f}  pool {np.mean(pool):.3f}  rerank {np.mean(re):.3f}")
+            print(f"bytes {index_bytes(2000)}  ratio {2000 * 128 * 4 / index_bytes(2000):.2f}")
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Retrieval is a funnel, and every stage has a recall number. Chunking
+        decides what can be found at all; the index decides what is cheap to
+        find; the reranker decides what wins. If the answer is not in the pool,
+        the reranker never sees it, so measure the pool before you tune anything
+        downstream.
+      blocks:
+        - kind: checklist
+          body: |
+            - What unit is a chunk measured in, and what is the stride?
+            - What is the candidate pool, and how is it produced?
+            - Which stage reads the query and the document together?
+            - Which number would you report to prove the index works?
+        - kind: warning
+          body: >-
+            A RAG demo that answers three questions proves nothing. The corpus
+            needs a known gold chunk per query before any of these numbers exist.
+      checkpoint: >-
+        If the reranker is perfect and the pool recall is 0.6, what is the
+        end-to-end recall ceiling?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Build the funnel bottom-up and measure each stage in isolation: chunk
+        arithmetic first, then exact search (the oracle), then the approximate
+        index against it, then the reranker against the pool. Every comparison is
+        against the stage immediately upstream, never against the final answer.
+      blocks:
+        - kind: checklist
+          body: |
+            - chunk: count, lengths, and the exact overlap between neighbours.
+            - exact search: brute-force dot products, the ground truth for recall.
+            - IVF: nprobe cells, candidate count, recall against exact.
+            - PQ: bytes, and the ADC score against the exact score.
+            - rerank: pool recall first, then rerank recall.
+        - kind: warning
+          body: >-
+            Recall@10 against exact search is not the same as answer accuracy.
+            Keep the two separate or you will tune the embedder when the
+            chunker is at fault.
+      checkpoint: >-
+        Which stage's recall can you measure without any labels at all?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Two passes: one builds the index, one answers a query. The query pass is
+        four lines, and every line is a different recall budget.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # build
+            for each document: chunks = window(tokens, size, stride=size-overlap)
+            X = [embed(c) for c in chunks]
+            coarse = kmeans(X, nlist); assign = nearest(coarse, X)
+            books  = [kmeans(X[:, i*sub:(i+1)*sub], 256) for i in range(m)]
+            codes  = [nearest(books[i], X_sub_i) for i in range(m)]
+
+            # query
+            cells = argsort(distance(q, coarse))[:nprobe]
+            cand  = vectors whose assign is in cells
+            lut   = [[||c||^2 - 2 q_i.c for c in books[i]] for i in range(m)]
+            approx = sum(lut[i][codes[cand, i]] for i in range(m))
+            pool  = cand[argsort(approx)[:50]]
+            final = rerank(q_tokens, pool, docs)[:10]
+      checkpoint: >-
+        Why is the lookup table computed per query rather than per vector?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three formulas cover the whole design: the chunk count, the byte count,
+        and the expected recall of a random retriever.
+      blocks:
+        - kind: math
+          body: |
+            Chunks for $n$ tokens: starts at $0, s, 2s, \dots$ with
+            $s = \text{size} - \text{overlap}$, so
+            $n_{chunks} = \lceil (n - \text{overlap})/s \rceil$. For $n = 1000$,
+            size 200, overlap 50: $\lceil 950/150 \rceil = 7$.
+
+            Bytes: $N(m+4) + 2^{b} m (d/m) 4 + n_{list} d \cdot 4$. At
+            $N=2000, m=8, d=128, b=8, n_{list}=64$ that is
+            $24{,}000 + 131{,}072 + 32{,}768 = 187{,}840$.
+
+            Random recall@k: expected overlap between a fixed truth set of size
+            $k$ and a random draw of size $k$ from $N$ is $k^2/N$, so
+            $k^2/(kN) = k/N = 10/2000 = 0.005$.
+      checkpoint: >-
+        At what $N$ do the PQ codes overtake the codebooks in bytes, and why
+        does that number not depend on $d$?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The reference implementation is below. It is the whole funnel, plus a
+        synthetic corpus so every number in the milestones can be reproduced.
+      blocks:
+        - kind: warning
+          body: >-
+            The bug that costs the most time is not in the index: it is computing
+            the query embedding with a different normalisation than the corpus.
+            Assert `np.linalg.norm(q) == 1` at the query boundary.
+      checkpoint: >-
+        Which single line would you delete to turn this into a pure-PQ retriever,
+        and how much recall would you lose?
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A 4,000-token document is chunked at size 200 with overlap 50. How many
+        chunks, and how many tokens are stored?
+      answerKind: short_text
+      hint: "Stride is 150; the last chunk may be short."
+      solution: >-
+        $\lceil (4000-50)/150 \rceil = \lceil 26.33 \rceil = 27$ chunks. The
+        stored token count is $26 \times 200 + 1 \times 50 = 5{,}250$ (the last
+        chunk is 50 tokens), a 1.31× factor, approaching the asymptotic
+        $200/150 = 1.33$.
+    - id: cp-2
+      question: >-
+        Why is the PQ compression ratio 5.45× at 2,000 vectors when the codes
+        themselves are 64× smaller?
+      answerKind: short_text
+      hint: "Add the codebooks and the coarse centroids to the numerator and denominator."
+      solution: >-
+        The codes are 24,000 bytes against 1,024,000 raw, but the index also
+        stores 131,072 bytes of PQ codebooks and 32,768 bytes of coarse
+        centroids, so the total is 187,840 and the ratio is 5.45×. The codebooks
+        are a fixed cost: at 10M vectors, the index is 120 MB of codes plus 164
+        KB of tables, and the ratio approaches the asymptotic 64×.
+    - id: cp-3
+      question: >-
+        Your reranker improves nDCG@10 from 0.61 to 0.78 but answer accuracy is
+        unchanged. What are the two most likely explanations?
+      answerKind: short_text
+      hint: "One is about the generator, one is about which documents matter."
+      solution: >-
+        Either the generator was already answering correctly from the documents
+        it had (nDCG measures order, accuracy measures whether the answer is
+        present at all), or the questions that fail do so because the gold
+        document is not in the pool, so reordering the pool cannot help. Check
+        pool recall and the fraction of failures where the answer is absent from
+        the top 10 entirely.
+    - id: cp-4
+      question: >-
+        nprobe=8 scans 318 of 2,000 vectors. Why 318 and not 250?
+      answerKind: short_text
+      hint: "How are vectors distributed across IVF cells?"
+      solution: >-
+        $8/64 = 12.5\%$ of 2,000 is 250, but IVF cells follow the data
+        distribution: the synthetic corpus has 40 dense clusters mapped onto 64
+        cells, so the eight nearest cells to a query are above-average size.
+        The expected count is $N \sum_{c \in \text{probed}} n_c/N$, which is not
+        $N \cdot n_{probe}/n_{list}$ unless the cells are equal-sized.
+
+  visualizers: []

@@ -1,0 +1,698 @@
+id: build-mini-transformer
+slug: build-mini-transformer
+title: "Build a Mini Transformer: RMSNorm, RoPE, Causal Attention, SwiGLU"
+summary: >-
+  Implement a 4.2M-parameter decoder-only transformer from an empty file —
+  RMSNorm, rotary positions, masked multi-head attention, a SwiGLU block, a
+  tied head and temperature sampling — and prove each piece with a milestone
+  test that fails loudly, ending with a loss curve on a copy task you trained
+  yourself.
+kind: lesson
+difficulty: hard
+position: 1
+estMinutes: 22
+prerequisites: []
+phase: build-systems
+tags: [transformer, rmsnorm, rope, causal-attention, swiglu, sampling, from-scratch]
+
+body:
+  big_idea: >-
+    A transformer is nine tensor operations in a fixed order, each a shape
+    contract plus one numerical decision — state the shapes, the mask
+    inequality and the parameter count, and the implementation is bookkeeping.
+  problem:
+    - "You cannot write it from a blank file, and the first attempt trains slowly and is wrong: the head split used reshape, not a transpose."
+    - "You mask after the softmax, which leaks a little of the future into every position: the training loss looks excellent and the evaluation collapses."
+    - "A config says rope_theta 10000 and 8,192 positions, and you cannot say what 10,000 controls or which pair has a 47,117-token wavelength."
+  analogy: >-
+    A relay race through a one-way mirror. Each runner may look only at those
+    who have already passed — the causal mask, a physical barrier on the
+    track, not a coat of paint applied afterwards. RoPE is the clock stamped
+    on every baton: what matters is the difference between two stamps, never
+    the absolute time. RMSNorm is the gauge at each leg.
+  concept_points:
+    - "**Every op is a shape contract, and the head split is where it breaks.** Attention happens on $(B, H, T, d_h)$, so the scores are $(B, H, T, T)$: at $B = 8$, $T = 2{,}048$ and float32 that is **512 MiB per layer**, the number that explains FlashAttention. `reshape(B, T, H, dh)` plus `.transpose(1, 2)` gives contiguous head slices; skip the transpose and every head sees all four."
+    - "**The causal mask is `-inf` added before the softmax, and the test is exact equality.** Position $i$ may attend to $j \\le i$ only, so $S_{ij} = -\\infty$ for $j > i$; after the row max subtraction those entries are $e^{-\\infty} = 0$. Mask after the softmax and float32 sums the unmasked row, so output moves by $\\sim 10^{-3}$ when a later token changes."
+    - "**RoPE makes the score depend on $m - n$, and its wavelengths are set by the base.** Rotate pair $i$ by $m\\theta_i$ with $\\theta_i = 10000^{-2i/d_h}$, so $q_m^\\top k_n$ depends only on $(m-n)$, because $R_m^\\top R_n = R_{n-m}$. For $d_h = 64$ the fastest wavelength is $2\\pi \\approx 6.28$ tokens and the slowest $47{,}117$."
+    - "**RMSNorm drops the mean and the bias, and that changes what it is.** $y = x/\\sqrt{\\frac{1}{d}\\sum_j x_j^2 + \\epsilon} \\odot g$: no centring, so $y(3x) = y(x)$, at **2 flops per element instead of 4** and $d$ parameters per norm instead of $2d$. The invariance is exact only while $\\epsilon \\ll \\text{mean}(x^2)$ — at $\\epsilon = 10^{-6}$ a rescaling by 3 moves the output by $3.61 \\times 10^{-6}$."
+    - "**SwiGLU has three matrices, so $d_{ff}$ is chosen to keep the parameter count.** A GELU MLP is $2d^2(d_{ff}/d)$; SwiGLU is $3d\\,d_{ff}$, so $3d_{ff} = 2 \\cdot 4d$ gives $d_{ff} = \\tfrac{8}{3}d$ — 683 for $d = 256$, rounded to 688. That block is $3 \\times 256 \\times 688 = 528{,}384$ parameters against $2 \\times 256 \\times 1024 = 524{,}288$, a 1.0078x rounding, not a design change."
+    - "**The tied head is free parameters and a summed gradient.** Reusing $E$ as the output projection saves $V \\cdot d = 4096 \\times 256 = 1{,}048{,}576$ parameters — **24.9%** of the 4,212,992-parameter model. The cost is that $E$ appears twice, so its gradient is the sum of the embedding lookup and the head product; a backward that assigns instead of adds trains at half speed with no error."
+  definitions:
+    - { term: "RMSNorm", meaning: "A normalisation that divides by the root-mean-square of the feature vector and multiplies by a learned gain, with no mean subtraction and no bias. 2 flops per element, d parameters per layer." }
+    - { term: "RoPE (rotary position embedding)", meaning: "A position scheme that rotates pairs of query and key dimensions by an angle proportional to the token index, so that the dot product of a query at m and a key at n depends only on m − n. It has no parameters and is applied to Q and K, never to V." }
+    - { term: "Causal mask", meaning: "The constraint S[i, j] = −∞ for j > i, applied to the attention scores before the softmax. It is what makes a decoder able to train on a whole sequence in one pass without seeing the token it is predicting." }
+    - { term: "SwiGLU", meaning: "A gated MLP: (xW_g ⊙ silu(xW_u))W_d. Three matrices instead of two, with d_ff = 8d/3 chosen so the parameter count matches a 4× GELU MLP." }
+    - { term: "Tied embedding", meaning: "Using the token embedding matrix as the output projection, so logits = hEᵀ. Saves V·d parameters and makes the gradient of E the sum of two paths." }
+    - { term: "Temperature", meaning: "The scalar T that divides logits before the softmax. T < 1 sharpens toward greedy, T > 1 flattens toward uniform, and T = 1 samples from the model's distribution." }
+
+  diagrams:
+    - type: architecture
+      title: "The four stages of one decoder block, and where the residual joins"
+      nodes:
+        - { id: tok, x: 0, y: 0, label: "tokens (B, T)", kind: client, detail: "Integer ids. The only place a vocabulary index exists; after the embedding lookup everything is (B, T, d)." }
+        - { id: emb, x: 1, y: 0, label: "E[tok] → (B,T,d)", kind: storage, detail: "4096 × 256 = 1,048,576 parameters, tied to the output head. Gradient arrives from two paths and must be summed." }
+        - { id: n1, x: 2, y: 0, label: "RMSNorm", kind: worker, detail: "Pre-norm: applied before attention, not after the residual. 256 gains, eps 1e-6." }
+        - { id: attn, x: 2, y: 1, label: "causal MHA + RoPE", kind: model, detail: "4 heads of 64. Scores (B,4,T,T); at T=2048, B=8 that tensor is 512 MiB in float32 — the reason kernels fuse the mask and the softmax." }
+        - { id: add1, x: 3, y: 1, label: "x = x + attn(·)", kind: model, detail: "The residual stream. Nothing else writes to x directly, which is why every sublayer's output is an additive update." }
+        - { id: n2, x: 2, y: 2, label: "RMSNorm", kind: worker, detail: "Second norm, second set of 256 gains. Two norms per block, 512 parameters, 3,164,160 across four blocks with the rest." }
+        - { id: mlp, x: 2, y: 3, label: "SwiGLU 256→688→256", kind: model, detail: "Three matrices: W_gate, W_up (256×688) and W_down (688×256) = 528,384 parameters, 1.0078× a 4× GELU MLP of the same width." }
+        - { id: add2, x: 3, y: 3, label: "x = x + mlp(·)", kind: model, detail: "Second residual. After four blocks a final RMSNorm and the tied head produce (B, T, 4096) logits." }
+      edges:
+        - { from: tok, to: emb, label: "lookup" }
+        - { from: emb, to: n1, label: "(B,T,d)" }
+        - { from: n1, to: attn, label: "normalised" }
+        - { from: attn, to: add1, label: "Δ" }
+        - { from: emb, to: add1, label: "skip", style: "async" }
+        - { from: add1, to: n2, label: "" }
+        - { from: n2, to: mlp, label: "normalised" }
+        - { from: mlp, to: add2, label: "Δ" }
+        - { from: add1, to: add2, label: "skip", style: "async" }
+      caption: "Four columns, one block. The two dashed edges are the residual stream: a path with derivative exactly 1 from the embedding to the final norm, which is why a four-block model needs no warmup beyond the usual."
+
+    - type: compare
+      title: "Pre-norm vs post-norm, and why every current model is pre-norm"
+      left_label: "Post-norm (original paper)"
+      left_points:
+        - "x = norm(x + f(x)): the residual is normalised, so the identity path is not identity — it is scaled by the norm's Jacobian"
+        - "At depth 12 the gradient through the skip path is multiplied by a norm Jacobian at every block; it needs learning-rate warmup to survive"
+        - "Slightly better final quality at shallow depth, which is why some vision models still use it"
+        - "A 24-block post-norm model without warmup diverges in the first few hundred steps at lr 1e-3"
+      right_label: "Pre-norm (every LLM since GPT-2)"
+      right_points:
+        - "x = x + f(norm(x)): the skip path is exactly the identity, so gradient reaches the embedding unscaled at any depth"
+        - "Trains at lr 3e-4 without warmup; warmup becomes a stability nicety rather than a requirement"
+        - "Costs one extra norm at the end of the stack, because the residual stream is never normalised until then"
+        - "The price is a residual stream whose norm grows with depth, which is why the final norm is not optional"
+
+  markdown: |
+    ## What you are building
+
+    A working transformer in NumPy, from an empty file. It takes a row of token ids and returns a score for each of 4,096 vocabulary entries. Between those two ends sit four identical blocks: a normaliser, an attention layer that moves information between positions, and a small gated network.
+
+    The finished model has 4,212,992 parameters and weighs 17 MB in float32. You will write the forward pass one piece at a time, and prove each piece with a test that can fail. Then you will train a tiny version on a copy task until its held-out loss falls below 0.35.
+
+    The deliverable is one module: `rmsnorm`, `rope`, `attention`, `swiglu`, `forward`, `sample` and `train_copy`. Everything stays in float64, because at float32 the tolerances below stop meaning anything.
+
+    ## Why this exists
+
+    Every transformer tutorial shows the same diagram and skips the same three decisions. Which axis is the head axis. Where the mask goes. What the 10,000 in the config actually controls.
+
+    Get the first one wrong and nothing crashes. The model runs, trains, and is quietly worse, because each head now sees a blended slice of all four. Get the second one wrong and training looks excellent. At 1,024 tokens each position can see 511 later positions on average, so the answer is already in its own input. Evaluation then collapses, and the loss curve never warned you.
+
+    There is a second gap, and it is the one that makes the first two hard to fix. A diagram does not tell you which axis is which. And you cannot hold a formula in working memory if you cannot say it out loud. Every formula below therefore comes with a spoken reading. Read it, then read the code.
+
+    ## Step 1 - Turn token ids into vectors
+
+    The input is a grid of integers, one per position. The embedding table is a learned list with one row per vocabulary entry: 4,096 rows of 256 numbers. A lookup swaps each id for its row, and everything downstream works on those 256 numbers. This is the only place in the model where a vocabulary index exists, so every shape error later traces back to here.
+
+    $$x = E[\text{tok}]$$
+
+    > **Say it aloud:** "x equals E of tok — the embedding table E, indexed by the token ids."
+
+    ```python
+    import numpy as np
+    rng = np.random.default_rng(0)
+    V, d, B, T = 4096, 256, 2, 8
+    E = rng.normal(0, 0.02, (V, d))
+    tok = rng.integers(0, V, (B, T))
+    x = E[tok]
+    print(x.shape, E.size)          # (2, 8, 256) 1048576
+    ```
+
+    > **Check:** a single lookup reads 256 numbers. How many rows of the table change during one training step?
+
+    ## Step 2 - Rescale each vector with RMSNorm
+
+    Residual streams drift in scale as blocks are stacked, and a layer that receives a vector 40 times too large produces saturated outputs. RMSNorm divides each 256-number vector by its own root-mean-square, then multiplies by a learned gain per channel. It skips the mean subtraction that LayerNorm does, which halves the arithmetic and the parameters.
+
+    $$y = g \odot \frac{x}{\sqrt{\frac{1}{d}\sum_{j=1}^{d} x_j^2 + \epsilon}}$$
+
+    > **Say it aloud:** "y equals g, the learned gain, element-wise times x, divided by the square root of: one over d, times the sum over j from one to d of x sub j squared, plus epsilon."
+
+    ```python
+    import numpy as np
+    def rmsnorm(x, g, eps=1e-6):
+        r = np.sqrt((x * x).mean(-1, keepdims=True) + eps)
+        return x / r * g
+
+    x = np.random.default_rng(0).normal(size=(2, 5, 256))
+    y = rmsnorm(x, np.ones(256))
+    print(y.shape, np.sqrt((y * y).mean(-1)).round(6)[0, 0])   # (2, 5, 256) 1.0
+    print(np.abs(rmsnorm(3 * x, np.ones(256)) - y).max() < 1e-5)   # True
+    ```
+
+    > **Check:** multiplying the input by 3 barely moves the output. Why is it not exactly identical?
+
+    ## Step 3 - Split the width into four heads
+
+    A single 256-wide attention would average four different kinds of relationship into one score. Splitting the width into four heads of 64 lets each head learn its own. Reshape to put heads before positions, then transpose, so each head owns a contiguous 64-number slice. The reshape alone is not enough: without the transpose, memory still holds one 256-wide row per position and the head axis is a fiction.
+
+    $$d_h = d / H = 256 / 4 = 64$$
+
+    > **Say it aloud:** "d sub h equals d divided by H, which is 256 divided by 4, which equals 64, where H is the number of heads."
+
+    ```python
+    import numpy as np
+    def split_heads(a, B, T, H):
+        return a.reshape(B, T, H, -1).transpose(0, 2, 1, 3)
+
+    q = np.random.default_rng(0).normal(size=(2, 8, 256))
+    qh = split_heads(q, 2, 8, 4)
+    print(qh.shape)                                 # (2, 4, 8, 64)
+    print(np.array_equal(qh[0, 0], q[0, :, :64]))   # True
+    ```
+
+    > **Check:** after the transpose, which 64 numbers of the original 256-wide row does head 2 hold?
+
+    ## Step 4 - Stamp positions on with RoPE
+
+    Attention is blind to order: shuffle the tokens and the scores permute with them. RoPE fixes that by rotating each pair of dimensions by an angle set by the token's index, which is a rotary position embedding. A query at position 5 and a key at position 2 then meet at the same relative angle wherever they sit. The score depends on the gap between them, never on the address.
+
+    $$\theta_i = 10000^{-2i/d_h}$$
+
+    > **Say it aloud:** "theta sub i equals ten thousand, raised to the power of minus two i divided by d sub h."
+
+    The base is a wavelength dial. Pair zero turns a full circle every 6.28 tokens; the slowest of the 32 pairs takes 47,117. Raising the base stretches the slow pairs, which is what long-context models do.
+
+    ```python
+    import numpy as np
+    dh = 64
+    theta = 10000.0 ** (-2 * np.arange(dh // 2) / dh)   # radians per token, per pair
+    print(theta[0], round(2 * np.pi / theta[0], 2))            # 1.0 6.28
+    print(round(theta[-1], 8), round(2 * np.pi / theta[-1]))   # 0.00013335 47117
+    ang = 5 * theta[0]                                  # position 5, pair 0
+    print(round(np.cos(ang), 3), round(-np.sin(ang), 3))       # 0.284 0.959
+    ```
+
+    > **Check:** two tokens are eight apart. Does the angle between their keys change when you move both of them 1,000 positions later?
+
+    ## Step 5 - Score every query against every key
+
+    Each head compares its query at position i with the key at position j by a dot product. Raw products grow with the width: about 16 in size at width 256. The softmax would then saturate, and only one key would win. Dividing by the square root of the head width brings the scores back near unit scale.
+
+    $$S = \frac{QK^\top}{\sqrt{d_h}}$$
+
+    > **Say it aloud:** "S equals Q times K transpose, divided by the square root of d sub h."
+
+    The grid is square in the sequence length. At batch 8, 2,048 positions and four heads in float32 it is 512 MiB for one layer. That number is why real kernels fuse the mask and the softmax instead of materialising the grid.
+
+    Note what the score does not contain: nothing in it knows where position i is. Position arrives only through the rotation in step 4, which is the whole reason that step exists.
+
+    ```python
+    import numpy as np
+    rng = np.random.default_rng(0)
+    for width in (64, 256):
+        q = rng.normal(size=(512, width))
+        off = (q @ q.T)[np.triu_indices(512, 1)]
+        print(width, round(float(off.std()), 1), round(float((off / np.sqrt(width)).std()), 1))
+    # raw dots: 8 then 16, growing with width; after scaling: 1.0 both times
+    ```
+
+    > **Check:** why divide by 8 for a 64-wide head, rather than by 64?
+
+    ## Step 6 - Block the future with a mask
+
+    A decoder predicts the next token, so position i must never read position j when j comes after i. Set those scores to negative infinity before the softmax. The row maximum subtraction leaves them at negative infinity, and the exponential turns that into exactly zero.
+
+    $$S_{ij} = -\infty \quad \text{for } j > i$$
+
+    > **Say it aloud:** "S sub i j equals negative infinity, whenever j is greater than i."
+
+    Mask after the softmax instead, by multiplying by a triangle, and the arithmetic is the same on paper. In float32 it is not. The row sum was taken over the future's mass, so editing a later token moves an earlier output by about 0.001. Nothing in the loss curve shows it, which is why the test compares outputs and not losses.
+
+    ```python
+    import numpy as np
+    def causal_mask(S):
+        T = S.shape[-1]
+        return np.where(np.triu(np.ones((T, T), bool), 1), -np.inf, S)
+
+    s = causal_mask(np.random.default_rng(0).normal(size=(8, 8)))
+    s = s - s.max(-1, keepdims=True)          # subtract the row max first
+    p = np.exp(s)
+    p = p / p.sum(-1, keepdims=True)
+    print(p[0].round(3))                      # [1. 0. 0. 0. 0. 0. 0. 0.]
+    print(p.sum(-1).round(6))                 # every row sums to 1.0
+    ```
+
+    > **Check:** an 8-by-8 score grid has 64 entries. How many survive the mask?
+
+    ## Step 7 - Give each position a gated network
+
+    Attention moves information between positions; the MLP thinks inside one. Roughly two thirds of a block's parameters live here, so the width choice matters more than it looks. SwiGLU runs the vector through two 256-by-688 matrices, gates one by the silu of the other, then projects back down. Silu is a smooth switch that lets large positive values through and squashes negative ones.
+
+    $$\text{swiglu}(x) = \big(\text{silu}(xW_g) \odot xW_u\big)W_d$$
+
+    > **Say it aloud:** "swiglu of x equals, in brackets, silu of x times W sub g, element-wise multiplied by x times W sub u, then all of it times W sub d."
+
+    Three matrices instead of two, so the hidden width is 688 rather than 1,024, which keeps the parameter count level. The 688 is eight thirds of 256, rounded up to a multiple of 16. That block is 528,384 parameters against 524,288 for a plain four-times MLP, a rounding rather than a redesign.
+
+    ```python
+    import numpy as np
+    d, F = 256, 688
+    def silu(a):
+        return a / (1.0 + np.exp(-a))
+
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(2, 8, d))
+    Wg, Wu, Wd = (rng.normal(0, 0.02, s) for s in [(d, F), (d, F), (F, d)])
+    h = silu(x @ Wg) * (x @ Wu)
+    print(h.shape, (h @ Wd).shape, 3 * d * F)   # (2, 8, 688) (2, 8, 256) 528384
+    ```
+
+    > **Check:** why is the hidden width 688 and not 1,024?
+
+    ## Step 8 - Tie the head and sample
+
+    The last layer turns 256 numbers into 4,096 scores, one per vocabulary entry. Reusing the embedding table transposed saves a whole second matrix: 1,048,576 parameters, a quarter of the model. Then divide the scores by a temperature before the softmax, which sharpens toward the top token below 1 and flattens toward uniform above it.
+
+    $$p = \operatorname{softmax}(z / \tau)$$
+
+    > **Say it aloud:** "p equals the softmax of z divided by tau, where z is the vector of raw scores and tau is the temperature."
+
+    ```python
+    import numpy as np
+    def probs(logits, tau):
+        z = np.asarray(logits, float) / tau
+        p = np.exp(z - z.max())
+        return p / p.sum()
+
+    logits = np.array([2.0, 1.0])
+    for tau in (0.25, 1.0, 4.0):
+        print(tau, probs(logits, tau).round(3))
+    ```
+
+    > **Check:** at tau 0.1, two logits differ by 1. What is the ratio of their probabilities?
+
+    ## Putting it together
+
+    The forward pass is the eight steps in order, run four times:
+
+    1. Look up the ids (step 1): `(B, T)` becomes `(B, T, 256)`.
+    2. Normalise (step 2), then project to queries, keys and values with three 256-by-256 matrices.
+    3. Split into heads (step 3), then rotate queries and keys but never values (step 4).
+    4. Score (step 5), mask (step 6), softmax, multiply by values, merge heads back to `(B, T, 256)`.
+    5. Project with `W_o` and add to the input. The add sits outside the norm, so the residual is a clean line from the embedding to the last layer.
+    6. Normalise again, run SwiGLU (step 7), add again. That is one block. Run it four times.
+    7. Final norm, tied head (step 8), temperature, sample.
+
+    The parameter count follows the same order: four blocks of 791,040 each, plus 1,048,576 tied rows, plus 256 final gains. That is 4,212,992. Write that arithmetic down before you type, and a shape error becomes a failed assertion rather than a silently worse model.
+
+    ## What breaks
+
+    - **Loss falls, then plateaus near 4.0** -> heads split with a reshape and no transpose, so every head mixes all four -> reshape to `(B, T, H, dh)`, then transpose axes 1 and 2.
+    - **Training loss 0.02, held-out loss 2.5** -> the mask was applied after the softmax -> set the future scores to negative infinity before the softmax.
+    - **Logits in the thousands after four blocks** -> the final norm was dropped, so the residual reaches the head unnormalised -> normalise before the tied head.
+    - **Generation repeats the prompt for 40 tokens** -> the copy objective was learned and tau sits near zero -> sample at tau 0.8, but check the task before blaming the sampler.
+  try_it: >-
+    Implement `rmsnorm`, `attention` and `rope`, then break each one on purpose.
+    Mask after the softmax and run M3: record the leak size. Swap
+    `reshape(B,T,H,dh).transpose(1,2)` for `reshape(B,H,T,dh)` and train for 300
+    steps: record the loss. Rotate V as well as Q and K: record the loss. Three
+    deliberate bugs, three numbers — that is the debugging intuition the
+    milestones are standing in for.
+  interview_questions:
+    - question: "Write causal multi-head attention. What are the shapes at every step, and where does the mask go?"
+      level: mid
+      key_points:
+        - "Project to (B, T, d), reshape to (B, T, H, dh), transpose to (B, H, T, dh) — the transpose is what makes each head a contiguous slice, not the reshape."
+        - "Scores are QKᵀ/√dh, shape (B, H, T, T); the mask sets S[i, j] = −∞ for j > i before the softmax, so masked entries become exactly zero after exp."
+        - "Softmax over the key axis, multiply by V, transpose back to (B, T, H, dh), reshape to (B, T, d), then the output projection."
+        - "RoPE applies to Q and K before the score, never to V, and the mask must be applied to the scores, not to the probabilities."
+      follow_up: "Your implementation matches the reference at T=7 but the model cannot learn a copy task. Which two bugs are most likely, and what test separates them?"
+    - question: "Why does RoPE make attention depend on relative position, and what does the base 10,000 control?"
+      level: senior
+      key_points:
+        - "Each pair of dimensions is rotated by mθ_i; the dot product picks up R_mᵀR_n = R_(n−m), so only the offset survives."
+        - "θ_i = base^(−2i/dh), so the base sets the ratio between the fastest and slowest pair — for dh=64 the wavelengths run from 6.28 to about 47,117 tokens."
+        - "The slowest wavelength is the longest relative distance the model can resolve unambiguously; raising the base stretches it, which is what long-context variants do."
+        - "There are no parameters, so nothing is trained; the scheme is a fixed geometric prior, and extrapolation degrades because phases wrap rather than because weights are wrong."
+      follow_up: "A model trained at 4,096 tokens is evaluated at 8,192 and perplexity doubles. What would you change about the rotation, and what would you have to retrain?"
+    - question: "Why is RMSNorm enough, and what breaks if you swap it for LayerNorm mid-training?"
+      level: senior
+      key_points:
+        - "RMSNorm divides by the root-mean-square and multiplies by a gain: no centring, no bias, d parameters instead of 2d, 2 flops per element instead of 4."
+        - "Both norms are invariant to positive rescaling while eps is negligible; RMSNorm's measured deviation at eps=1e-6 and a 3× rescale is 3.61e-6 on the M1 draw (a few times 1e-6 in general)."
+        - "The functions differ by the mean subtraction, so the learned gain absorbs a different statistic — swapping mid-run invalidates the gain and the residual stream's scale at once."
+        - "Pre-norm makes the residual an identity path; the norm choice changes conditioning, not the topology, which is why either norm trains at depth."
+      follow_up: "Where in a transformer would you expect the missing mean subtraction to matter most: the attention input, the MLP input, or the final norm before a tied head?"
+    - question: "Your from-scratch model reaches 0.2 nats on the training batch but 1.4 on held-out sequences. What do you check first?"
+      level: mid
+      key_points:
+        - "Whether the split is leaking: with shifted copy, position 0 is unpredictable, so the loss must mask it or the floor is ln(V)/T."
+        - "Whether the model is memorising the 16 sequences rather than the rule — measure on sequences generated with a different seed, not a different batch of the same data."
+        - "Whether the mask is applied at inference: a model trained with a mask but sampled without one sees a different function."
+        - "Whether the loss you are printing is the last batch's or a running mean; a single batch of 16 at 0.2 and a held-out 64 at 1.4 is a variance problem before it is a modelling problem."
+      follow_up: "Design the smallest change to the task that would make the gap disappear, and say what that tells you about the original result."
+  common_mistakes:
+    - "Masking after the softmax instead of before it, which leaks roughly 1e-3 of the future into every position and is invisible in the loss curve."
+    - "Splitting heads with `reshape(B, H, T, dh)` instead of `reshape(B, T, H, dh).transpose(1, 2)`, so each head sees a strided view of all the others."
+    - "Forgetting that the residual is `x = x + f(norm(x))` and normalising after the add, which turns the identity path into a scaled one and requires warmup to train."
+    - "Rotating V along with Q and K, which mixes position into the values for no benefit and makes the output basis position-dependent."
+  further_reading:
+    - label: "Vaswani et al., Attention Is All You Need (NeurIPS 2017) — the original block, post-norm"
+    - label: "Su et al., RoFormer: Enhanced Transformer with Rotary Position Embedding (2021)"
+    - label: "Zhang & Sennrich, Root Mean Square Layer Normalization (NeurIPS 2019)"
+    - label: "Shazeer, GLU Variants Improve Transformer (2020)"
+
+  implementations:
+    - language: python
+      title: "Reference solution"
+      note: >-
+        The complete forward pass plus a hand-derived backward pass for the
+        one-block training model: 120 lines, of which 66 are the forward path
+        that M1–M3 test and 54 are the backward pass and Adam that M4 needs.
+        Three things are deliberately simplified. (1) The training
+        model is one block; the same code stacks to four by looping `forward`,
+        but the backward pass here is written for exactly one. (2) The attention
+        backward assumes the mask is causal and constant, so it never needs to
+        differentiate through it — correct, because a mask has no gradient. (3)
+        `train_copy` uses Adam without weight decay or clipping; at these sizes
+        that is enough, and at 125M parameters it is not. The numerics are
+        float64 throughout, so the milestone tolerances are meaningful; in
+        float32 the RMSNorm scale-invariance residual moves from 3.61e-6 to
+        about 1e-4 and the leakage test stops being an equality.
+      code: |
+        import numpy as np
+
+
+        def rmsnorm(x, g, eps=1e-6):
+            r = np.sqrt((x * x).mean(-1, keepdims=True) + eps)
+            xn = x / r
+            return xn * g, (xn, g, r)
+
+
+        def rmsnorm_bwd(dy, c):
+            xn, g, r = c
+            dxn = dy * g
+            dx = (dxn - xn * (dxn * xn).mean(-1, keepdims=True)) / r
+            return dx, (dy * xn).reshape(-1, dy.shape[-1]).sum(0)
+
+
+        def rope(x, base=10000.0, sign=1.0):
+            T, dh = x.shape[-2:]
+            half = dh // 2
+            a = np.arange(T)[:, None] * (base ** (-np.arange(half) / half))[None, :]
+            c, s = np.cos(a), sign * np.sin(a)
+            x1, x2 = x[..., :half], x[..., half:]
+            return np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s], -1)
+
+
+        def attention(q, k, v, causal=True):
+            s = q @ np.swapaxes(k, -1, -2) / np.sqrt(q.shape[-1])
+            if causal:
+                s = np.where(np.triu(np.ones(s.shape[-2:], bool), 1), -1e30, s)
+            s = s - s.max(-1, keepdims=True)
+            p = np.exp(s)
+            p /= p.sum(-1, keepdims=True)
+            return p @ v, (p, q, k, v)
+
+
+        def attention_bwd(do, c):
+            p, q, k, v = c
+            dp = do @ np.swapaxes(v, -1, -2)
+            dv = np.swapaxes(p, -1, -2) @ do
+            ds = p * (dp - (dp * p).sum(-1, keepdims=True))
+            rs = np.sqrt(q.shape[-1])
+            return ds @ k / rs, np.swapaxes(ds, -1, -2) @ q / rs, dv
+
+
+        def swiglu(x, wg, wu, wd):
+            a, b = x @ wg, x @ wu
+            s = a / (1.0 + np.exp(-a))
+            h = s * b
+            return h @ wd, (x, a, b, s, h)
+
+
+        def swiglu_bwd(dy, c, wg, wu, wd):
+            x, a, b, s, h = c
+            n = x.shape[0] * x.shape[1]
+            f = lambda z: z.reshape(n, -1)
+            dh = f(dy) @ wd.T
+            sig = 1.0 / (1.0 + np.exp(-f(a)))
+            da = dh * f(b) * sig * (1.0 + f(a) * (1.0 - sig))
+            db = dh * f(s)
+            return f(x).T @ da, f(x).T @ db, f(h).T @ f(dy), (da @ wg.T + db @ wu.T).reshape(x.shape)
+
+
+        def init(V=16, d=32, H=2, F=64, seed=0):
+            r = np.random.default_rng(seed)
+            n = lambda *s: r.normal(0.0, 0.02, s)
+            return dict(E=n(V, d), Wq=n(d, d), Wk=n(d, d), Wv=n(d, d), Wo=n(d, d), Wg=n(d, F),
+                        Wu=n(d, F), Wd=n(F, d), g1=np.ones(d), g2=np.ones(d), gf=np.ones(d), H=H)
+
+
+        def forward(tok, p):
+            B, T = tok.shape
+            d, H = p["E"].shape[1], p["H"]
+            x = p["E"][tok]
+            xn, c1 = rmsnorm(x, p["g1"])
+            q, k, v = xn @ p["Wq"], xn @ p["Wk"], xn @ p["Wv"]
+            sp = lambda a: a.reshape(B, T, H, d // H).transpose(0, 2, 1, 3)
+            q, k, v = map(sp, (q, k, v))
+            o, ac = attention(rope(q), rope(k), v)
+            o = o.transpose(0, 2, 1, 3).reshape(B, T, d)
+            h1 = x + o @ p["Wo"]
+            x2, c2 = rmsnorm(h1, p["g2"])
+            mlp, mc = swiglu(x2, p["Wg"], p["Wu"], p["Wd"])
+            xf, cf = rmsnorm(h1 + mlp, p["gf"])
+            return xf @ p["E"].T, (tok, c1, ac, o, c2, mc, cf, xf, xn)
+
+
+        def loss_and_grads(tok, tgt, p, mask=None):
+            logits, c = forward(tok, p)
+            tok_in, c1, ac, o, c2, mc, cf, xf, xn = c
+            B, T = tok.shape
+            n, V = B * T, p["E"].shape[0]
+            z = logits - logits.max(-1, keepdims=True)
+            prob = np.exp(z)
+            prob /= prob.sum(-1, keepdims=True)
+            w = np.ones((B, T)) if mask is None else np.broadcast_to(mask, (B, T)).astype(float)
+            pn = prob.reshape(n, V)
+            loss = float((-np.log(pn[np.arange(n), tgt.ravel()] + 1e-12) * w.ravel()).sum() / w.sum())
+            d = pn.copy()
+            d[np.arange(n), tgt.ravel()] -= 1.0
+            dlogits = (d * (w / w.sum()).ravel()[:, None]).reshape(B, T, V)
+            g = {"E": dlogits.reshape(n, V).T @ xf.reshape(n, -1)}
+            dx3, g["gf"] = rmsnorm_bwd(dlogits @ p["E"], cf)
+            g["Wg"], g["Wu"], g["Wd"], dx2 = swiglu_bwd(dx3, mc, p["Wg"], p["Wu"], p["Wd"])
+            dh1, g["g2"] = rmsnorm_bwd(dx2, c2)
+            dh1 = dh1 + dx3
+            g["Wo"] = o.reshape(n, -1).T @ dh1.reshape(n, -1)
+            do = (dh1 @ p["Wo"].T).reshape(B, T, p["H"], -1).transpose(0, 2, 1, 3)
+            dq, dk, dv = attention_bwd(do, ac)
+            fp = lambda a: a.transpose(0, 2, 1, 3).reshape(n, -1)
+            dq, dk, dv = fp(rope(dq, sign=-1.0)), fp(rope(dk, sign=-1.0)), fp(dv)
+            g["Wq"], g["Wk"], g["Wv"] = (xn.reshape(n, -1).T @ dq, xn.reshape(n, -1).T @ dk,
+                                         xn.reshape(n, -1).T @ dv)
+            dxn = dq @ p["Wq"].T + dk @ p["Wk"].T + dv @ p["Wv"].T
+            dx, g["g1"] = rmsnorm_bwd(dxn.reshape(B, T, -1), c1)
+            gE = np.zeros_like(p["E"])
+            np.add.at(gE, tok_in, dx + dh1)
+            g["E"] = g["E"] + gE
+            return loss, g
+
+
+        def sample(logits, temperature=1.0, greedy=False, rng=None):
+            """Greedy at T -> 0; temperature divides LOGITS, never probabilities."""
+            if greedy:
+                return int(np.argmax(logits))
+            z = np.asarray(logits, float) / temperature
+            p = np.exp(z - z.max())
+            p /= p.sum()
+            return int((rng or np.random.default_rng()).choice(len(p), p=p))
+
+
+        def train_copy(steps=1500, lr=3e-3, seed=0):
+            r = np.random.default_rng(seed + 1)
+            p = init(seed=seed)
+            V, T = p["E"].shape[0], 8
+            m = {k: np.zeros_like(v) for k, v in p.items() if isinstance(v, np.ndarray)}
+            v2 = {k: np.zeros_like(v) for k, v in p.items() if isinstance(v, np.ndarray)}
+            for t in range(1, steps + 1):
+                tok = r.integers(0, V, (16, T))
+                loss, g = loss_and_grads(tok, np.roll(tok, 1, 1), p, np.arange(T) >= 1)
+                for k in g:
+                    m[k] = 0.9 * m[k] + 0.1 * g[k]
+                    v2[k] = 0.999 * v2[k] + 0.001 * g[k] ** 2
+                    p[k] -= lr * (m[k] / (1 - 0.9 ** t)) / (np.sqrt(v2[k] / (1 - 0.999 ** t)) + 1e-8)
+            return p, loss
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        You are not writing a model, you are writing seven shape contracts and
+        one inequality. Tokens become vectors; vectors become queries, keys and
+        values; attention mixes values by a softmax over key positions; the
+        inequality says a position may only see itself and earlier ones. Every
+        remaining line is a projection or a residual.
+      blocks:
+        - kind: checklist
+          body: |
+            Before you type, answer on paper:
+            - What is the shape after the embedding lookup, and after the head split?
+            - Which axis does the attention softmax normalise over?
+            - Which tensor does the mask touch, and is it before or after the softmax?
+            - Where does the residual add happen relative to the norm?
+        - kind: warning
+          body: >-
+            If you cannot answer the third question without looking, the mask
+            will be in the wrong place and every test will still run.
+      checkpoint: >-
+        Which of those four answers would still produce a model that trains,
+        slowly, if you got it wrong?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Build bottom-up and test each primitive against a loop before you
+        assemble anything. The loop is your oracle: three lines, no broadcasting
+        tricks, obviously correct. Then assemble the block and only then the
+        model. Keep float64 until the milestones pass.
+      blocks:
+        - kind: checklist
+          body: |
+            - rmsnorm: mean of squares, add eps inside the sqrt, multiply by g.
+            - attention: scores, mask with -inf, subtract row max, exp, normalise, multiply V.
+            - rope: reshape the head dimension into two halves and rotate one against the other.
+            - block: norm → attention → add; norm → SwiGLU → add.
+            - head: logits = final_norm(x) @ E.T, with E the same array as the embedding.
+        - kind: warning
+          body: >-
+            Do not test attention by checking that the output has the right
+            shape. A transposed head split has the right shape.
+      checkpoint: >-
+        What is the smallest oracle you can write for attention that does not
+        share code with your implementation?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The forward pass is nine lines of tensor algebra once the shapes are
+        written down. The backward pass is the same nine lines in reverse, each
+        one a vector–Jacobian product.
+      blocks:
+        - kind: pseudocode
+          body: |
+            x  = E[tokens]                       # (B, T, d)
+            h  = rmsnorm(x, g1)
+            q, k, v = h @ Wq, h @ Wk, h @ Wv     # each (B, T, d)
+            q, k, v = split_heads(q, k, v)       # (B, H, T, dh)
+            q, k = rope(q), rope(k)
+            s  = q @ k.T / sqrt(dh)              # (B, H, T, T)
+            s  = where(mask, -inf, s)
+            p  = softmax(s, axis=-1)
+            o  = merge_heads(p @ v) @ Wo
+            x  = x + o
+            x  = x + swiglu(rmsnorm(x, g2))
+            logits = rmsnorm(x, gf) @ E.T
+      checkpoint: >-
+        The backward pass needs the softmax probabilities, the normalised
+        inputs, and the rotary cosines. Which of those can be recomputed cheaply
+        and which must be cached?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Two derivatives carry the whole project: the softmax Jacobian and the
+        RMSNorm Jacobian. Everything else is a matmul transpose.
+      blocks:
+        - kind: math
+          body: |
+            Softmax, row-wise with $p = \operatorname{softmax}(s)$:
+
+            $$\frac{\partial L}{\partial s_j} = p_j\left(g_j - \sum_i g_i p_i\right)$$
+
+            so the backward is `p * (dp - sum(dp * p))`, one line, no matrix.
+
+            RMSNorm, with $r = \sqrt{\frac{1}{d}\sum_j x_j^2 + \epsilon}$ and
+            $y = g \odot x / r$:
+
+            $$\frac{\partial L}{\partial x_j} = \frac{1}{r}\left(g_j\,\delta_j - \frac{x_j}{r^2}\cdot\frac{1}{d}\sum_i g_i\,\delta_i\,x_i\right)$$
+
+            where $\delta = \partial L/\partial y$. In code that is
+            `dxn = dy * g; dx = (dxn - xn * mean(dxn * xn)) / r`.
+
+            For the tied head, $E$ appears in the lookup and in
+            $\text{logits} = hE^\top$, so
+            $\partial L/\partial E = \partial L/\partial E_{\text{in}} + \partial L/\partial E_{\text{out}}$.
+      checkpoint: >-
+        Why does the RMSNorm derivative have no mean-subtraction term, and what
+        would the LayerNorm version add?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The reference implementation below is the whole thing: forward,
+        hand-derived backward, Adam, and the held-out evaluation. Read it after
+        your own version passes M1 and M2, not before.
+      blocks:
+        - kind: warning
+          body: >-
+            The line that is easiest to get wrong is not in the transformer at
+            all: `np.add.at(gE, tok_in, dx + dh1)` accumulates into the
+            embedding table because a token id can repeat in a batch. A plain
+            `gE[tok_in] += ...` silently keeps only the last occurrence.
+      checkpoint: >-
+        If a token appears twice in one sequence, how much of its embedding
+        gradient does a non-accumulating implementation keep?
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        You mask after the softmax and the model still trains. What is the
+        smallest experiment that shows the leak, and how big is it?
+      answerKind: short_text
+      hint: "Change one future token and compare the output at an earlier position."
+      solution: >-
+        Replace positions $j > i$ with noise and compare the output at position
+        $i$. With a correct pre-softmax mask the difference is exactly 0.0;
+        masking afterwards leaves the row sum computed over the full
+        distribution, so the earlier position moves by roughly the mass you
+        deleted, $\sim 10^{-3}$ in float32. The experiment is one line and it is
+        the same one M3 runs.
+    - id: cp-2
+      question: >-
+        Why is the RMSNorm scale-invariance milestone a `< 1e-5` rather than an
+        equality, and what would make it an equality?
+      answerKind: short_text
+      hint: "Write rms(3x) and factor out the 3. What happens to eps?"
+      solution: >-
+        $\text{rms}(3x) = \sqrt{9\,\text{mean}(x^2) + \epsilon}$, while
+        $3\,\text{rms}(x) = \sqrt{9\,\text{mean}(x^2) + 9\epsilon}$. The
+        difference is the unscaled $\epsilon$, which at unit variance and
+        $\epsilon = 10^{-6}$ produces a $3.61\times10^{-6}$ output difference on the M1 draw.
+        Setting $\epsilon = 0$ makes it exact; every real implementation keeps a
+        non-zero epsilon for the zero-input case, so the invariance is
+        approximate by construction.
+    - id: cp-3
+      question: >-
+        Your 4-block model's initial loss is 8.32 rather than ln(4096) = 8.317.
+        Is that a bug?
+      answerKind: short_text
+      hint: "What is ln(4096), and how much does a 0.003 nat difference matter?"
+      solution: >-
+        No. $\ln 4096 = 8.3178$, so 8.32 is the uniform distribution to three
+        significant figures; a randomly initialised model is uniform over the
+        vocabulary up to the small bias in its logits. A loss far from 8.32 at
+        step 0 — say 12 — means the logits are too large, which usually means a
+        missing final norm or an embedding initialised at the wrong scale.
+    - id: cp-4
+      question: >-
+        The model trains and the loss falls, but generation repeats the prompt
+        verbatim for 40 tokens and then stops. What are the two most likely
+        causes?
+      answerKind: short_text
+      hint: "One is a training-distribution problem, one is a sampling problem."
+      solution: >-
+        Either the model was trained on a copy-like objective, where repeating
+        the input is the correct answer, or sampling is greedy with a
+        distribution that has a strong self-transition — the model learned
+        bigram statistics and nothing else. Check the training task first, then
+        the sampler: temperature 0.8 with top-p 0.95 would break the tie, but it
+        will not create knowledge the model never learned.

@@ -1,0 +1,1465 @@
+id: sequence-expert-parallelism
+slug: sequence-expert-parallelism
+title: "Sequence and Expert Parallelism"
+summary: >-
+  Sequence parallelism splits the token axis and buys activation memory; expert
+  parallelism splits the FFN and buys parameter memory, at the price of an
+  all-to-all that moves 68.72 GB per rank per step on an 8x7B model — 2.48x the
+  data-parallel gradient all-reduce, spread over 128 barriers. The exchange runs
+  at 10,752 FLOP/byte, so bandwidth never explains it: the domain boundary does,
+  at 12.3% of a compute step inside NVLink against 73.6% across a 400 Gb/s
+  fabric for exactly the same bytes.
+kind: lesson
+difficulty: expert
+position: 5
+estMinutes: 30
+prerequisites: [pipeline-parallelism, mixture-of-experts]
+phase: distributed-training
+tags:
+  [expert-parallelism, sequence-parallelism, context-parallelism, all-to-all,
+   mixture-of-experts, capacity-factor, token-dropping, load-imbalance,
+   ring-attention, straggler, distributed-training]
+
+body:
+  big_idea: >-
+    Sequence and expert parallelism split the token axis and the FFN axis, and
+    both are paid for in an all-to-all of fixed volume — so what decides
+    affordability is where the experts physically live.
+  problem:
+    - "You shard 8x7B by expert and it dies at 110.83 GB on an 80 GB card: the 94.99 GB of Adam state never sharded."
+    - "Eight experts inside one node cost 12.3% overhead; sixteen across two nodes cost 73.6%, because the exchange left NVLink for 50 GB/s."
+    - "Your router is healthy, yet the cluster idles 40.7% of every step: the barrier waits for the rank whose expert drew the most tokens."
+  analogy: >-
+    A mail sorting hub: every letter is read at the door, thrown into one of E
+    outbound bags, and twice per layer the whole floor stops while everybody
+    throws bundles at everybody else. The cost is not the weight of the mail
+    but that the floor stops, and that the stop lasts as long as the fullest
+    bag takes to close.
+  concept_points:
+    - "**Sequence parallelism is two techniques sharing a name.** Megatron's SP is bookkeeping that rides along with tensor parallelism: the region between the two TP matmuls is replicated on every rank, so at 8,192 tokens and 4,096 hidden it holds 67.11 MB per layer per rank instead of 536.87 MB, returning 15.03 GB over 32 layers. Ring attention really does divide the token axis."
+    - "**Context parallelism pays in KV traffic, and its intensity is $2s/b$.** At CP = 8, s = 32,768 each device ships its 67.11 MB KV block once around the ring per layer — 2.147 GB per forward, 17.18 GB aggregate — an intensity of **32,768 FLOP/byte**, 111x the 295 ridge. That falls under the ridge below about 590 tokens, so CP at 2k context is barriers for nothing."
+    - "**Expert parallelism is the only parallelism that shards parameters without sharding a matmul.** At EP = 8 the 8x7B model puts 7,916,224,512 parameters and 15.83 GB of bf16 weights on each rank, each a complete 176,160,768-parameter FFN that exchanges no activation with another expert. The independence is why the tokens must move instead: 68.72 GB per rank per step."
+    - "**EP shards weights and leaves the optimizer state alone, which is why nothing ships as pure EP.** Adam costs 12 bytes per parameter and every parameter has state, so the same shard carries 94.99 GB: EP = 8 with DP = 1 needs **110.83 GB** on an 80 GB card and dies before the first activation. ZeRO-1 over a DP = 8 group brings the resident total to **27.71 GB**."
+    - "**Four all-to-alls per MoE layer per step, not two.** The forward has dispatch and combine; the backward has a combine-shaped exchange back to the token owners and a dispatch-shaped one to the expert owners. Each moves $kTdb$ per rank per direction — **67.11 MB** at T = 4,096, k = 2, d = 4,096 — so 268.44 MB per layer and **68.72 GB per rank per step**."
+    - "**What makes large-E MoE communication-bound is the domain boundary, not the expert count.** The identical 68.72 GB takes **0.2291 s** at 300 GB/s inside one NVLink domain and **1.3744 s** at 50 GB/s across a 400 Gb/s fabric, against 1.8677 s of compute at 40% MFU: **12.3% overhead against 73.6%**. At 25 GB/s on an oversubscribed leaf the step is 147.2% communication."
+  definitions:
+    - term: "Sequence parallelism (SP)"
+      meaning: >-
+        In Megatron's sense, splitting the activation region that tensor
+        parallelism leaves replicated — LayerNorm, dropout, the residual add —
+        along the sequence axis, then re-gathering it before each TP matmul and
+        reduce-scattering the result after. It removes 469.76 MB per layer of
+        duplicated activation at 8,192 tokens and 8 ranks, and moves exactly the
+        same bytes as the all-reduce it replaces.
+    - term: "Context parallelism (CP)"
+      meaning: >-
+        Splitting the token axis for attention itself, so each device owns s/CP
+        queries and must see every key. Two implementations: ring attention,
+        which passes KV blocks around a ring of CP devices, and Ulysses, which
+        all-to-alls the head axis so each device computes all queries for a
+        subset of heads. Both divide attention compute by CP and multiply the KV
+        each device must read by CP.
+    - term: "All-to-all"
+      meaning: >-
+        The collective where every rank sends a different buffer to every other
+        rank, so it is a full transpose of the data across the group rather than
+        a reduction. It is the only collective whose cost is set by the maximum
+        over participants rather than the sum, which is why routing imbalance
+        becomes a synchronisation cost rather than a FLOP inefficiency.
+    - term: "Dispatch and combine"
+      meaning: >-
+        The two forward all-to-alls of an MoE layer. Dispatch ships each token's
+        hidden row to the ranks owning its k experts, k T d b bytes per rank.
+        Combine ships the experts' outputs back to the ranks owning the tokens,
+        the same volume. Each has a mirror in the backward, so a training step
+        pays four.
+    - term: "Expert parallelism group"
+      meaning: >-
+        The set of ranks across which the E experts of one layer are divided, one
+        shard of E/N per rank. It carries the all-to-all and nothing else. Its
+        size is a topology decision, not a memory decision: inside one NVLink
+        domain the exchange runs at 300 GB/s, and across a fabric at 25 to 50.
+    - term: "EP times DP grid"
+      meaning: >-
+        The two-dimensional rank layout every real MoE training job uses: the EP
+        axis shards the experts and carries the token all-to-all, the DP axis
+        replicates the whole (already sharded) model and carries the gradient
+        all-reduce. On 64 devices as 8x8, each rank holds one expert per layer
+        and 1/8 of the optimizer state, and the two collectives are on different
+        axes so they do not contend.
+    - term: "Cluster capacity factor"
+      meaning: >-
+        The multiplier in C = CF kG/E, where G is the global token count for the
+        step rather than any one rank's batch. It is a *cluster* quantity: the
+        buffer is allocated per expert at its owner rank against a global mean,
+        so a rank that receives 1.4x its share overflows a buffer that was sized
+        for 1.0x, and the tokens it loses are whichever ones arrived late.
+    - term: "Straggler factor"
+      meaning: >-
+        The ratio of the slowest rank's expert work to the mean, which equals
+        E times the maximum load share and is therefore the same number as the
+        capacity factor needed to drop nothing. At 1.4 it means the barrier
+        converts a 40% excess on one rank into 40.7% idle time on all of them.
+    - term: "Expert shard"
+      meaning: >-
+        One rank's contiguous subset of the E experts. At EP = 8 on 8x7B it is
+        one expert per layer, 176,160,768 parameters, 352.3 MB in bf16, and it is
+        a complete FFN: no expert ever reads another expert's weights or
+        activations, which is exactly why the tokens move instead.
+    - term: "Split-phase overlap"
+      meaning: >-
+        Issuing the dispatch of layer l+1 before waiting on the combine of layer
+        l, so the network transfer for the next layer hides behind the current
+        layer's expert arithmetic. It is the only lever that removes all-to-all
+        time rather than rescheduling it, and it costs one extra activation
+        buffer per layer in flight.
+    - term: "Dropped assignment"
+      meaning: >-
+        An assignment beyond an expert's capacity, discarded at the destination
+        rank. At cluster scale the token is not lost: the residual carries it and
+        the block is the identity for that token, so the damage is a silent
+        quality regression whose per-token pattern depends on network arrival
+        order.
+
+  diagrams:
+    - type: architecture
+      title: "One MoE layer across an EP group, and the second collective on the other axis"
+      nodes:
+        - id: tok
+          x: 0
+          y: 0
+          label: "tokens, T per rank"
+          kind: client
+          detail: "Every rank holds its own T tokens for the step. Under EP the same token is never split across ranks, it is *copied* to whichever ranks own its experts, so the token axis and the expert axis are independent."
+        - id: route
+          x: 1
+          y: 0
+          label: "router + top-k"
+          kind: worker
+          detail: "Local arithmetic, no communication, 32,768 parameters at E = 8 and d = 4096. It decides where 100% of the layer's expert compute goes and has no view of the load it is creating on any other rank."
+        - id: disp
+          x: 2
+          y: 0
+          label: "dispatch all-to-all"
+          kind: queue
+          detail: "First of four collectives per layer per step. Each rank sends k T d b = 67.11 MB at T = 4096 per micro-batch, to E/N distinct destinations, and receives the same in aggregate."
+        - id: exp
+          x: 3
+          y: 0
+          label: "expert FFN on its owner"
+          kind: gpu
+          detail: "The only arithmetic EP touches. A rank owning E/N experts computes kT assignments per micro-batch regardless of E, because the assignments per expert fall as 1/E while the experts per rank rise as E/N."
+        - id: comb
+          x: 3
+          y: 1
+          label: "combine all-to-all"
+          kind: queue
+          detail: "Second of four. Sends each expert's output back to the rank that owns the token. Same 67.11 MB, opposite direction, and the reason the layer cannot be pipelined with itself without split-phase overlap."
+        - id: sum
+          x: 2
+          y: 1
+          label: "weighted sum, residual"
+          kind: server
+          detail: "k terms summed with router probabilities. A token whose assignments all overflowed capacity gets x + 0 here, which is why dropping is silent."
+        - id: dp
+          x: 1
+          y: 1
+          label: "DP gradient all-reduce"
+          kind: queue
+          detail: "The other axis. Once per step rather than once per layer, and 27.71 GB per rank against the all-to-all's 68.72 GB — 2.48x smaller, and the number people mistakenly compare against when they say MoE communication is fine."
+        - id: nxt
+          x: 0
+          y: 1
+          label: "next layer"
+          kind: external
+          detail: "Layer l+1's dispatch can be issued before layer l's combine returns. That overlap is the only thing that removes all-to-all time instead of rescheduling it."
+      edges:
+        - { from: tok, to: route, label: "read" }
+        - { from: route, to: disp, label: "k indices" }
+        - { from: disp, to: exp, label: "67.11 MB per rank", style: async }
+        - { from: exp, to: comb, label: "expert outputs", style: async }
+        - { from: comb, to: sum, label: "gathered" }
+        - { from: sum, to: nxt, label: "residual add" }
+        - { from: sum, to: dp, label: "once per step", style: async }
+      caption: "Two collectives per layer on the EP axis and one per step on the DP axis. Everything that decides whether this is affordable happens at the two async edges, and both of them are barriers."
+
+    - type: sequence
+      title: "The four exchanges of one MoE layer in a training step"
+      items:
+        - "Forward, dispatch: each rank sends its kT token rows to the ranks owning the selected experts. 67.11 MB out per rank at T = 4,096 per micro-batch, k = 2, d = 4,096, bf16."
+        - "Forward, expert FFN: no communication at all. This is the only stage where EP behaves like data parallelism, and it is why the technique exists."
+        - "Forward, combine: the experts' outputs travel back to the token owners. Another 67.11 MB, and the point at which a token dropped by capacity silently loses one of its k contributions."
+        - "Backward, combine-grad: the gradient arriving at combine is dispatched to the same experts, so this is a dispatch-shaped exchange. 67.11 MB."
+        - "Backward, expert FFN: gradients for the local experts only, accumulated across every token that visited them from any rank."
+        - "Backward, dispatch-grad: the expert-output gradients travel back to the token owners, so this is a combine-shaped exchange. 67.11 MB."
+        - "Total: four collectives, 268.44 MB per layer per rank, 8.59 GB per layer per step at 8 micro-batches, 68.72 GB per rank per step at 32 layers."
+
+    - type: compare
+      title: "The same router seen from the batch and from the cluster"
+      left_label: "Batch view: what the router did"
+      left_points:
+        - "Load entropy 2.981 of a possible 3.000 bits at E = 8"
+        - "Maximum share 0.158, so E times s is 1.266"
+        - "No dead experts, 512 of 512 assignments honoured at CF = 1.25"
+        - "Drop rate 6.4% at CF = 1.0, 0.2% at CF = 1.25"
+        - "Judgement: the router is balanced, ship it"
+      right_label: "Cluster view: what the barrier does"
+      right_points:
+        - "The barrier lasts as long as the fullest expert, so utilisation is 1/(E s) = 0.79"
+        - "One 1.4x hot expert makes E s = 1.407 and idles 40.7% of the step"
+        - "At a fixed 262,144-token batch, a uniform router still gives E s = 1.2227 at E = 2,048"
+        - "Drop rate at CF = 1.0 is 5.09% at E = 8 with that hot expert, and 2.54% at E = 2,048 with no hot expert at all"
+        - "Judgement: 21% of the cluster is idle and the loss curve looks fine"
+
+    - type: plot
+      title: "Straggler factor against expert count, at a fixed 262,144-token batch"
+      chart: line
+      xLabel: "experts, one per rank"
+      yLabel: "max load / mean load"
+      series:
+        - name: "uniform router"
+          points:
+            - { x: 8, y: 1.0063 }
+            - { x: 32, y: 1.0131 }
+            - { x: 128, y: 1.0427 }
+            - { x: 512, y: 1.1055 }
+            - { x: 2048, y: 1.2227 }
+        - name: "router with one 1.4x hot expert"
+          points:
+            - { x: 8, y: 1.4074 }
+            - { x: 32, y: 1.3917 }
+            - { x: 128, y: 1.3669 }
+
+    - type: pipeline
+      title: "Split-phase overlap: hiding the exchange behind the arithmetic"
+      nodes:
+        - label: "dispatch layer l"
+          note: "67.11 MB out"
+          detail: "Issued as a non-blocking send. Nothing downstream can start until it lands, so on its own it is pure exposed latency added to the step."
+        - label: "expert FFN layer l"
+          note: "compute only"
+          detail: "The only stage with no communication. Under EP = 8 it is 738.87 TFLOP per rank per step, or 1.8677 s at 40% MFU — which is the budget any overlap has to hide behind."
+        - label: "combine layer l"
+          note: "67.11 MB back"
+          detail: "Can overlap with dispatch of layer l+1 if the activation buffer for l+1 exists. The buffer is the price: one extra kTdb slot per layer in flight."
+        - label: "dispatch layer l+1"
+          note: "overlapped"
+          detail: "Issued before combine l completes. This is the only lever that removes exchange time from the critical path rather than rescheduling it, and it converts the 73.6% fabric overhead into something closer to max(comm, compute) instead of their sum."
+        - label: "expert FFN layer l+1"
+          note: "compute only"
+          detail: "If the overlap is complete, the network has already finished and the second layer's compute runs at full rate. What you cannot overlap is the imbalance: a straggling rank delays every stage that depends on it, overlapped or not."
+
+  markdown: |
+    ## Two axes that are not the same axis
+
+    Data parallelism replicates the model and splits the batch. Tensor
+    parallelism splits a weight matrix and pays an all-reduce inside every layer.
+    Pipeline parallelism splits the layers and pays idle time. Sequence and
+    expert parallelism are the two remaining axes, and they are not variations on
+    those three: one splits the *token* axis, the other splits the *FFN* axis,
+    and neither splits a matrix multiplication the way tensor parallelism does.
+
+    The first buys activation memory. The second buys parameter memory. Both are
+    paid for in collectives shaped differently from an all-reduce, and the expert
+    one is the most expensive routine in modern training.
+
+    ## Sequence parallelism: the cheap form and the real one
+
+    Megatron's sequence parallelism is bookkeeping inside tensor parallelism, not
+    a new axis. TP splits the matmuls of attention and of the FFN, and the region
+    between them — LayerNorm, dropout, the residual add — stays replicated on
+    every TP rank. At $s = 8192$ tokens, $b = 2$ and $h = 4096$ that region is
+    $sbh = 67.11$ MB per layer per rank, so on eight ranks it is 536.87 MB of
+    duplicate activation. Sharding it along the sequence costs one all-gather
+    before the first matmul and one reduce-scatter after the second:
+
+    $$\underbrace{sbh}_{\text{all-gather}} +
+      \underbrace{sbh}_{\text{reduce-scatter}} = 2sbh =
+      \underbrace{2sbh}_{\text{ring all-reduce}}$$
+
+    The bytes are identical, which is why the technique is worth doing: it
+    removes 469.76 MB per layer of duplicate state, 15.03 GB over 32 layers at
+    8,192 tokens and 60.13 GB at 32,768, for one extra collective launch per
+    layer per pass.
+
+    Ring attention is the version that genuinely divides the sequence. Each
+    device keeps $s/CP$ queries and every other device's keys pass by:
+
+    $$\text{KV per device per layer} = 2 \cdot \frac{s}{CP} \cdot d \cdot b$$
+
+    At $s = 32768$ and $CP = 8$ that is 67.11 MB per layer, 2.147 GB per forward
+    over 32 layers, and 17.18 GB of aggregate traffic because each of the eight
+    devices receives every block. Its arithmetic intensity is
+
+    $$\frac{4\,(s/CP)\,s\,d}{2\,(s/CP)\,d\,b} = \frac{2s}{b} = s
+      \ \text{FLOP/byte},$$
+
+    which is 32,768 FLOP/byte here — 111x the 295 FLOP/byte ridge of the part. At
+    $s = 512$ it would be 512 FLOP/byte and still above the ridge; the technique
+    only starts losing below about 590 tokens, which is not a context length
+    anyone shards for. What CP actually costs is memory and serialisation: the
+    ring is $CP$ sequential hops and every one of them is a barrier.
+
+    ## Expert parallelism: shard the FFN, keep everything else
+
+    EP splits the expert axis. Nothing else moves — attention, norms, embeddings
+    and the router are replicated in full — so the per-device parameter count is
+
+    $$N_{\text{device}} = L\left(4d^{2} + \frac{E}{N_{\text{ep}}}\cdot
+      3dd_{ff} + 4d\right) + Vd .$$
+
+    At $d = 4096$, $d_{ff} = 14336$, $L = 32$, $E = 8$, $V = 32000$ and
+    $N_{\text{ep}} = 8$: 7,916,224,512 parameters, 15.83 GB in bf16, against
+    47,376,236,544 and 94.75 GB unsharded.
+
+    The optimizer is the part that does not shard:
+
+    $$M_{\text{device}} = \underbrace{2P_{\text{device}}}_{\text{bf16 weights}}
+      + \underbrace{\frac{12 P_{\text{device}}}{N_{\text{dp}}}}_{\text{fp32
+      master, } m, v}$$
+
+    At $N_{\text{dp}} = 1$ that is 110.83 GB, which does not fit an 80 GB card
+    with zero activations. At $N_{\text{dp}} = 8$ it is 27.71 GB. That one line
+    is why the deployment unit of a large MoE is an EP times DP grid rather than
+    an EP group: the experts shard, the state does not, and the two collectives
+    ride different axes so they do not contend for the same links.
+
+    ## The exchange, and why there are four of them
+
+    Dispatch sends each token's hidden row to the ranks owning its $k$ experts.
+    Combine sends the outputs back. Both are all-to-alls, and both have a mirror
+    in the backward pass, because the gradient of a gather is a scatter and the
+    gradient of a scatter is a gather. So a training step pays four per layer:
+
+    $$V_{\text{call}} = kTdb, \qquad V_{\text{layer}} = 4kTdb, \qquad
+      V_{\text{step}} = 4LkTdb .$$
+
+    At $T = 4096$ tokens per rank per micro-batch, $k = 2$, $d = 4096$ and
+    $b = 2$, one call is 67.11 MB, a layer is 268.44 MB, and a step of eight
+    micro-batches over 32 layers is **68.72 GB per rank**. The data-parallel
+    gradient all-reduce on the same step — 2(N-1)/N times 7.92B parameters at
+    bf16 — is 27.71 GB per rank. The MoE exchange is 2.48x the collective that
+    everyone already budgets for, and it happens thirty-two times per step.
+
+    ## Why the expert count cancels
+
+    Divide the exchange time by the compute it enables, with $B$ the bandwidth
+    per rank and $P\eta$ the achieved FLOP rate:
+
+    $$\frac{t_{\text{comm}}}{t_{\text{compute}}} =
+      \frac{4LkTdb / B}{LkT \cdot 6dd_{ff} / (P\eta)} =
+      \frac{4db}{6dd_{ff}}\cdot\frac{P\eta}{B} =
+      \frac{2db}{3dd_{ff}}\cdot\frac{P\eta}{B}.$$
+
+    $E$ is not in this expression, and neither is $T$. The per-rank traffic
+    $kTdb$ and the per-rank arithmetic $kT \cdot 6dd_{ff}$ carry the same token
+    count, so they rise and fall together — there is no expert count at which
+    the exchange becomes a bandwidth problem that was not already one. At these
+    shapes the ratio evaluates to 10,752 FLOP/byte, 36x the ridge point: **the
+    all-to-all is comfortably compute-bound, and it is still the bottleneck**,
+    because what it costs is 128 barriers per step and a barrier costs whatever
+    its slowest participant costs.
+
+    ## Where the time actually goes
+
+    The only free variable left in that expression is $B$, and $B$ is a property
+    of where the experts live, not of the model.
+
+    | link | per-rank bandwidth | exchange time | compute at 40% MFU | ratio |
+    |---|---|---|---|---|
+    | NVLink domain, 8 ranks | 300 GB/s | 0.2291 s | 1.8677 s | 0.1226 |
+    | 400 Gb/s fabric, 64 ranks | 50 GB/s | 1.3744 s | 1.8677 s | 0.7359 |
+    | oversubscribed leaf, 2:1 | 25 GB/s | 2.7488 s | 1.8677 s | 1.4717 |
+
+    Same bytes, same arithmetic, 6x and 12x the time. This is the whole of the
+    "MoE training is communication-bound at large E" claim: $E = 8$ fits inside
+    one NVLink domain, $E = 64$ does not, so scaling $E$ for capacity means
+    crossing a boundary that costs a factor of six — and at 25 GB/s the step is
+    147% communication, meaning the GPUs wait on the wire more than they compute.
+
+    ## Balance is a property of the cluster
+
+    Capacity is allocated per expert against the global mean, $C = \mathrm{CF}
+    \cdot kG/E$, and the slowest rank is the one whose local experts drew the
+    most tokens. So the fraction of the step that is useful is
+
+    $$U = \frac{1}{E\,\max_i (n_i / kG)} = \frac{1}{E s},$$
+
+    and the quantity to log is $Es$, not $s$: at $s = 0.158$ and $E = 8$ the
+    cluster runs at 79% and the router looks fine, while at $s = 0.354$ and
+    $E = 8$ it runs at 35% and the router is the problem after all. Everything in
+    *Mixture of Experts* about load entropy is a statement about the batch;
+    $Es$ is the statement about the machine.
+
+    The part nobody budgets for is that $Es$ has a floor no router can go below.
+    Even with a perfectly uniform router each expert's count is multinomial, so
+
+    $$\mathbb{E}\left[\max_i n_i\right] \approx \frac{kG}{E} +
+      \sqrt{2\,\frac{kG}{E}\ln E}
+      \quad\Longrightarrow\quad
+      Es \approx 1 + \sqrt{\frac{2E\ln E}{kG}} .$$
+
+    At a fixed 262,144-token batch that is 1.0063 at $E = 8$ and 1.2227 at
+    $E = 2,048$: at a fixed token budget, more experts means less work each and
+    the same counting noise, so the barrier gets relatively worse as the cluster
+    gets wider. Measured drop rates at $\mathrm{CF} = 1.0$ follow the same curve,
+    0.13% to 2.54%, with no router pathology whatsoever.
+
+    ## Arrival order decides who is dropped
+
+    Dispatch is a network transfer, so the order in which a rank's tokens arrive
+    at an expert is not the order they were routed. The destination closes the
+    buffer when it is full, which makes the drop pattern a function of the
+    network. Measured at capacity 870 with one 1.6x hot expert: 36.69% of tokens
+    end with a different number of surviving assignments across two arrival
+    orders, and 8.20% lose both. A token that loses all of its assignments is not
+    an error — the residual carries it and the layer is the identity — which is
+    why this reproduces as a small loss difference and not as a crash.
+
+    ## The 8x7B budget on eight devices
+
+    | item | per device | note |
+    |---|---|---|
+    | expert weights, EP = 8 | 5.637B params, 11.27 GB | one expert per layer |
+    | replicated dense block | 2.279B params, 4.56 GB | attention, norms, embeddings |
+    | bf16 weights total | 7,916,224,512 params, 15.83 GB | |
+    | Adam state, DP = 1 | 94.99 GB | 12 bytes per parameter |
+    | Adam state, DP = 8 | 11.87 GB | ZeRO-1 over the DP axis |
+    | resident, DP = 1 | 110.83 GB | does not fit |
+    | resident, DP = 8 | 27.71 GB | 52 GB left for activations |
+    | all-to-all, per step | 68.72 GB | four collectives per layer |
+    | compute, per step | 738.87 TFLOP | 1.8677 s at 40% MFU |
+
+    ## What to do
+
+    Size the EP group by the interconnect, not by the parameter count: an EP
+    group that fits inside one NVLink domain pays 12% and one that does not pays
+    74%, for identical bytes. Then shard the optimizer with DP and ZeRO, because
+    no amount of expert sharding touches it. Then overlap, because split-phase
+    dispatch is the only lever that removes exchange time instead of rescheduling
+    it. Then log $Es$ per layer, not load entropy, because $Es$ is what the step
+    actually costs. And expect the drop pattern to move between runs — if it must
+    be reproducible, sort by token id at the destination rather than trusting
+    arrival order.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Sequence parallelism and expert parallelism both split something other than a weight matrix — the token axis and the FFN axis — and both are paid for in an all-to-all whose volume is fixed at tokens times hidden times dtype per direction, so the number that decides whether it is affordable is never the expert count and always where the experts physically live.
+
+    ### The analogy, in full
+
+    A mail sorting hub. Every letter is read at the door, thrown into one of E outbound bags, and the bags belong to different buildings. Twice per layer the entire floor stops, and everybody throws bundles at everybody else at once. The cost is not the weight of the mail. The cost is that the floor stops, and that the stop lasts exactly as long as the fullest bag takes to close. The mapping is exact. A letter is a token row of 4,096 bf16 numbers — 8 KB; a bag is an expert's input buffer; the floor stopping is the all-to-all; and the fullest bag is the straggler, which is why the step time tracks the maximum load rather than the mean. Three places it breaks, and each one is load-bearing. A real hub sorts continuously with buffers between stages, so a slow bag delays only its own letters — here the exchange is a barrier over all E bags, so a slow bag delays every letter on the floor. A real hub can hold a bag open and send a second truck; here capacity is fixed before dispatch, so the overflow is discarded rather than delayed, and a discarded letter still arrives at the destination with its contents unchanged because the residual carries it. And a real hub's cost is per kilogram, which is why moving the same tonnage between two buildings in one city and across the country costs the same postage — here it does not: the same 68.72 GB costs 0.2291 s inside a node and 1.3744 s across one.
+
+    ### Failure modes, in full
+
+    - You shard an 8x7B model across eight GPUs by expert and the job dies at 110.83 GB on an 80 GB card. The weights sharded perfectly — 15.83 GB each, exactly an eighth — and the 94.99 GB of Adam state did not move at all, because expert parallelism shards the FFN and nothing else.
+    - Eight experts on eight GPUs inside one node train at 12.3% communication overhead. You add a second node to reach sixteen experts, the byte count per rank halves, and the overhead goes to 73.6% — because the exchange left the NVLink domain and the fabric delivers 50 GB/s where the switch delivered 300.
+    - Your router is healthy — 2.98 bits of load entropy, no dead experts — and the cluster still idles 40.7% of every step, because the barrier waits for the rank whose expert drew the most tokens and one 1.4x hot expert is enough to hold seven ranks at the gate.
+    - You rerun the same batch to chase a loss spike and 36.69% of tokens take a different path through the layer, because capacity is enforced at the destination rank in arrival order, so the drop pattern is a function of the network and not of the data.
+    - You double the expert count to double capacity per FLOP, and the drop rate at capacity factor 1.0 rises from 0.13% to 2.54% with a router that has no preference at all — because at a fixed token budget each expert now sees an eighth as many assignments and the counting noise did not shrink with it.
+
+    ### The mechanisms, in full
+
+    - **Sequence parallelism is two techniques sharing a name, and only one of them splits the sequence.** Megatron's SP is a bookkeeping change that rides along with tensor parallelism: the region between the two TP matmuls — LayerNorm, dropout, the residual add — is replicated on every TP rank, so at 8,192 tokens, 4,096 hidden and bf16 it holds 67.11 MB per layer per rank instead of the 536.87 MB that eight ranks would each duplicate, and sharding it returns 15.03 GB of activation over 32 layers. Ring attention (context parallelism) really does divide the token axis: each device keeps s/CP queries and streams every other device's KV block past them. The trap is expecting the first to help long context. It cannot, because attention's QK^T still needs the whole sequence on every rank.
+    - **SP adds no bytes; it converts one collective into two of the same total.** TP's ring all-reduce moves 2sbh. SP's all-gather plus reduce-scatter moves sbh + sbh — the identical 536.87 MB per layer at 8,192 tokens, which is the whole reason it is worth doing. What changes is the launch count (two instead of one, so 64 more collectives per step at 32 layers) and the layout: sequence-sharded outside the matmul, sequence-replicated inside it. The trap is budgeting it as free. It is free in bandwidth and not free in latency, and on a small model the extra launches are the entire cost.
+    - **Context parallelism pays in KV traffic, and its intensity is 2s/b, so it is a long-context technique or nothing.** At CP = 8 and s = 32,768 each device holds 4,096 queries and ships its own 2 x 4,096 x 4,096 x 2 = 67.11 MB KV block once around the ring per layer: 2.147 GB per forward over 32 layers, and 17.18 GB of aggregate traffic because all eight devices receive every block. Compute is 4(s/CP)sd and traffic is 2(s/CP)db, so the ratio is 2s/b = 32,768 FLOP/byte at this context — 111x the 295 FLOP/byte ridge, and it only falls under the ridge below about 590 tokens. The trap is deploying CP at 2k context, where the arithmetic intensity is 16x worse and the ring is eight sequential barriers for nothing.
+    - **Expert parallelism is the only parallelism that shards parameters without sharding a single matmul.** At EP = 8 the 8x7B model puts 7,916,224,512 parameters and 15.83 GB of bf16 weights on each rank, and each rank's expert is a complete 176,160,768-parameter FFN that never exchanges an activation with another expert. Compare tensor parallelism, which must split every weight matrix and therefore every activation and every gradient, or pipeline parallelism, which keeps a whole stage resident. The trap is concluding that independent experts mean no communication: the independence is precisely why the tokens have to move instead, and 68.72 GB per rank per step is what that costs.
+    - **EP shards the weights and leaves the optimizer state alone, which is why nothing ships as pure EP.** Adam costs 12 bytes per parameter — four for the fp32 master weight, four each for m and v — and none of it is shardable by expert, because every parameter has optimizer state. On the same 7,916,224,512-parameter shard that is 94.99 GB, so EP = 8 with DP = 1 needs 110.83 GB on an 80 GB card and dies before the first activation. ZeRO-1 over a DP = 8 group brings the optimizer to 11.87 GB and the resident total to 27.71 GB. The trap is sizing the cluster by parameter count and meeting the optimizer at step one.
+    - **Four all-to-alls per MoE layer per step, not two.** The forward has dispatch and combine. The backward has two more and they are not optional: the gradient of combine is a dispatch-shaped exchange back to the ranks that own the experts, and the gradient of dispatch is a combine-shaped exchange back to the ranks that own the tokens. Each moves kTdb per rank per direction — at T = 4,096 tokens per micro-batch, k = 2, d = 4,096 and bf16, 67.11 MB. Four of them is 268.44 MB per layer, and 32 layers times 8 micro-batches is 68.72 GB per rank per step. The trap is costing the forward's two: 34.36 GB, half the real bill.
+    - **At 10,752 FLOP/byte the exchange is 36x above the ridge point, so its cost is never bandwidth at small E.** The same rank does 738.87 TFLOP of expert arithmetic per step against 68.72 GB of dispatch and combine. For scale, the data-parallel gradient all-reduce on that step moves 27.71 GB per rank — the MoE exchange is 2.48x the traffic of the collective everyone already budgets for, and it happens 32 times per step instead of once. The trap is reading "compute bound" as "ignore it": what you are ignoring is 128 barriers, and a barrier costs what its slowest participant costs.
+    - **What makes large-E MoE communication-bound is the domain boundary, not the expert count.** The identical 68.72 GB takes 0.2291 s at 300 GB/s inside one NVLink domain and 1.3744 s at 50 GB/s across a 400 Gb/s fabric, against 1.8677 s of compute at 40% MFU: 12.3% overhead against 73.6%. At 25 GB/s — a 2:1 oversubscribed leaf — it is 2.7488 s and the step is 147.2% communication, which is to say the GPUs wait for the network more than they work. The trap is that E = 8 fits in a node and E = 64 does not, so every increase in E that you make for capacity moves you across the boundary that costs 6x.
+    - **The straggler is E times the maximum share, so balance is a cluster property rather than a router property.** Capacity is C = CF kG/E and the slowest rank's time is proportional to its largest local count, so the step's utilisation is 1/(E s) where s is the maximum share. With a perfectly uniform router the loads are still multinomial, so the maximum exceeds the mean by about sqrt(2 (kG/E) ln E): measured at a fixed 262,144 token batch, 1.0063 at E = 8, 1.0427 at E = 128 and 1.2227 at E = 2,048, with the drop rate at CF = 1.0 rising from 0.13% to 2.54% on the way. One 1.4x hot expert costs 5.09% of assignments at E = 8 and idles the cluster 40.7% of every step.
+    - **Capacity is enforced after the exchange, in arrival order, so the same batch takes two different paths on two runs.** Dispatch is a real network transfer whose completion order is not the token order, and the destination rank closes each expert's buffer when it is full. Measured at capacity 870 with a 1.6x hot expert: 36.69% of tokens end with a different number of surviving assignments across two arrival orders, and 8.20% lose both of theirs. Also note the two failure modes scale in opposite directions — at E = 8 a 1.4x hot expert drops 5.09% of assignments and idles 40.7% of the step; at E = 128 it drops 0.755% and still idles 36.7%. Dropping is a fraction of tokens, straggling is a fraction of time, and only one of them improves as you scale.
+  derivations:
+    - title: "Four exchanges per layer, and the volume of each"
+      latex: |
+        Dispatch moves a token's hidden row to the rank that owns the expert it
+        selected. With $T$ tokens on a rank, $k$ selections each, $d$ hidden
+        units and $b$ bytes per element, the outbound volume per rank is
+
+        $$V_{\text{dispatch}} = k\,T\,d\,b .$$
+
+        Conservation makes the inbound volume equal on average: the $N$ ranks
+        send $NkTdb$ bytes in total and the $E$ experts receive them, so each of
+        the $N$ ranks receives $kTdb$ back. Note what $V$ does not contain: the
+        expert count. A rank owning $E/N$ experts receives $(E/N)\cdot(kNT/E) =
+        kT$ assignments, which is $kTdb$ — one expert per rank or eight, the same
+        bytes.
+
+        Combine is the same exchange reversed, so the forward pays $2kTdb$.
+
+        The backward pays two more, and they are forced by the shape of the
+        forward rather than chosen. The forward combine is a gather from expert
+        owners to token owners, so its gradient is a scatter to the expert
+        owners: a dispatch. The forward dispatch is a scatter from token owners
+        to expert owners, so its gradient is a gather back: a combine. Therefore
+
+        $$V_{\text{layer}} = 4\,k\,T\,d\,b, \qquad
+          V_{\text{step}} = 4\,L\,k\,T\,d\,b .$$
+
+        At $T = 4096$, $k = 2$, $d = 4096$, $b = 2$: 67.11 MB per call,
+        268.44 MB per layer, 68.72 GB per rank per step at $L = 32$ and eight
+        micro-batches. Dividing by $2P_{\text{device}} = 15.83$ GB of weights
+        gives 4.34 bytes of exchange per byte of parameter per step, which is the
+        number that makes an MoE job feel unlike a dense one.
+      prose: >-
+        The count is four because a gather and a scatter are transposes of each
+        other and autograd transposes them back. Any cost model that carries two
+        is computing the inference bill and applying it to training, which is
+        exactly a factor of two — 34.36 GB instead of 68.72 — and it is the most
+        common way an MoE cluster gets undersized.
+
+    - title: "The straggler factor, and the floor that no router can beat"
+      latex: |
+        Let $n_i$ be the assignments expert $i$ receives out of $kG$ total, with
+        $G$ the global token count for the step. Capacity is
+        $C = \mathrm{CF}\cdot kG/E$ and the step's duration is set by the
+        fullest expert, so
+
+        $$U = \frac{kG/E}{\max_i n_i} = \frac{1}{E\,s}, \qquad
+          s = \frac{\max_i n_i}{kG},$$
+
+        and the same quantity $Es$ is exactly the capacity factor needed to drop
+        nothing, since $C \ge \max_i n_i \iff \mathrm{CF} \ge Es$. Time and
+        quality are governed by one number.
+
+        Now suppose the router is perfect: every token picks its $k$ experts
+        uniformly. The counts are still multinomial with
+
+        $$\mathbb{E}[n_i] = \frac{kG}{E}, \qquad
+          \operatorname{sd}(n_i) \approx \sqrt{\frac{kG}{E}},$$
+
+        and the maximum of $E$ such variables sits about $\sqrt{2\ln E}$
+        standard deviations above the mean, giving
+
+        $$Es \approx 1 + \sqrt{\frac{2E\ln E}{kG}} .$$
+
+        At $G = 262144$, $k = 2$ and $E = 8$: $1 + \sqrt{2 \cdot 8 \cdot 2.079 /
+        524288} = 1.0056$, measured 1.0063. At $E = 2048$: $1 + 0.244 = 1.244$,
+        measured 1.2227. The floor rises with $E$ at fixed $G$ because the work
+        per expert falls as $1/E$ while the noise falls only as $1/\sqrt{E}$.
+
+        The dropped fraction at $\mathrm{CF} = 1$ is the expected overshoot,
+        $E\cdot\sigma/\sqrt{2\pi}$ divided by $kG$, which is why it tracks the
+        same curve: 0.13% at $E = 8$ and 2.54% at $E = 2,048$ with a router that
+        has no preferences at all.
+      prose: >-
+        This is the argument for calling imbalance a cluster property. On one
+        batch, $s$ is a router statistic and you can tune it. On $E$ ranks, $Es$
+        is a counting statistic and you cannot: at a fixed token budget the
+        multiplexing gain of more experts is partly spent on the variance of
+        having more of them, and the only levers left are a larger global batch
+        or smaller experts with replication.
+
+    - title: "Why E cancels, and what is left when it does"
+      latex: |
+        The exchange time per step and the compute it enables, both per rank:
+
+        $$t_{\text{comm}} = \frac{4LkTdb}{B}, \qquad
+          t_{\text{compute}} = \frac{LkT \cdot 6dd_{ff}}{P\eta},$$
+
+        where $B$ is the bandwidth a rank actually achieves in the collective and
+        $P\eta$ the achieved FLOP rate. Their ratio is
+
+        $$\frac{t_{\text{comm}}}{t_{\text{compute}}} =
+          \frac{4db}{6dd_{ff}}\cdot\frac{P\eta}{B}
+          = \frac{2db}{3dd_{ff}}\cdot\frac{P\eta}{B},$$
+
+        which contains neither $E$ nor $T$ nor $L$. Equivalently, the intensity is
+
+        $$\frac{6dd_{ff}}{4db} = 10{,}752\ \text{FLOP/byte}$$
+
+        at $d_{ff} = 14336$ and $b = 2$ — 36x the 295 FLOP/byte ridge point of a
+        989 TFLOP/s part with 3.35 TB/s of memory bandwidth.
+
+        So the only quantity in the ratio that can move is $B$. Moving the EP
+        group from an NVLink domain to a fabric takes $B$ from 300 GB/s to
+        50 GB/s, a factor of 6, and the ratio from 0.1226 to 0.7359. Take it to
+        25 GB/s and the ratio passes 1: the step is communication-bound with the
+        same expert count, the same tokens and the same bytes.
+
+        The corollary is a design rule. Because $E$ cancels, doubling the expert
+        count does not change the communication fraction *provided* the new
+        experts land on the same kind of link. Because they usually do not, the
+        practical statement is the opposite of the algebra: every increase in $E$
+        is a topology change, and should be budgeted as one.
+      prose: >-
+        This derivation is the topic. The intuition people carry is that MoE is
+        communication-heavy because there are many experts; the algebra says the
+        bytes per FLOP do not know how many experts there are. What changed
+        between the 12% job and the 74% job was not $E$, it was $B$ — and $B$ is
+        decided by which racks the experts sit in, which is a decision you make
+        once and then live with for the length of the run.
+
+  implementations:
+    - language: python
+      title: "One step of an EP cluster: the bill, the barrier, and the arrival order"
+      note: >-
+        Correct, and it is a cost model rather than a benchmark: the bandwidth
+        (50 GB/s), the peak rate (989 TFLOP/s) and the MFU (0.4) are inputs, and
+        everything downstream of them is derived. What it does measure is the
+        part people get wrong — the multinomial load, the straggler that follows
+        from it, and the arrival-order dependence of dropping. Read the first
+        table by its last column: 0.7359 at E = 8, 64 and 256, identical to four
+        decimals because the ratio has no E in it, while GB/step falls from 68.72
+        to 2.15. That column is the derivation above, reproduced by arithmetic
+        rather than asserted. The second table is the same job with only the
+        bandwidth changed, and it is the one to show a capacity planner. The last
+        block is the result with no closed form at all: two arrival orders, same
+        batch, same weights, 36.69% of tokens taking a different path. Caveat:
+        `ep_step` assumes every rank holds exactly one expert, so it says nothing
+        about the E/N case, and its compute term ignores attention, which is
+        about 19% of the layer's FLOPs and would lower the ratio by that much.
+      code: |
+        import numpy as np
+
+        D, D_FF, L, K, B = 4096, 14336, 32, 2, 2
+
+
+        def ep_step(n_experts, tokens_per_rank, cf=1.25, skew=1.4, bw_gbs=50.0,
+                    mfu=0.4, peak_tflops=989.0, seed=0):
+            """One training step's EP bill and the barrier it pays for."""
+            rng = np.random.default_rng(seed)
+            p = np.full(n_experts, 1.0 / n_experts)
+            p[0] = skew / n_experts                      # one hot expert
+            p[1:] = (1.0 - p[0]) / (n_experts - 1)
+            counts = rng.multinomial(K * tokens_per_rank * n_experts, p)
+            assign = K * tokens_per_rank * n_experts
+            cap = int(np.floor(cf * assign / n_experts))
+
+            per_call = K * tokens_per_rank * D * B                 # one collective, one way
+            bytes_step = 4 * L * per_call                          # 4 collectives per layer
+            flops = K * tokens_per_rank * 6 * D * D_FF * L
+            return {
+                "straggler": float(counts.max() / (assign / n_experts)),
+                "drop": float(np.maximum(counts - cap, 0).sum() / assign),
+                "gb_step": bytes_step / 1e9,
+                "comm_s": bytes_step / (bw_gbs * 1e9),
+                "compute_s": flops / (peak_tflops * 1e12 * mfu),
+            }
+
+
+        if __name__ == "__main__":
+            print(" E   T/rank   straggler  drop     GB/step   comm_s  comp_s  comm/comp")
+            for E, T in ((8, 32768), (64, 4096), (256, 1024)):
+                r = ep_step(E, T)
+                print("%3d %8d %10.4f %7.4f %9.3f %8.4f %7.4f %10.4f"
+                      % (E, T, r["straggler"], r["drop"], r["gb_step"],
+                         r["comm_s"], r["compute_s"], r["comm_s"] / r["compute_s"]))
+
+            print("\nsame E=8 at three bandwidths:")
+            for bw in (300.0, 50.0, 25.0):
+                r = ep_step(8, 32768, bw_gbs=bw)
+                print("  %5.0f GB/s  comm %.4f s  ratio %.4f"
+                      % (bw, r["comm_s"], r["comm_s"] / r["compute_s"]))
+
+            rng = np.random.default_rng(5)
+            E, T = 8, 4096
+            p = np.full(E, 1.0 / E)
+            p[0] = 1.6 / E
+            p[1:] = (1.0 - p[0]) / (E - 1)
+            C = int(np.floor(0.85 * K * T / E))
+            kept = []
+            for s in (11, 22):
+                r = np.random.default_rng(s)
+                lab = r.integers(0, E, size=(T, K))
+                order = r.permutation(T)
+                kk = np.zeros(T, int)
+                for e in range(E):
+                    for t in [t for t in order if (lab[t] == e).any()][:C]:
+                        kk[t] += 1
+                kept.append(kk)
+            print("\narrival-order sensitivity, capacity %d:" % C)
+            print("  tokens with a different surviving-assignment count: %d of %d (%.2f%%)"
+                  % (int((kept[0] != kept[1]).sum()), T,
+                     100 * (kept[0] != kept[1]).sum() / T))
+            print("  tokens losing every assignment: %d (%.2f%%)"
+                  % (int((kept[0] == 0).sum()), 100 * (kept[0] == 0).sum() / T))
+
+        #  E   T/rank   straggler  drop     GB/step   comm_s  comp_s  comm/comp
+        #   8    32768     1.4053  0.0194    68.719   1.3744  1.8677     0.7359
+        #  64     4096     1.4159  0.0026     8.590   0.1718  0.2335     0.7359
+        # 256     1024     1.4321  0.0007     2.147   0.0429  0.0584     0.7359
+        #
+        # same E=8 at three bandwidths:
+        #    300 GB/s  comm 0.2291 s  ratio 0.1226
+        #     50 GB/s  comm 1.3744 s  ratio 0.7359
+        #     25 GB/s  comm 2.7488 s  ratio 1.4717
+        #
+        # arrival-order sensitivity, capacity 870:
+        #  tokens with a different surviving-assignment count: 1503 of 4096 (36.69%)
+        #  tokens losing every assignment: 336 (8.20%)
+
+    - language: python
+      title: "The cost model everybody writes first — numerically WRONG"
+      note: >-
+        Both bugs produce a plausible number and neither raises. Bug 1 counts two
+        all-to-alls per layer because the author thought about the forward pass
+        and then applied it to training: that halves the traffic to 34.360 GB and
+        halves the overhead to 0.3679, which reads as "MoE communication is 37% of
+        a step, fine" when the truth is 73.6% — the difference between a cluster
+        that needs a fabric upgrade and one that does not. Bug 2 divides the
+        overflow by the token count instead of the assignment count, and with
+        $k = 2$ that **doubles** the reported drop rate: 3.88% against the correct
+        5.09% at E = 8 and 1.25 capacity... except it is not even that, because it
+        also uses the wrong capacity, and the printed 0.0388 against 0.0509 is
+        the two errors partially cancelling at E = 8 and diverging at E = 64
+        (0.0052 against 0.0044). That is the signature of this class of bug: right
+        order of magnitude, wrong by a factor that changes with configuration, so
+        it survives every review that only checks one shape. The tell is that
+        `gb_step` scales with $k$ but not with the number of collectives, so
+        changing top-k moves the answer even though the derivation says the two
+        are separate knobs.
+      code: |
+        import numpy as np
+
+        D, D_FF, L, K, B = 4096, 14336, 32, 2, 2
+
+
+        def step_cost(n_experts, tokens_per_rank, cf=1.25, skew=1.4, bw_gbs=50.0, mfu=0.4):
+            # WRONG 1: only the forward's two all-to-alls. Training has four.
+            per_call = K * tokens_per_rank * D * B
+            bytes_step = 2 * L * per_call
+            flops = K * tokens_per_rank * 6 * D * D_FF * L
+
+            rng = np.random.default_rng(0)
+            p = np.full(n_experts, 1.0 / n_experts)
+            p[0] = skew / n_experts
+            p[1:] = (1.0 - p[0]) / (n_experts - 1)
+            tokens = tokens_per_rank * n_experts
+            counts = rng.multinomial(K * tokens, p)
+            cap = int(np.floor(cf * K * tokens / n_experts))
+            # WRONG 2: drop reported as a fraction of tokens, not of assignments
+            drop = float(np.maximum(counts - cap, 0).sum() / tokens)
+
+            return {"gb_step": bytes_step / 1e9,
+                    "comm_s": bytes_step / (bw_gbs * 1e9),
+                    "compute_s": flops / (989e12 * mfu),
+                    "drop": drop}
+
+
+        if __name__ == "__main__":
+            print("WRONG model:")
+            for E, T in ((8, 32768), (64, 4096)):
+                r = step_cost(E, T)
+                print("  E=%3d  GB/step %7.3f  comm %.4f s  ratio %.4f  drop %.4f"
+                      % (E, r["gb_step"], r["comm_s"],
+                         r["comm_s"] / r["compute_s"], r["drop"]))
+            print("RIGHT:  E=8   GB/step  68.719  comm 1.3744 s  ratio 0.7359  drop 0.0509")
+            print("        E=64  GB/step   8.590  comm 0.1718 s  ratio 0.7359  drop 0.0044")
+
+        # WRONG model:
+        #   E=  8  GB/step  34.360  comm 0.6872 s  ratio 0.3679  drop 0.0388
+        #   E= 64  GB/step   4.295  comm 0.0859 s  ratio 0.3679  drop 0.0052
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        The weights of an 8x7B model fit on eight 80 GB cards at 15.83 GB each
+        with room to spare, and the job still dies at step one. What exactly did
+        expert parallelism shard, what did it leave, and what is the smallest
+        change that makes it fit?
+      answerKind: short_text
+      hint: >-
+        Weights are 2 bytes per parameter. Adam keeps three more numbers per
+        parameter, in fp32, and every one of them is per-parameter — so ask which
+        axis can shard it.
+      solution: >-
+        EP shards the expert FFNs and nothing else, which is 45.10B of the
+        47.38B parameters — so the weights do fall a factor of eight, to
+        7,916,224,512 parameters and 15.83 GB in bf16. The optimizer does not
+        shard, because Adam's fp32 master weight, $m$ and $v$ exist for every
+        parameter including the replicated attention, norms and embeddings: 12
+        bytes per parameter is 94.99 GB on the same shard, and the resident total
+        is 110.83 GB on an 80 GB card, before a single activation. The smallest
+        fix is not more EP — the experts are already maximal at one per rank —
+        it is a DP axis with ZeRO-1: at $N_{\text{dp}} = 8$ the optimizer falls to
+        11.87 GB and the resident total to 27.71 GB, leaving 52 GB for
+        activations. Which is the structural reason real MoE jobs are EP times DP
+        and never EP alone.
+    - id: cp-2
+      question: >-
+        A cost model in a design document budgets 34.36 GB per rank per step for
+        the MoE exchange on an 8x7B job. The number is exactly half the real one.
+        Where do the missing two exchanges come from, and what property of
+        autograd forces them?
+      answerKind: short_text
+      hint: >-
+        The forward has a gather and a scatter. Ask what the derivative of each
+        one is, and which direction the data has to travel to compute it.
+      solution: >-
+        The forward's two are dispatch (a scatter from token owners to expert
+        owners) and combine (a gather from expert owners back to token owners).
+        Autograd transposes the forward graph, so the gradient of a gather is a
+        scatter and the gradient of a scatter is a gather: combine's backward is
+        a dispatch-shaped exchange to the expert owners, and dispatch's backward
+        is a combine-shaped exchange back to the token owners. Four collectives,
+        each moving $kTdb$ per rank per direction. At $T = 4096$, $k = 2$,
+        $d = 4096$ and bf16 that is 67.11 MB each, 268.44 MB per layer, and
+        68.72 GB per rank per step over 32 layers and eight micro-batches — not
+        34.36. The model was correct about inference and applied to training, so
+        it understates the overhead as 0.3679 where the truth is 0.7359, which is
+        the difference between "no action needed" and "the fabric is the job".
+    - id: cp-3
+      question: >-
+        With a router that has no preference at all — every token picks its two
+        experts uniformly at random — the cluster still idles 22% of its step at
+        E = 2,048 on a 262,144-token batch. Nothing is wrong with the router. What
+        is the mechanism, and what are the two levers that reduce it?
+      answerKind: short_text
+      hint: >-
+        Each expert's count is a sum of independent coin flips. Ask how the mean
+        and the standard deviation scale with the number of experts when the
+        total number of assignments is fixed.
+      solution: >-
+        The mean per expert is $kG/E$ and the standard deviation is
+        $\sqrt{kG/E}$, so the mean falls as $1/E$ while the noise falls only as
+        $1/\sqrt{E}$ — the relative noise grows as $\sqrt{E}$. The maximum of $E$
+        such counts sits about $\sqrt{2\ln E}$ deviations above the mean, so
+        $Es \approx 1 + \sqrt{2E\ln E/kG}$: 1.0056 predicted at $E = 8$ and 1.244
+        at $E = 2,048$ against 1.0063 and 1.2227 measured. The levers are a
+        larger global batch, which is the $G$ in the denominator and the only
+        thing that shrinks the noise, or fewer and larger experts with redundant
+        copies, which trades memory for balance. Neither a better router nor a
+        higher capacity factor touches it: capacity factor buys back the dropped
+        tokens, not the idle time, because the barrier lasts as long as the
+        fullest expert whether or not you dropped anything.
+    - id: cp-4
+      question: >-
+        Moving an EP group from eight ranks in one node to 64 ranks across a
+        fabric takes the modelled overhead from 12.3% to 73.6% while the bytes
+        per rank *fall* by a factor of eight. Explain the sign, and say which
+        quantity in the cost model moved.
+      answerKind: short_text
+      hint: >-
+        Write the ratio of exchange time to compute time and cancel everything
+        that appears in both.
+      solution: >-
+        Bytes per rank fall because at a fixed global batch each rank gets $1/E$
+        of the tokens; compute per rank falls by exactly the same factor, so the
+        ratio is unchanged in the algebra:
+        $t_{\text{comm}}/t_{\text{compute}} = (2db/3dd_{ff})(P\eta/B)$, which
+        contains neither $E$ nor $T$. Only $B$ moved — from 300 GB/s inside the
+        NVLink domain to 50 GB/s across the fabric, a factor of six, giving
+        0.1226 to 0.7359. At 25 GB/s on an oversubscribed leaf the ratio passes
+        1.0 at 1.4717 and the step becomes communication-bound with identical
+        bytes. That is why "MoE is communication-bound at large $E$" is true and
+        also mis-stated: it is bound by the link the experts ended up on, and $E$
+        is merely the thing that usually forces you off the good one.
+    - id: cp-5
+      question: >-
+        You are debugging a loss spike and rerun the exact batch on the same
+        checkpoint. The losses differ, and 36.69% of tokens take a different path
+        through the MoE layers. Which line of code do you change, and what do you
+        give up?
+      answerKind: short_text
+      hint: >-
+        Capacity is enforced at the destination after a network transfer. Ask
+        what determines which assignments fill the buffer first, and whether that
+        order is a function of the data.
+      solution: >-
+        The buffer is closed in arrival order at the destination rank, and
+        arrival order is a property of the network — so the drop pattern is not a
+        function of the batch and cannot be reproduced by replaying it. Measured
+        at capacity 870 with a 1.6x hot expert: 36.69% of tokens end with a
+        different number of surviving assignments across two arrival orders and
+        8.20% lose both. The fix is to make the drop decision a deterministic
+        function of the data — sort each expert's incoming assignments by token
+        id and keep the lowest $C$ — which costs a sort per expert per layer and
+        makes the layer's output independent of the fabric. What you give up is
+        the zero-copy path: the sort has to materialise the route table before
+        the exchange instead of consuming it as it lands, which is why production
+        stacks usually ship the nondeterministic version and pin the symptom by
+        logging per-expert drop counts instead.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Every parallelism you have met so far splits something inside a matrix or
+        between layers. These two split somewhere else. Sequence parallelism
+        splits the token axis, which is where the activations live, so it buys
+        memory rather than FLOPs. Expert parallelism splits the FFN axis, which
+        is where the parameters live, so it buys capacity rather than FLOPs.
+
+        Both are paid for in an all-to-all: a collective where every rank sends a
+        different buffer to every other rank, which is a transpose of the data
+        rather than a reduction. An all-reduce costs the same on every rank and
+        finishes when the slowest one arrives. An all-to-all has the same barrier
+        but a much worse property — the amount each rank must *send* is fixed by
+        its own token count, so a rank with a hot expert makes everyone wait, and
+        the wait is not proportional to the average load. That is why a
+        technique that looks like a pure memory win turns into the dominant cost
+        of the step.
+      blocks:
+        - kind: checklist
+          body: |
+            - Sequence parallelism splits tokens; expert parallelism splits experts
+            - SP removes duplicated activation between TP matmuls, same bytes
+            - CP (ring attention) really divides the sequence, intensity 2s/b
+            - EP shards weights and leaves the optimizer state replicated
+            - Four all-to-alls per MoE layer per training step, not two
+            - Volume per call is k T d b; per step it is 4 L k T d b
+            - Cost is the barrier, so it scales with the max, not the mean
+      checkpoint: >-
+        Before reading on: the exchange moves 68.72 GB per rank per step and the
+        arithmetic intensity works out to 10,752 FLOP/byte, which is 36x the
+        ridge point of the GPU. If it is that comfortably compute-bound, why is
+        it ever the bottleneck?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Four questions, in this order, and each one has a different unit.
+
+        *How much memory does the shard save?* Parameters per device, then bytes.
+        Then look at the optimizer, which is 12 bytes per parameter and shards
+        only on the DP axis. If the total does not fit, the answer is DP, not
+        more EP.
+
+        *How many bytes cross the wire?* $kTdb$ per collective per rank, four
+        per layer, $L$ layers, and the micro-batch count multiplies it. Compare
+        against the data-parallel all-reduce on the same step; if the exchange is
+        larger — and it usually is, by about 2.5x — then it is the thing to
+        optimise.
+
+        *What bandwidth do you actually get?* Not the NIC's number: the
+        collective's, at that group size. Inside one NVLink domain it is
+        hundreds of GB/s; across a fabric it is tens. This is the only quantity
+        in the ratio that differs between a 12% job and a 74% job.
+
+        *What is the maximum share?* Compute $Es$, not $s$. That is the fraction
+        of the step that is idle, and the capacity factor you need to drop
+        nothing.
+      blocks:
+        - kind: checklist
+          body: |
+            - Per-device params: L(4d^2 + (E/Nep) 3 d dff + 4d) + Vd
+            - Optimizer: 12 bytes/param, sharded by DP only
+            - Exchange: 4 L k T d b per rank per step
+            - Compare against 2(N-1)/N * P * b for the DP all-reduce
+            - Intensity 6 dff / (4 d b); E does not appear
+            - Idle fraction = 1 - 1/(E s); capacity factor needed = E s
+            - At fixed G, E s has a floor of about 1 + sqrt(2 E lnE / kG)
+      checkpoint: >-
+        You have a 74% communication overhead and a budget for exactly one
+        change. The candidates are: a better router, a larger capacity factor, a
+        bigger global batch, a faster interconnect, and split-phase overlap.
+        Which two of those can actually remove time from the step, and which
+        three only move it around?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Write the placement first, then the collective, then the barrier. If the
+        placement is wrong, none of the arithmetic matters.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # placement: a 2-D grid, EP on one axis, DP on the other
+            world   = ep * dp
+            rank    = ep_rank + ep * dp_rank
+            experts = [e for e in range(E) if e % ep == ep_rank]   # E / ep of them
+            params  = L * (4*d*d + len(experts) * 3*d*dff + 4*d) + V*d
+            state   = params * 12 / dp                             # ZeRO-1, DP axis only
+
+            # the layer, and the four collectives
+            dispatch(tokens, experts)          # k T d b out, EP group
+            y = expert_ffn(dispatch_out)        # no communication
+            combine(y)                          # k T d b back, EP group
+            # backward: combine-grad is a dispatch, dispatch-grad is a combine
+
+            # the bill
+            per_call = k * T * d * b
+            per_step = 4 * L * per_call
+            ratio    = per_step / (bandwidth * compute_seconds)
+
+            # the barrier
+            s  = max(counts) / sum(counts)
+            U  = 1 / (E * s)                    # NOT 1 / (1 + something)
+            CF = max(1.0, E * s)                # to drop nothing at all
+            if arrival_order_decides_drops: sort_by_token_id_before_closing()
+      checkpoint: >-
+        In that pseudocode `params` uses `len(experts)` but `state` divides by
+        `dp`. Why is it not `len(experts)` in both, and what would happen at
+        $E = 8$, $ep = 8$, $dp = 1$ if you used it?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three results: the four-collective volume, the straggler floor, and the
+        cancellation that says the expert count is not the problem.
+      blocks:
+        - kind: math
+          body: |
+            Volume. Dispatch sends $kTdb$ per rank, combine returns it, and each
+            has a mirror in the backward because the gradient of a gather is a
+            scatter:
+
+            $$V_{\text{layer}} = 4kTdb, \qquad
+              V_{\text{step}} = 4LkTdb .$$
+
+            At $T = 4096$, $k = 2$, $d = 4096$, $b = 2$, $L = 32$ and eight
+            micro-batches: 67.11 MB, 268.44 MB, 68.72 GB.
+
+            Straggler. With $n_i$ multinomial over $E$ experts and $kG$
+            assignments,
+
+            $$Es \approx 1 + \sqrt{\frac{2E\ln E}{kG}},$$
+
+            which is 1.0056 at $E = 8$ and 1.244 at $E = 2,048$ on a 262,144
+            token batch, against 1.0063 and 1.2227 measured. The rate at which it
+            rises is the whole reason balance is a cluster property.
+
+            Cancellation.
+
+            $$\frac{t_{\text{comm}}}{t_{\text{compute}}} =
+              \frac{4LkTdb/B}{LkT \cdot 6dd_{ff}/(P\eta)} =
+              \frac{2db}{3dd_{ff}}\cdot\frac{P\eta}{B},$$
+
+            with no $E$, $T$ or $L$ left in it. At $d_{ff} = 14336$ and $b = 2$
+            the intensity is 10,752 FLOP/byte, so the ratio is set entirely by
+            $B$: 0.1226 at 300 GB/s, 0.7359 at 50, 1.4717 at 25.
+      checkpoint: >-
+        Which of those three would you put in a design review, and which one
+        would you compute before ordering a cluster?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete picture: placement, the four-collective bill, the topology
+        table, the barrier arithmetic, and the two cost-model bugs that produce
+        plausible numbers.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the failure modes first, because three of the four do not raise
+            and one of them makes the training loss look better. A cost model
+            with two collectives instead of four halves the traffic and reports
+            37% overhead on a job that is at 74% — a cluster sized from that
+            document will be short by a factor of two and nobody will know until
+            the runs are slower than the benchmark. A drop rate computed against
+            tokens instead of assignments is wrong by $k$. A model that shards
+            the optimizer by EP looks fine until the first step, when it is
+            110.83 GB on an 80 GB card. And the one that raises no error and
+            cannot be reproduced is arrival-order dropping: 36.69% of tokens
+            taking a different path on a rerun, which reads as nondeterminism in
+            the kernel and is really the fabric.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+
+            def device_params(L, d, dff, E, ep, V):
+                return L * (4 * d * d + (E // ep) * 3 * d * dff + 4 * d) + V * d
+
+
+            def resident_gb(params, dp, weight_bytes=2, opt_bytes=12):
+                return (params * weight_bytes + params * opt_bytes / dp) / 1e9
+
+
+            def all_to_all_gb(L, T, k, d, b=2, mb=1):
+                return 4 * L * k * T * d * b * mb / 1e9
+
+
+            def ratio(gb, compute_s, bw_gbs):
+                return gb / (bw_gbs * compute_s)
+
+
+            def straggler(E, G, k=2):
+                return 1 + math.sqrt(2 * E * math.log(E) / (k * G))
+
+
+            if __name__ == "__main__":
+                p = device_params(32, 4096, 14336, 8, 8, 32000)
+                print("params/device %d" % p)
+                print("DP=1 %.4f GB   DP=8 %.4f GB"
+                      % (resident_gb(p, 1), resident_gb(p, 8)))
+                gb = all_to_all_gb(32, 32768, 2, 4096, 2, 8)
+                print("exchange %.4f GB/step" % gb)
+                for bw in (300, 50, 25):
+                    print("  %3d GB/s ratio %.4f" % (bw, ratio(gb, 1.8677, bw)))
+                for E in (8, 2048):
+                    print("  straggler floor at E=%4d: %.4f" % (E, straggler(E, 262144)))
+      checkpoint: >-
+        `straggler(2048, 262144)` returns 1.2437 and the simulator measured
+        1.2227. Which of the two would you quote in a capacity plan, and why is
+        the gap in the conservative direction?
+
+  problems:
+    - id: p-ep-budget
+      title: "What actually fits: the EP shard, the optimizer, and the card"
+      difficulty: medium
+      prompt: >-
+        Implement `ep_budget(d_model, d_ff, n_layers, n_experts, top_k, vocab,
+        ep, dp, bytes_per_param=2.0, optimizer_bytes=12.0, card_gb=80.0)`
+        returning a dict with exactly the keys `params_total`,
+        `params_per_device`, `weights_gb`, `optimizer_gb`, `resident_gb` and
+        `fits`.
+
+        One layer is `4 * d_model ** 2` attention parameters plus `4 * d_model`
+        of LayerNorm, plus one expert = `3 * d_model * d_ff` parameters, of which
+        there are `n_experts`. The embedding and unembedding are tied:
+        `vocab * d_model`.
+
+        Expert parallelism shards only the experts: a device holds
+        `n_experts // ep` of them per layer and the dense part in full.
+        `params_total` counts every expert and every device; `params_per_device`
+        is one rank's shard. `top_k` affects neither — a parameter count does not
+        know how many experts a token visits.
+
+        `weights_gb` is `params_per_device * bytes_per_param / 1e9`.
+        `optimizer_gb` is `params_per_device * optimizer_bytes / dp / 1e9` — the
+        optimizer shards on the DP axis only, which is the point of the problem.
+        `resident_gb` is their sum and `fits` is whether it is `<= card_gb`.
+
+        `n_experts` is always divisible by `ep`, and `d_model`, `d_ff`,
+        `n_layers`, `vocab`, `ep` and `dp` are positive integers.
+      starter: |
+        def ep_budget(d_model, d_ff, n_layers, n_experts, top_k, vocab, ep, dp,
+                      bytes_per_param=2.0, optimizer_bytes=12.0, card_gb=80.0):
+            # your implementation here
+            pass
+      language: python
+      entry: ep_budget
+      testCases:
+        - input: '[4096, 14336, 32, 8, 2, 32000, 8, 8]'
+          expected: '{"params_total": 47376236544, "params_per_device": 7916224512, "weights_gb": 15.832449024, "optimizer_gb": 11.874336768, "resident_gb": 27.706785792, "fits": true}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4096, 14336, 32, 8, 2, 32000, 8, 1]'
+          expected: '{"params_total": 47376236544, "params_per_device": 7916224512, "weights_gb": 15.832449024, "optimizer_gb": 94.994694144, "resident_gb": 110.827143168, "fits": false}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4096, 14336, 32, 8, 2, 32000, 8, 64]'
+          expected: '{"params_total": 47376236544, "params_per_device": 7916224512, "weights_gb": 15.832449024, "optimizer_gb": 1.484292096, "resident_gb": 17.31674112, "fits": true}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4096, 14336, 32, 64, 2, 32000, 8, 8]'
+          expected: '{"params_total": 363056332800, "params_per_device": 47376236544, "weights_gb": 94.752473088, "optimizer_gb": 71.064354816, "resident_gb": 165.816827904, "fits": false}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[768, 3072, 12, 8, 2, 50257, 4, 4]'
+          expected: '{"params_total": 746423040, "params_per_device": 236815104, "weights_gb": 0.473630208, "optimizer_gb": 0.710445312, "resident_gb": 1.18407552, "fits": true}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4096, 14336, 32, 8, 2, 32000, 8, 8, 2.0, 12.0, 27.706785792]'
+          expected: '{"params_total": 47376236544, "params_per_device": 7916224512, "weights_gb": 15.832449024, "optimizer_gb": 11.874336768, "resident_gb": 27.706785792, "fits": true}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4096, 14336, 32, 8, 2, 32000, 8, 8, 2.0, 12.0, 27.70678579]'
+          expected: '{"params_total": 47376236544, "params_per_device": 7916224512, "weights_gb": 15.832449024, "optimizer_gb": 11.874336768, "resident_gb": 27.706785792, "fits": false}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        def ep_budget(d_model, d_ff, n_layers, n_experts, top_k, vocab, ep, dp,
+                      bytes_per_param=2.0, optimizer_bytes=12.0, card_gb=80.0):
+            d, ff = int(d_model), int(d_ff)
+            L, E, V = int(n_layers), int(n_experts), int(vocab)
+            ep, dp = int(ep), int(dp)
+            if E % ep:
+                raise ValueError("n_experts must be divisible by ep")
+            dense = 4 * d * d + 4 * d
+            total = L * (dense + E * 3 * d * ff) + V * d
+            per_dev = L * (dense + (E // ep) * 3 * d * ff) + V * d
+            weights = per_dev * float(bytes_per_param) / 1e9
+            opt = per_dev * float(optimizer_bytes) / dp / 1e9
+            return {"params_total": total, "params_per_device": per_dev,
+                    "weights_gb": weights, "optimizer_gb": opt,
+                    "resident_gb": weights + opt,
+                    "fits": (weights + opt) <= float(card_gb)}
+      solutionExplanation: >-
+        The first two cases are the whole topic in one comparison. Both shard the
+        weights identically — 7,916,224,512 parameters, 15.83 GB, an eighth of
+        47,376,236,544 — and the second one needs 110.83 GB because 94.99 GB of
+        Adam state did not shard at all. That is $12 \times 7.916 \times 10^{9}$
+        bytes with $N_{\text{dp}} = 1$: the optimizer is per-parameter, and every
+        parameter has one, including the replicated attention. The third case
+        shows the fix, a DP of 64 for 1.48 GB of state and 17.32 GB resident, and
+        the fourth shows why EP alone cannot rescue a bigger model: 64 experts on
+        an EP of 8 is eight experts per rank, 47,376,236,544 parameters per
+        device — the same as the whole unsharded model — and 165.82 GB resident.
+        Note that `top_k` appears in the signature and in no expression: cases
+        one and five of the Mixture of Experts topic differ only in `top_k` and
+        have identical `params_total`, and an implementation that multiplies by
+        `top_k` here will fail every case. The last two cases pin the boundary:
+        at exactly 27.706785792 GB the configuration fits, and at 27.70678579 it
+        does not, so `fits` has to be `<=` and not `<`. The small case is a
+        sanity check that nothing is hard-coded to 4096; it also shows the regime
+        where the optimizer is *larger* than the weights, which is what happens
+        on any model small enough to fit before it is sharded.
+      complexity: "O(1) time and space"
+      tags: [expert-parallelism, memory, zero, optimizer-state, sharding]
+
+    - id: p-ep-all-to-all
+      title: "The four-collective bill, and the ratio with no E in it"
+      difficulty: medium
+      prompt: >-
+        Implement `all_to_all(tokens_per_rank, d_model, d_ff, top_k, n_layers,
+        bandwidth_gbs, bytes_per_element=2.0, peak_tflops=989.0, mfu=0.4)`
+        returning a dict with exactly the keys `bytes_per_call`,
+        `bytes_per_layer`, `gb_per_step`, `seconds`, `compute_seconds`,
+        `comm_ratio` and `flops_per_byte`.
+
+        `tokens_per_rank` is the token count per rank for the whole step. One
+        all-to-all moves `top_k * tokens_per_rank * d_model * bytes_per_element`
+        bytes per rank in one direction. A training step performs **four** of
+        them per MoE layer (dispatch and combine forward, and their two
+        gradients), so `bytes_per_layer` is four calls and `gb_per_step` is
+        `n_layers * bytes_per_layer / 1e9`.
+
+        `seconds` is the exchange time at `bandwidth_gbs` (decimal GB, 1e9
+        bytes). `compute_seconds` is the expert arithmetic the exchange enables:
+        `top_k * tokens_per_rank * 6 * d_model * d_ff * n_layers` FLOPs at
+        `peak_tflops * mfu` TFLOP/s. `comm_ratio` is `seconds /
+        compute_seconds`. `flops_per_byte` is the same FLOP count divided by
+        `n_layers * bytes_per_layer` — note it does not depend on the token count
+        at all.
+
+        Everything except `bytes_per_call` and `bytes_per_layer` is a float;
+        those two are exact byte counts.
+      starter: |
+        def all_to_all(tokens_per_rank, d_model, d_ff, top_k, n_layers, bandwidth_gbs,
+                       bytes_per_element=2.0, peak_tflops=989.0, mfu=0.4):
+            # your implementation here
+            pass
+      language: python
+      entry: all_to_all
+      testCases:
+        - input: '[32768, 4096, 14336, 2, 32, 50.0]'
+          expected: '{"bytes_per_call": 536870912.0, "bytes_per_layer": 2147483648.0, "gb_per_step": 68.719476736, "seconds": 1.37438953472, "compute_seconds": 1.86772450420999, "comm_ratio": 0.7358630952380952, "flops_per_byte": 10752.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[32768, 4096, 14336, 2, 32, 300.0]'
+          expected: '{"bytes_per_call": 536870912.0, "bytes_per_layer": 2147483648.0, "gb_per_step": 68.719476736, "seconds": 0.22906492245333332, "compute_seconds": 1.86772450420999, "comm_ratio": 0.1226438492063492, "flops_per_byte": 10752.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[32768, 4096, 14336, 2, 32, 25.0]'
+          expected: '{"bytes_per_call": 536870912.0, "bytes_per_layer": 2147483648.0, "gb_per_step": 68.719476736, "seconds": 2.74877906944, "compute_seconds": 1.86772450420999, "comm_ratio": 1.4717261904761905, "flops_per_byte": 10752.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4096, 4096, 14336, 2, 32, 50.0]'
+          expected: '{"bytes_per_call": 67108864.0, "bytes_per_layer": 268435456.0, "gb_per_step": 8.589934592, "seconds": 0.17179869184, "compute_seconds": 0.23346556302624874, "comm_ratio": 0.7358630952380952, "flops_per_byte": 10752.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[32768, 4096, 14336, 1, 32, 50.0]'
+          expected: '{"bytes_per_call": 268435456.0, "bytes_per_layer": 1073741824.0, "gb_per_step": 34.359738368, "seconds": 0.68719476736, "compute_seconds": 0.933862252104995, "comm_ratio": 0.7358630952380952, "flops_per_byte": 10752.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[1024, 7168, 2048, 6, 61, 400.0, 2.0]'
+          expected: '{"bytes_per_call": 88080384.0, "bytes_per_layer": 352321536.0, "gb_per_step": 21.491613696, "seconds": 0.05372903424, "compute_seconds": 0.0834456992847725, "comm_ratio": 0.6438802083333334, "flops_per_byte": 1536.0}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        def all_to_all(tokens_per_rank, d_model, d_ff, top_k, n_layers, bandwidth_gbs,
+                       bytes_per_element=2.0, peak_tflops=989.0, mfu=0.4):
+            T, d, ff = int(tokens_per_rank), int(d_model), int(d_ff)
+            k, L = int(top_k), int(n_layers)
+            b = float(bytes_per_element)
+            call = k * T * d * b
+            step = 4 * L * call
+            flops = k * T * 6 * d * ff * L
+            sec = step / (float(bandwidth_gbs) * 1e9)
+            comp = flops / (float(peak_tflops) * 1e12 * float(mfu))
+            return {"bytes_per_call": call, "bytes_per_layer": 4 * call,
+                    "gb_per_step": step / 1e9, "seconds": sec,
+                    "compute_seconds": comp, "comm_ratio": sec / comp,
+                    "flops_per_byte": flops / step}
+      solutionExplanation: >-
+        Read the second and sixth cases together, because they are the point. The
+        bandwidth changes from 50 GB/s to 300 GB/s, `comm_ratio` falls from
+        0.7359 to 0.1226, and `flops_per_byte` is 10,752.0 in both — the
+        intensity is a property of the shape and the ratio is a property of the
+        link. The fourth case halves the tokens and every byte and FLOP number
+        halves with them, so `comm_ratio` and `flops_per_byte` do not move at
+        all: that is the derivation's claim that $E$ and $T$ cancel, reproduced
+        by changing $T$ instead. The fifth case halves `top_k` and halves the
+        traffic *and* the compute, which leaves the ratio at exactly 0.7359
+        again; a model that had put the four collectives in the wrong place would
+        move here. The last case is a DeepSeek-shaped configuration at 6-token
+        routing on 61 layers, and its intensity is 1,536 FLOP/byte — seven times
+        worse than 8x7B, because fine-grained experts at $d = 7168$ move more
+        bytes per FLOP, and it is still 5x above the ridge. The single most
+        common wrong answer is `gb_per_step` = 34.36, from two collectives: the
+        factor of two is invisible in `comm_ratio` if you also halve the compute,
+        which is exactly how it survives review.
+      complexity: "O(1) time and space"
+      tags: [expert-parallelism, all-to-all, arithmetic-intensity, roofline]
+
+    - id: p-cluster-balance
+      title: "Straggler, capacity, and the drop rate at cluster scale"
+      difficulty: hard
+      prompt: >-
+        Implement `cluster_balance(counts, capacity_factor)` returning a dict
+        with exactly the keys `assignments`, `mean_per_expert`, `max_share`,
+        `straggler`, `capacity`, `drop_fraction` and `cf_needed`.
+
+        `counts` is the number of assignments each expert received across the
+        whole cluster for one step — one entry per expert, possibly zero.
+        `assignments` is their sum. `mean_per_expert` is the arithmetic mean.
+
+        `max_share` is `max(counts) / assignments`. `straggler` is the slowest
+        rank's work over the mean, `max(counts) / mean_per_expert` — which is the
+        same number as `max_share * n_experts` and the same number as the
+        capacity factor you would need to drop nothing. `capacity` is
+        `floor(capacity_factor * assignments / n_experts)`, an integer.
+
+        `drop_fraction` is the fraction of **assignments** lost to capacity, not
+        of tokens: `sum(max(0, c - capacity) for c in counts) / assignments`.
+        With $k = 2$ those differ by a factor of two, which is the bug in the
+        next implementation along.
+
+        If `assignments` is 0, every float is 0.0 and `capacity` is 0.
+        `capacity_factor` is positive.
+      starter: |
+        import math
+
+        def cluster_balance(counts, capacity_factor):
+            # your implementation here
+            pass
+      language: python
+      entry: cluster_balance
+      testCases:
+        - input: '[[0, 0, 167, 0, 0, 181, 164, 0], 1.0]'
+          expected: '{"assignments": 512, "mean_per_expert": 64.0, "max_share": 0.353515625, "straggler": 2.828125, "capacity": 64, "drop_fraction": 0.625, "cf_needed": 2.828125}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[81, 64, 56, 58, 68, 45, 71, 69], 1.0]'
+          expected: '{"assignments": 512, "mean_per_expert": 64.0, "max_share": 0.158203125, "straggler": 1.265625, "capacity": 64, "drop_fraction": 0.064453125, "cf_needed": 1.265625}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[81, 64, 56, 58, 68, 45, 71, 69], 1.25]'
+          expected: '{"assignments": 512, "mean_per_expert": 64.0, "max_share": 0.158203125, "straggler": 1.265625, "capacity": 80, "drop_fraction": 0.001953125, "cf_needed": 1.265625}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384], 1.0]'
+          expected: '{"assignments": 131072, "mean_per_expert": 16384.0, "max_share": 0.125, "straggler": 1.0, "capacity": 16384, "drop_fraction": 0.0, "cf_needed": 1.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[92237, 24272, 24272, 24272, 24272, 24272, 24272, 24273], 1.25]'
+          expected: '{"assignments": 262142, "mean_per_expert": 32767.75, "max_share": 0.35185891615994386, "straggler": 2.814871329279551, "capacity": 40959, "drop_fraction": 0.195611538784323, "cf_needed": 2.814871329279551}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[0, 0, 0, 0], 1.0]'
+          expected: '{"assignments": 0, "mean_per_expert": 0.0, "max_share": 0.0, "straggler": 0.0, "capacity": 0, "drop_fraction": 0.0, "cf_needed": 0.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[[5], 2.0]'
+          expected: '{"assignments": 5, "mean_per_expert": 5.0, "max_share": 1.0, "straggler": 1.0, "capacity": 10, "drop_fraction": 0.0, "cf_needed": 1.0}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import math
+
+
+        def cluster_balance(counts, capacity_factor):
+            n = [int(c) for c in counts]
+            E = len(n)
+            tot = sum(n)
+            if tot == 0:
+                return {"assignments": 0, "mean_per_expert": 0.0, "max_share": 0.0,
+                        "straggler": 0.0, "capacity": 0, "drop_fraction": 0.0,
+                        "cf_needed": 0.0}
+            cap = int(math.floor(float(capacity_factor) * tot / E))
+            mean = tot / E
+            mx = max(n)
+            return {"assignments": tot, "mean_per_expert": mean,
+                    "max_share": mx / tot, "straggler": mx / mean,
+                    "capacity": cap,
+                    "drop_fraction": sum(max(0, c - cap) for c in n) / tot,
+                    "cf_needed": mx / mean}
+      solutionExplanation: >-
+        The first case is the collapsed router from *Mixture of Experts* and it
+        carries the identity the problem is built around: three live experts hold
+        all 512 assignments, so `max_share` is 0.3535, `straggler` is 2.828125,
+        and `cf_needed` is 2.828125 — the same number three times, because
+        $Es = E \cdot s = \max_i n_i / (kG/E)$. That is the quantity to log: not
+        the share, not the entropy, but $Es$, because it is simultaneously the
+        fraction of the step that is idle (utilisation $1/Es = 0.354$) and the
+        capacity factor required to stop dropping. The second and third cases are
+        the balanced router at two capacity factors: `drop_fraction` falls from
+        0.064453125 to 0.001953125, exactly the 6.4% and 0.2% from the earlier
+        topic, and `straggler` does not move at all — a capacity factor buys back
+        tokens, never time, which is the most common thing people expect it to
+        do. The fifth case is the one that punishes an implementation that
+        divides by the token count instead of the assignment count: 2.81 is a
+        plausible-looking straggler, but the drop fraction of 0.1956 comes from
+        dividing by 262,142 assignments, and dividing by 131,071 tokens would
+        double it to 0.3912. A uniform distribution (fourth case) gives 1.0 and
+        zero drop, which is the sanity check that the identity holds at its
+        lower bound. A single expert (last case) has `max_share` 1.0 and still
+        `straggler` 1.0, because there is nobody to straggle behind. And the
+        zero case must not divide by zero: it returns zeros rather than raising,
+        because a step with no tokens is a legitimate warm-up state.
+      complexity: "O(E) time, O(1) space"
+      tags: [expert-parallelism, straggler, capacity-factor, token-dropping]
+
+  visualizers:
+    - id: vs-ep-budget
+      kind: shape_flow
+      title: "Where the 8x7B parameters and bytes actually go"
+      description: >-
+        Move the expert count, the EP degree and the DP degree and watch three
+        numbers separate. Parameters per device fall as 1/ep while the optimizer
+        state falls as 1/dp, so ep = 8 and dp = 1 gives 15.83 GB of weights and
+        a fatal 110.83 GB resident total, while ep = 8 and dp = 8 gives the same
+        15.83 GB and 27.71 GB. Push ep to 64 and each rank holds eight experts,
+        47,376,236,544 parameters — the whole model — and 165.82 GB resident.
+        Meanwhile the all-to-all per rank falls with tokens per rank and the
+        bytes per FLOP do not move at all.
+      params:
+        d_model: 4096
+        d_ff: 14336
+        n_layers: 32
+        n_experts: 8
+        top_k: 2
+        vocab: 32000
+        ep: [1, 2, 4, 8]
+        dp: [1, 2, 4, 8, 64]
+        tokens_per_rank: [1024, 4096, 32768]
+
+  try_it: >-
+    An 8x7B model at EP = 8 puts 7,916,224,512 parameters and 15.83 GB of bf16 weights on each
+    rank. Add Adam's 12 bytes per parameter to that same shard and compute the per-rank total:
+    94.99 GB of optimizer state, 110.83 GB with the weights. Then say why the job dies on an
+    80 GB card when the weight sharding was exact.
+  interview_questions:
+    - question: "Why does expert parallelism shard the weights but not the optimizer state, and what follows for how you deploy it?"
+      level: mid
+      key_points:
+        - "Each expert is a complete FFN owned entirely by one rank, so weights shard by expert: 15.83 GB per rank at EP = 8, exactly an eighth."
+        - "Adam state is per parameter — 12 bytes for the fp32 master plus two moments — and every parameter has it, so it cannot be sharded by expert."
+        - "The same 7.9e9-parameter shard therefore carries 94.99 GB of optimizer state, 110.83 GB in total, which does not fit on an 80 GB card."
+        - "Every real MoE deployment is EP combined with data parallelism or ZeRO across the expert groups, because that is what shards the state."
+      follow_up: "Which parallelism would you add to an 8x7B job at EP = 8, and what exactly does it shard?"
+    - question: "Eight experts on one node run at 12.3% communication overhead. Sixteen experts across two nodes run at 73.6% with half the bytes per rank. Explain."
+      level: senior
+      key_points:
+        - "The exchange volume per rank halved, but the same 68.72 GB per step now crosses a 400 Gb/s fabric at 50 GB/s instead of NVLink at 300 GB/s."
+        - "That is 0.2291 s inside one NVLink domain against 1.3744 s across it, against 1.8677 s of expert compute — 12.3% against 73.6%."
+        - "The number that decides affordability is therefore where the experts physically live, not how many there are."
+        - "A 2:1 oversubscribed leaf at 25 GB/s is worse still, which is why topology is chosen before expert count."
+      follow_up: "Would you change placement or expert count first, and what measurement justifies it?"
+    - question: "Your router shows 2.98 bits of load entropy and no dead experts, yet the step idles 40.7%. Why?"
+      level: senior
+      key_points:
+        - "The barrier waits for the rank whose local expert drew the most tokens, so step utilisation is 1/(E·s) where s is the maximum share."
+        - "Capacity is C = CF·k·G/E, so one 1.4× hot expert is enough to hold seven ranks at the gate."
+        - "Balance is a cluster property, not a router property: entropy measures how evenly the router spreads tokens, not how long the slowest rank takes."
+        - "Raising the capacity factor buys balance at the cost of extra compute and memory, and dropping tokens instead costs path stability — 36.69% of tokens changed path on a rerun at capacity 870."
+      follow_up: "What does raising the capacity factor cost, and where would you see it in the step time?"
+  common_mistakes:
+    - "Shipping pure expert parallelism and dying at 110.83 GB per rank, because the 94.99 GB of Adam state is not sharded by expert at all."
+    - "Treating high router entropy as proof of balance when the step is gated by the hottest rank at 1/(E·s) utilisation."
+    - "Assuming the same batch takes the same path twice — capacity is enforced in arrival order, so 36.69% of tokens changed path on a rerun of one batch."
+  further_reading:
+    - label: "Fedus, Zoph, Shazeer, Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity, JMLR 2022"
+    - label: "Lepikhin et al., GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding, ICLR 2021"

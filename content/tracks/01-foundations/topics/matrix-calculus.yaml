@@ -1,0 +1,1059 @@
+id: matrix-calculus
+slug: matrix-calculus
+title: "Matrix Calculus: The Gradient You Can Derive From Its Shape Alone"
+summary: >-
+  Derive the gradient, Jacobian, and Hessian of any expression you will meet in
+  a training loop — by shape rather than by memory — and know exactly when the
+  second derivative is worth its cost and when it is a 4-terabyte mistake.
+kind: lesson
+difficulty: medium
+position: 3
+estMinutes: 24
+prerequisites: [linear-algebra-foundations, vectors-and-geometry]
+phase: mathematical-foundations
+tags: [matrix-calculus, jacobian, hessian, autodiff, backpropagation, curvature]
+
+body:
+  big_idea: >-
+    A derivative is a linear map with a shape — $m$ outputs against $n$ inputs is an
+    $m \times n$ matrix — so tracking shapes and writing differentials turns
+    backpropagation into bookkeeping.
+
+  problem:
+    - "Every blog post disagrees about where the transpose goes — half use numerator layout, half denominator, and none say which."
+    - "The commonest bug in a hand-written layer is a transpose that silently broadcasts: `(d,)` joins `(n, d)` and the loss still falls."
+    - "The Hessian of a $10^6$-parameter model has $10^{12}$ entries, 4 TB in float32, so the skill is knowing which product you need."
+
+  analogy: |
+    A derivative is the currency-exchange board at an airport: your input space
+    has $n$ currencies, your output space $m$, and the board is an $m \times n$
+    table whose entry $(i,j)$ says how much output $i$ you get per unit of input
+    $j$. Composing two functions multiplies the boards, and the inner currencies
+    must cancel.
+
+  concept_points:
+    - "**The derivative's shape is the whole story.** For $f:\\mathbb{R}^n \\to \\mathbb{R}^m$ the derivative is the linear map $J$ in $f(x+\\Delta) \\approx f(x) + J\\Delta$, with $J \\in \\mathbb{R}^{m\\times n}$. A $512\\times768$ layer has 393,216 Jacobian entries, and a scalar loss's gradient with respect to its weight has exactly that weight's shape."
+    - "**Two layout conventions, one tie-breaker.** Numerator layout writes $\\partial y/\\partial x$ with shape $(\\dim y, \\dim x)$; denominator layout is its transpose, and both appear in print unlabelled. The tie-breaker is the differential: write $dy = W\\,dx$ for $y = Wx$ and the Jacobian is $W$, shape 768 × 512, with nothing to guess. That is why `torch.autograd.functional.jacobian` returns `(*out, *in)`."
+    - "**Four rules generate every formula, and one is order.** Linearity, product, chain, and non-commutativity: $d(AX) = A\\,dX$ but $d(XA) = dX\\,A$. For $f(x) = \\tfrac12 x^\\top A x$ without assuming symmetry, $df = \\tfrac12 x^\\top(A^\\top + A)\\,dx$; assume symmetry and you get $Ax$, which is 45° off and 1.41× too long when the skew part is nonzero."
+    - "**The chain rule is a product of Jacobians, and backprop evaluates it right-to-left.** $J_{g\\circ f}(x) = J_g(f(x))J_f(x)$, inner dimensions cancelling like units. Forward mode (a JVP) produces one *column* per pass, so a full Jacobian costs $n$ passes; reverse mode (a VJP) produces one *row*, so it costs $m$. For a scalar loss on $10^9$ parameters that is one pass against a billion."
+    - "**Elementwise functions have diagonal Jacobians, so never build them.** For $y = \\tanh(z)$ applied elementwise, $J = \\operatorname{diag}(1-y^2)$: at $z = (0,1,2)$ that is $\\operatorname{diag}(1.000, 0.420, 0.071)$, and for a 4096-wide layer a 16.7-million-entry matrix with 4,096 nonzeros. You multiply elementwise instead — and the diagonality vanishes the moment the op mixes coordinates."
+    - "**The only Hessian you ever build is a Hessian-vector product.** $Hv = \\nabla(v^\\top \\nabla f)$: the scalar $v^\\top\\nabla f$ has gradient exactly $Hv$, so one extra reverse pass gives curvature at 2–4× the cost of a gradient and $O(n)$ memory. Truncated Newton, trust-region, conjugate gradient and every sharpness estimate run on this. Building $H$ for $10^6$ parameters would be $10^{12}$ entries, 4 TB in float32."
+
+  definitions:
+    - term: "Gradient"
+      meaning: >-
+        For $f:\mathbb{R}^n \to \mathbb{R}$, the vector $\nabla f$ of first
+        partial derivatives, with the same shape as the input. It points in the
+        direction of steepest ascent, and its negative is the descent direction.
+    - term: "Jacobian"
+      meaning: >-
+        For $f:\mathbb{R}^n \to \mathbb{R}^m$, the $m \times n$ matrix
+        $J_{ij} = \partial f_i/\partial x_j$ of first partial derivatives. It is
+        the best linear approximation to $f$ at a point:
+        $f(x+\Delta) \approx f(x) + J\Delta$.
+    - term: "Hessian"
+      meaning: >-
+        For a scalar $f$, the $n \times n$ symmetric matrix of second partial
+        derivatives $H_{ij} = \partial^2 f/\partial x_i \partial x_j$. It is the
+        Jacobian of the gradient, and its eigenvalues are the curvatures of the
+        loss surface along its eigenvector directions.
+    - term: "Differential"
+      meaning: >-
+        The linear part of the change in a function,
+        $df = \sum_i (\partial f/\partial x_i)\,dx_i$, written without choosing a
+        layout. Manipulating $df$ into the form $\operatorname{tr}(G^\top dX)$
+        and reading off $G$ is the most reliable way to derive a matrix
+        derivative.
+    - term: "Numerator layout"
+      meaning: >-
+        The convention in which $\partial y/\partial x$ has shape
+        $(\dim y, \dim x)$ — output rows, input columns. Denominator layout is
+        its transpose. PyTorch's `jacobian` and most ML papers use numerator
+        layout; most statistics texts use denominator layout.
+    - term: "JVP (Jacobian-vector product)"
+      meaning: >-
+        $J v$ — one column of the Jacobian, computed in a single forward-mode
+        pass at roughly the cost of one function evaluation. What you want when
+        the input dimension is small, or when you need a directional derivative.
+    - term: "VJP (vector-Jacobian product)"
+      meaning: >-
+        $v^\top J$ — one row of the Jacobian, computed in a single reverse-mode
+        pass at 2–4× the cost of a forward pass, given stored activations. What
+        `backward()` computes, and what makes training a 10^9-parameter model
+        possible.
+    - term: "Hessian-vector product"
+      meaning: >-
+        $Hv = \nabla(v^\top \nabla f)$, available for one extra reverse pass
+        without ever forming $H$. The primitive behind truncated Newton,
+        trust-region optimisation, and Lanczos curvature estimation.
+    - term: "Gauss–Newton approximation"
+      meaning: >-
+        $H \approx J^\top J$ for a least-squares loss, obtained by dropping the
+        residual-weighted second-derivative term $\sum_i r_i \nabla^2 r_i$. It
+        is always positive semidefinite, which is why it is safe to use as a
+        preconditioner even when the true Hessian is indefinite.
+    - term: "Gradient checking"
+      meaning: >-
+        Comparing an analytic derivative against a finite-difference estimate to
+        catch sign, transpose, and reduction errors. Central differences with
+        $h \approx 10^{-5}$ reach about $10^{-11}$ accuracy in float64; the pass
+        threshold should be $10^{-7}$ relative, not $10^{-15}$.
+    - term: "Curvature"
+      meaning: >-
+        The second-order sensitivity of a function along a direction: the
+        Rayleigh quotient $v^\top H v / v^\top v$. Large positive curvature means
+        a narrow valley and a learning-rate ceiling; near-zero curvature means a
+        plateau; negative curvature means a descent direction the gradient does
+        not reveal.
+
+  diagrams:
+    - type: compare
+      title: "Forward mode versus reverse mode: the same Jacobian, wildly different cost"
+      left_label: "Forward mode (JVP, $Jv$)"
+      left_points:
+        - "One pass gives one column of $J$"
+        - "Full Jacobian costs $n$ passes — one per input dimension"
+        - "A scalar loss on $10^9$ parameters needs $10^9$ passes"
+        - "Memory stays $O(1)$ above the primal computation"
+        - "Wins when $n$ is small: directional derivatives, ODE sensitivities, RNN checkpointing"
+      right_label: "Reverse mode (VJP, $v^\\top J$)"
+      right_points:
+        - "One pass gives one row of $J$"
+        - "Full Jacobian costs $m$ passes — one per output dimension"
+        - "A scalar loss on $10^9$ parameters needs one pass, at 2–4× forward cost"
+        - "Must retain or recompute activations — memory is the real bill"
+        - "Wins when $m$ is small, which is every training loop ever written"
+    - type: plot
+      title: "The finite-difference U-curve: why 1e-8 is the wrong step and 1e-12 is worse"
+      chart: line
+      xLabel: "−log10(step size h)"
+      yLabel: "absolute error in d/dx sin(x) at x = 0.7"
+      series:
+        - name: "central difference"
+          points:
+            - { x: 1, y: 0.001274 }
+            - { x: 2, y: 0.00001275 }
+            - { x: 3, y: 0.0000001275 }
+            - { x: 4, y: 0.000000001275 }
+            - { x: 5, y: 0.00000000001702 }
+            - { x: 6, y: 0.00000000002184 }
+            - { x: 7, y: 0.0000000004778 }
+            - { x: 8, y: 0.000000002298 }
+            - { x: 9, y: 0.000000002298 }
+            - { x: 10, y: 0.0000004464 }
+            - { x: 11, y: 0.000001557 }
+            - { x: 12, y: 0.000009546 }
+        - name: "forward difference"
+          points:
+            - { x: 1, y: 0.03346 }
+            - { x: 2, y: 0.003234 }
+            - { x: 3, y: 0.0003222 }
+            - { x: 4, y: 0.00003221 }
+            - { x: 5, y: 0.000003221 }
+            - { x: 6, y: 0.0000003221 }
+            - { x: 7, y: 0.00000003212 }
+            - { x: 8, y: 0.000000002298 }
+            - { x: 9, y: 0.000000002298 }
+            - { x: 10, y: 0.0000004464 }
+            - { x: 11, y: 0.000001557 }
+            - { x: 12, y: 0.000009546 }
+    - type: architecture
+      title: "Where the shapes live in one backward pass"
+      caption: >-
+        Forward along the top row, then down, then backward along the bottom row.
+        Every node is labelled with the shape it carries; every backward edge is a
+        VJP that contracts the incoming gradient against a Jacobian.
+      nodes:
+        - { id: x, x: 0, y: 0, label: "x  (d,)", kind: client, detail: "One training example. The gradient that arrives here is never used for training, but it is what a saliency map or an adversarial attack consumes." }
+        - { id: z1, x: 1, y: 0, label: "z1 = W1x + b1  (h,)", kind: model, detail: "W1 is (h, d). The Jacobian dz1/dx is exactly W1 — a linear map's Jacobian is the matrix itself, no transposes. This is the fact that makes the first backward step trivial." }
+        - { id: h, x: 2, y: 0, label: "h = tanh(z1)  (h,)", kind: model, detail: "Elementwise, so its Jacobian is diag(1 - h^2): 16.7 million entries for a 4096-wide layer, of which 4096 are nonzero. Never materialised; the backward edge multiplies elementwise." }
+        - { id: z2, x: 3, y: 0, label: "z2 = W2h + b2  (k,)", kind: model, detail: "W2 is (k, h). The Jacobian dz2/dh is W2, shape (k, h) — matching the chain-rule product (k,h)(h,h)(h,d)." }
+        - { id: loss, x: 3, y: 1, label: "L = mean ||z2 - y||^2 / 2", kind: server, detail: "Scalar. m = 1, which is the entire reason reverse mode is the right choice: the full gradient costs one pass rather than n." }
+        - { id: dz2, x: 3, y: 2, label: "dL/dz2  (k,)", kind: worker, detail: "Equals the residual (z2 - y) divided by the batch size. The divide-by-n is where sum-versus-mean bugs enter, and it changes the gradient by a factor of n." }
+        - { id: dh, x: 2, y: 2, label: "dL/dh = W2^T (dL/dz2)  (h,)", kind: worker, detail: "The transpose appears here and only here: a VJP contracts a (k,) cotangent against a (k, h) Jacobian, giving (h,). If your expression has W2 instead of W2^T, the shapes will usually still multiply — which is exactly why the bug survives." }
+        - { id: dz1, x: 1, y: 2, label: "dL/dz1 = dL/dh elementwise* (1 - h^2)  (h,)", kind: worker, detail: "The diagonal Jacobian applied as an elementwise product: 4096 multiplies instead of a 4096x4096 matrix-vector product, a factor of 4096 in both flops and memory." }
+        - { id: dW1, x: 0, y: 2, label: "dL/dW1 = dL/dz1 * x^T  (h, d)", kind: storage, detail: "An outer product, and its shape (h, d) matches W1 exactly. That match is the check: if dW1 comes out (d, h) you transposed something, and the optimiser will happily apply it anyway." }
+      edges:
+        - { from: x, to: z1, label: "W1 (h×d)" }
+        - { from: z1, to: h, label: "tanh" }
+        - { from: h, to: z2, label: "W2 (k×h)" }
+        - { from: z2, to: loss, label: "scalar" }
+        - { from: loss, to: dz2, label: "dL/dz2" }
+        - { from: dz2, to: dh, label: "W2 transpose" }
+        - { from: dh, to: dz1, label: "elementwise (1-h^2)" }
+        - { from: dz1, to: dW1, label: "x transpose" }
+    - type: pipeline
+      title: "The four-step procedure that derives any matrix derivative"
+      nodes:
+        - label: "Write the objective as a scalar"
+          note: "never start from a vector output"
+          detail: "If you have a vector-valued function, add an inner product with an arbitrary constant vector: d(v^T y). That turns every Jacobian question into a gradient question and removes the layout ambiguity entirely."
+        - label: "Differentiate to get dL"
+          note: "product rule, chain rule, no transposes yet"
+          detail: "Treat dX as a small arbitrary matrix. The rules are d(AX) = A dX, d(XA) = dX A, d(X^T) = (dX)^T, and d(f(X)) = f'(X) times dX for elementwise f. Order matters; commutativity does not hold."
+        - label: "Rearrange into tr(G^T dX)"
+          note: "everything else must be constant"
+          detail: "Use tr(AB) = tr(BA) cyclically to isolate dX on the right of the trace. Cyclic permutation is legal; arbitrary reordering is not. This step is where a missing transpose becomes visible, because the trace will refuse to balance."
+        - label: "Read off G = dL/dX"
+          note: "and check its shape against X"
+          detail: "By definition tr(G^T dX) = <G, dX>, so G is the gradient. Its shape is forced to be the shape of X by the trace, which is why this method cannot produce a transposed answer."
+        - label: "Verify numerically at one point"
+          note: "central differences, h around 1e-5, tolerance 1e-7"
+          detail: "One random point, one random direction v: compare (L(X + hv) - L(X - hv)) / 2h against <G, v>. A single directional check catches sign errors, transpose errors, and reduction-scale errors simultaneously."
+    - type: stack
+      title: "The derivative objects, in order of how often you touch them"
+      layers:
+        - "Order 0 — f(x): one scalar. You never differentiate this; you evaluate it."
+        - "Order 1 — gradient, n entries: 4 MB for a 1M-parameter model. Computed once per step, always."
+        - "Order 2 — Hessian, n² entries: 4 TB for a 1M-parameter model. Only ever touched through products Hv."
+        - "Order 3 and beyond — n³ entries: used in saddle-node analysis and in Taylor expansions you will never implement."
+
+  markdown: |
+    ## The derivative is a linear map with a shape
+
+    For $f:\mathbb{R}^n \to \mathbb{R}^m$, the derivative at a point is the
+    linear map that best approximates $f$ there:
+
+    $$f(x + \Delta) \approx f(x) + J\,\Delta, \qquad J \in \mathbb{R}^{m \times n},
+      \quad J_{ij} = \frac{\partial f_i}{\partial x_j}.$$
+
+    Everything else in this topic is bookkeeping about $m$ and $n$.
+
+    | Object | Function | Symbol | Shape |
+    |---|---|---|---|
+    | Gradient | $\mathbb{R}^n \to \mathbb{R}$ | $\nabla f$ | $n \times 1$ — same as $x$ |
+    | Jacobian | $\mathbb{R}^n \to \mathbb{R}^m$ | $J$ | $m \times n$ |
+    | Hessian | $\mathbb{R}^n \to \mathbb{R}$ | $H = \nabla^2 f$ | $n \times n$, symmetric |
+
+    The invariant that catches most bugs: **the gradient of a scalar with
+    respect to a tensor has the same shape as that tensor.** If your `dW` is not
+    the shape of `W`, no amount of training will fix it, because the optimiser
+    will broadcast it into something plausible and wrong.
+
+    ### Two conventions, one tie-breaker
+
+    Numerator layout writes $\partial y/\partial x$ with shape
+    $(\dim y, \dim x)$; denominator layout transposes it. Papers use both
+    without saying which, which is why derivations appear to contradict each
+    other. The tie-breaker is the differential: for $y = Wx$ with
+    $W \in \mathbb{R}^{768 \times 512}$,
+
+    $$dy = W\,dx \implies J = W \in \mathbb{R}^{768 \times 512}.$$
+
+    No transposes to guess. This is also why `torch.autograd.functional.jacobian`
+    returns shape `(*out, *in)` — numerator layout, mechanically derived. Note
+    that `loss.backward()` gives you `x.grad` in the shape of `x`, which is a
+    contraction of the Jacobian, not the Jacobian.
+
+    ## The differential method
+
+    Four steps, and it does not fail:
+
+    1. Write the objective as a **scalar**.
+    2. Differentiate to get $dL$ — product rule, chain rule, no transposes yet.
+    3. Rearrange into $\langle G, dX\rangle = \operatorname{tr}(G^\top dX)$, with
+       everything except $dX$ constant.
+    4. Read off $\partial L/\partial X = G$.
+
+    Worked, for $f(x) = \tfrac12 x^\top A x - b^\top x$ with $A$ **not** assumed
+    symmetric:
+
+    $$df = \tfrac12\,dx^\top A x + \tfrac12\,x^\top A\,dx - b^\top dx
+        = \tfrac12 x^\top (A^\top + A)\,dx - b^\top dx,$$
+
+    so $\nabla f = \tfrac12 (A + A^\top) x - b$. Take
+    $A = \begin{bmatrix} 0 & 2 \\ 0 & 0\end{bmatrix}$ and $x = (1,1)$. The true
+    gradient is $(1,1)$; the "obviously it is $Ax$" answer is $(2,0)$ — 1.41×
+    too long and 45° off. The skew part of $A$ contributes nothing to
+    $x^\top A x$, but it contributes everything to $Ax$.
+
+    | $f$ | $df$ | $\nabla f$ |
+    |---|---|---|
+    | $a^\top x$ | $a^\top dx$ | $a$ |
+    | $\tfrac12 x^\top A x$ | $\tfrac12 x^\top (A + A^\top)\,dx$ | $\tfrac12 (A + A^\top) x$ |
+    | $\tfrac12 \|x\|^2$ | $x^\top dx$ | $x$ |
+    | $\operatorname{tr}(AX)$ | $\operatorname{tr}(A\,dX)$ | $A^\top$ |
+    | $\log \det X$ | $\operatorname{tr}(X^{-1} dX)$ | $X^{-\top}$ |
+
+    The last row is what makes Gaussian likelihoods tractable, and it is
+    unreadable index-by-index. Note the pattern: the answer's shape is the shape
+    of the thing you differentiated, every time.
+
+    ## The chain rule is a product, and direction is a cost decision
+
+    $$J_{g \circ f}(x) = J_g(f(x)) \, J_f(x).$$
+
+    The inner dimensions cancel like units. That is the entire content of "the
+    shapes must line up", and it is why a mis-transposed layer sometimes still
+    runs: for square matrices, almost every permutation of the factors
+    multiplies.
+
+    A full Jacobian can be built from either side, and the cost differs by
+    orders of magnitude:
+
+    | | Forward mode (JVP) | Reverse mode (VJP) |
+    |---|---|---|
+    | One pass produces | one **column** of $J$ | one **row** of $J$ |
+    | Passes for the full $J$ | $n$ | $m$ |
+    | Scalar loss, $n = 10^6$ | $10^6$ passes | 1 pass, 2–4× forward cost |
+    | Memory | $O(1)$ above the primal | must retain or recompute activations |
+
+    A language model with $10^9$ parameters and a scalar loss is trainable only
+    because $m = 1$. Reverse mode buys the whole gradient for about twice a
+    forward pass; forward mode would need a billion.
+
+    ## Hessians: the object you never build
+
+    The Hessian is the Jacobian of the gradient, $H = \nabla(\nabla f)^\top$,
+    and $H = H^\top$ wherever $f$ is twice continuously differentiable. For
+    $f = \tfrac12 x^\top A x - b^\top x$ it is the constant
+    $\tfrac12 (A + A^\top)$ — the skew part of $A$ is invisible one derivative
+    higher too.
+
+    $H$ decides what kind of critical point you are standing on. At the origin,
+    $f(x,y) = x^2 - y^2$ has zero gradient and $H = \operatorname{diag}(2,-2)$:
+    one negative eigenvalue, so it is a saddle, and gradient descent stalls
+    there because the gradient is exactly zero while the point is not a minimum.
+    With $10^6$ parameters, $H$ has $10^{12}$ entries — 4 TB in float32 — so
+    nobody forms it. What you form is $Hv$, and
+
+    $$Hv = \nabla\big(v^\top \nabla f\big)$$
+
+    costs one extra reverse pass, because $v^\top \nabla f$ is a scalar whose
+    gradient is exactly $Hv$. That identity drives truncated Newton, trust-region
+    methods, and the Lanczos curvature estimates behind every sharpness paper.
+
+    ## Checking your work
+
+    Central differences, $\big(f(x+h) - f(x-h)\big) / 2h$, measured on $\sin$ at
+    $x = 0.7$ in float64:
+
+    | $h$ | forward error | central error |
+    |---|---|---|
+    | $10^{-1}$ | 3.3e-2 | 1.3e-3 |
+    | $10^{-2}$ | 3.2e-3 | 1.3e-5 |
+    | $10^{-5}$ | 3.2e-6 | **1.7e-11** |
+    | $10^{-7}$ | 3.2e-8 | 4.8e-10 |
+    | $10^{-10}$ | 4.5e-7 | 4.5e-7 |
+    | $10^{-12}$ | 9.5e-6 | 9.5e-6 |
+
+    Both columns are U-shaped for the same reason: truncation error grows with
+    $h$ (as $h$, or $h^2$ for central) while round-off grows as
+    $\varepsilon_{\text{mach}} / h$. The optima are $h \approx \varepsilon^{1/2}
+    \approx 1.5\times 10^{-8}$ and $h \approx \varepsilon^{1/3} \approx
+    8.7\times 10^{-6}$, giving best-case accuracy near $10^{-9}$ and
+    $10^{-11}$. Below $h \approx 10^{-10}$ both are useless: the subtraction has
+    cancelled away every significant digit.
+
+    Practical consequence: $10^{-7}$ relative is a *tight* gradient-check
+    tolerance in float64, and about $10^{-3}$ is the floor in float32, where
+    $\varepsilon \approx 1.2\times 10^{-7}$ moves the optimal step to
+    $\approx 5\times 10^{-3}$.
+
+    ## What actually breaks
+
+    - **Non-smooth points.** $\max$, $\mathrm{ReLU}$, $|x|$ and sorting have no
+      derivative at ties. Autodiff returns a subgradient — 0 for ReLU at 0 —
+      which is fine for SGD, fatal for a finite-difference check that lands on
+      the kink and for second-order methods that assume $H$ exists.
+    - **Broadcasting.** Adding a `(d,)` array to an `(n, d)` array silently
+      produces `(n, d)`. Most wrong transposes still run.
+    - **Assuming symmetry.** Every formula that drops $(A - A^\top)$ requires
+      $A$ symmetric. Check it; do not assume it.
+    - **Reduction scale.** Sum versus mean changes every gradient by a factor of
+      $n$. A relative-error check passes locally and the loss diverges at scale.
+
+    The habit that prevents all four: write the shape of every intermediate next
+    to it, and assert it at runtime.
+
+    ## The longer version
+
+    The remaining mechanisms, verbatim: why the Hessian only ever sees the
+    symmetric part of $A$, how eigenvalues classify critical points, the
+    Gauss–Newton approximation and the exact softmax Hessian, and the U-curve
+    that fixes a finite-difference step size.
+
+    ### Failure modes, in full
+
+    - You call `loss.backward()` a thousand times a day, and then one day you have to hand-derive a custom op, and every blog post you find disagrees about where the transpose goes — because half of them use numerator layout and half use denominator layout, and none of them say which.
+    - The most common bug in a hand-written layer is not a wrong formula, it is a transpose that silently broadcasts. A `(d,)` vector added to an `(n, d)` matrix becomes `(n, d)` without complaint, the loss still decreases, and the model quietly learns something adjacent to what you meant. Shape bugs do not raise exceptions; they cost you a week.
+    - Second-order methods, Laplace approximations, uncertainty estimates and sharpness measurements all need the Hessian, and the Hessian of a model with $10^6$ parameters has $10^{12}$ entries — 4 TB in float32. The skill is not computing it, it is knowing which product of it you actually need.
+    - Gradient checking is the only defence against the above, and it is a numerical-methods problem with a genuine optimum: pick the step size from theory, not from a tutorial that says `1e-8` for everything.
+
+    ### The mechanisms, in full
+
+    - **The derivative's shape is the whole story.** For $f:\mathbb{R}^n \to \mathbb{R}^m$ the derivative at a point is the linear map $J$ in $f(x+\Delta) \approx f(x) + J\Delta$, and $J \in \mathbb{R}^{m\times n}$ with $J_{ij} = \partial f_i/\partial x_j$. A linear layer $W \in \mathbb{R}^{512\times768}$ has 393,216 Jacobian entries, and the gradient of any scalar loss with respect to $W$ has exactly the shape of $W$ — 512 × 768, never transposed. The invariant to memorise is: *the gradient of a scalar with respect to a tensor has the shape of that tensor.* The trap: when the output is a vector, "the gradient" is ambiguous, and PyTorch's `loss.backward()` gives you `x.grad` in the shape of `x`, which is a *contraction* of the Jacobian, not the Jacobian itself.
+    - **Two layout conventions, one tie-breaker.** Numerator layout writes $\partial y/\partial x$ with shape $(\dim y, \dim x)$; denominator layout is its transpose. Both appear in print without labels, which is why derivations seem to disagree. The tie-breaker is the differential: write $dy = W\,dx$ for $y = Wx$ with $W \in \mathbb{R}^{768\times512}$ and the Jacobian is $W$, shape 768 × 512, with no transposes to guess. This is why `torch.autograd.functional.jacobian` returns shape `(*out, *in)` — numerator layout, mechanically derived, never argued about.
+    - **Four rules generate every formula, and one of them is order.** Linearity, the product rule, the chain rule, and non-commutativity: $d(AX) = A\,dX$ but $d(XA) = dX\,A$, and $d(X^\top) = (dX)^\top$. Apply them to $f(x) = \tfrac12 x^\top A x$ without assuming symmetry and you get $df = \tfrac12 x^\top(A^\top + A)\,dx$, so $\nabla f = \tfrac12(A + A^\top)x$. Assume symmetry and you get $Ax$. Take $A = \begin{bmatrix}0 & 2\\ 0 & 0\end{bmatrix}$, $x = (1,1)$: the true gradient is $(1,1)$, the naive one is $(2,0)$ — 1.41× too long and 45° off. The skew part of $A$ is invisible to $x^\top A x$ but very visible to $Ax$.
+    - **The chain rule is a product of Jacobians, and backprop is that product evaluated right-to-left.** $J_{g\circ f}(x) = J_g(f(x))\,J_f(x)$, with the inner dimensions cancelling like units. Direction is a cost decision, not a style one: forward mode (a JVP) produces one *column* of $J$ per pass, so a full Jacobian costs $n$ passes; reverse mode (a VJP) produces one *row*, so it costs $m$. For a scalar loss on $10^9$ parameters, reverse mode gets the entire gradient for 2–4× the cost of one forward pass while forward mode would need a billion passes — a factor of roughly 300 million. This single asymmetry is why deep learning exists in its current form.
+    - **Elementwise functions have diagonal Jacobians, so never build them.** For $y = \tanh(z)$ applied elementwise, $J = \operatorname{diag}(1 - y^2)$: at $z = (0, 1, 2)$ that is $\operatorname{diag}(1.000,\ 0.420,\ 0.071)$ — a 3×3 matrix with 3 nonzeros out of 9, and for a 4096-wide layer it is a 16.7-million-entry matrix with 4096 nonzeros, i.e. 99.98% structural zeros. You multiply elementwise instead, which is why every activation in a framework is a fused kernel rather than a matrix multiply. The trap: the diagonality is a property of *elementwise* application, and it disappears the moment the op mixes coordinates — `softmax` and `LayerNorm` have dense Jacobians.
+    - **The Hessian is the Jacobian of the gradient, and it only ever sees the symmetric part.** $H_{ij} = \partial^2 f/\partial x_i \partial x_j$, and $H = H^\top$ wherever $f$ is twice continuously differentiable (Schwarz). For $f = \tfrac12 x^\top A x - b^\top x$ the Hessian is the constant $\tfrac12(A + A^\top)$ — again independent of the skew part of $A$, which is the same fact as above seen one derivative higher. Size is the reason you never touch it: $10^6$ parameters give $10^{12}$ entries, 4 TB in float32 and about $10^{12}$ flops to fill, versus roughly $2\times10^9$ flops for one gradient.
+    - **Eigenvalues are curvature, and curvature decides what kind of critical point you are on.** All eigenvalues positive at a zero-gradient point means a strict local minimum; any negative eigenvalue means a saddle. At the origin, $f(x,y) = x^2 - y^2$ has zero gradient and $H = \operatorname{diag}(2, -2)$: it is a saddle, and gradient descent stalls there because the gradient is exactly zero while the point is not a minimum. In the random-field model of a loss landscape the typical critical point has index $n/2$, so in a million dimensions you should expect on the order of 500,000 downhill directions — minima are not the common case, they are the rare case.
+    - **The only Hessian you ever build is a Hessian-vector product.** $Hv = \nabla(v^\top \nabla f)$: the scalar $v^\top \nabla f$ has gradient exactly $Hv$, so one extra reverse pass gives a Hessian-vector product at 2–4× the cost of a gradient and $O(n)$ memory. Truncated Newton, trust-region methods, conjugate gradient, and the Lanczos estimates behind every "sharpness" paper run on this identity. The trap: $Hv$ gives you curvature in *one* direction; a full spectrum needs $k$ of them, and the small eigenvalues you actually care about are exactly the ones power iteration converges to last.
+    - **Most useful Hessians are approximated by $J^\top J$, and for softmax cross-entropy the approximation is exact.** For $L = \tfrac12\|r(x)\|^2$ the exact Hessian is $J^\top J + \sum_i r_i \nabla^2 r_i$; dropping the second term gives Gauss–Newton, which is positive semidefinite and needs only first derivatives. For $L = -\log \operatorname{softmax}(z)_k$ the Hessian is exactly $\operatorname{diag}(p) - pp^\top$ — independent of which class $k$ you scored, equal to the covariance of the gradient, with rank $n-1$ because $H\mathbf{1} = 0$. That rank deficiency is not a bug: adding a constant to every logit does not change the loss, so the Hessian must have a null direction, and any second-order step must be regularised or solved in the subspace orthogonal to $\mathbf{1}$.
+    - **Finite differences are a U-curve, and the step size is not a constant.** Truncation error grows with $h$ ($h$ for forward, $h^2/6$ for central) while round-off grows as $\varepsilon_{\text{mach}}/h$, so the optimum is $h \approx \varepsilon^{1/2} \approx 1.5\times10^{-8}$ for forward differences and $h \approx \varepsilon^{1/3} \approx 8.7\times10^{-6}$ for central, with best-case accuracy near $10^{-9}$ and $10^{-11}$ respectively. Measured on $\sin$ at $x = 0.7$: central difference gives $1.7\times10^{-11}$ at $h = 10^{-5}$ but $9.5\times10^{-6}$ at $h = 10^{-12}$, where the subtraction has cancelled away twelve digits. Practical floor: a relative tolerance of $10^{-7}$ in float64, and roughly $10^{-3}$ in float32, where $\varepsilon \approx 1.2\times10^{-7}$.
+
+
+  derivations:
+    - title: "The gradient of a quadratic form when A is not symmetric"
+      latex: |
+        Let $f(x) = \tfrac12 x^\top A x - b^\top x$ with $A$ arbitrary.
+        \begin{aligned}
+        df &= \tfrac12\,(dx)^\top A x + \tfrac12\,x^\top A\,dx - b^\top dx \\
+           &= \tfrac12\,x^\top A^\top dx + \tfrac12\,x^\top A\,dx - b^\top dx \\
+           &= x^\top \cdot \tfrac12 (A^\top + A)\,dx - b^\top dx.
+        \end{aligned}
+        Since $df = \langle \nabla f, dx\rangle$ for all $dx$,
+        $$\nabla f = \tfrac12 (A + A^\top) x - b, \qquad H = \tfrac12 (A + A^\top).$$
+      prose: >-
+        The first line uses $d(x^\top A x) = (dx)^\top A x + x^\top A\,dx$, and
+        the second rewrites the scalar $(dx)^\top A x$ as its own transpose
+        $x^\top A^\top dx$. Skipping that step is the single most common error in
+        the whole subject: it silently assumes $A = A^\top$. Note also that the
+        Hessian is constant and symmetric even when $A$ is neither, so a
+        quadratic form carries only $n(n+1)/2$ meaningful parameters no matter
+        how many entries $A$ has.
+    - title: "The softmax Jacobian is diag(s) minus s s^T"
+      latex: |
+        Let $s_i = e^{z_i} / S$ with $S = \sum_j e^{z_j}$. Then
+        $\partial S/\partial z_j = e^{z_j} = s_j S$, and
+        $$\frac{\partial s_i}{\partial z_j}
+          = \frac{\delta_{ij} e^{z_i} S - e^{z_i} \cdot e^{z_j}}{S^2}
+          = \frac{\delta_{ij} e^{z_i}}{S} - \frac{e^{z_i}}{S}\frac{e^{z_j}}{S}
+          = s_i \delta_{ij} - s_i s_j.$$
+        In matrix form, $J = \operatorname{diag}(s) - s s^\top$. Because
+        $J\mathbf{1} = s - s(\mathbf{1}^\top s) = s - s = 0$, the Jacobian is
+        singular with rank $n-1$.
+      prose: >-
+        The denominator $S$ is shared by every class, which is why changing one
+        logit moves every probability — the matrix is dense, not diagonal. The
+        null direction is $\mathbf{1}$, and it is not an accident: adding a
+        constant to every logit leaves softmax unchanged, so the derivative along
+        that direction must be zero. Any second-order method that inverts this
+        Jacobian without regularisation will divide by that zero eigenvalue.
+    - title: "Why Gauss–Newton is J^T J plus a term you drop"
+      latex: |
+        For $L(x) = \tfrac12 \|r(x)\|^2$ with residual Jacobian
+        $J_{ij} = \partial r_i / \partial x_j$:
+        $$\nabla L = J^\top r, \qquad
+          H = J^\top J + \sum_i r_i \,\nabla^2 r_i.$$
+        Gauss–Newton keeps only the first term:
+        $$H_{\text{GN}} = J^\top J \succeq 0.$$
+      prose: >-
+        The dropped term is a weighted sum of residual Hessians, so it is small
+        when the residuals are small — near a good fit — and it can dominate at
+        initialisation, which is exactly when you were hoping to use it. Keeping
+        only $J^\top J$ buys positive semidefiniteness and first-derivative-only
+        cost; the price is that the step is only as good as the fit already is.
+        For softmax cross-entropy the same object appears with no approximation
+        at all: $H = \operatorname{diag}(p) - p p^\top$ is exactly a $J^\top J$
+        in the probability metric.
+
+  implementations:
+    - language: python
+      title: "A central-difference Jacobian with a step size chosen from theory"
+      note: >-
+        Correct as written, but numerically wrong in two situations you will
+        actually hit: (1) when $f$ has an input dimension above a few thousand
+        this costs $2n$ forward passes and becomes unusable, and it is $n$ — not
+        the output count — that dominates; (2) when the outputs differ wildly in
+        scale, a single absolute tolerance flags the large-magnitude entries as
+        fine while the small ones are garbage. It also silently returns a
+        one-sided difference at a non-smooth point, where no derivative exists.
+      code: |
+        import numpy as np
+
+        def numeric_jacobian(f, x, eps=None):
+            """Central-difference Jacobian of f: R^n -> R^m at x.
+
+            Returns J with shape (m, n). The step is chosen from machine
+            epsilon: eps = eps_mach**(1/3) ~ 6e-6 for float64. Using 1e-8 --
+            the value copied from every forward-difference tutorial -- throws
+            away roughly two decades of accuracy, and 1e-12 throws away twelve.
+            """
+            x = np.asarray(x, dtype=float)
+            if eps is None:
+                eps = np.finfo(float).eps ** (1.0 / 3.0)
+            n = x.size
+            f0 = np.asarray(f(x), dtype=float)          # shape (m,)
+            J = np.empty((f0.size, n))
+            for j in range(n):
+                step = np.zeros(n)
+                step[j] = eps
+                # One column per input dimension: this is forward mode, n passes.
+                J[:, j] = (np.asarray(f(x + step)) - np.asarray(f(x - step))) / (2 * eps)
+            return J
+
+        if __name__ == "__main__":
+            W = np.array([[1.0, -2.0], [0.5, 3.0]])
+            b = np.array([0.0, 1.0])
+            x = np.array([0.5, -0.5])
+            J_num = numeric_jacobian(lambda v: np.tanh(W @ v + b), x)
+            y = np.tanh(W @ x + b)
+            J_exact = (1.0 - y * y)[:, None] * W      # diag(1 - y^2) W
+            print("max |numeric - exact| =", np.abs(J_num - J_exact).max())
+            # -> 2.6e-10
+    - language: python
+      title: "A two-layer MLP's gradients by hand, with a shape assertion"
+      note: >-
+        Every gradient here is computed as a VJP, and each one has the shape of
+        the parameter it belongs to — that is the assertion. The implementation is
+        numerically wrong if you reduce with `mean` twice (once in the loss, once
+        in the backward pass), which scales every gradient by $1/n$ and looks
+        like a badly tuned learning rate rather than a bug. It is also unstable in
+        float32 for saturated tanh, where `1 - h*h` underflows to exactly zero and
+        the gradient dies silently.
+      code: |
+        import numpy as np
+
+        def mlp_gradients(X, Y, W1, b1, W2, b2):
+            """Gradients of L = mean_i ||W2 tanh(W1 x_i + b1) + b2 - y_i||^2 / 2.
+
+            Shapes: X (n, d), W1 (h, d), W2 (k, h).
+            Every returned gradient has the shape of its parameter.
+            """
+            X = np.asarray(X, float); Y = np.asarray(Y, float)
+            n = X.shape[0]
+
+            # ---- forward ---------------------------------------------------
+            Z1 = X @ W1.T + b1          # (n, h)
+            H = np.tanh(Z1)             # (n, h)
+            Yhat = H @ W2.T + b2        # (n, k)
+            R = Yhat - Y                # (n, k)
+            loss = 0.5 * np.mean(np.sum(R * R, axis=1))
+
+            # ---- backward: one VJP per line, right to left -----------------
+            gYhat = R / n                       # (n, k)   dL/dYhat
+            gW2 = gYhat.T @ H                   # (k, h)   same shape as W2
+            gb2 = gYhat.sum(axis=0)             # (k,)
+            gH = gYhat @ W2                     # (n, h)   contract (n,k)(k,h)
+            gZ1 = gH * (1.0 - H * H)            # (n, h)   diagonal Jacobian, elementwise
+            gW1 = gZ1.T @ X                     # (h, d)   same shape as W1
+            gb1 = gZ1.sum(axis=0)               # (h,)
+
+            assert gW1.shape == W1.shape and gW2.shape == W2.shape
+            return loss, {"W1": gW1, "b1": gb1, "W2": gW2, "b2": gb2}
+
+        def check(X, Y, W1, b1, W2, b2, eps=1e-6):
+            """Central-difference check on every parameter. eps from theory."""
+            _, grads = mlp_gradients(X, Y, W1, b1, W2, b2)
+            params = {"W1": W1, "b1": b1, "W2": W2, "b2": b2}
+            worst = 0.0
+            for name, P in params.items():
+                flat = P.ravel()
+                num = np.zeros_like(flat)
+                for i in range(flat.size):
+                    old = flat[i]
+                    flat[i] = old + eps; lp, _ = mlp_gradients(X, Y, W1, b1, W2, b2)
+                    flat[i] = old - eps; lm, _ = mlp_gradients(X, Y, W1, b1, W2, b2)
+                    flat[i] = old
+                    num[i] = (lp - lm) / (2 * eps)
+                rel = np.abs(num - grads[name].ravel()) / np.maximum(1.0, np.abs(num))
+                worst = max(worst, rel.max())
+            return worst
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            n, d, h, k = 8, 3, 5, 2
+            X = rng.normal(size=(n, d)); Y = rng.normal(size=(n, k))
+            W1 = rng.normal(size=(h, d)) * 0.5; b1 = np.zeros(h)
+            W2 = rng.normal(size=(k, h)) * 0.5; b2 = np.zeros(k)
+            print("worst relative gradient error:", check(X, Y, W1, b1, W2, b2))
+            # -> 6.1e-11
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        What is the shape of $\partial \|Wx\|^2 / \partial W$ for
+        $W \in \mathbb{R}^{m \times n}$ and $x \in \mathbb{R}^n$, and why?
+      answerKind: short_text
+      hint: "The gradient of a scalar with respect to a tensor has the shape of that tensor. Then check it against the differential."
+      solution: >-
+        $m \times n$ — the same shape as $W$. From $f = \|Wx\|^2 = x^\top W^\top
+        W x$ we get $df = 2\,x^\top W^\top W\,dx$, which is not yet in terms of
+        $dW$. Use $d(Wx) = (dW)x$:
+        $df = 2 (Wx)^\top (dW) x = 2\operatorname{tr}\big(x (Wx)^\top dW\big)$, so
+        $\partial f/\partial W = 2 (Wx)x^\top$ — an outer product of an
+        $m$-vector and an $n$-vector, hence $m \times n$. The differential
+        derivation and the shape rule agree, which is the point of doing both.
+    - id: cp-2
+      question: >-
+        Why is $\nabla(\tfrac12 x^\top A x)$ equal to $\tfrac12 (A + A^\top)x$
+        rather than $Ax$, and how large is the error if you assume symmetry?
+      answerKind: short_text
+      hint: "Expand $d(x^\\top A x)$ into two terms and transpose the scalar first term."
+      solution: >-
+        $d(x^\top A x) = (dx)^\top A x + x^\top A\,dx$. The first term is a
+        scalar, so it equals its own transpose $x^\top A^\top dx$, giving
+        $x^\top(A^\top + A)dx$ and hence $\tfrac12(A + A^\top)x$ for the
+        half-scaled version. Assuming $A = A^\top$ silently discards the skew
+        part, so the error is $\tfrac12(A - A^\top)x$ — zero only when $A$ is
+        symmetric. With $A = \begin{bmatrix}0&2\\0&0\end{bmatrix}$ and
+        $x = (1,1)$ the true gradient is $(1,1)$ and $Ax$ is $(2,0)$: 1.41× too
+        long and 45° off. A quadratic form cannot see the skew part, but a
+        gradient expression written as $Ax$ can.
+    - id: cp-3
+      question: >-
+        You need the full Jacobian of a map from $\mathbb{R}^{1000}$ to
+        $\mathbb{R}^{10}$. Forward or reverse mode, how many passes, and what
+        dominates the cost?
+      answerKind: short_text
+      hint: "Count rows versus columns of the Jacobian."
+      solution: >-
+        Reverse mode: 10 VJPs, one per output, each at 2–4× the cost of a forward
+        pass. Forward mode would need 1000 passes. The rule is `min(m, n)` passes,
+        chosen by whichever dimension is smaller — here $m = 10$ against
+        $n = 1000$, a 100× difference. The thing that dominates in practice is
+        not the flops but the memory: reverse mode must retain every intermediate
+        activation, which is why checkpointing exists.
+    - id: cp-4
+      question: "Your model has $10^6$ parameters and you want curvature information. Why not build the Hessian, and what do you compute instead?"
+      answerKind: short_text
+      hint: "Count the entries, then ask what a solver actually needs."
+      solution: >-
+        $H$ has $10^{12}$ entries — 4 TB in float32, and about $10^{12}$ flops
+        to fill. Instead compute Hessian-vector products
+        $Hv = \nabla(v^\top \nabla f)$, each one extra reverse pass at 2–4×
+        gradient cost with $O(n)$ memory. Iterative solvers (conjugate gradient,
+        Lanczos, trust-region subproblems) only ever need $H$ applied to a
+        vector, and they converge in far fewer than $n$ iterations when the
+        spectrum is clustered. What you lose is the explicit matrix; what you
+        keep is every product a solver uses.
+    - id: cp-5
+      question: "A gradient check passes at $h = 10^{-5}$ but reports a relative error of $10^{-4}$ at $h = 10^{-12}$. Is your analytic gradient wrong?"
+      answerKind: short_text
+      hint: "What happens to $f(x+h) - f(x-h)$ when $h$ is far below machine epsilon relative to $f$?"
+      solution: >-
+        No. At $h = 10^{-12}$ the two function values agree to about 12 digits,
+        so their difference retains only ~4 significant digits after the
+        cancellation, and dividing by $2h$ amplifies that noise. The error curve
+        is a U: truncation falls as $h^2$ while round-off rises as
+        $\varepsilon/h$, with the minimum at $h \approx \varepsilon^{1/3} \approx
+        8.7\times10^{-6}$. Measured on $\sin$ at 0.7, the error is
+        $1.7\times10^{-11}$ at $h = 10^{-5}$ and $9.5\times10^{-6}$ at
+        $h = 10^{-12}$ — nine orders worse for a step a thousand times smaller.
+    - id: cp-6
+      question: >-
+        The Hessian of softmax cross-entropy is $\operatorname{diag}(p) - pp^\top$,
+        which is singular. Why must it be, and what does that force a
+        second-order optimiser to do?
+      answerKind: short_text
+      hint: "What happens to the loss if you add the same constant to every logit?"
+      solution: >-
+        Because the loss is invariant to adding a constant to all logits: softmax
+        renormalises, so the loss does not change along the $\mathbf{1}$
+        direction. A function constant along a direction has zero second
+        derivative along it, so $H\mathbf{1} = 0$ and the rank is $n-1$. A Newton
+        step $H^{-1}g$ therefore does not exist. The fixes are to add damping
+        $\lambda I$ (Levenberg–Marquardt), to solve in the subspace orthogonal to
+        $\mathbf{1}$, or to fix one logit as a reference — all three are the same
+        repair seen from different sides.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        The loss is a scalar built from the logits in two stages: an exponential
+        normalisation, then a negative log. Differentiating a scalar with respect
+        to a vector gives a vector; differentiating that vector gives a matrix.
+        The complication is that the normalisation is *shared*: touching one logit
+        moves every probability, so you cannot differentiate one coordinate at a
+        time and hold the others fixed. Whatever you compute has to account for
+        all $n^2$ cross-effects, and it has to have the shape of the thing you
+        differentiated.
+      blocks:
+        - kind: checklist
+          body: |
+            - What is shared between coordinates? (the normaliser)
+            - What is the shape of the answer? (same as the logit vector)
+            - What is the shape of the second answer? (n x n, symmetric)
+            - Which class index does the loss refer to, and should it matter?
+        - kind: warning
+          body: >-
+            Do not start by differentiating $e^{z_i} / \sum_j e^{z_j}$ with the
+            quotient rule. You will get a correct expression, in $n^2$ terms, and
+            then make an algebra slip on the third line. There is a form of the
+            loss that has no quotient in it at all.
+      checkpoint: >-
+        Before going further: the loss for a 10-class problem is invariant to
+        adding the same constant to every logit. What does that imply about the
+        Hessian, before you compute a single derivative?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Two moves, both about choosing the easier object. First, rewrite the loss
+        so the quotient disappears: pull the log through, leaving a linear term
+        plus a log-sum-exp. Second, notice that you do not need to differentiate
+        the loss twice at all — the Hessian of the loss with respect to the logits
+        is the *Jacobian of the gradient*, and the gradient's only non-constant
+        part is the probability vector. So one computation of $dp/dz$ gives you
+        the Hessian for free. This beats differentiating the scalar loss twice
+        with the quotient rule by an order of magnitude in algebra, and it is the
+        same trick as recognising $Hv = \nabla(v^\top \nabla f)$.
+      blocks:
+        - kind: checklist
+          body: |
+            - Rewrite L = -log p_k as -z_k + log(sum exp(z)) — no quotient
+            - Differentiate once: the linear term gives a constant, the log-sum-exp gives a probability-weighted average
+            - Recognise the result as p minus a one-hot vector
+            - Get dp/dz once, applying the quotient rule to a single ratio
+            - The Hessian is dp/dz, because the constant term differentiates to zero
+      checkpoint: >-
+        Why is it legitimate to compute the Hessian as the Jacobian of the
+        gradient, rather than differentiating the original scalar twice?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The shape of the solution, with the two structural facts you must not
+        lose: the normaliser is shared, and the constant logit shift is a null
+        direction.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # gradient
+            p = softmax(z)                  # subtract max first, or overflow
+            g = p
+            g[k] -= 1                       # the -z_k term
+            assert g.sum() == 0             # shift invariance
+
+            # Hessian = d(g)/d(z) = d(p)/d(z)
+            H = zeros(n, n)
+            for i in range(n):
+                for j in range(n):
+                    H[i, j] = p[i] * (delta(i, j) - p[j])
+
+            # structural checks, in this order
+            assert H is symmetric
+            assert H @ ones == 0            # rank n-1, null direction = shift
+            assert eigenvalues(H) >= -1e-12 # positive semidefinite
+            assert H.sum() == 0             # rows and columns both sum to zero
+        - kind: warning
+          body: >-
+            Compute the softmax with the max subtracted, even though the
+            mathematics is shift-invariant. With logits around 1000, `exp`
+            overflows to `inf`, every probability becomes `nan`, and the Hessian
+            is `nan` — the formula is right and the code is wrong.
+      checkpoint: >-
+        Why does `H @ ones == 0` hold, and which of the four structural checks
+        would catch a sign error in the off-diagonal terms?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Two lines of algebra, once the quotient has been removed. The first
+        derivative is a probability vector minus a one-hot; the second is the
+        derivative of that probability vector, which is the softmax Jacobian.
+      blocks:
+        - kind: math
+          body: |
+            $$L = -z_k + \log \sum_{j} e^{z_j}$$
+
+            $$\frac{\partial L}{\partial z_i}
+              = -\delta_{ik} + \frac{e^{z_i}}{\sum_j e^{z_j}}
+              = p_i - \delta_{ik}$$
+
+            For the second derivative, only $p_i$ depends on $z$:
+
+            $$\frac{\partial p_i}{\partial z_j}
+              = \frac{\delta_{ij} e^{z_i} S - e^{z_i} e^{z_j}}{S^2}
+              = p_i \delta_{ij} - p_i p_j, \qquad S = \sum_j e^{z_j}$$
+
+            $$H = \operatorname{diag}(p) - p p^\top$$
+
+            Consequences, all immediate from the form:
+
+            $$H\mathbf{1} = p - p\,(\mathbf{1}^\top p) = p - p = 0
+              \quad\Rightarrow\quad \operatorname{rank}(H) = n-1$$
+
+            $$v^\top H v = \sum_i p_i v_i^2 - \Big(\sum_i p_i v_i\Big)^2
+              = \operatorname{Var}_{i \sim p}(v) \;\ge\; 0$$
+        - kind: math
+          body: |
+            The last line is the reason this Hessian is exactly a $J^\top J$
+            object: it is the variance of $v$ under the categorical distribution
+            $p$, hence positive semidefinite, hence a metric. The same matrix
+            appears as the Fisher information of the categorical model and as the
+            covariance of the gradient — three names for one object.
+      checkpoint: >-
+        The variance form $v^\top H v = \operatorname{Var}_{i\sim p}(v)$ makes
+        positive semidefiniteness obvious. Which $v$ achieves zero, and why is
+        that the same direction the gradient-sum check rules out?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete implementation with the stability guard, the structural
+        assertions, and a finite-difference verification whose tolerance comes
+        from the step-size analysis rather than from folklore.
+      blocks:
+        - kind: warning
+          body: >-
+            Read this only after attempting the derivation. The code is three
+            lines; the value is in the assertions, which are what turn a plausible
+            formula into a verified one.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def softmax(z):
+                z = np.asarray(z, dtype=float)
+                z = z - z.max()              # shift-invariant; prevents overflow
+                e = np.exp(z)
+                return e / e.sum()
+
+            def softmax_ce_grad_hess(z, k):
+                """Gradient and Hessian of L = -log softmax(z)[k] with respect to z."""
+                p = softmax(z)
+                n = p.size
+
+                g = p.copy()
+                g[k] -= 1.0                  # dL/dz = p - e_k
+
+                H = np.diag(p) - np.outer(p, p)
+
+                # Structural facts, not decoration -- each catches a different
+                # class of bug.
+                assert g.shape == (n,)
+                assert H.shape == (n, n)
+                assert np.allclose(H, H.T), "Hessian must be symmetric"
+                assert np.allclose(H.sum(axis=1), 0.0), "rows must sum to zero"
+                assert np.allclose(g.sum(), 0.0), "gradient must sum to zero"
+                assert np.linalg.eigvalsh(H).min() > -1e-12, "must be PSD"
+                return g, H
+
+            def verify(z, k, h=1e-5):
+                """Directional finite-difference check of g and H along random v."""
+                rng = np.random.default_rng(0)
+                v = rng.normal(size=z.size)
+                g, H = softmax_ce_grad_hess(z, k)
+
+                L = lambda x: -np.log(softmax(x)[k])
+                num_dir = (L(z + h * v) - L(z - h * v)) / (2 * h)
+                ana_dir = float(g @ v)
+
+                # Second order: check that g moves like H v.
+                gp, _ = softmax_ce_grad_hess(z + h * v, k)
+                gm, _ = softmax_ce_grad_hess(z - h * v, k)
+                num_hv = (gp - gm) / (2 * h)
+                return abs(num_dir - ana_dir), np.abs(num_hv - H @ v).max()
+
+            if __name__ == "__main__":
+                z = np.array([1.0, 2.0, 3.0, -1.0])
+                err1, err2 = verify(z, k=2)
+                print(err1, err2)    # ~1e-11, ~1e-10
+      checkpoint: >-
+        The directional check uses one random $v$ and passes. What class of error
+        could survive a single directional check, and how would you close that
+        gap without paying for a full Jacobian?
+
+  problems:
+    - id: p-quadratic-gradient
+      title: "Gradient of a quadratic form with a non-symmetric matrix"
+      difficulty: easy
+      prompt: >-
+        Implement `solve(A, b, x)` returning $\nabla f$ for
+        $f(x) = \tfrac12 x^\top A x - b^\top x$, where $A$ is a square matrix
+        that is **not** guaranteed to be symmetric, $b$ and $x$ are vectors, and
+        the return value is a list of floats of the same length as $x$.
+      starter: |
+        import numpy as np
+
+        def solve(A, b, x):
+            # your implementation here
+            pass
+      language: python
+      entry: solve
+      testCases:
+        - input: "[[[2.0, 1.0], [0.0, 3.0]], [1.0, 2.0], [0.5, 0.5]]"
+          expected: "[0.25, -0.25]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[1.0, 2.0, 0.0], [0.0, 1.0, 3.0], [0.0, 0.0, 1.0]], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]"
+          expected: "[2.0, 3.5, 2.5]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[4.0, 1.0], [1.0, 2.0]], [1.0, -1.0], [1.0, 2.0]]"
+          expected: "[5.0, 6.0]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def solve(A, b, x):
+            A = np.asarray(A, dtype=float)
+            b = np.asarray(b, dtype=float)
+            x = np.asarray(x, dtype=float)
+            # f = 0.5 x^T A x - b^T x
+            # df = 0.5 x^T (A + A^T) dx - b^T dx
+            return 0.5 * (A + A.T) @ x - b
+      solutionExplanation: >-
+        The differential of the quadratic term is
+        $d(\tfrac12 x^\top A x) = \tfrac12 x^\top(A^\top + A)dx$, so the gradient
+        is $\tfrac12(A + A^\top)x - b$. The symmetric average is not cosmetic: in
+        the first test case $A = \begin{bmatrix}2&1\\0&3\end{bmatrix}$ gives
+        $\tfrac12(A+A^\top) = \begin{bmatrix}2&0.5\\0.5&3\end{bmatrix}$ and the
+        answer is $(0.25, -0.25)$, while the naive $Ax - b$ returns $(0.5, -0.5)$
+        — exactly twice as large. Both look plausible; only one is the gradient.
+        The third case uses a symmetric $A$ so the two implementations agree,
+        which is precisely the trap: a test suite made only of symmetric matrices
+        will certify a wrong implementation.
+      complexity: "O(n²) time, O(n²) space"
+      tags: [gradient, quadratic-form, transpose]
+    - id: p-tanh-jacobian
+      title: "Jacobian of an affine layer followed by tanh"
+      difficulty: medium
+      prompt: >-
+        Implement `solve(W, b, x)` returning the Jacobian of $y = \tanh(Wx + b)$
+        with respect to $x$, as a nested list of shape
+        $(\dim y,\, \dim x)$. $W$ is $m \times n$, $b$ has length $m$, $x$ has
+        length $n$.
+      starter: |
+        import numpy as np
+
+        def solve(W, b, x):
+            # your implementation here
+            pass
+      language: python
+      entry: solve
+      testCases:
+        - input: "[[[1.0, -2.0], [0.5, 3.0]], [0.0, 1.0], [0.5, -0.5]]"
+          expected: "[[0.18070663892364836, -0.3614132778472967], [0.470007424403189, 2.820044546419134]]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[1.0, 2.0], [0.0, -1.0], [1.5, 0.5]], [0.5, -0.5, 0.0], [2.0, -1.0]]"
+          expected: "[[0.7864477329659274, 1.5728954659318548], [0.0, -0.7864477329659274], [0.03988834002474079, 0.013296113341580262]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def solve(W, b, x):
+            W = np.asarray(W, dtype=float)
+            b = np.asarray(b, dtype=float)
+            x = np.asarray(x, dtype=float)
+            y = np.tanh(W @ x + b)
+            # Chain rule: dz/dx = W, and dy/dz = diag(1 - y^2).
+            # J = diag(1 - y^2) @ W, written as a row scaling so it stays O(mn).
+            return (1.0 - y * y)[:, None] * W
+      solutionExplanation: >-
+        $z = Wx + b$ is linear, so $J_z = W$ with shape $(m, n)$; $\tanh$ is
+        elementwise, so $J_y = \operatorname{diag}(1 - y^2)$ with shape
+        $(m, m)$. The chain rule gives $J = \operatorname{diag}(1 - y^2)\,W$, and
+        the product must be evaluated as a row scaling rather than by
+        materialising the diagonal matrix: for $m = 4096$ that diagonal has 16.7
+        million entries of which 4096 are nonzero. In the first test case
+        $z = (1.5, -0.25)$, so $y = (0.9051, -0.2449)$ and the row scales are
+        $(0.1807, 0.9400)$ — the second row of $J$ is the second row of $W$
+        multiplied by 0.94, while the first row is scaled by 0.18 and therefore
+        almost suppressed. That is saturation, visible in the Jacobian before it
+        is visible in the loss.
+      complexity: "O(mn) time, O(mn) space"
+      tags: [jacobian, chain-rule, tanh]
+    - id: p-softmax-hessian
+      title: "Hessian of softmax cross-entropy"
+      difficulty: medium
+      prompt: >-
+        Implement `solve(z)` returning the Hessian of
+        $L = -\log \operatorname{softmax}(z)_k$ with respect to the logits $z$,
+        as a nested list. The result must be independent of which class $k$ you
+        score — that is a property of the function, not a shortcut. Logits may be
+        large; the implementation must not overflow.
+      starter: |
+        import numpy as np
+
+        def solve(z):
+            # your implementation here
+            pass
+      language: python
+      entry: solve
+      testCases:
+        - input: "[[0.0, 0.0, 0.0]]"
+          expected: "[[0.2222222222222222, -0.1111111111111111, -0.1111111111111111], [-0.1111111111111111, 0.2222222222222222, -0.1111111111111111], [-0.1111111111111111, -0.1111111111111111, 0.2222222222222222]]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[1.0, 2.0, 3.0]]"
+          expected: "[[0.08192506906499324, -0.022033044520174298, -0.05989202454481893], [-0.022033044520174298, 0.1848364465099787, -0.1628034019898044], [-0.05989202454481893, -0.1628034019898044, 0.22269542653462338]]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[1000.0, 1001.0, 999.0]]"
+          expected: "[[0.1848364465099787, -0.1628034019898044, -0.022033044520174298], [-0.1628034019898044, 0.22269542653462338, -0.05989202454481893], [-0.022033044520174298, -0.05989202454481893, 0.08192506906499324]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def solve(z):
+            z = np.asarray(z, dtype=float)
+            # Softmax is shift invariant, so subtracting the max changes nothing
+            # mathematically and prevents exp(1000) from overflowing to inf.
+            z = z - z.max()
+            e = np.exp(z)
+            p = e / e.sum()
+            return np.diag(p) - np.outer(p, p)
+      solutionExplanation: >-
+        $H = \operatorname{diag}(p) - pp^\top$, independent of the scored class
+        $k$, because $L = -z_k + \log\sum_j e^{z_j}$ has a linear term whose
+        second derivative is zero. For uniform logits $p = (1/3, 1/3, 1/3)$ the
+        diagonal is $1/3 - 1/9 = 2/9 \approx 0.2222$ while the off-diagonals are
+        $-1/9 \approx -0.1111$. The third case is the real test: logits near 1000
+        overflow a naive `exp`, giving `inf/inf = nan` and a `nan` Hessian from a
+        formula that is perfectly correct. Because $H\mathbf{1} = 0$, every row
+        sums to zero — a one-line check that catches almost every sign error.
+      complexity: "O(n²) time, O(n²) space"
+      tags: [hessian, softmax, cross-entropy, numerical-stability]
+
+  visualizers:
+    - id: vs-curvature
+      kind: loss_surface
+      title: "Curvature, seen as a loss surface"
+      description: >-
+        Slide the eigenvalues of a 2-D quadratic and watch the surface pass from
+        bowl to valley to saddle. The Hessian is constant everywhere, which is
+        exactly why a quadratic is the one case where a single Newton step solves
+        the problem.
+      params:
+        eigenMin: -2
+        eigenMax: 4
+        mode: "hessian-eigenvalues"
+
+  try_it: >-
+    For $W \in \mathbb{R}^{512 \times 768}$ and a batch $X \in \mathbb{R}^{32 \times 768}$,
+    write $dL = \langle G, dZ\rangle$ and derive $dW$ and $dX$ from it on paper,
+    writing the shape of each next to it. Then assert both shapes in code before
+    calling `backward()`, and finite-difference one entry of $W$ at $h = 5\times10^{-6}$
+    to confirm the sign.
+  interview_questions:
+    - question: "Your hand-derived gradient has the right numbers and the wrong shape. What is the fastest way to find the bug?"
+      level: mid
+      key_points:
+        - "Derive in differentials: write $dL$ as an inner product with $dY$, and the gradient is whatever multiplies $dY$ — its shape falls out rather than being guessed."
+        - "For $f: \\mathbb{R}^n \\to \\mathbb{R}^m$ the derivative is $J \\in \\mathbb{R}^{m \\times n}$ with $J_{ij} = \\partial f_i / \\partial x_j$; a shape mismatch is a layout error, not an arithmetic one."
+        - "Check with a scalar finite difference on a single entry at $h \\approx \\epsilon^{1/3}$, which catches sign and transpose errors that a norm-only check hides."
+        - "A silent broadcast is the tell: adding an $(n,)$ vector to an $(n, d)$ matrix should be an error and is not."
+      follow_up: "Your check passes entry-wise but training still diverges. What else about the gradient can be wrong?"
+    - question: "Why does reverse mode give you a full gradient in one pass while forward mode needs $n$?"
+      level: senior
+      key_points:
+        - "Forward mode propagates a JVP and produces one column of $J$ per pass, so it costs $n$ passes for an $n$-dimensional input."
+        - "Reverse mode propagates a VJP and produces one row per pass; the loss is scalar, so $m = 1$ and one pass suffices."
+        - "The asymmetry is the entire content of reverse-mode autodiff — asking for the full Jacobian of a 1,000-dimensional output costs 1,000 reverse passes."
+        - "The backward pass costs roughly 3× the forward pass and its memory is the cached activations, which is why checkpointing trades compute for memory."
+      follow_up: "When would you deliberately choose forward mode over reverse mode?"
+    - question: "What is the Hessian of $f(x) = \\tfrac12 x^\\top A x - b^\\top x$, and why does only the symmetric part of $A$ matter?"
+      level: mid
+      key_points:
+        - "$H = \\tfrac12(A + A^\\top)$, not $A$; the skew-symmetric part contributes nothing to the quadratic form."
+        - "Because $H$ is symmetric by construction wherever $f$ is twice continuously differentiable (Schwarz), curvature only ever sees the symmetric part."
+        - "All eigenvalues positive at a stationary point means a strict local minimum; any negative eigenvalue means a saddle."
+        - "You never build the Hessian — $Hv = \\nabla(v^\\top \\nabla f)$ gives a Hessian-vector product for one extra reverse pass and $O(n)$ memory."
+  common_mistakes:
+    - "Materialising the elementwise Jacobian $\\operatorname{diag}(1 - y^2)$ for a 4096-wide layer — 16.7 million entries where only 4096 are nonzero."
+    - "Mixing numerator and denominator layout mid-derivation, which surfaces as a transpose that broadcasts instead of raising."
+    - "Gradient-checking with $h = 10^{-12}$ in float64: round-off $\\epsilon_{\\text{mach}}/h$ swamps the truncation term, and the check fails for the wrong reason."
+  further_reading:
+    - label: "Magnus & Neudecker, Matrix Differential Calculus with Applications in Statistics and Econometrics"
+    - label: "Baydin, Pearlmutter, Radul & Siskind, Automatic Differentiation in Machine Learning: a Survey (JMLR 2018)"

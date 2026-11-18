@@ -1,0 +1,394 @@
+id: deepseek-v3-r1
+title: "DeepSeek V3 and R1: a 671B model trained for $5.6M, and reasoning taught without a teacher"
+summary: >-
+  DeepSeek V3 is a 671B-parameter mixture-of-experts model with 37B active
+  parameters, trained on 14.8 trillion tokens in 2.788 million H800 GPU-hours.
+  R1 is the sequel that matters more: it showed that a reasoning model can be
+  produced by reinforcement learning against verifiable rewards, without a
+  cold-start supervised dataset, and that the resulting traces can be distilled
+  into 7B models that beat the base model at maths. The engineering story is
+  four techniques stacked: fine-grained MoE, MLA, DualPipe, and FP8.
+kind: case_study
+date: "2025-01-20"
+actors: [DeepSeek]
+key_facts:
+  - "DeepSeek-V3 (December 2024) is 671B total parameters with 37B active per token: 256 routed experts plus 1 shared expert, with the top 8 routed experts firing."
+  - "The pretrain used 14.8 trillion tokens and 2.788 million H800 GPU-hours, which at a $2 per GPU-hour cloud rate is about $5.6M of compute."
+  - "Training ran in FP8 mixed precision on 2,048 H800 GPUs, with per-block scaling rather than per-tensor scaling to keep the dynamic range usable."
+  - "DualPipe overlaps the forward and backward chunks of different micro-batches so the all-to-all communication of one chunk hides under the compute of another."
+  - "DeepSeek-R1 (20 January 2025) added RL for reasoning. R1-Zero skipped supervised cold-start entirely and trained from the base model with GRPO against rule-based rewards."
+  - "R1-Zero's reasoning traces grew in length spontaneously during RL, and its AIME 2024 pass@1 rose from 15.6% for the base model to 71.0%, with R1 at 79.8%."
+  - "Distilling R1's traces into Qwen and Llama models transferred much of the reasoning ability to 1.5B to 70B dense models, which is the cheapest part of the whole result."
+timeline:
+  - when: May 2024
+    what: "DeepSeek-V2 — introduces MLA and fine-grained MoE, and the 236B/21B shape that V3 scales up."
+  - when: Dec 2024
+    what: "DeepSeek-V3 released: 671B total, 37B active, FP8 training, 14.8T tokens, 2.788M H800 GPU-hours."
+  - when: 20 Jan 2025
+    what: "DeepSeek-R1 and R1-Zero released. R1-Zero is pure RL from the base model with no supervised cold start."
+  - when: Jan 2025
+    what: "R1 distilled into Qwen 1.5B to 32B and Llama 8B to 70B, released under MIT for the distilled models."
+  - when: Feb 2025
+    what: "The R1 paper documents the failed attempts: process reward models, MCTS, and pure RL on general tasks."
+decisions:
+  - choice: "Fine-grained experts (256 routed plus 1 shared) instead of 8 or 16 large ones"
+    why: "Smaller experts give a finer-grained partition of knowledge, so a token can assemble a more specific combination. A shared expert absorbs the common patterns every token needs, which lets the routed experts specialise rather than each relearning basic syntax."
+    cost: "More experts means more routing decisions per token, a larger router, and a harder load-balancing problem. The all-to-all now has 256 possible destinations, so the chance that eight selections land on eight distinct GPUs is high."
+  - choice: "FP8 mixed precision for the bulk of training"
+    why: "FP8 halves the bytes moved for activations and weights, which matters more than FLOPs because the run is communication and memory bound. On H800, FP8 also doubles the achievable tensor-core throughput relative to BF16."
+    cost: "Dynamic range is tight enough that per-tensor scaling loses accuracy, so the implementation needs per-block scaling, delayed scaling for the optimiser, and selective BF16 promotion for sensitive layers. Every one of those is a place a silent numerical bug can hide."
+  - choice: "DualPipe rather than a standard 1F1B pipeline schedule"
+    why: "In a standard pipeline schedule the all-to-all sits exposed between stages, and on an MoE model that communication is the dominant cost. DualPipe runs forward and backward chunks from different micro-batches in opposite directions so both communication phases overlap with compute."
+    cost: "It doubles the number of live activations, since two micro-batches are in flight, and it makes the schedule logic considerably harder to debug. A hang looks like a slow step rather than an error."
+  - choice: "GRPO with rule-based rewards instead of a learned reward model"
+    why: "For maths and code the answer is checkable. A verifier cannot be reward-hacked the way a preference model can, and GRPO removes the critic by using the group mean reward as the baseline, halving the memory of PPO."
+    cost: "It only works where verification is cheap. The moment you want good prose, helpfulness or tone, you are back to a learned reward model and its failure modes, which is exactly why R1 needed a second, general-purpose RL stage."
+  - choice: "Publish the distillation recipe and the small models under MIT"
+    why: "The 7B and 32B distilled models are what most teams can actually run. Releasing them converts a research result into an ecosystem, and it makes the technique legible rather than mysterious."
+    cost: "It caps the price of the small-model market and hands competitors a free student. The commercial defence is the API and the next base model, not the distilled artefacts."
+lessons:
+  - "Sparsity is a memory decision first and a compute decision second. 671B of weights is 671 GB at FP8 whatever the active count says."
+  - "Communication, not arithmetic, is the binding constraint on a multi-node MoE. Every serious technique in this stack is a communication optimisation."
+  - "A verifiable reward is worth more than a clever reward model. Where you can check the answer, RL becomes dramatically simpler and more stable."
+  - "Reasoning can emerge from RL alone, but it emerges messy. R1-Zero's traces drifted into mixed languages; the cold-start SFT in R1 was there to fix presentation, not capability."
+  - "Publishing the negative results — the failed process reward model, the failed MCTS — is what made the paper reproducible."
+mistakes:
+  - "Quoting $5.6M as the cost of the model. That is the marginal GPU rental for one successful run; it excludes the failed runs, the ablations, the data pipeline, the salaries and the cluster."
+  - "Assuming R1-Zero proves SFT is unnecessary. It proves SFT is unnecessary for the reasoning capability; it is still necessary for a model a human wants to talk to."
+  - "Treating GRPO as a general RL replacement. It needs a group of samples per prompt and a reliable verifier; without both it is just PPO with extra variance."
+  - "Reading 37B active as cheap to serve. The weights are 671 GB, so you still need a multi-GPU node before the first token."
+problem_statement: >-
+  DeepSeek had a fraction of the compute budget of the frontier labs and wanted
+  a model that could compete on reasoning. Two constraints followed. First, the
+  model had to be sparse enough that training and serving FLOPs stayed inside
+  the budget, which means MoE with a small active fraction. Second, every byte
+  of communication had to be hidden, because on a 2,048-GPU cluster the
+  all-to-all and the pipeline bubbles cost more than the matrix multiplies. The
+  V3 report is essentially a list of answers to those two constraints: 256
+  fine-grained experts with a shared expert, MLA to shrink the KV cache, FP8 to
+  halve the bytes, and DualPipe to overlap the traffic that remains. R1 then
+  asks a different question, namely whether reasoning can be trained rather than
+  distilled from a bigger model, and answers it with a reinforcement-learning
+  loop whose only reward is whether the final answer checks out.
+requirements:
+  functional:
+    - "Serve a 671B-parameter model with 37B active parameters per token at a cost per million tokens that undercuts dense models of comparable quality."
+    - "Support a 128K context window for code and document work, with a KV cache small enough to batch more than a handful of sequences."
+    - "Produce long chain-of-thought traces in reasoning mode, with the option to skip them for latency-sensitive calls."
+    - "Expose an OpenAI-compatible API so existing tooling works unchanged, plus an open-weight release for self-hosting."
+    - "Distil the reasoning behaviour into 1.5B to 70B dense students that run on a single node."
+  non_functional:
+    - "Keep the all-to-all off the critical path: no more than 15% of step time in exposed communication."
+    - "Hold numerical parity with a BF16 baseline within 0.5% on validation loss, despite FP8 matmuls."
+    - "Sustain at least 40% model FLOPs utilisation across a 2,048-GPU run, which requires near-perfect overlap."
+    - "Recover from a node failure without restarting from a checkpoint more than 30 minutes old."
+    - "Keep the serving footprint at or under 8 H200s per replica so that third parties can self-host."
+clarifying_questions:
+  - question: "Is the workload reasoning-heavy or throughput-heavy?"
+    why_it_matters: "Reasoning mode generates thousands of tokens per answer, so the bill is dominated by decode. That changes the optimal batching, the KV budget per request, and whether speculative decoding is worth the complexity."
+  - question: "Do we need to self-host, or is the API acceptable?"
+    why_it_matters: "671 GB of weights is a hard floor. A team that assumes a single 8-GPU node will discover the model does not fit at any precision above 4 bits, and the answer is either a bigger node or the API."
+  - question: "What is the acceptable quality loss for FP8 or 4-bit quantisation?"
+    why_it_matters: "DeepSeek trained in FP8 natively, so FP8 inference is close to lossless. Post-hoc 4-bit quantisation of the experts is a different trade and needs its own evaluation; assuming it is free is how serving bills get justified with numbers that do not hold."
+  - question: "How long are the reasoning traces allowed to be?"
+    why_it_matters: "R1's traces grew during RL to several thousand tokens. A cap on trace length is a direct cap on accuracy for hard problems, and it is the single largest lever on the GPU-hour budget."
+  - question: "Is the reward verifiable for this domain?"
+    why_it_matters: "The GRPO recipe only transfers where a checker exists. For maths and code it does; for summarisation or tone it does not, and a team that copies the recipe without a verifier will train a model to game a proxy."
+capacity_estimation:
+  assumptions:
+    - "All arithmetic uses the published figures: 671B total, 37B active, 14.8T tokens, 2.788M H800 GPU-hours, 2,048 GPUs."
+    - "An H800 has 80 GB of HBM and about 3.35 TB/s of bandwidth; FP8 dense tensor throughput is about 1.98 PFLOPS."
+    - "An H200 has 141 GB of HBM at 4.8 TB/s; an H100 has 80 GB at 3.35 TB/s."
+    - "Cloud rental is taken at $2 per GPU-hour for H800 and $2.50 for H200; these are market rates, not DeepSeek's cost."
+    - "KV cache for MLA is 576 bytes per token per layer at FP8, across 61 layers."
+  arithmetic:
+    - label: "Wall clock of the published training run"
+      calculation: "2.788e6 GPU-hours / 2,048 GPUs = 1,361 hours = 56.7 days"
+      conclusion: "The run is a two-month campaign, not a weekend. Checkpoint cadence, failure recovery and scheduler reliability matter as much as the model code."
+    - label: "Rental cost of the run"
+      calculation: "2.788e6 GPU-hours x $2/GPU-hour = $5.576M; add 30% for failed runs and ablations = $7.25M"
+      conclusion: "The famous $5.6M is the marginal compute for one successful pass. A realistic all-in compute budget for the project is closer to $7 to $10M, before salaries and data."
+    - label: "Tokens trained per GPU-hour"
+      calculation: "14.8e12 tokens / 2.788e6 GPU-hours = 5.31e6 tokens per GPU-hour; 5.31e6 / 3,600 = 1,475 tokens/s per GPU"
+      conclusion: "This is the efficiency number worth copying. A dense 70B model at 40% MFU processes roughly 4,200 tokens per GPU-hour, so the MoE shape buys a large multiple in tokens per GPU-hour while activating 37B parameters."
+    - label: "Weight memory at FP8"
+      calculation: "671e9 x 1 byte = 671 GB; x 1.2 overhead = 805 GB; 8 x H200 at 141 GB = 1.128 TB leaves 323 GB spare; 8 x H800 at 80 GB = 640 GB does not fit"
+      conclusion: "The model is sized to the H200 generation. On H800 you need 16 GPUs per replica, which doubles the interconnect hop count and the cost per token."
+    - label: "KV cache at 128K context"
+      calculation: "576 bytes x 61 layers = 35.1 KB/token; x 131,072 tokens = 4.6 GB per sequence; at batch 32 that is 147 GB"
+      conclusion: "147 GB of cache exceeds a single H200, so a 32-sequence batch must be sharded across at least two nodes. Context length and batch size trade against each other linearly."
+    - label: "The same cache with 8-head GQA"
+      calculation: "2 x 8 heads x 128 dim x 1 byte x 61 layers = 125 KB/token; x 131,072 = 16.4 GB per sequence; at batch 32 = 524 GB"
+      conclusion: "GQA would need 3.6x the cache, turning a two-node batch into a seven-node one. MLA is what makes 128K context servable at any real concurrency."
+    - label: "GRPO rollout cost for one RL step"
+      calculation: "128 prompts x 64 samples x 4,000 tokens = 3.28e7 generated tokens per step; at 40,000 tokens/s for the inference fleet that is 820 s; x 500 steps = 4.7 days"
+      conclusion: "Generation, not gradient updates, dominates RL wall clock. The rollout fleet is a separate capacity pool from the training cluster, and it is usually the larger one."
+    - label: "Distillation cost"
+      calculation: "800K reasoning traces x 6,000 tokens = 4.8e9 tokens; at 20,000 tokens/s on one 16-GPU node that is 2.8 days of generation"
+      conclusion: "Distilling the reasoning behaviour costs a few GPU-days of generation plus a small SFT run, which is why the small models are the highest-leverage artefact in the release."
+architecture_summary: >-
+  V3 is a decoder-only transformer in which every feed-forward block is replaced
+  by a router and 257 experts: 256 routed plus one shared that every token uses.
+  Attention uses MLA, so the cache is a compressed latent rather than per-head
+  keys and values. The training cluster is 2,048 H800s organised as 16 nodes of
+  128 GPUs; within a node, tensor parallelism splits the attention heads, and
+  across nodes expert parallelism scatters the 256 routed experts so each GPU
+  owns 16 of them per layer. Every MoE layer therefore begins with an all-to-all
+  dispatch and ends with an all-to-all combine, and the entire training schedule
+  is built around hiding those two collectives. DualPipe runs a forward chunk and
+  a backward chunk from different micro-batches simultaneously, in opposite
+  directions through the pipeline, so that the dispatch of one overlaps the
+  matmuls of the other. FP8 is used for the GEMMs with per-block scaling factors
+  accumulated in higher precision, and the master weights and optimiser states
+  stay in BF16 and FP32. The result is a model that trains at roughly 1,475
+  tokens per GPU-hour and serves from a single 8-GPU H200 node.
+deep_dives:
+  - topic: "Fine-grained MoE: 256 experts, top-8, and one shared expert"
+    explanation: >-
+      The V3 shape is 256 routed experts plus 1 shared expert, with 8 routed
+      experts active per token. Each expert is small, roughly 2.1B parameters
+      when you divide the routed parameter count by 256, so the router is
+      choosing among many narrow specialists rather than a few broad ones. The
+      argument for granularity is combinatorial: with 8 of 256 you can form on
+      the order of 10 to the 14th distinct expert sets, where 8 of 16 gives only
+      12,870. The shared expert is the other half of the idea. Every token needs
+      basic syntax, function words and common patterns, and forcing a routed
+      expert to learn those wastes capacity on redundancy. Giving the model one
+      always-on expert lets the routed pool specialise. The cost is routing
+      overhead: 256 logits per token per layer is a small matmul but a real one,
+      and the dispatch has 256 possible destinations, so a top-8 selection almost
+      always spans many GPUs. DeepSeek's answer is auxiliary-loss-free balancing,
+      which adds a per-expert bias to the router logits and adjusts it after each
+      step rather than adding a load-balance term to the loss. That matters
+      because an auxiliary loss trades model quality for balance, and at this
+      scale even a small quality tax is expensive.
+    tradeoffs:
+      - option: "Many small experts (256, top-8)"
+        pros: "Fine-grained specialisation and a huge combinatorial space of expert combinations; the shared expert removes redundant work."
+        cons: "More routing decisions, worse locality, and an all-to-all with a wider fan-out; the router becomes a meaningful fraction of compute at short sequence lengths."
+      - option: "Few large experts (8, top-2)"
+        pros: "Fewer destinations per token, better locality, simpler kernels; the classic Switch and GShard shape."
+        cons: "Coarse specialisation; a token that needs 1B of a 20B expert pays for 19B of irrelevant weights, and quality per active parameter is worse."
+      - option: "Dense feed-forward"
+        pros: "No router, no all-to-all, no load imbalance; trivially shardable and easy to serve."
+        cons: "671B dense would need 671 GB read per token, which is far more serving cost than the 37B-active MoE for the same quality."
+  - topic: "MLA in production: the cache is the product"
+    explanation: >-
+      DeepSeek introduced multi-head latent attention in V2 and kept it for V3.
+      The mechanism is a low-rank compression of keys and values: instead of
+      caching one key vector and one value vector per head, the model caches a
+      512-dimension latent plus a 64-dimension rope component, and reconstructs
+      K and V by up-projection at attention time. At 61 layers and FP8 that is
+      35 KB per token, so a 128K conversation costs 4.6 GB of cache instead of
+      16.4 GB with 8-head GQA. In a serving cluster the consequence is not
+      marginal. A single H200 has 141 GB, of which 805 GB divided by 8 GPUs
+      leaves about 40 GB per GPU for cache after weights. At 35 KB per token
+      that is roughly 1.1M tokens of aggregate cache per GPU, about 8 concurrent
+      128K sequences; with GQA it would be 2 sequences. MLA is the difference
+      between a batched service and a queue. The cost is that the up-projection
+      matrix has to be applied on every decode step, which adds arithmetic to a
+      bandwidth-bound loop. That arithmetic is nearly free in wall-clock terms
+      because the SM is idle waiting on HBM, but it is not free in engineering:
+      the absorbed matrices have to be fused into the attention kernel, and the
+      latent dimension is shared across heads, so tensor parallelism has to split
+      the up-projection rather than the heads.
+    tradeoffs:
+      - option: "MLA with a 576-byte cache per token per layer"
+        pros: "3.6x smaller than 8-head GQA and 57x smaller than MHA; makes 128K context batchable on one node."
+        cons: "Custom kernels, awkward tensor-parallel sharding, and an extra matmul per decode step."
+      - option: "GQA with 8 KV heads"
+        pros: "Every framework supports it; head-parallel sharding is trivial; quality loss is small and well measured."
+        cons: "3.6x the cache, which at 128K turns an 8-sequence batch into a 2-sequence batch and doubles the cost per token."
+      - option: "Quantise the cache to 4 bits"
+        pros: "Halves or quarters the cache again, on top of whatever attention scheme you chose; works with either MLA or GQA."
+        cons: "Long-context retrieval degrades first and silently; the evaluation that catches it is needle-in-a-haystack, which most teams do not run."
+  - topic: "FP8 training: per-block scaling is not a detail"
+    explanation: >-
+      FP8 has 8 bits of exponent and 3 or 4 bits of mantissa depending on the
+      format. E4M3 gives more precision and less range; E5M2 gives more range and
+      less precision. A transformer's activations have outliers, a few channels
+      with magnitudes 10 to 100 times the median, and a single per-tensor scale
+      either clips the outliers or quantises everything else into a handful of
+      levels. DeepSeek's solution is per-block scaling: tiles of 128x128 for
+      weights and 1x128 for activations get their own scale factor, accumulated
+      in FP32 and applied on the fly. That keeps the effective dynamic range
+      usable without a per-channel calibration pass. Two further details make it
+      work. First, the accumulation is in FP32 or a higher-precision tensor-core
+      mode, because an FP8 multiply is fine but an FP8 accumulator is not.
+      Second, sensitive operations stay in BF16 — the embedding, the router
+      softmax, the layernorm, and the final output projection — because they are
+      cheap and because errors there propagate everywhere. The benefit is
+      roughly double the tensor-core throughput and half the memory traffic for
+      activations; the cost is a small quality delta that has to be measured
+      against a BF16 baseline rather than assumed away.
+    tradeoffs:
+      - option: "FP8 with per-block scaling"
+        pros: "About 2x tensor-core throughput and half the activation traffic; memory saved lets you hold a larger batch or a longer sequence."
+        cons: "Every GEMM needs scale bookkeeping; a mis-scaled block produces a loss spike that looks like a data problem and is not."
+      - option: "BF16 throughout"
+        pros: "Numerically boring; every kernel and debugging tool expects it; no calibration logic."
+        cons: "Twice the bytes and half the throughput, which on a fixed cluster is twice the wall clock for the same token count."
+      - option: "FP8 weights, BF16 activations"
+        pros: "Most of the memory saving with far less numerical risk; a good middle ground for serving."
+        cons: "Misses the throughput win on the matmuls; the activation traffic, which is the real bottleneck in MoE, is unchanged."
+  - topic: "DualPipe: hiding the all-to-all behind the pipeline"
+    explanation: >-
+      A standard pipeline schedule divides the model into stages and feeds
+      micro-batches through them. Between stages there is a communication step,
+      and in an MoE model there is also a dispatch and combine inside every MoE
+      layer. Naively these serialise: compute, wait, compute, wait. DualPipe
+      changes the schedule so that a forward chunk and a backward chunk from
+      different micro-batches are in flight at the same time, moving in opposite
+      directions through the pipeline. When the forward chunk is doing its
+      all-to-all, the backward chunk is doing matmuls, and vice versa. In steady
+      state most of the communication disappears from the critical path. The cost
+      is memory: two micro-batches of activations are live instead of one, and
+      activations for a 671B model at 2K sequence length are not small. The
+      implementation also has to handle the corners — the pipeline fill and
+      drain, where there is no counterpart chunk to overlap with, and the moments
+      where both chunks want the same collective. Those corners are where the
+      measured exposed communication comes from, and they are why the technique
+      buys less than the theoretical maximum.
+    tradeoffs:
+      - option: "DualPipe with bidirectional chunks"
+        pros: "Hides the majority of the all-to-all; the only technique here that attacks communication and pipeline bubbles at once."
+        cons: "Doubles activation memory, complicates the scheduler, and makes a hang hard to distinguish from a slow step."
+      - option: "Standard 1F1B pipeline"
+        pros: "Well understood, implemented in every framework, easy to debug."
+        cons: "Communication sits exposed between stages; on an MoE model that can be 30 to 40% of step time."
+      - option: "No pipeline at all, pure expert and tensor parallel"
+        pros: "Simplest possible topology; no bubbles by construction."
+        cons: "Does not scale past a single node's worth of stages, so a 671B model cannot fit the topology."
+  - topic: "Teaching reasoning with a verifier: GRPO and the R1 result"
+    explanation: >-
+      PPO needs a value network, which for a language model is another model of
+      comparable size, and that doubles the memory and the engineering. GRPO
+      removes it. For each prompt it samples a group of G outputs, scores them
+      with a reward function, and uses the group's mean reward as the baseline
+      for every member. The advantage of an output is its reward minus the group
+      mean, divided by the group standard deviation, and that is the whole
+      estimator. With a rule-based reward — does the maths answer match, does the
+      code pass the tests — there is nothing to learn and nothing to hack.
+      R1-Zero ran this loop directly on the V3 base model with no supervised cold
+      start, and the model's reasoning traces lengthened on their own as accuracy
+      improved: longer traces meant more chances to self-correct, and the reward
+      selected for it. AIME 2024 pass@1 went from 15.6% to 71.0%. The traces were
+      also messy, with language mixing and repetitive formatting, which is why R1
+      added a small cold-start dataset, then RL, then a rejection-sampling SFT
+      pass, then a final RL stage. The four stages exist to keep the capability
+      that pure RL produced while fixing how it presented itself. That is a
+      subtler lesson than the slogan that RL beats SFT: RL produced the
+      reasoning, SFT produced the usability.
+    tradeoffs:
+      - option: "GRPO with rule-based rewards"
+        pros: "No critic, half the memory of PPO, no reward model to hack; stable where a checker exists."
+        cons: "Only applies to domains with verifiable answers; group sampling multiplies generation cost by G, typically 64."
+      - option: "PPO with a learned reward model"
+        pros: "Works for any preference, including tone and helpfulness; the standard RLHF recipe."
+        cons: "A critic doubles memory, and the reward model is a proxy that the policy will eventually learn to exploit."
+      - option: "Rejection-sampling SFT only"
+        pros: "Extremely stable, no RL infrastructure, easy to reproduce; captures much of the gain."
+        cons: "Cannot exceed the best sample in the pool; no exploration beyond what the base model already produces."
+bottlenecks:
+  - failure: "All-to-all congestion at the pipeline stage boundary"
+    symptom: "Step time oscillates instead of holding steady; NIC throughput hits line rate while tensor cores sit at 50%, and the oscillation period matches the pipeline depth."
+    mitigation: "DualPipe-style overlap, hierarchical dispatch that stays on NVLink within a node, and capping the micro-batch count so the collectives do not queue behind each other."
+  - failure: "Expert collapse during training"
+    symptom: "A few experts receive most tokens, the rest receive almost none, and validation loss stalls because the effective parameter count has fallen to a fraction of 671B."
+    mitigation: "Auxiliary-loss-free bias updates on the router, a capacity factor that drops overflow, and monitoring the per-expert token histogram as a first-class training metric rather than a dashboard curiosity."
+  - failure: "FP8 loss spikes"
+    symptom: "Loss jumps by a visible step at a scale-factor boundary, then partially recovers; the spike correlates with a particular data shard rather than a step count."
+    mitigation: "Per-block rather than per-tensor scaling, FP32 accumulation, keeping the router, layernorm and embedding in BF16, and a rollback path that can replay the last 200 steps in BF16 to isolate whether the cause is numerical."
+  - failure: "Reward hacking in RL"
+    symptom: "Reward climbs while held-out accuracy falls. The model learns that a particular answer format scores well, or that repeating the question in the trace earns length-based credit."
+    mitigation: "Use a verifier rather than a preference model, hold out a test set the RL loop never sees, and audit traces by hand every few hundred steps, because the failure is legible to a human long before it is legible in the reward curve."
+  - failure: "Checkpoint and restart cost"
+    symptom: "After a node failure the run takes 40 minutes to resume, and at two failures a day that is 5% of the training budget spent not training."
+    mitigation: "Asynchronous checkpointing to local NVMe with a background upload, sharded checkpoint files so only the failed rank's shard is re-read, and a topology-aware restart that reuses the surviving nodes' resident weights."
+interview_questions:
+  - question: "Walk me through the DeepSeek V3 shape. Why 256 experts and not 8?"
+    level: senior
+    key_points:
+      - "671B total, 37B active, 256 routed experts plus 1 shared, top-8 routing."
+      - "Granularity gives a combinatorial increase in the number of distinct expert sets, so specialisation is finer at the same active budget."
+      - "The shared expert absorbs common patterns so the routed pool does not waste capacity relearning syntax."
+      - "The cost is router overhead, wider all-to-all fan-out and a harder load-balance problem."
+    follow_up: "What is the effect on serving latency if the eight selected experts land on eight different nodes?"
+  - question: "Your MoE training run has 40% exposed all-to-all. What do you do?"
+    level: staff
+    key_points:
+      - "First separate the two collectives: dispatch and combine have different sizes and different overlap opportunities."
+      - "Overlap with DualPipe or a similar bidirectional schedule so communication and compute are concurrent."
+      - "Improve locality: place co-activated experts on the same node, and use hierarchical all-to-all so NVLink carries the first hop."
+      - "Reduce the fan-out with fewer active experts or a capacity factor, but both cost quality, so measure before committing."
+    follow_up: "DualPipe doubles activation memory. How do you decide whether that trade is affordable on a given cluster?"
+  - question: "Explain how FP8 training works without destroying accuracy."
+    level: senior
+    key_points:
+      - "E4M3 for weights and activations, with per-block scale factors rather than one scale per tensor."
+      - "FP32 accumulation in the tensor-core path; FP8 inputs do not imply FP8 accumulation."
+      - "Sensitive ops stay in BF16: embeddings, layernorm, router softmax, output projection."
+      - "Master weights and optimiser states stay high precision; only the GEMM inputs are FP8."
+    follow_up: "You see a loss spike at step 40,000 and suspect FP8. How do you confirm or rule it out without restarting the run?"
+  - question: "Why does GRPO remove the critic, and what does that cost you?"
+    level: senior
+    key_points:
+      - "The group of G samples per prompt provides the baseline, so no value network is needed."
+      - "Advantage is reward minus group mean, normalised by group standard deviation."
+      - "Memory drops to roughly half of PPO because the critic is gone."
+      - "Cost is G times the generation compute per prompt, plus higher variance when the group is homogeneous."
+    follow_up: "What happens to GRPO when every sample in the group gets the same reward? How would you fix it?"
+  - question: "R1-Zero skipped supervised fine-tuning. Why did R1 put it back?"
+    level: staff
+    key_points:
+      - "R1-Zero's reasoning was real but unreadable: language mixing, repetition, poor formatting."
+      - "Cold-start SFT teaches a readable output format, not the reasoning itself; capability came from RL."
+      - "R1 uses four stages: cold start, reasoning RL, rejection-sampling SFT, then general RL."
+      - "The general RL stage exists because reasoning-only RL degrades helpfulness and harmlessness."
+    follow_up: "If SFT only fixes presentation, why not fix it with a formatting reward inside the RL loop instead of a separate stage?"
+  - question: "Size a serving deployment for V3 at 10,000 output tokens per second."
+    level: senior
+    key_points:
+      - "Weights are 671 GB at FP8, so one replica is 8 H200s with about 320 GB left for cache."
+      - "At 35 KB per token of MLA cache, a 128K request costs 4.6 GB, so roughly 8 long sequences per replica."
+      - "Throughput is bandwidth-bound: 37 GB of active weights per token spread across 8 GPUs at 4.8 TB/s each gives a ceiling in the low hundreds of tokens per second."
+      - "10,000 tokens/s therefore needs on the order of 30 to 40 replicas before redundancy."
+    follow_up: "How does that change if the median request is 500 output tokens rather than 4,000?"
+  - question: "The $5.6M training cost is widely quoted. What is wrong with that number?"
+    level: mid
+    key_points:
+      - "It is the marginal GPU rental for the successful run only, at a market rate the lab did not necessarily pay."
+      - "It excludes failed runs, ablations, and the small-model experiments that produced the recipe."
+      - "It excludes data collection, filtering and deduplication, which for 14.8T tokens is a large engineering effort."
+      - "It excludes salaries and the cost of the cluster's existence; as a unit-economics figure it is a floor, not a total."
+    follow_up: "What number would you use to compare research efficiency between two labs, and why?"
+what_to_steal:
+  - "Count tokens per GPU-hour, not just FLOPs. It is the metric that survives contact with a real cluster."
+  - "Put a shared expert in your MoE. It is cheap and it stops the routed pool from relearning the obvious."
+  - "Balance experts with a router bias, not an auxiliary loss. Quality is too expensive to spend on load balance."
+  - "Use a verifier wherever you can. A checkable reward is worth more than a clever reward model."
+  - "Separate capability from presentation. RL can produce reasoning; SFT is still how you make it readable."
+  - "Publish the failed experiments. The process reward model and MCTS attempts are the most useful pages of the R1 report."
+further_reading:
+  - label: "DeepSeek-V3 technical report"
+    url: "https://arxiv.org/abs/2412.19437"
+  - label: "DeepSeek-R1 — incentivising reasoning capability in LLMs via RL"
+    url: "https://arxiv.org/abs/2501.12948"
+  - label: "DeepSeek-V2 — MLA and fine-grained MoE"
+    url: "https://arxiv.org/abs/2405.04434"
+  - label: "DeepSeekMath — the GRPO origin"
+    url: "https://arxiv.org/abs/2402.03300"
+  - label: "DeepSeek-V3 repository — inference kernels and model config"
+    url: "https://github.com/deepseek-ai/DeepSeek-V3"
+  - label: "FP8 formats for deep learning — the scaling rationale"
+    url: "https://arxiv.org/abs/2209.05433"
+sources:
+  - label: "DeepSeek-V3 technical report (arXiv 2412.19437)"
+    url: "https://arxiv.org/abs/2412.19437"
+  - label: "DeepSeek-R1 paper (arXiv 2501.12948)"
+    url: "https://arxiv.org/abs/2501.12948"
+  - label: "DeepSeek-V2 paper (arXiv 2405.04434)"
+    url: "https://arxiv.org/abs/2405.04434"
+  - label: "DeepSeekMath — GRPO (arXiv 2402.03300)"
+    url: "https://arxiv.org/abs/2402.03300"
+tags: [moe, fp8, dualpipe, grpo, reasoning, serving]

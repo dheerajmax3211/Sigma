@@ -1,0 +1,1230 @@
+id: imbalanced-data
+slug: imbalanced-data
+title: "Imbalance Is a Threshold Problem, and SMOTE Is a Detour"
+summary: >-
+  Learn why class imbalance is a threshold problem and a metric problem rather
+  than a modelling problem — and why every resampling scheme, from random
+  oversampling to SMOTE, is a way of paying for a threshold move you could have
+  made directly, without adding a single bit of information.
+kind: lesson
+difficulty: medium
+position: 13
+estMinutes: 23
+prerequisites: [model-evaluation]
+phase: classical-models
+tags: [imbalance, resampling, smote, class-weights, pr-auc, threshold, calibration]
+
+body:
+  big_idea: >-
+    Imbalance does not damage the ranking — it damages the default threshold and the
+    default metric, so every resampling scheme is an information-free detour to a
+    threshold you could have moved directly.
+
+  problem:
+    - "You train at 1.22% prevalence, read the confusion matrix at threshold 0.5, and conclude the model is broken — the threshold was never chosen."
+    - "You balance the training set, watch recall jump from 2% to 78%, and report it as improvement: the ranking never moved, only the cut point."
+    - "Your team spends two weeks arguing SMOTE versus class weights, and the difference is 0.0008 AP — 0.069 standard deviations of the bootstrap noise."
+
+  analogy: |
+    A hiring pipeline: 1,200 applicants, 14 qualified. A consultant "fixes the
+    imbalance" by photocopying each qualified CV eighty-five times, so the pile
+    is half qualified. You have not met a single new candidate — only changed
+    where you stop reading. SMOTE is the next consultant: average two finalists'
+    CVs and you get a candidate with five years of each, worse at both than
+    either.
+
+  concept_points:
+    - "**The ratio is not the problem; the threshold is.** At 1.22% prevalence a well-calibrated model at the default 0.5 flags 30 of 80,000 rows and catches 20 of 976 positives — recall 0.0205, precision 0.6667. Move the threshold to 0.0099 and the *same weights* catch 800 (recall 0.8197) at precision 0.0380. The 0.5 default claims a miss and a false alarm cost the same."
+    - "**Class weights and random oversampling are the same intercept shift, and the shift is $\\log k$.** Weighting positives by the balancing ratio $k = 85.269$ moved the fitted intercept by 4.4431 against a predicted $\\log k = 4.4458$. The oversampled model at 0.5 must equal the unweighted model at $1/(1+k) = 0.01159$: measured 18,608 flagged with recall 0.7828 against 18,448 and 0.7797."
+    - "**SMOTE cannot leave the convex hull, and multimodality makes it fabricate.** Every synthetic point is a convex combination of two real positives: all 116,844 synthetic points fell inside the minority's per-feature box, the furthest 1.0887 from any real positive. With two minority clusters 8.0 apart and $k=5$, 20.2% of 4,000 synthetic points landed in the empty gap. Filling interior gaps is not extending the region."
+    - "**Never rebalance the evaluation set.** The same predictions, scored against test sets of increasing positive rate, give AP 0.1510 at 1.22%, 0.2716 at 3%, 0.8691 at 50% — while ROC-AUC stays at 0.8611, 0.8612, 0.8677. Rebalancing the test set changes the question from \"when I flag, am I right?\" to \"can I rank one positive against one negative?\" and keeps the old name."
+    - "**Balancing asserts a specific cost ratio, and it is usually wrong.** A 50/50 training set says a miss costs $(1-\\pi)/\\pi \\approx 85$ times a false alarm. Measured: at 1:1 the balanced operating point cost 18,056 against 964 for the cost-optimal threshold (18.7× worse); at 100:1 it cost 39,044 against 37,865 (1.03×, nearly right); at 1000:1 it under-corrected by 3.30×."
+    - "**Resampling destroys calibration, and the repair is one intercept.** A model fit on the 50/50 resample predicts a mean probability of 0.3080 on the natural test set whose true rate is 0.0122 — ECE 0.2958. The exact prior correction recovered a mean of 0.01217 and ECE 0.00048, ranking untouched. The naive rescale $p\\cdot\\pi_t/\\pi_s$ gives 0.00753, 38% low, because it is not a probability transform."
+
+  definitions:
+    - term: "Prevalence (base rate), $\\pi$"
+      meaning: >-
+        The fraction of positives in the population you will deploy on. It sets
+        the constant-classifier accuracy $(1-\pi)$, caps attainable precision,
+        and determines how large the threshold correction has to be.
+    - term: "Resampling"
+      meaning: >-
+        Changing the class composition of the *training* set by duplicating
+        rows (oversampling), deleting rows (undersampling), or synthesising
+        rows. It changes the effective prior, never the information content.
+    - term: "Random oversampling (ROS)"
+      meaning: >-
+        Duplicating minority rows until the classes are at the desired ratio.
+        For any model with a likelihood, duplicating a row k times is identical
+        to weighting it k, which for a logistic model is an intercept shift of
+        log k.
+    - term: "Random undersampling (RUS)"
+      meaning: >-
+        Deleting majority rows until the classes are at the desired ratio. It
+        throws away real evidence, so it increases the variance of everything
+        estimated about the majority class — including precision.
+    - term: "SMOTE"
+      meaning: >-
+        Synthetic Minority Oversampling Technique. For each synthetic row, pick
+        a real minority point, pick one of its k nearest minority neighbours,
+        and take a uniform random point on the segment between them. The result
+        lies in the convex hull of the minority class by construction.
+    - term: "Class weight / `scale_pos_weight`"
+      meaning: >-
+        A per-class multiplier in the loss. For logistic regression it is an
+        intercept shift; for trees and neural networks it also changes split
+        selection and leaf values, so it is not a pure threshold move there.
+    - term: "Effective prior"
+      meaning: >-
+        The positive rate the trained model's probabilities actually refer to —
+        the resampled training rate, not the deployment rate. Every predicted
+        probability is conditioned on it whether you intended that or not.
+    - term: "Prior correction (intercept correction)"
+      meaning: >-
+        Multiplying the model's odds by $[\pi_t/(1-\pi_t)]/[\pi_s/(1-\pi_s)]$
+        to move probabilities from the training prior $\pi_s$ to the deployment
+        prior $\pi_t$. Exactly reverses the effect of resampling on calibration.
+    - term: "Average precision (AP)"
+      meaning: >-
+        The step-wise area under the precision-recall curve,
+        $\sum_n (R_n - R_{n-1}) P_n$. Prevalence-sensitive by construction, and
+        the standard summary for rare-positive ranking.
+    - term: "Cost-sensitive threshold"
+      meaning: >-
+        The threshold that minimises $c_{FN}\,\text{FN} + c_{FP}\,\text{FP}$.
+        For calibrated probabilities it is exactly $c_{FP}/(c_{FN}+c_{FP})$,
+        independent of prevalence.
+    - term: "Effective number of samples"
+      meaning: >-
+        $ (1-\beta^{n})/(1-\beta)$ for a class with $n$ examples — a soft cap on
+        how much a class should be up-weighted. Used to build class-balanced
+        losses that do not over-weight a class that already has thousands of
+        examples.
+    - term: "Tomek link"
+      meaning: >-
+        A pair of nearest neighbours of opposite classes. Removing the majority
+        member of each such pair cleans the boundary rather than rebalancing the
+        classes — undersampling aimed at noise instead of at volume.
+
+  diagrams:
+    - type: compare
+      title: "What imbalance is blamed for, and what it actually breaks"
+      left_label: "The usual diagnosis"
+      left_points:
+        - "The model is biased toward the majority class"
+        - "We need a balanced training set"
+        - "Resampling will fix the accuracy"
+        - "SMOTE adds information about the minority"
+        - "Balanced accuracy is the honest metric"
+      right_label: "What is actually wrong"
+      right_points:
+        - "The 0.5 threshold encodes a cost ratio nobody chose"
+        - "Accuracy averages over 98.8% negatives"
+        - "Resampling moves the intercept by log k — nothing else, for a linear model"
+        - "SMOTE interpolates inside the hull; it cannot extend the minority region"
+        - "Precision at the shipping threshold is the number that matters"
+    - type: plot
+      title: "One model, one set of weights, five thresholds"
+      chart: "line"
+      xLabel: "decision threshold"
+      yLabel: "value"
+      series:
+        - name: "recall"
+          points:
+            - { x: 0.002, y: 0.9703 }
+            - { x: 0.005, y: 0.9119 }
+            - { x: 0.0099, y: 0.8197 }
+            - { x: 0.02, y: 0.6404 }
+            - { x: 0.05, y: 0.4201 }
+            - { x: 0.1, y: 0.2531 }
+            - { x: 0.2, y: 0.1045 }
+            - { x: 0.3, y: 0.0605 }
+            - { x: 0.5, y: 0.0205 }
+        - name: "precision"
+          points:
+            - { x: 0.002, y: 0.0182 }
+            - { x: 0.005, y: 0.0263 }
+            - { x: 0.0099, y: 0.038 }
+            - { x: 0.02, y: 0.0565 }
+            - { x: 0.05, y: 0.1104 }
+            - { x: 0.1, y: 0.1973 }
+            - { x: 0.2, y: 0.3312 }
+            - { x: 0.3, y: 0.447 }
+            - { x: 0.5, y: 0.6667 }
+        - name: "accuracy (and the constant-zero baseline is 0.9878)"
+          points:
+            - { x: 0.002, y: 0.3611 }
+            - { x: 0.005, y: 0.5869 }
+            - { x: 0.0099, y: 0.7445 }
+            - { x: 0.02, y: 0.8651 }
+            - { x: 0.05, y: 0.9516 }
+            - { x: 0.1, y: 0.9783 }
+            - { x: 0.2, y: 0.9865 }
+            - { x: 0.3, y: 0.9876 }
+            - { x: 0.5, y: 0.9879 }
+    - type: plot
+      title: "Average precision tracks the evaluation set's base rate; ROC-AUC does not"
+      chart: "line"
+      xLabel: "positive rate of the evaluation set"
+      yLabel: "score"
+      series:
+        - name: "average precision"
+          points:
+            - { x: 0.0122, y: 0.151 }
+            - { x: 0.03, y: 0.2716 }
+            - { x: 0.1, y: 0.5018 }
+            - { x: 0.25, y: 0.6911 }
+            - { x: 0.5, y: 0.8691 }
+        - name: "ROC-AUC"
+          points:
+            - { x: 0.0122, y: 0.8611 }
+            - { x: 0.03, y: 0.8612 }
+            - { x: 0.1, y: 0.8621 }
+            - { x: 0.25, y: 0.8555 }
+            - { x: 0.5, y: 0.8677 }
+    - type: architecture
+      title: "Where resampling is allowed to sit in a pipeline"
+      nodes:
+        - { id: raw, x: 0, y: 1, label: "Raw labelled data", kind: database, detail: "200,000 rows, 2,367 positives. The only thing that contains information." }
+        - { id: split, x: 1, y: 1, label: "Split FIRST", kind: server, detail: "Train / validation / test, stratified. If resampling happens before this line, synthetic points leak into the test set and every number downstream is fiction." }
+        - { id: resample, x: 2, y: 1, label: "Resample train only", kind: worker, detail: "Oversample, undersample, or SMOTE — applied to the training fold alone, inside the cross-validation loop. Fitted statistics (neighbour graphs, scalers) must be re-fit per fold." }
+        - { id: model, x: 3, y: 0, label: "Model", kind: model, detail: "Learns a boundary against the resampled prior. Its probabilities now mean 'given a 50/50 world', which is not the world." }
+        - { id: correct, x: 3, y: 2, label: "Prior correction", kind: server, detail: "Move the probabilities back to the deployment prior before anything downstream multiplies them by money." }
+        - { id: eval, x: 1, y: 3, label: "Untouched test set", kind: storage, detail: "Natural class ratio, forever. Resampling it is the single most common way to report an AP five times too high." }
+        - { id: thresh, x: 3, y: 3, label: "Threshold from costs", kind: client, detail: "Pick t on validation by c_FP/(c_FN+c_FP) or by direct cost minimisation, then report TP/FP/FN counts at t on test." }
+      edges:
+        - { from: raw, to: split, label: "stratified" }
+        - { from: split, to: resample, label: "train fold" }
+        - { from: resample, to: model, label: "balanced prior" }
+        - { from: model, to: correct, label: "odds rescale" }
+        - { from: split, to: eval, label: "held out" }
+        - { from: eval, to: thresh, label: "choose t here" }
+        - { from: correct, to: thresh, label: "calibrated scores" }
+    - type: pipeline
+      title: "The order that actually fixes an imbalanced problem"
+      nodes:
+        - label: "Compute the constant-zero baseline"
+          note: "accuracy = 1 − π = 0.9878"
+          detail: "Before anything else. If your reported accuracy is at or below this, you have not yet built a model."
+        - label: "Report AP and the operating point, not accuracy"
+          note: "AP 0.1510, recall 0.0205 at t = 0.5"
+          detail: "Two numbers: how well it ranks (AP), and what happens at the threshold you would ship (counts). ROC-AUC is for comparing rankers, not for reporting to a business."
+        - label: "Choose the threshold from the cost ratio"
+          note: "t* = c_FP / (c_FN + c_FP) = 1/101"
+          detail: "This is the step that does 90% of the work, and it is free. If you cannot state the cost ratio, you cannot choose a threshold, and resampling will not choose it for you."
+        - label: "Only now consider resampling"
+          note: "and only for a local learner"
+          detail: "If the 0.5 threshold is hard-coded somewhere you cannot change, class weights are the workaround. If the learner is k-NN, a tree, or a forest, SMOTE can genuinely change the boundary — measure it."
+        - label: "Correct the prior, then check calibration"
+          note: "ECE 0.2958 → 0.00048"
+          detail: "Resampling leaves the model calibrated to the wrong world. One odds rescale fixes it exactly; skipping it means every downstream expected-value calculation is wrong."
+        - label: "Verify against the untouched test set"
+          note: "and put a bootstrap interval on AP"
+          detail: "AP 0.1510 ± 0.0117. If the improvement you are claiming is smaller than that, you have not shown an improvement — you have shown a coin flip."
+
+  markdown: |
+    ## The table that should stop you
+
+    80,000 held-out rows, 976 positives, 1.22% prevalence. A logistic model with
+    ROC-AUC 0.8611 and average precision 0.1510. One set of weights, five
+    thresholds:
+
+    | threshold | flagged | TP | FP | FN | precision | recall | accuracy |
+    |---|---|---|---|---|---|---|---|
+    | 0.5 | 30 | 20 | 10 | 956 | 0.6667 | 0.0205 | **0.9879** |
+    | 0.1 | 1,252 | 247 | 1,005 | 729 | 0.1973 | 0.2531 | 0.9783 |
+    | 0.05 | 3,714 | 410 | 3,304 | 566 | 0.1104 | 0.4201 | 0.9516 |
+    | 0.0099 | 21,067 | 800 | 20,267 | 176 | 0.0380 | 0.8197 | 0.7445 |
+    | 0.002 | 52,027 | 947 | 51,080 | 29 | 0.0182 | 0.9703 | 0.3611 |
+
+    Read the last column against the first. The model is *most accurate* at the
+    threshold where it catches 2% of the fraud, and least accurate at the one
+    where it catches 97%. The constant-zero classifier scores 0.9878 — the
+    "best" row in this table is indistinguishable from doing nothing, and the
+    rows that actually work score 0.74 and 0.36.
+
+    That is the whole topic in one table. Imbalance did not damage the model. It
+    damaged the two defaults you inherited: the threshold and the word
+    "accuracy".
+
+    ## Only the intercept moves
+
+    With deployment prevalence $\pi$ and a sample whose positive rate is
+    $\tilde\pi$, Bayes gives
+
+    $$
+    \frac{\tilde P(y{=}1 \mid x)}{\tilde P(y{=}0 \mid x)}
+    =
+    \frac{P(y{=}1 \mid x)}{P(y{=}0 \mid x)}
+    \cdot
+    \frac{\tilde\pi/(1-\tilde\pi)}{\pi/(1-\pi)} .
+    $$
+
+    The factor does not depend on $x$, so resampling moves the log-odds by a
+    **constant** — for a logistic model, the intercept — by exactly $\log k$,
+    leaving every slope alone.
+
+    Measured: $k = 85.269$ gave an intercept shift of 4.4431 against a predicted
+    $\log k = 4.4458$, all other coefficients moving by at most 0.0245 — the
+    identity above, holding to three decimals.
+
+    Two consequences follow immediately:
+
+    - **Random oversampling is a threshold move.** Duplicating a row $k$ times
+      is the same likelihood as weighting it $k$. So an oversampled model at
+      threshold 0.5 is the unweighted model at $1/(1+k)$. Here that is 0.01159,
+      and indeed 18,608 rows were flagged with recall 0.7828, against 18,448 and
+      0.7797 for the oversampled model at 0.5. The same operating point, bought
+      with 236,844 rows instead of one number.
+    - **`scale_pos_weight` is the same move wearing a different hat.** $w = 100$
+      at 0.5 gave 20,955 flagged / 798 true positives; the unweighted model at
+      $1/101$ gave 21,067 / 800.
+
+    For a tree or a neural network the equivalence weakens — weights change
+    split selection and leaf values — but the direction is the same and the
+    effect on ranking is still usually invisible: AP 0.1510 (raw), 0.1502 (class
+    weights), 0.1502 (oversampling), 0.1502 (SMOTE). Four methods, 0.0008 apart.
+
+    ## What balancing actually asserts
+
+    The balanced threshold is the cost-optimal threshold only when the cost
+    ratio happens to equal $(1-\pi)/\pi$. With $\pi = 0.0116$ that is
+    $\approx 85.3$, so a 50/50 training set is the claim "a miss costs 85
+    times a false alarm". If your real ratio is 1:1, you have over-corrected by
+    a factor of 85; if it is 1000:1, you have under-corrected by 12.
+
+    | cost ratio $c_{FN}:c_{FP}$ | cost-optimal $t^{\star}$ | cost | cost at the balanced point | penalty |
+    |---|---|---|---|---|
+    | 1:1 | 0.4879 | 964 | 18,056 | **18.7x** |
+    | 10:1 | 0.0919 | 8,199 | 19,964 | 2.44x |
+    | 100:1 | 0.0099 | 37,865 | 39,044 | 1.03x |
+    | 1000:1 | 0.0012 | 69,714 | 229,844 | 3.30x |
+
+    Balancing is not a safe default; it is a guess at a number you can ask for.
+
+    ## SMOTE: what it does, and what it cannot do
+
+    SMOTE picks a real minority point $x_i$, picks one of its $k$ nearest
+    minority neighbours $x_j$, and returns $x_i + \lambda(x_j - x_i)$ for
+    $\lambda \sim U(0,1)$. Each output is a convex combination of two real
+    positives, so it lies in their convex hull. **SMOTE cannot place a point
+    outside the region your minority already occupies.** All 116,844 synthetic
+    rows here fell inside the minority's per-feature box; the furthest was
+    1.0887 from any real positive.
+
+    So the claim is narrow: SMOTE changes the *density* inside the minority
+    region, which moves the boundary only for a learner that reads local
+    density. Measured both ways on the same data: a linear logistic model went
+    from AP 0.1510 to 0.1502 — nothing, because a linear boundary can only be
+    translated — while a 15-NN over a compact 2-D minority went from 0.4384 to
+    0.5683, a 30% gain.
+
+    And the failure mode that gets shipped: **multimodal minorities.** With the
+    minority in two clusters of 4 points 8.0 apart and $k = 5$, every neighbour
+    pair straddles the gap. 20.2% of 4,000 synthetic points landed in empty
+    space, the furthest 4.0117 from any real positive. You do not have a
+    denser minority; you have invented one.
+
+    ## Evaluating it
+
+    AP, because precision is the operator's cost and precision is bounded by the
+    base rate:
+
+    $$
+    \text{precision} = \frac{\text{TPR}}{\text{TPR} + \frac{1-\pi}{\pi}\,\text{FPR}} .
+    $$
+
+    At the 100:1 operating point, TPR 0.8197 with precision 0.0380 implies
+    FPR 0.2565. That is not a weak model — it is a rare event being flagged.
+
+    What you must not do is rebalance the test set. The same predictions score
+    AP 0.1510 at 1.22% prevalence and 0.8691 at 50%, while ROC-AUC sits at
+    0.8611 and 0.8677. Rebalancing the test set is not a fairness correction; it
+    is a different question with the old question's label.
+
+    And put an interval on it. Bootstrap AP over 300 resamples of 80,000 rows:
+    standard deviation 0.0117, 95% interval [0.1285, 0.1772]. The spread between
+    ROS, class weights and SMOTE is 0.0008 — 0.069 standard deviations. No
+    experiment on this test set can tell them apart.
+
+    ## What to do, in order
+
+    1. Compute the constant-zero baseline. It is 0.9878 here.
+    2. Report AP and a confusion matrix in **counts** at a named threshold.
+    3. Get the cost ratio from a human and set $t^{\star} = c_{FP}/(c_{FN}+c_{FP})$.
+       This is free, and it is usually the whole fix.
+    4. If the threshold is immovable — a vendor system, a hard-coded 0.5 — use
+       class weights, and know you are paying for a threshold.
+    5. Consider SMOTE only if the learner uses local density **and** the
+       minority is unimodal and continuous. Check the hull.
+    6. Correct the prior and report ECE. Resampling without this leaves the
+       model confidently wrong at every score.
+
+    ## Where the analogy breaks
+
+    The analogy says synthetic candidates are always fake, which is too strong.
+    If two positives are two noisy measurements of the same thing — two
+    spectrograms of one word, two crops of one lesion — the midpoint is a
+    plausible third measurement, and SMOTE is closer to augmentation than to
+    interpolation. The real distinction is *feature semantics*: interpolation is
+    meaningful when the segment between two real points stays on the data
+    manifold. For dense continuous features it usually does; for one-hot
+    categories, counts, or separated clusters it does not. Knowing which case
+    you are in is the skill.
+
+    ## The longer version
+
+    The remaining mechanisms, verbatim: why undersampling deletes exactly the
+    rows that produce false alarms, and why the differences between resampling
+    schemes sit inside your own bootstrap noise.
+
+    ### Failure modes, in full
+
+    - You will train a fraud model at 1.22% prevalence, look at the confusion matrix for the default 0.5 threshold, and conclude the model is broken: it flags 30 rows out of 80,000 and catches 20 of 976 positives. The model is fine. The threshold is the one thing you never chose.
+    - You will balance the training set, watch recall jump from 2% to 78%, and report it as an improvement — when the ranking never moved and all you did was change where you cut. Same model, same AUC to four decimals.
+    - You will rebalance the **test** set 'so the evaluation is fair', and report average precision 0.8691 for a model whose true AP is 0.1510. Nobody will catch it, because the number looks great and the mistake is invisible in the metric.
+    - Your team will spend two weeks arguing SMOTE versus class weights, and the difference between them will be 0.0008 AP — 0.069 standard deviations of the bootstrap noise on your own test set. The argument is not resolvable with the data you have.
+    - You will interpolate a one-hot encoded feature and get a row that is 0.5 of 'country=DE' and 0.5 of 'country=FR', feed it to a model that believes it is a valid category, and never see an error.
+
+    ### The mechanisms, in full
+
+    - **The ratio is not the problem; the threshold is.** At 1.22% prevalence a well-calibrated model at the default 0.5 threshold flags 30 of 80,000 rows and catches 20 of 976 positives — recall 0.0205, precision 0.6667. Move the threshold to 0.0099 and the *same weights* catch 800 positives (recall 0.8197) at precision 0.0380. Nothing was retrained, no data was resampled. The 0.5 default is a claim that a miss and a false alarm cost the same, which is the identical claim accuracy makes, and it is wrong for the identical reason.
+    - **Class weights and random oversampling are the same intercept shift, and the shift is log k.** Weighting positives by k = 85.269 — the exact balancing ratio — moved the fitted intercept by 4.4431 against a predicted log k = 4.4458, and left every other coefficient within 0.0245. Duplicating each positive k times is that same likelihood, so the oversampled model at 0.5 must equal the unweighted model at $1/(1+k) = 0.01159$: measured 18,608 flagged with recall 0.7828, against 18,448 and 0.7797 for the oversampled model at 0.5. Same operating point, 0.3% apart — bought with 236,844 rows instead of one number. And `scale_pos_weight = 100` at 0.5 flagged 20,955 rows with 798 true positives, against 21,067 and 800 for the unweighted model at 1/101.
+    - **SMOTE cannot leave the convex hull of the minority class.** Every synthetic point is a convex combination of two real positives, so by construction it lies inside their convex hull. All 116,844 synthetic points generated from 1,391 real positives fell inside the minority's per-feature box; the furthest synthetic point was 1.0887 from any real positive, the median 0.2469. It fills gaps *inside* the minority region. It can never extend that region, which is the only thing that would help when the boundary is in the wrong place.
+    - **SMOTE helps exactly when the decision surface is local — and fabricates a class when the minority is multimodal.** Same data, two learners. For a correctly specified logistic model — a linear boundary, which can only be translated — SMOTE moved AP from 0.1510 to 0.1502, a 0.5% change. For a 15-nearest-neighbour classifier on a compact 2-D minority inside a diffuse negative cloud, SMOTE at 9x moved AP from 0.4384 to 0.5683, a 30% gain. The difference is whether the classifier can use local density. And when the minority is multimodal, k forces the neighbour graph across empty space: with two clusters of 4 points 8.0 apart and k = 5, 20.2% of 4,000 synthetic points landed in the gap, the furthest 4.0117 from any real positive — 807 fabricated positives in territory the data says is negative.
+    - **Undersampling deletes the negative evidence, which is the evidence you need.** At 1.18% prevalence, balancing the training set means keeping 1,391 of 118,609 negatives — 98.83% of the majority rows discarded. Every precision you then estimate is estimated from the surviving 1.17%. This is why an undersampled model looks excellent on an undersampled holdout and mediocre in production: you deleted exactly the rows that produce the false alarms.
+    - **Never rebalance the evaluation set.** The same predictions, scored against test sets of increasing positive rate: AP 0.1510 at 1.22%, 0.2716 at 3%, 0.5018 at 10%, 0.6911 at 25%, 0.8691 at 50% — while ROC-AUC stayed at 0.8611, 0.8612, 0.8621, 0.8555, 0.8677. Rebalancing the test set does not make the evaluation fairer; it changes the question from "when I flag, am I right?" to "among one positive and one negative, can I rank?", and then reports the answer under the old question's name.
+    - **PR-AUC is the right summary because precision is the operator's cost.** Precision is bounded by the base rate: at the cost-optimal threshold, a TPR of 0.8197 with precision 0.0380 implies an FPR of 0.2565 — arithmetic, not model weakness. AP integrates that trade-off over every threshold. ROC-AUC cannot see it, which is why 0.8611 reads as "good" at 1.22% prevalence and at 50% alike, while AP reads 0.1510 and 0.8691 for the same predictions.
+    - **The differences you are arguing about are inside the noise.** AP is 0.1510 with a bootstrap standard deviation of 0.0117 over 300 resamples (95% interval [0.1285, 0.1772], from 976 positives). Random oversampling, class weights and SMOTE all landed within 0.0008 AP of each other — 0.069 standard deviations. You cannot distinguish them with this test set. Four times the positives would halve that standard deviation; no resampling scheme produces a positive.
+    - **Balancing asserts a specific cost ratio, and it is usually the wrong one.** A 50/50 training set says a miss costs $(1-\pi)/\pi \approx 85$ times a false alarm. Measured against true cost ratios: at 1:1 the balanced operating point cost 18,056 against 964 for the cost-optimal threshold (18.7x worse); at 10:1, 19,964 against 8,199 (2.44x); at 100:1, 39,044 against 37,865 (1.03x — balancing happens to be nearly right); at 1000:1, 229,844 against 69,714 (3.30x, now under-correcting). Balancing is not a safe default. It is a guess at a number you can measure.
+    - **Resampling destroys calibration, and the repair is one intercept.** A model fit on the 50/50 resample predicts a mean probability of 0.3080 on the natural test set whose true rate is 0.0122 — ECE 0.2958. Applying the exact prior correction recovered a mean of 0.01217 and ECE 0.00048, with the ranking untouched (AUC 0.8610 before and after). The naive rescale $p \cdot \pi_t/\pi_s$ gives 0.00753, 38% low, because it is not a probability transform at all.
+
+
+  derivations:
+    - title: "Why resampling moves only the intercept"
+      latex: |
+        Let $\pi$ be the deployment prevalence and $\tilde\pi$ the prevalence in
+        a resampled training set. Bayes' rule gives, for the same likelihood
+        $P(x \mid y)$,
+        $$
+        \frac{\tilde P(y{=}1\mid x)}{\tilde P(y{=}0\mid x)}
+        =
+        \frac{P(x\mid y{=}1)\,\tilde\pi}{P(x\mid y{=}0)\,(1-\tilde\pi)}
+        =
+        \underbrace{\frac{P(x\mid y{=}1)\,\pi}{P(x\mid y{=}0)\,(1-\pi)}}_{\text{deployment odds}}
+        \cdot
+        \underbrace{\frac{\tilde\pi/(1-\tilde\pi)}{\pi/(1-\pi)}}_{=\;k,\ \text{independent of } x}.
+        $$
+        Taking logs,
+        $$
+        \operatorname{logit}\tilde P(y{=}1\mid x) = \operatorname{logit} P(y{=}1\mid x) + \log k .
+        $$
+      prose: >-
+        The multiplier k does not depend on x, so the entire effect of
+        resampling is one additive constant on the log-odds. In a logistic model
+        that constant IS the intercept, which is why every slope is unchanged
+        and why the fitted intercept moved by 4.4431 against a predicted
+        log k = 4.4458. Resampling is a threshold move because a threshold is
+        just a different intercept.
+    - title: "The cost-optimal threshold is c_FP/(c_FN + c_FP)"
+      latex: |
+        Flag an example with predicted probability $p$ when the expected cost of
+        flagging is below the expected cost of not flagging:
+        $$
+        c_{FP}\,(1-p) \;<\; c_{FN}\,p
+        \quad\Longleftrightarrow\quad
+        p \;>\; \frac{c_{FP}}{c_{FN} + c_{FP}} .
+        $$
+        Since the decision boundary is a comparison on $p$ alone, the optimal
+        threshold is prevalence-free.
+      prose: >-
+        With c_FN = 100 and c_FP = 1 the threshold is 1/101 = 0.009901, and the
+        measured cost-minimising threshold on 80,000 rows was 0.009901 — the
+        same number, because the model is calibrated. Note what this says about
+        balancing: a 50/50 training set is the hypothesis c_FN/c_FP =
+        (1-pi)/pi = 85.3, so balancing is a cost-aware procedure that guessed
+        the cost ratio instead of asking for it.
+    - title: "Why SMOTE cannot extend the minority region"
+      latex: |
+        Let $S = \{x_1,\dots,x_m\}$ be the real minority points and let
+        $C = \operatorname{conv}(S)$ be their convex hull. Every synthetic point
+        is
+        $$
+        x' = (1-\lambda)\,x_i + \lambda\,x_j, \qquad \lambda \in [0,1],\ x_i,x_j \in S .
+        $$
+        $C$ is convex, so $x_i, x_j \in C$ implies $x' \in C$. Hence
+        $S \cup S_{\text{syn}} \subseteq C$ and $\operatorname{conv}(S \cup
+        S_{\text{syn}}) = C$.
+      prose: >-
+        Oversampling by interpolation cannot enlarge the region your minority
+        occupies — it can only change the density inside it. Any classifier
+        whose boundary is determined by that density (k-NN, a tree, a forest)
+        can therefore move; any classifier that only needs the hull (a linear
+        model) cannot. That is exactly the 30% gain for 15-NN and the 0.5%
+        change for logistic regression on the same data.
+
+  implementations:
+    - language: python
+      title: "The four interventions, and how little they differ"
+      note: >-
+        This fits a plain logistic model from scratch, so the four interventions
+        are near-equivalent BY CONSTRUCTION — that is the point of the
+        experiment, not a bug in it. It is numerically wrong as a general claim:
+        swap in a k-NN and the ranking moves by 0.13 AP. The equivalence is a
+        property of the model class, not of resampling.
+      code: |
+        import numpy as np
+
+        def fit_logreg(X, y, w=None, l2=1e-8, iters=80):
+            """Newton/IRLS. w is a per-row weight, not a class weight."""
+            Xb = np.hstack([np.ones((len(X), 1)), X])
+            w = np.ones(len(y)) if w is None else np.asarray(w, float)
+            beta = np.zeros(Xb.shape[1])
+            for _ in range(iters):
+                p = 1.0 / (1.0 + np.exp(-(Xb @ beta)))
+                g = Xb.T @ (w * (p - y))
+                H = (Xb * (w * p * (1 - p))[:, None]).T @ Xb
+                H += l2 * np.eye(H.shape[0])
+                step = np.linalg.solve(H, g)
+                beta -= step
+                if np.max(np.abs(step)) < 1e-13:
+                    break
+            return beta
+
+        def predict(beta, X):
+            Xb = np.hstack([np.ones((len(X), 1)), X])
+            return 1.0 / (1.0 + np.exp(-(Xb @ beta)))
+
+        def average_precision(y, s):
+            o = np.argsort(-np.asarray(s, float), kind="mergesort")
+            y = np.asarray(y).astype(int)[o]
+            tp = np.cumsum(y)
+            fp = np.cumsum(1 - y)
+            prec = tp / np.maximum(tp + fp, 1)
+            rec = tp / max(int(y.sum()), 1)
+            out, prev = 0.0, 0.0
+            for i in range(len(y)):
+                if y[i] == 1:
+                    out += prec[i] * (rec[i] - prev)
+                    prev = rec[i]
+            return float(out)
+
+        def smote(Xm, k, n_syn, seed=0):
+            """Interpolate inside the minority hull. Cannot leave it."""
+            rng = np.random.default_rng(seed)
+            m = len(Xm)
+            k = min(k, m - 1)
+            D = ((Xm[:, None, :] - Xm[None, :, :]) ** 2).sum(-1)
+            np.fill_diagonal(D, np.inf)
+            nn = np.argsort(D, axis=1, kind="mergesort")[:, :k]
+            out = np.empty((n_syn, Xm.shape[1]))
+            for i in range(n_syn):
+                a = int(rng.integers(0, m))
+                b = int(nn[a, rng.integers(0, k)])
+                lam = float(rng.random())
+                out[i] = Xm[a] + lam * (Xm[b] - Xm[a])
+            return out
+
+        def compare(Xtr, ytr, Xte, yte, seed=0):
+            pos = np.where(ytr == 1)[0]
+            neg = np.where(ytr == 0)[0]
+            k = len(neg) / len(pos)
+            base = fit_logreg(Xtr, ytr)
+
+            # 1. class weights
+            w_cw = fit_logreg(Xtr, ytr, w=np.where(ytr == 1, k, 1.0))
+
+            # 2. random oversampling, k copies of every positive
+            rep = max(int(round(k)) - 1, 0)
+            Xos = np.vstack([Xtr] + [Xtr[pos]] * rep)
+            yos = np.concatenate([ytr] + [np.ones(len(pos), int)] * rep)
+            w_os = fit_logreg(Xos, yos)
+
+            # 3. SMOTE
+            S = smote(Xtr[pos], 5, len(pos) * rep, seed=seed)
+            Xsm = np.vstack([Xtr, S])
+            ysm = np.concatenate([ytr, np.ones(len(S), int)])
+            w_sm = fit_logreg(Xsm, ysm)
+
+            out = {}
+            for name, beta in [("raw", base), ("weights", w_cw),
+                               ("oversample", w_os), ("smote", w_sm)]:
+                s = predict(beta, Xte)
+                pred = (s > 0.5).astype(int)
+                out[name] = {
+                    "ap": average_precision(yte, s),
+                    "flagged": int(pred.sum()),
+                    "recall": float(((pred == 1) & (yte == 1)).sum() / yte.sum()),
+                }
+            # The threshold the oversampled model is really using.
+            out["oversample"]["equivalent_raw_threshold"] = 1.0 / (1.0 + k)
+            return out
+    - language: python
+      title: "SMOTE with the two diagnostics nobody runs"
+      note: >-
+        Numerically wrong on categorical features: the midpoint of the one-hot
+        rows [1,0,0] and [0,1,0] is [0.5,0.5,0], which is not a category, and
+        any model will consume it as if it were. It is also wrong when k is at
+        least the size of the smallest minority cluster — the neighbour graph
+        then crosses empty space, and 20.2% of the synthetic points land where
+        the data says the class does not exist.
+      code: |
+        import numpy as np
+
+        def smote(Xm, k, n_syn, seed=0):
+            rng = np.random.default_rng(seed)
+            m = len(Xm)
+            k = min(k, m - 1)
+            D = ((Xm[:, None, :] - Xm[None, :, :]) ** 2).sum(-1)
+            np.fill_diagonal(D, np.inf)
+            nn = np.argsort(D, axis=1, kind="mergesort")[:, :k]
+            out = np.empty((n_syn, Xm.shape[1]))
+            for i in range(n_syn):
+                a = int(rng.integers(0, m))
+                b = int(nn[a, rng.integers(0, k)])
+                lam = float(rng.random())
+                out[i] = Xm[a] + lam * (Xm[b] - Xm[a])
+            return out
+
+        def hull_check(Xm, S, tol=1e-9):
+            """Fraction of synthetic rows inside the per-feature box.
+
+            Cheap lower bound on the convex-hull statement. Any value below 1.0
+            means the interpolation code is not doing what SMOTE is supposed to
+            do (a common symptom: sampling two random points instead of one
+            point and one neighbour).
+            """
+            inside = ((S >= Xm.min(0) - tol) & (S <= Xm.max(0) + tol)).all(1)
+            return float(inside.mean())
+
+        def reach_check(Xm, S):
+            """How far outside the real data the synthetic points reach.
+
+            Baseline: the median nearest-neighbour distance among the real
+            positives. Synthetic points sit BETWEEN real ones, so on a unimodal
+            6-D minority this ratio is 0.73 — below 1, as it should be. On two
+            clusters of 4 points 8.0 apart with k = 5 it is 12.4, which is the
+            signature of k bridging empty space.
+            """
+            Dm = np.sqrt(((Xm[:, None, :] - Xm[None, :, :]) ** 2).sum(-1))
+            np.fill_diagonal(Dm, np.inf)
+            scale = float(np.median(Dm.min(1)))
+            Ds = np.sqrt(((S[:, None, :] - Xm[None, :, :]) ** 2).sum(-1)).min(1)
+            p95 = float(np.percentile(Ds, 95))
+            return {"real_nn_median": scale, "synthetic_p95": p95,
+                    "reach_ratio": p95 / scale}
+    - language: python
+      title: "Prior correction, and the version that is numerically wrong"
+      note: >-
+        The naive rescale p * pi_target / pi_train is WRONG, not merely
+        approximate: it is not a probability transform (it exceeds 1 whenever
+        pi_target > pi_train) and its error changes sign with p — too low for
+        confident positives, too high for weak ones. On the reference case it
+        returns a mean of 0.00753 where the correct value is 0.01217, 38% low,
+        and ECE 0.00467 against 0.00048 — ten times worse, but still small,
+        which is exactly why ECE alone is not enough of a check.
+      code: |
+        import numpy as np
+
+        def prior_correct(probs, train_prevalence, target_prevalence, eps=1e-12):
+            """Exact odds rescale from the training prior to the deployment prior.
+
+            p = sigmoid(logit(p_s) + log(pi_t/(1-pi_t)) - log(pi_s/(1-pi_s)))
+            """
+            p = np.clip(np.asarray(probs, float), eps, 1 - eps)
+            pi_s = min(max(float(train_prevalence), eps), 1 - eps)
+            pi_t = min(max(float(target_prevalence), eps), 1 - eps)
+            odds = p / (1 - p)
+            odds *= (pi_t / (1 - pi_t)) / (pi_s / (1 - pi_s))
+            return odds / (1 + odds)
+
+        def naive_rescale(probs, train_prevalence, target_prevalence):
+            """WRONG. Kept so you can see how wrong, in numbers."""
+            return np.asarray(probs, float) * target_prevalence / train_prevalence
+
+        def expected_calibration_error(y_true, probs, bins=15):
+            y = np.asarray(y_true, dtype=float)
+            p = np.asarray(probs, dtype=float)
+            idx = np.clip((p * bins).astype(int), 0, bins - 1)
+            e = 0.0
+            for b in range(bins):
+                m = idx == b
+                if m.any():
+                    e += (m.sum() / len(p)) * abs(p[m].mean() - y[m].mean())
+            return float(e)
+
+        # Measured on 80,000 rows at 1.22% prevalence, from a 50/50 resample:
+        #   mean(p_balanced)                 0.3080
+        #   mean(prior_correct(...))         0.01217   (truth 0.0122)
+        #   mean(naive_rescale(...))         0.00753   <- 38% low
+        #   ECE 0.2958 -> 0.00048, AUC 0.8610 -> 0.8610 (ranking untouched)
+
+  checkpoints:
+    - id: cp-1
+      question: "Your model has ROC-AUC 0.861 and AP 0.151 at 1.22% prevalence. Is 0.151 bad?"
+      answerKind: short_text
+      hint: "What does a random ranker score on AP at 1.22% prevalence?"
+      solution: >-
+        No. A random ranker's AP equals the prevalence, so 0.151 is 12.4x
+        better than chance — a genuinely strong ranker. AP cannot go far above
+        the base rate when precision itself is capped by it. Compare against
+        the prevalence baseline, never against 1.0, and never against the AP of
+        a model evaluated at a different prevalence.
+    - id: cp-2
+      question: "Class weights took recall from 0.0205 to 0.7797 and AP from 0.1510 to 0.1502. What happened?"
+      answerKind: short_text
+      hint: "Weighting positives by k shifts the intercept by log k. What does a threshold do?"
+      solution: >-
+        The threshold moved; the model did not. Weighting positives by
+        k = 85.269 shifted the intercept by 4.4431 against a predicted
+        log k = 4.4458, and left every slope within 0.0245. So the weighted
+        model at 0.5 is the unweighted model at 1/(1+k) = 0.01159 — the same
+        operating point, reached without retraining. AP barely moved because
+        the ranking barely moved. That is not a failure; it is the mechanism.
+    - id: cp-3
+      question: "You resample the test set to 50/50 'so the evaluation is not biased'. What have you just reported?"
+      answerKind: short_text
+      hint: "Which axis of the PR curve depends on the number of negatives?"
+      solution: >-
+        A different question. The predictions are unchanged but AP went from
+        0.1510 to 0.8691 while ROC-AUC stayed at 0.8611 versus 0.8677. Precision
+        conditions on being flagged, so it depends on how many negatives exist;
+        ROC conditions on one of each class, so it does not. You have measured
+        performance in a world where fraud is as common as honesty, which is not
+        the world the model will be deployed in.
+    - id: cp-4
+      question: "SMOTE produced 116,844 synthetic positives and AP moved by 0.0008. Why so little?"
+      answerKind: short_text
+      hint: "Where can a convex combination of two positives possibly land?"
+      solution: >-
+        Inside the convex hull of the minority class. SMOTE changes the density
+        inside the region the minority already occupies; it cannot extend that
+        region. A linear boundary is fixed by the hull and its orientation, so
+        filling the interior changes nothing but the intercept. AP moved by
+        0.5%. The same SMOTE on a 15-NN over a compact 2-D minority moved AP
+        from 0.4384 to 0.5683, because k-NN votes on local density and that is
+        the only thing SMOTE changes.
+    - id: cp-5
+      question: "At 1.22% prevalence, why does the cost-optimal threshold not depend on the prevalence?"
+      answerKind: short_text
+      hint: "Write the expected cost of flagging one example in terms of its probability."
+      solution: >-
+        Flag when c_FP(1-p) < c_FN p, which rearranges to p > c_FP/(c_FN+c_FP).
+        Prevalence never enters because p is already the calibrated posterior —
+        it has absorbed the base rate. With 100:1 costs the threshold is
+        1/101 = 0.009901, and the empirically cost-minimising threshold on
+        80,000 rows was 0.009901. This is also why balancing is not
+        prevalence-free in the same way: a 50/50 training set asserts
+        c_FN/c_FP = (1-pi)/pi = 85.3.
+    - id: cp-6
+      question: "A colleague reports AP improved from 0.150 to 0.153 after switching from class weights to SMOTE. Do you believe it?"
+      answerKind: short_text
+      hint: "How many positives are in the test set, and what is the bootstrap standard deviation of AP?"
+      solution: >-
+        No. With 976 positives the bootstrap standard deviation of AP is 0.0117
+        (95% interval [0.1285, 0.1772] around 0.1510). A 0.003 gap is 0.26
+        standard deviations — indistinguishable from noise. To resolve a
+        difference that small you would need roughly 16x the positives, since
+        the standard deviation falls as 1/sqrt(n_pos). The honest report is
+        "no measurable difference", and that is a result, not a failure.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Ask what imbalance actually damages. It is not the model's ability to
+        rank — a well-trained model on 1% positives can rank perfectly well. It
+        is two inherited defaults: a decision threshold of 0.5, which silently
+        asserts that a miss and a false alarm cost the same, and a metric
+        (accuracy) that averages over a population that is 98.8% negatives.
+        Everything else — resampling, class weights, SMOTE — acts on those two
+        things, mostly indirectly.
+      blocks:
+        - kind: checklist
+          body: |
+            - Imbalance breaks the THRESHOLD, not the ranking
+            - Imbalance breaks ACCURACY, not AP
+            - Resampling changes the effective prior
+            - For a logistic model, changing the prior moves only the intercept
+            - SMOTE interpolates inside the minority hull; it cannot extend it
+            - The test set is never resampled
+      checkpoint: >-
+        If resampling cannot add information, and the model's ranking is
+        unchanged, why does anyone do it at all? Name two legitimate reasons
+        before reading on.
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Three levers, in order of power and cost. (1) Move the threshold, chosen
+        from a cost ratio — free, exact, and usually sufficient. (2) Reweight
+        the loss — the same move, for when the threshold is not yours to set.
+        (3) Resample — which only earns its keep when the learner is local
+        (k-NN, tree, forest) and the minority is continuous and unimodal, and
+        even then must be measured against a bootstrap interval. If you cannot
+        state c_FN/c_FP, you cannot choose any of them correctly, and that is
+        the conversation to have first.
+      blocks:
+        - kind: checklist
+          body: |
+            - Can you state the cost ratio? -> threshold = c_FP/(c_FN+c_FP)
+            - Is the threshold hard-coded by a vendor? -> class weights
+            - Is the learner local (kNN/tree/forest)? -> SMOTE might help
+            - Is the learner linear? -> resampling is a threshold, full stop
+            - Is the minority multimodal or categorical? -> SMOTE is harmful
+            - Always -> correct the prior, then check ECE
+      checkpoint: >-
+        Which of the three levers changes the model's ranking? For which model
+        classes is the answer "none of them"?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The measurement protocol matters more than the algorithm. Split first,
+        resample the training fold only, and compare variants on the same
+        untouched test set with an interval attached.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. Baselines, before any model
+            accuracy_zero = 1 - mean(y_test)          # 0.9878
+            ap_random     = mean(y_test)               # 0.0122
+
+            # 2. The free fix
+            k = n_neg / n_pos
+            t_star = c_fp / (c_fn + c_fp)              # 1/101 with 100:1
+            report(confusion(y_test, scores > t_star)) # counts, not rates
+
+            # 3. Resampling, train fold only
+            for method in [class_weights, oversample, smote]:
+                model = fit(resample(X_train, method))
+                scores = model.predict(X_test)          # NEVER resampled
+                ap     = average_precision(y_test, scores)
+                boot   = bootstrap_sd(ap, n=300)
+                print(method, ap, boot)
+
+            # 4. Repair the probabilities. pi_eff is the RESAMPLED prior the
+            #    model was actually fitted to, not the original pi_train.
+            p = prior_correct(model.predict_proba(X_test), pi_eff, pi_test)
+            assert abs(p.mean() - mean(y_test)) < 0.002
+      checkpoint: >-
+        Why does step 3 print a bootstrap standard deviation next to every AP?
+        What decision does that number change?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The three identities that make this topic arithmetic instead of folklore:
+        the log-odds shift from a prior change, the cost-optimal threshold, and
+        the convex-hull bound on SMOTE.
+      blocks:
+        - kind: math
+          body: |
+            **Prior change = intercept shift.**
+            $$\frac{\tilde P(1\mid x)}{\tilde P(0\mid x)}
+              = \frac{P(1\mid x)}{P(0\mid x)} \cdot
+              \frac{\tilde\pi/(1-\tilde\pi)}{\pi/(1-\pi)}$$
+            The factor is independent of $x$, so
+            $\operatorname{logit}\tilde P = \operatorname{logit} P + \log k$.
+            For a logistic model, that is the intercept and nothing else.
+
+            **Cost-optimal threshold.** Flag iff
+            $c_{FP}(1-p) < c_{FN}p$, i.e.
+            $$p > \frac{c_{FP}}{c_{FN}+c_{FP}}$$
+            which contains no $\pi$: the base rate is already inside $p$.
+
+            **SMOTE cannot leave the hull.** With
+            $x' = (1-\lambda)x_i + \lambda x_j$ and $x_i,x_j \in C$ convex,
+            $x' \in C$, so $\operatorname{conv}(S \cup S_{\text{syn}}) = C$.
+      checkpoint: >-
+        The prior-shift derivation says only the intercept moves. Then why does
+        class weighting change the boundary of a decision tree? Identify the
+        assumption that the derivation silently uses.
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete treatment harness: baselines, the free threshold fix, the
+        three resampling variants with an interval, and the prior repair. Read
+        the printed order, not just the code.
+      blocks:
+        - kind: warning
+          body: >-
+            The most important line in this code is the one that does NOT
+            resample X_test. Every other mistake in this topic is recoverable;
+            that one produces a number you will put in a slide deck.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def fit_logreg(X, y, w=None, l2=1e-8, iters=80):
+                Xb = np.hstack([np.ones((len(X), 1)), X])
+                w = np.ones(len(y)) if w is None else np.asarray(w, float)
+                beta = np.zeros(Xb.shape[1])
+                for _ in range(iters):
+                    p = 1.0 / (1.0 + np.exp(-(Xb @ beta)))
+                    g = Xb.T @ (w * (p - y))
+                    H = (Xb * (w * p * (1 - p))[:, None]).T @ Xb
+                    H += l2 * np.eye(H.shape[0])
+                    step = np.linalg.solve(H, g)
+                    beta -= step
+                    if np.max(np.abs(step)) < 1e-13:
+                        break
+                return beta
+
+            def predict(beta, X):
+                Xb = np.hstack([np.ones((len(X), 1)), X])
+                return 1.0 / (1.0 + np.exp(-(Xb @ beta)))
+
+            def average_precision(y, s):
+                o = np.argsort(-np.asarray(s, float), kind="mergesort")
+                y = np.asarray(y).astype(int)[o]
+                tp = np.cumsum(y); fp = np.cumsum(1 - y)
+                prec = tp / np.maximum(tp + fp, 1)
+                rec = tp / max(int(y.sum()), 1)
+                out, prev = 0.0, 0.0
+                for i in range(len(y)):
+                    if y[i] == 1:
+                        out += prec[i] * (rec[i] - prev)
+                        prev = rec[i]
+                return float(out)
+
+            def prior_correct(p, pi_s, pi_t, eps=1e-12):
+                p = np.clip(np.asarray(p, float), eps, 1 - eps)
+                o = (p / (1 - p)) * ((pi_t / (1 - pi_t)) / (pi_s / (1 - pi_s)))
+                return o / (1 + o)
+
+            def bootstrap_sd(y, s, n=300, seed=0):
+                rng = np.random.default_rng(seed)
+                vals = []
+                for _ in range(n):
+                    i = rng.integers(0, len(y), len(y))
+                    if y[i].sum():
+                        vals.append(average_precision(y[i], s[i]))
+                return float(np.std(vals, ddof=1))
+
+            def treatment_report(Xtr, ytr, Xte, yte, c_fn=100.0, c_fp=1.0, seed=3):
+                pi_s = float(ytr.mean()); pi_t = float(yte.mean())
+                k = (1 - pi_s) / pi_s
+                # The prior the weighted model is actually calibrated to.
+                pi_eff = (k * pi_s) / (k * pi_s + (1 - pi_s))
+
+                # -- baseline, computed before anything else
+                out = {"constant_zero_accuracy": 1.0 - pi_t,
+                       "ap_random": pi_t}
+
+                base = fit_logreg(Xtr, ytr)
+                s = predict(base, Xte)
+                out["ap"] = average_precision(yte, s)
+                out["ap_bootstrap_sd"] = bootstrap_sd(yte, s, seed=seed)
+
+                # -- the free fix: threshold from costs
+                t_star = c_fp / (c_fn + c_fp)
+                pred = (s > t_star).astype(int)
+                out["t_star"] = t_star
+                out["tp"] = int(((pred == 1) & (yte == 1)).sum())
+                out["fp"] = int(((pred == 1) & (yte == 0)).sum())
+                out["fn"] = int(((pred == 0) & (yte == 1)).sum())
+
+                # -- the paid fix: weights, for when you cannot move t
+                w_beta = fit_logreg(Xtr, ytr, w=np.where(ytr == 1, k, 1.0))
+                out["weights_ap"] = average_precision(yte, predict(w_beta, Xte))
+                out["intercept_shift"] = float(w_beta[0] - base[0])
+                out["log_k"] = float(np.log(k))
+
+                # -- calibration repair. Note pi_eff, not pi_s: the weighted
+                # model's probabilities refer to the BALANCED prior, so
+                # correcting from pi_s would be a no-op and would leave the
+                # outputs at ~0.32 instead of ~0.012.
+                p_corr = prior_correct(predict(w_beta, Xte), pi_eff, pi_t)
+                out["mean_p_corrected"] = float(p_corr.mean())
+                out["mean_p_target"] = pi_t
+                return out
+
+            # Reported, in order:
+            #   constant_zero_accuracy 0.9878
+            #   ap 0.1510   ap_bootstrap_sd 0.0117
+            #   t_star 0.009901 -> tp 800, fp 20267, fn 176
+            #   weights_ap 0.1502   intercept_shift 4.4431 (log_k 4.4458)
+            #   mean_p_corrected 0.01217 (target 0.0122)
+      checkpoint: >-
+        The harness reports the constant-zero accuracy and the random-AP
+        baseline. Which of the two would you drop if the audience is a product
+        manager, and which would you keep if the audience is an ML engineer?
+        Argue both.
+
+  problems:
+    - id: p-prior-correct
+      title: "Correct probabilities across a prior shift"
+      difficulty: medium
+      prompt: >-
+        A model was trained on a resampled set with positive rate
+        `train_prevalence`, and its outputs must be interpreted at the deployment
+        rate `target_prevalence`. Implement `prior_correct(probs,
+        train_prevalence, target_prevalence)` returning a list of corrected
+        probabilities, using the exact odds rescale
+
+        $$\text{odds}' = \text{odds}\cdot
+        \frac{\pi_t/(1-\pi_t)}{\pi_s/(1-\pi_s)},\qquad p' = \frac{\text{odds}'}{1+\text{odds}'}.$$
+
+        Clip inputs to `[1e-12, 1 - 1e-12]` before the transform so that 0.0 and
+        1.0 are handled without division by zero, and return plain floats. When
+        the two prevalences are equal the result must be the input (to within
+        the clipping).
+      starter: |
+        import numpy as np
+
+        def prior_correct(probs, train_prevalence, target_prevalence):
+            # your implementation here
+            pass
+      language: python
+      entry: prior_correct
+      testCases:
+        - input: '[[0.9, 0.5, 0.1], 0.5, 0.01]'
+          expected: "[0.08333333333333337, 0.01, 0.0011210762331838565]"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.2, 0.8], 0.01, 0.01]'
+          expected: "[0.2, 0.8]"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.0, 1.0, 0.5], 0.5, 0.5]'
+          expected: "[1e-12, 0.999999999999, 0.5]"
+          mode: json
+          tolerance: 1e-09
+        - input: '[[0.308], 0.5, 0.0122]'
+          expected: "[0.005467069548294582]"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def prior_correct(probs, train_prevalence, target_prevalence, eps=1e-12):
+            p = np.clip(np.asarray(probs, dtype=float), eps, 1.0 - eps)
+            pi_s = min(max(float(train_prevalence), eps), 1.0 - eps)
+            pi_t = min(max(float(target_prevalence), eps), 1.0 - eps)
+            odds = p / (1.0 - p)
+            odds = odds * (pi_t / (1.0 - pi_t)) / (pi_s / (1.0 - pi_s))
+            return [float(x) for x in odds / (1.0 + odds)]
+      solutionExplanation: >-
+        This is the identity that makes resampling invertible. A model trained at
+        pi_s encodes P(y=1|x) under the pi_s prior; Bayes says the odds at the
+        pi_t prior are the pi_s odds times one constant. The first case is the
+        one to stare at: 0.9 at a 50/50 prior becomes 0.0833 at a 1% prior, and
+        0.5 becomes exactly 0.01 — the prior itself, which is what a
+        non-informative score should become. The naive alternative,
+        p * pi_t / pi_s, gives 0.018 for the first value (4.6x too low), 0.01
+        for the second (right only by coincidence, because p equals pi_s there)
+        and 0.002 for the third (1.8x too high). The error changes sign with p,
+        which is the signature of applying a linear map to an odds-scale
+        problem — and it can exceed 1, which no probability transform may do.
+      complexity: "O(n) time, O(n) space"
+      tags: [calibration, prior-shift, resampling, numpy]
+
+    - id: p-smote
+      title: "SMOTE interpolation, with the k clamp"
+      difficulty: medium
+      prompt: >-
+        Implement `smote(X, k, n_synthetic, seed)` returning `n_synthetic`
+        synthetic rows, each a uniform point on the segment between a real row
+        and one of its `k` nearest neighbour real rows. Follow this protocol
+        exactly, because the expected values depend on the random stream:
+
+        1. `kk = min(k, len(X) - 1)`. If `len(X) < 2` or `n_synthetic <= 0`,
+           return `[]`.
+        2. Build the neighbour lists from squared Euclidean distances, excluding
+           the point itself (set its self-distance to infinity), sorted with
+           `np.argsort(..., kind="mergesort")` so ties break by index. Take the
+           first `kk` columns.
+        3. `rng = np.random.default_rng(seed)`. For each synthetic row, draw in
+           exactly this order: `a = int(rng.integers(0, len(X)))`, then
+           `b = int(rng.integers(0, kk))` (an index into row `a`'s neighbour
+           list), then `lam = float(rng.random())`.
+        4. Emit `X[a] + lam * (X[nn[a, b]] - X[a])` as floats.
+
+        Return a list of lists (an empty list for the degenerate cases).
+      starter: |
+        import numpy as np
+
+        def smote(X, k, n_synthetic, seed=0):
+            # your implementation here
+            pass
+      language: python
+      entry: smote
+      testCases:
+        - input: '[[[0.0], [2.0]], 1, 3, 0]'
+          expected: "[[1.4604265724722594], [1.9180529521276106], [1.6265404784005448]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[0.0, 0.0], [1.0, 1.0], [3.0, -1.0]], 5, 4, 7]'
+          expected: "[[0.30835859709127345, -0.10278619903042452], [1.4504143799811837, 0.5495856200188163], [0.8735534453962619, 0.8735534453962619], [1.3575431632344674, 0.6424568367655326]]"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[1.0, 2.0]], 1, 5, 0]'
+          expected: "[]"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[[0.0], [1.0]], 1, 2, 0]'
+          expected: "[[0.7302132862361297], [0.9590264760638053]]"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def smote(X, k, n_synthetic, seed=0):
+            Xm = np.asarray(X, dtype=float)
+            m = Xm.shape[0]
+            if m < 2 or int(n_synthetic) <= 0:
+                return []
+            kk = min(int(k), m - 1)
+            D = ((Xm[:, None, :] - Xm[None, :, :]) ** 2).sum(-1)
+            np.fill_diagonal(D, np.inf)
+            nn = np.argsort(D, axis=1, kind="mergesort")[:, :kk]
+            rng = np.random.default_rng(seed)
+            out = np.empty((int(n_synthetic), Xm.shape[1]))
+            for i in range(int(n_synthetic)):
+                a = int(rng.integers(0, m))
+                b = int(nn[a, rng.integers(0, kk)])
+                lam = float(rng.random())
+                out[i] = Xm[a] + lam * (Xm[b] - Xm[a])
+            return out.tolist()
+      solutionExplanation: >-
+        The clamp is not defensive programming, it is the algorithm's actual
+        constraint: with fewer than k+1 minority points, "the k nearest
+        neighbours" does not exist, and every real implementation silently
+        reduces k. The third case is the degenerate one — a single minority point
+        has no segment to interpolate along, so no synthetic point can be
+        manufactured without leaving the hull (which is empty: it is a point).
+        Note that every output lies between two real rows on every coordinate,
+        because lambda is in [0,1]; if your implementation samples two random
+        points instead of one point and one neighbour, the outputs will leave
+        that range, which is the cheapest possible bug check.
+      complexity: "O(m²d) time for the neighbour graph, O(n_synthetic·d) after"
+      tags: [smote, oversampling, interpolation, numpy]
+
+    - id: p-cost-threshold
+      title: "The threshold that minimises expected cost"
+      difficulty: medium
+      prompt: >-
+        Implement `cost_threshold(y_true, probs, c_fn, c_fp)` returning
+        `{"threshold": float, "cost": float}`.
+
+        Candidate thresholds are the distinct values in `probs`, plus
+        `max(probs) + 1.0` (which flags nothing). For a candidate `t`, predict
+        positive when `probs >= t`, count false negatives and false positives,
+        and score `c_fn * fn + c_fp * fp`. Return the threshold with the lowest
+        cost. **On a tie, return the largest such threshold** — fewer alerts for
+        the same money. Empty input returns `{"threshold": 0.0, "cost": 0.0}`.
+      starter: |
+        import numpy as np
+
+        def cost_threshold(y_true, probs, c_fn, c_fp):
+            # your implementation here
+            pass
+      language: python
+      entry: cost_threshold
+      testCases:
+        - input: '[[0, 0, 1, 1], [0.1, 0.4, 0.35, 0.8], 10, 1]'
+          expected: '{"threshold": 0.35, "cost": 1.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0, 0, 1, 1], [0.1, 0.4, 0.35, 0.8], 1, 1]'
+          expected: '{"threshold": 0.8, "cost": 1.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[1, 0], [0.2, 0.9], 1, 100]'
+          expected: '{"threshold": 1.9, "cost": 1.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0, 1], [0.2, 0.9], 1, 1]'
+          expected: '{"threshold": 0.9, "cost": 0.0}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def cost_threshold(y_true, probs, c_fn, c_fp):
+            y = np.asarray(y_true).astype(int)
+            p = np.asarray(probs, dtype=float)
+            if y.size == 0:
+                return {"threshold": 0.0, "cost": 0.0}
+            cands = np.append(np.unique(p), float(p.max()) + 1.0)
+            best_cost = None
+            best_t = None
+            for t in cands:
+                pred = (p >= t).astype(int)
+                fn = int(((pred == 0) & (y == 1)).sum())
+                fp = int(((pred == 1) & (y == 0)).sum())
+                cost = float(c_fn) * fn + float(c_fp) * fp
+                if best_cost is None or cost < best_cost or (
+                    cost == best_cost and t > best_t
+                ):
+                    best_cost = cost
+                    best_t = float(t)
+            return {"threshold": best_t, "cost": best_cost}
+      solutionExplanation: >-
+        The cost is a step function of the threshold with a breakpoint at every
+        observed score, so the minimum is always attained at one of them — no
+        search over a grid is needed, and a grid is how people silently miss the
+        optimum. The second case is the tie: at 1:1 costs, t = 0.35 and t = 0.8
+        both cost 1 (one error either way), and the rule returns 0.8 because it
+        flags one row instead of three. The third case is the one people forget
+        to handle: when a false alarm costs 100x a miss, the cheapest model is
+        the one you never deploy, and the `max + 1` candidate is what represents
+        it. This is also the free alternative to resampling — with calibrated
+        probabilities, the answer is c_fp/(c_fn+c_fp) in closed form.
+      complexity: "O(n log n + n·u) with u distinct scores; O(n log n) with a sweep"
+      tags: [cost-sensitive, threshold, operating-point, imbalance]
+
+  visualizers:
+    - id: vs-threshold-sweep
+      kind: loss_surface
+      title: "Move the threshold, watch precision and recall trade"
+      description: >-
+        Sweep the decision threshold on a model with 1.22% prevalence and watch
+        recall fall as precision rises — while accuracy climbs toward the
+        constant-zero baseline of 0.9878. The point where the accuracy curve
+        peaks is the point where the model does nothing.
+      params:
+        prevalence: 0.0122
+        constantZeroAccuracy: 0.9878
+        optimalThreshold: 0.009901
+
+  try_it: >-
+    Fit on the 1.22% prevalence data, then sweep the threshold from 0.5 down to
+    0.0099 on the same fitted model and record recall, precision and ROC-AUC at
+    each step. Recall moves off 0.0205 while ROC-AUC does not budge — write down
+    why the ranking was never the problem.
+  interview_questions:
+    - question: "Does class imbalance damage a model's ranking?"
+      level: mid
+      key_points:
+        - "No: the ranking is unchanged, which is why ROC-AUC stayed at 0.8611, 0.8612, 0.8621, 0.8555 and 0.8677 as the positive rate went 1.22% → 50%."
+        - "What imbalance damages is the default threshold: at 0.5 a calibrated model flags 30 of 80,000 rows and catches 20 of 976 positives, recall 0.0205."
+        - "Moving the threshold to 0.0099 on the same weights changes what is caught without changing a single coefficient."
+        - "So 'the model is broken' is usually a statement about a threshold nobody chose and a metric nobody picked."
+      follow_up: "If the ranking is fine, what does a resampled training set actually buy you?"
+    - question: "Class weights, random oversampling and SMOTE — same thing or different?"
+      level: senior
+      key_points:
+        - "Weights and random oversampling are the same intercept shift: the shift is $\\log k$, and weighting positives by $k = 85.269$ moved the intercept by 4.4431 against a predicted 4.4458, leaving other coefficients within 0.0245."
+        - "SMOTE interpolates, so every synthetic point is a convex combination of two real positives and cannot leave the minority convex hull — all 116,844 synthetic points fell inside the per-feature box."
+        - "SMOTE helps only where the decision surface is local: a correctly specified logistic model moved AP from 0.1510 to 0.1502, a 0.5% change."
+        - "The differences people argue about sit inside the noise: AP 0.1510 has a bootstrap standard deviation of 0.0117, and the three methods landed within 0.0008 AP of each other."
+      follow_up: "Your minority class is genuinely multimodal. Which of the three would you reach for, and what would you check afterwards?"
+    - question: "Why is PR-AUC the right summary here rather than ROC-AUC?"
+      level: mid
+      key_points:
+        - "Precision is the operator's cost: every false positive is a person or a transaction you acted on."
+        - "Precision is bounded by the base rate, so at the cost-optimal threshold a TPR of 0.8197 with precision 0.0380 implies an FPR of 0.2565 — arithmetic, not weakness."
+        - "AP summarises that trade-off across every threshold, while ROC-AUC's prevalence invariance hides it."
+        - "The same predictions scored against increasing positive rates gave AP 0.1510 → 0.2716 → 0.5018, so AP must be reported at the deployment prevalence."
+  common_mistakes:
+    - "Rebalancing the evaluation set, which moved AP from 0.1510 to 0.8691 while ROC-AUC stayed near 0.86 — the model did not get better."
+    - "Reporting a recall jump from 2% to 78% after balancing as an improvement, when only the cut point moved."
+    - "Trusting an undersampled precision estimate computed from the 1.17% of negatives that survived undersampling."
+  further_reading:
+    - label: "Chawla, Bowyer, Hall & Kegelmeyer, SMOTE: Synthetic Minority Over-sampling Technique (JAIR, 2002)"
+    - label: "He & Garcia, Learning from Imbalanced Data (IEEE Transactions on Knowledge and Data Engineering, 2009)"

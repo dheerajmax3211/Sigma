@@ -1,0 +1,1015 @@
+id: backpropagation
+slug: backpropagation
+title: "Backpropagation by Hand: One VJP per Node, Every Path Summed"
+summary: >-
+  Differentiate a small network on paper and in code by walking its computation
+  graph backwards — one vector–Jacobian product per node, in reverse topological
+  order, with every path a parameter takes summed into one accumulator.
+kind: lesson
+difficulty: hard
+position: 11
+estMinutes: 24
+prerequisites: [matrix-calculus, gradient-descent-variants]
+phase: mathematical-foundations
+tags: [backpropagation, chain-rule, autodiff, computational-graph, tied-weights, gradients]
+
+body:
+  big_idea: >-
+    One vector–Jacobian product per node in reverse order is the whole of backprop, and
+    a weight used twice whose contributions are assigned rather than summed learns at
+    half strength.
+
+  problem:
+    - "`loss.backward()` raises *a variable needed for gradient computation has been modified by an inplace operation*, and you do not know what backward was holding."
+    - "Your two-layer net trains and the loss falls, but the second layer converges to half the magnitude you derived: `dW` was assigned twice, not accumulated."
+    - "Backprop a two-layer MLP by hand: which array is summed, which transposed, where the batch axis goes, and what happens to a matrix used twice."
+
+  analogy: |
+    A factory ships parts 0.30 out of spec and wants to blame one machine. The
+    dock inspector hands the last station a rate: each unit of output error
+    costs 0.30. That station knows its output moves 0.5 per unit of input, so it
+    passes back 0.15; every station multiplies the number it received by its own
+    local sensitivity and passes the product upstream. That is a VJP.
+
+  concept_points:
+    - "**One VJP per node, in reverse topological order.** For a graph with $N$ nodes and $E$ edges the backward pass is one vector–Jacobian product per edge — also $O(E)$, at a constant near two. A two-layer MLP with $10^6$ parameters costs about three forward passes; central differences cost $2\\times10^6$, a factor of 666,667."
+    - "**The cotangent is a row vector: $g_{\\text{in}} = g_{\\text{out}} J$.** For $Z = XW$ with $X \\in \\mathbb{R}^{n \\times d}$, $g_X = g_Z W^\\top$ is $(n,d)$ and $g_W = X^\\top g_Z$ is $(d,h)$. $gJ$ is a VJP; $Jg$ is a JVP that fails the shape check. The invariant: every gradient has the shape of the thing it differentiates."
+    - "**Local Jacobians are structured, so you never build them.** An elementwise activation's Jacobian is diagonal — at most $0.25$ for the sigmoid, exactly $0.25$ at $z=0$. A 4096-wide GELU would need $4096^2 = 16{,}777{,}216$ entries per sample; the diagonal is 4,096 numbers, a **4,096× saving**. A broadcast bias's VJP sums over the batch axis."
+    - "**Fan-out means sum.** If $h$ feeds two nodes, $\\partial L/\\partial h$ is the sum of both cotangents — the multivariate chain rule over a DAG. For $y = x + f(x)$, $\\partial L/\\partial x = g_y(1 + f'(x))$, where the $1$ is the identity path: with per-block derivative $0.9$ and no skip, fifty blocks leave $0.9^{50} = 0.00515$ of the gradient."
+    - "**A parameter used twice receives two contributions, and they add.** For $h_1 = Wx$, $h_2 = Wh_1$ with $W=2$, $x=0.5$, $y=1$, the two uses contribute $1+1=2$; overwrite and you get $1$ — exactly half, with a loss that still falls. Adam hides it, because scaling every gradient by $c$ leaves $\\hat m/\\sqrt{\\hat v}$ unchanged."
+    - "**The activation cache is the memory wall.** For a 7B model — 32 blocks, batch 8, sequence 2,048, width 4,096 in bf16 — one activation tensor is 134 MB, one per block 4.3 GB, and ten per block **43 GB**, three times the 14 GB of weights. Checkpointing buys $O(\\sqrt{L})$ storage for about 33% more compute."
+
+  definitions:
+    - { term: "Cotangent (adjoint)", meaning: "The derivative of the scalar loss with respect to one node's output, $\\bar z = \\partial L/\\partial z$. A row vector for a vector node, and always the same shape as that node. Backpropagation is the business of computing cotangents." }
+    - { term: "VJP (vector–Jacobian product)", meaning: "The map $g \\mapsto gJ$ for a Jacobian $J \\in \\mathbb{R}^{m\\times n}$ and a row vector $g \\in \\mathbb{R}^m$, producing a vector in $\\mathbb{R}^n$. It costs one matvec and never materialises $J$. Every backward function in every framework is one." }
+    - { term: "JVP (Jacobian–vector product)", meaning: "The map $v \\mapsto Jv$ for $v \\in \\mathbb{R}^n$, producing a vector in $\\mathbb{R}^m$. It is forward-mode differentiation: one column of the Jacobian per pass, which is the wrong direction when the output is a scalar." }
+    - { term: "Computation graph", meaning: "The DAG whose nodes are operations and whose edges carry tensors. A network is this graph, not the algebraic expression you would write for it — the graph is what makes the reverse sweep well defined when a value is used more than once." }
+    - { term: "Reverse topological order", meaning: "Any ordering in which every node appears before all of its inputs. The backward sweep must use one, because a node's cotangent is only complete once every consumer has contributed to it." }
+    - { term: "Local Jacobian", meaning: "The derivative of one node's output with respect to its own input, holding everything else fixed. It is the only thing a backward function needs to know about its op, and it is usually diagonal or a transpose rather than a stored matrix." }
+    - { term: "Reverse-mode automatic differentiation", meaning: "The general algorithm — forward pass with caching, then one VJP per node in reverse topological order — of which backpropagation is the special case applied to a scalar loss. It is exact to machine precision, unlike numerical differentiation." }
+    - { term: "Fan-out accumulation", meaning: "Summing the cotangents arriving at a node from all of its consumers. It is the multivariate chain rule: $\\partial L/\\partial x = \\sum_j (\\partial y_j/\\partial x)^\\top \\bar y_j$." }
+    - { term: "Tied weights", meaning: "One parameter array used at several places in the graph — an embedding tied to an output projection, or a recurrent matrix applied at every timestep. Its gradient is the sum over uses, and any implementation that assigns instead of adding is wrong by a factor that depends on the data." }
+    - { term: "Activation checkpointing (rematerialisation)", meaning: "Storing only every $k$-th layer's activations and recomputing the intermediate ones during the backward pass. Memory falls from $O(L)$ to $O(\\sqrt{L})$ at roughly 33% extra compute — the standard trade for training models that do not otherwise fit." }
+    - { term: "Gradient check", meaning: "Comparing an analytic gradient against a central finite difference on a few coordinates. Exact in principle, delicate in practice: the step size has an optimum at $\\epsilon_{\\text{mach}}^{1/3}$, and the check must perturb the *shared* array when a parameter is tied." }
+
+  diagrams:
+    - type: architecture
+      title: "The computation graph of the worked example, with every backward rule in place"
+      nodes:
+        - { id: W1, x: 0, y: 0, label: "W₁ (2×2)", kind: storage, detail: "[[1, −1], [−1, 1]]. Backward: g_W1 = g_Z1ᵀ X, shape (2,2) — the shape of W₁, as it must be." }
+        - { id: x, x: 0, y: 1, label: "x = (1, 1)", kind: client, detail: "Input, shape (2,). Cached twice over: z₁ needs it forward, and g_W1 = g_Z1ᵀ X needs it again backward." }
+        - { id: b1, x: 0, y: 2, label: "b₁ = (0, 0)", kind: storage, detail: "Broadcast add. Backward: g_b1 = sum of g_Z1 over the batch axis. With n = 1 that is a no-op, which is exactly how the missing-axis bug hides until you use a real batch." }
+        - { id: z1, x: 1, y: 0, label: "z₁ = (0, 0)", kind: model, detail: "Pre-activation. Either z₁ or h must be cached; you never need both, because σ and its derivative are each one cheap function of the other." }
+        - { id: h, x: 1, y: 1, label: "h = σ(z₁) = (0.5, 0.5)", kind: model, detail: "σ(0) = 0.5 exactly, so σ′ = h(1−h) = 0.25 exactly. This is why the worked example is hand-computable with no rounding at all." }
+        - { id: w2, x: 2, y: 0, label: "w₂ = (1, 2)", kind: storage, detail: "Output weights. Backward: g_w2 = Hᵀ g_ŷ, shape (2,) — H is (1,2) and g_ŷ is (1,), so the contraction is over the batch axis, not the feature axis." }
+        - { id: yhat, x: 2, y: 1, label: "ŷ = 1.5", kind: model, detail: "The scalar prediction. Everything downstream of this point is a scalar, which is precisely what makes reverse mode cost O(1) passes instead of O(n)." }
+        - { id: b2, x: 2, y: 2, label: "b₂ = 0", kind: storage, detail: "Scalar bias. Backward: g_b2 = Σ g_ŷ = 1.0." }
+        - { id: L, x: 3, y: 1, label: "L = 0.5", kind: model, detail: "L = ½(ŷ − y)² with y = 0.5. Seeded with g_L = 1.0; every other cotangent in the graph is derived from that single seed." }
+      edges:
+        - { from: W1, to: z1, label: "W₁x" }
+        - { from: x, to: z1, label: "x" }
+        - { from: b1, to: z1, label: "+ b₁" }
+        - { from: z1, to: h, label: "σ" }
+        - { from: h, to: yhat, label: "hᵀw₂" }
+        - { from: w2, to: yhat, label: "w₂" }
+        - { from: b2, to: yhat, label: "+ b₂" }
+        - { from: yhat, to: L, label: "½(ŷ−y)²" }
+      caption: "Read left to right it is a forward pass; read right to left it is four ops, each one a shape-preserving contraction over the edges that feed it. The graph has nine nodes and eight edges: the backward pass costs one product per edge, and nothing in it scales with the number of parameters."
+
+    - type: pipeline
+      title: "One optimiser step, in the only order that is correct"
+      nodes:
+        - label: "Forward pass"
+          note: "ŷ = f(x; θ), caching what the backward needs"
+          detail: "The tape records the op, the cached inputs, and the output. A define-by-run framework builds this tape while the Python executes, which is why a `while` loop whose trip count depends on data constructs a different graph on every step."
+        - label: "Scalar loss"
+          note: "L = ℓ(ŷ, y) — must reduce to one number"
+          detail: "Reverse mode's cost advantage comes entirely from m = 1. If your loss is a per-example vector and you never reduce it, `backward()` will either error or silently sum it for you."
+        - label: "backward()"
+          note: "one VJP per node, reverse topological order"
+          detail: "Each node's cotangent is complete before it is used, because every consumer has already pushed into it. This is the invariant the topological order exists to guarantee."
+        - label: "Accumulate across microbatches"
+          note: "grad += ...; no optimiser step inside the loop"
+          detail: "Gradient accumulation is fan-out at the step level: the same p.grad buffer receives one contribution per microbatch. Divide each microbatch's loss by the number of accumulation steps, so the sum equals what one full-batch step would have produced."
+        - label: "Unscale and clip"
+          note: "after all accumulation, before step()"
+          detail: "Clipping per-microbatch is not clipping: the norm you bound is the norm of a fraction of the gradient. Mixed precision also requires unscaling first, or the clip threshold is off by 2^16."
+        - label: "optimizer.step()"
+          note: "exactly one step per effective batch"
+          detail: "This is where Gradient Descent Variants hands over: backprop produces g, the optimiser decides what to do with it, and nothing in the optimiser knows or cares how g was computed."
+        - label: "optimizer.zero_grad()"
+          note: "after step, before the next forward"
+          detail: "Because .grad accumulates by design, forgetting this sums every step's gradient forever. Setting gradients to None frees the buffers; filling with zero keeps them."
+      caption: "Two of these seven lines are where the bugs live: `zero_grad` and the placement of `step()` relative to accumulation. Both are consequences of the same design decision — gradients accumulate — which is also what makes tied weights work."
+
+    - type: compare
+      title: "Hand-derived gradients vs reverse-mode AD"
+      left_label: "Symbolic / manual"
+      left_points:
+        - "Produces an expression you can read and simplify — useful for one layer, not for fifty"
+        - "Expression swell: the derivative of a deep net has exponentially many paths unless you memoise, and memoising the paths *is* reverse mode"
+        - "Exact, but the algebra is done by a human, so the error rate is the human error rate"
+        - "No memory cost beyond the expression itself"
+      right_label: "Reverse-mode AD (backprop)"
+      right_points:
+        - "Numerically exact to machine precision — there is no truncation error at all, unlike finite differences"
+        - "≈3 forward passes for $10^6$ parameters, versus $2 \\times 10^6$ for central differences"
+        - "One VJP per node; fan-out and repeated use accumulate automatically"
+        - "Costs $O(\\text{activations})$ memory — the only real bill, and the reason checkpointing exists"
+
+    - type: graph
+      title: "Weight tying: two paths into one accumulator"
+      nodes:
+        - { id: W, label: "W (one array)" }
+        - { id: u1, label: "use 1: h₁ = Wx" }
+        - { id: u2, label: "use 2: h₂ = Wh₁" }
+        - { id: loss, label: "L" }
+        - { id: acc, label: "∂L/∂W = c₁ + c₂" }
+      edges:
+        - { from: W, to: u1, label: "x" }
+        - { from: u1, to: u2, label: "W" }
+        - { from: u2, to: loss, label: "r = h₂ − y" }
+        - { from: u1, to: acc, label: "c₁ = r h₁ᵀ" }
+        - { from: u2, to: acc, label: "c₂ = (Wᵀr) xᵀ" }
+      caption: "With W = 2, x = 0.5, y = 1: c₁ = 1 and c₂ = 1, so ∂L/∂W = 2. An implementation that writes `dW = ...` at each site keeps only the last contribution and returns 1."
+
+    - type: mermaid
+      title: "A residual block is fan-out on the activation, not on a parameter"
+      code: |
+        flowchart RL
+          L["L"] -->|"g"| Y["y = x + f(x)"]
+          Y -->|"g · 1"| P["identity path"]
+          Y -->|"g · f'(x)"| Q["residual branch f"]
+          P --> S["g_x = g · (1 + f'(x))"]
+          Q --> S
+
+  markdown: |
+    ## A network is a graph, not a formula
+
+    You can write a two-layer network as one nested expression and differentiate
+    it with the chain rule. Nobody does, because the expression duplicates work:
+    if a value is used twice, the naive derivation differentiates it twice and
+    walks the shared subgraph twice. The graph representation makes the sharing
+    explicit, and the backward pass visits each node **once**.
+
+    The algorithm:
+
+    1. Run the forward pass, keeping every intermediate value the backward will
+       need.
+    2. Seed the output cotangent: $\bar L = 1$, because $\partial L/\partial L = 1$.
+    3. Walk the nodes in reverse topological order. At each node, push
+       $\bar z_{\text{in}} = \bar z_{\text{out}} J$ to every input, **adding** to
+       whatever is already there.
+
+    Step 3 is the whole of it. Step 1 is the whole cost.
+
+    ## The worked example, by hand
+
+    A 2-2-1 network with a logistic hidden layer and squared error, one sample:
+
+    $$x = (1, 1), \quad W_1 = \begin{bmatrix} 1 & -1 \\ -1 & 1\end{bmatrix}, \quad
+      b_1 = (0,0), \quad w_2 = (1, 2), \quad b_2 = 0, \quad y = 0.5.$$
+
+    The weights are chosen so that $z_1 = (0,0)$: the sigmoid sits exactly at its
+    inflection point, where $\sigma(0) = 0.5$ and $\sigma'(0) = 0.25$. Every
+    number below is exact — no rounding, no table lookup, which is what makes this
+    example worth doing on paper rather than reading.
+
+    | node | forward value | local rule | incoming $\bar z$ | computed gradient |
+    |---|---|---|---|---|
+    | $\hat y$ | $1.5$ | $\bar z = \hat y - y$ | $1.0$ | $1.0$ |
+    | $w_2$ | $(1, 2)$ | $g = H^\top \bar z$ | — | $(0.5,\ 0.5)$ |
+    | $b_2$ | $0$ | $g = \mathbf{1}^\top \bar z$ | — | $1.0$ |
+    | $H$ | $(0.5, 0.5)$ | $g = \bar z\, w_2^\top$ | $(1.0,\ 2.0)$ | $(1.0,\ 2.0)$ |
+    | $Z_1$ | $(0, 0)$ | $g \odot h(1-h)$ | $(1.0,\ 2.0)$ | $(0.25,\ 0.5)$ |
+    | $W_1$ | [[1, −1], [−1, 1]] | $g = g_{Z_1}^\top X$ | — | [[0.25, 0.25], [0.5, 0.5]] |
+    | $b_1$ | $(0,0)$ | sum over batch | — | $(0.25,\ 0.5)$ |
+
+    Check the last row against a finite difference: perturbing $W_{1,00}$ by
+    $10^{-6}$ changes the loss by $0.25 \times 10^{-6}$. The loss itself
+    is $0.5$, and the prediction $\hat y = 1.5$ is $1.0$ above the target, so the
+    first gradient is $1.0$ and everything downstream is that number multiplied by
+    local factors of $0.5$ and $0.25$.
+
+    ## Four rules cover every layer you will write
+
+    | op | forward | backward |
+    |---|---|---|
+    | matmul $Z = XW$ | $Z_{ij} = \sum_k X_{ik}W_{kj}$ | $g_X = g_Z W^\top$, $g_W = X^\top g_Z$ |
+    | elementwise $h = \sigma(z)$ | apply $\sigma$ | $g_z = g_h \odot \sigma'(z)$ |
+    | broadcast add $Z = X + b$ | add along the batch | $g_b = \sum_i g_{Z,i}$ |
+    | sum / mean | reduce | broadcast back, scaled by $1/n$ for mean |
+
+    Every one of these is a VJP: contract the incoming row vector against the
+    local Jacobian. The matmul's local Jacobian with respect to $X$ is $W^\top$,
+    which is where the transpose comes from and the only place it comes from.
+
+    ## Tied weights: the bug that survives
+
+    A parameter that appears twice in the graph has two cotangents arriving at it.
+    The total derivative is their sum, because perturbing $W_{ij}$ perturbs
+    *every* use at once:
+
+    $$\frac{dL}{dW} = \sum_{k \in \text{uses}} \left.\frac{\partial L}{\partial W}\right|_k.$$
+
+    Concretely, with $W = 2$, $x = 0.5$, $y = 1$ and two applications of $W$:
+    the contribution through the second use is $r\,h_1 = 1 \cdot 1 = 1$, and
+    through the first is $(Wr)\,x = 2 \cdot 0.5 = 1$. The answer is $2$. Code that
+    writes `dW = ...` at each site returns $1$ and trains at half speed in that
+    direction.
+
+    Three properties make this bug expensive:
+
+    - **It does not crash.** The array has the right shape either way.
+    - **It does not stop learning.** The gradient still points downhill; it is
+      just the gradient of a different (untied) model.
+    - **Adam hides it.** $m/\sqrt{v}$ is invariant to a uniform rescaling of $g$,
+      so the optimiser compensates and the only symptom is slower convergence.
+
+    ## What it costs
+
+    | quantity | forward | backward |
+    |---|---|---|
+    | flops | $O(E)$ | $\approx 2 \times O(E)$ |
+    | memory | $O(1)$ per layer | $O(\text{activations})$ |
+    | passes for a scalar loss | 1 | 1 |
+
+    The flop count is why backprop won. The memory count is why training a model
+    is a memory problem: at batch 8, sequence 2,048, width 4,096 and 32 blocks in
+    bf16, one cached activation tensor is 134 MB, the 32 copies of it are 4.3 GB,
+    and a realistic block caches about ten such tensors.
+
+    ## Where it breaks
+
+    Reverse mode needs the whole forward pass to have happened, so it cannot
+    stream: you cannot free an activation until its last consumer has run. It also
+    assumes the graph is known and finite — a `while` loop whose trip count
+    depends on data produces a different graph each step, which is why dynamic
+    control flow in a compiled framework is such a sharp edge. And it gives you
+    exact derivatives of the *code you wrote*, not of the function you meant: an
+    in-place `relu_()` or a `detach()` silently changes the graph, and the
+    gradient is then the correct gradient of the wrong program.
+
+    ## The longer version
+
+    The full text of each mechanism and failure mode, with the worked numbers
+    condensed out of the summary above.
+
+    ### Failure modes, in full
+
+    - You have written a custom layer, `loss.backward()` raises *one of the variables needed for gradient computation has been modified by an inplace operation*, and you have no model of what the backward pass was holding on to or why it needed it.
+    - Your two-layer net trains, the loss falls, and the second layer's weights converge to about half the magnitude you derived on paper. Nothing errors. `dW` was assigned twice instead of accumulated once, and the only symptom is a model that is quietly worse than it should be.
+    - You add gradient accumulation so a batch of 512 fits on one GPU. The effective batch is 4× too small because `optimizer.step()` sits inside the accumulation loop — and the loss curve looks entirely fine, because it is a curve of a model that is learning 4× more noisily than you believe.
+    - An interviewer asks you to backprop a two-layer MLP on a whiteboard. The differentiator is not remembering `dW = x^T dz`; it is knowing which array is summed, which is transposed, where the batch axis goes, and what happens to a matrix that appears twice in the graph.
+    - Every framework you use — PyTorch's tape, JAX's `vjp`, TensorFlow's `GradientTape` — is this algorithm plus a memory trick. If you cannot derive it by hand you cannot debug a custom op, write a fused kernel, or reason about why activation checkpointing costs 33% more compute.
+
+    ### The mechanisms, in full
+
+    - **The backward pass is one VJP per node in reverse topological order, and its cost does not depend on the parameter count.** For a graph with $N$ nodes and $E$ edges, the forward pass is $O(E)$ and the backward pass is one vector–Jacobian product per edge — also $O(E)$, with a constant of roughly two. A two-layer MLP with $10^6$ parameters therefore costs about three forward-pass-equivalents in total, while central differences need $2 \times 10^6$ forward passes: a factor of **666,667**. Scale it up and the claim becomes absurd: a 7B model would need $1.4 \times 10^{10}$ passes, which at 1 ms each is **162 days** for one gradient. The trap is thinking of backprop as "the chain rule written backwards" instead of as an algorithm with a cost model; the cost model is the entire reason it exists.
+    - **The cotangent is a row vector, and every backward function computes $g_{\text{in}} = g_{\text{out}} J$.** For $Z = XW$ with $X \in \mathbb{R}^{n \times d}$ and $W \in \mathbb{R}^{d \times h}$, the Jacobian of $Z$ with respect to $X$ is $W^\top$, and the incoming cotangent $g_Z$ has shape $(n, h)$ — so $g_X = g_Z W^\top$ is $(n, d)$, the shape of $X$. For the parameter the rule is $g_W = X^\top g_Z$, shape $(d, h)$, the shape of $W$. This is the VJP from *Matrix Calculus* with an algorithm wrapped around it: $gJ$ contracts a row vector against a Jacobian, whereas $Jg$ is a JVP — a different operation that usually fails a shape check and always points the wrong way. The invariant that catches both: **every gradient has the shape of the thing it differentiates.**
+    - **Local Jacobians are structured, so you never build them.** An elementwise activation has a diagonal Jacobian: for the logistic sigmoid, $J = \operatorname{diag}(\sigma(z)(1-\sigma(z)))$, which is at most $0.25$ and is exactly $0.25$ at $z = 0$. A 4096-wide GELU layer would otherwise need a $4096 \times 4096 = 16{,}777{,}216$-entry matrix per sample; the diagonal is 4,096 numbers, a **4,096× saving**, and the reason every activation ships as a fused kernel rather than a matmul. A broadcast bias has a Jacobian of ones, so its VJP is a **sum over the batch axis**: forget the `axis=0` and you get an $(n, h)$ array where an $(h,)$ belongs, and numpy will broadcast it into the next layer's gradient without complaint.
+    - **Fan-out means sum: a gradient is complete only after every consumer has contributed.** If $h$ feeds two downstream nodes, $\partial L/\partial h$ is the sum of both incoming cotangents — that is the multivariate chain rule over a DAG, not a special case. The residual connection is the cleanest instance: for $y = x + f(x)$, $\partial L/\partial x = g_y\,(1 + f'(x))$, where the $1$ is the identity path. Without a skip and with a per-block derivative of $0.9$, fifty blocks leave $0.9^{50} = 0.00515$ — half a percent of the loss gradient reaches layer one. With a skip, the identity path contributes exactly $1.0$ at any depth. "Gradient flows" is a statement about graph topology, not about activation functions.
+    - **A parameter used twice receives two contributions, and they add.** Take the two-step linear recurrence $h_1 = Wx$, $h_2 = Wh_1$, $L = \tfrac12\|h_2 - y\|^2$ with $W = 2$, $x = 0.5$, $y = 1$: then $h_1 = 1$, $h_2 = 2$ and $r = h_2 - y = 1$. The contribution from the *second* use is $r\,h_1 = 1$; from the *first* use is $(Wr)\,x = 1$; so $\partial L/\partial W = 2$. Overwrite instead of accumulate and you get $1$ — **exactly half**, with a loss that still goes down. In a $2 \times 2$ version the two pieces are $\begin{bmatrix}-0.625 & -0.25\\ 7.5 & 3\end{bmatrix}$ and $\begin{bmatrix}4.375 & -8.75\\ 1 & -2\end{bmatrix}$, summing to $\begin{bmatrix}3.75 & -9\\ 8.5 & 1\end{bmatrix}$; keeping only the second use flips the sign of one entry and makes another $8.5\times$ too small. Every weight-tied architecture has this shape: an embedding tied to the output projection with a 50,257-token vocabulary and width 4,096 has **205,852,672** parameters, and $\partial L/\partial E = \partial L/\partial E_{\text{in}} + \partial L/\partial E_{\text{out}}$.
+    - **Why the tied-weight bug survives Adam.** Adam's update is $\hat m/(\sqrt{\hat v} + \epsilon)$; scale every gradient entry by $c > 0$ and $\hat m \to c\hat m$, $\hat v \to c^2\hat v$, so the ratio is unchanged. A gradient that is *uniformly* half of what it should be is therefore **invisible** at Adam's steady state: the step size absorbs the scale, and training converges to the same place, more slowly, with no symptom. Under SGD with a tuned learning rate it shows up as a 2× slowdown in that parameter's effective rate. This is the link back to *Gradient Descent Variants*: adaptive preconditioning buys robustness to scale, and it spends your ability to notice scale errors.
+    - **The forward pass must cache what the backward needs, and that cache is the memory wall.** For a 7B model with 32 blocks, batch 8, sequence 2,048 and hidden width 4,096 in bf16, one activation tensor is $8 \times 2048 \times 4096 \times 2\ \text{B} = 134$ MB; one per block is 4.3 GB, and a realistic ten per block is **43 GB** — three times the 14 GB of weights. Most of it is redundant: from $h = \sigma(z)$ you need either $z$ (recompute $h$ with one `exp`) or $h$ (recompute $1 - h^2$ with one multiply), never both. Activation checkpointing drops storage to $O(\sqrt{L})$ for roughly 33% extra compute, which is the trade every `torch.utils.checkpoint` call is making on your behalf.
+    - **Fusing ops is a numerical requirement, not a speed optimisation.** Cross-entropy through `log(softmax(z))` has a dense Jacobian and, worse, is undefined when the softmax underflows: in float32, $e^{-104}$ rounds to exactly `0.0`, so `log(0)` is `-inf` and the gradient is `NaN`. The fused backward $\partial L/\partial z = p - \text{onehot}$ is exact, bounded in $[-1, 1]$, and costs $O(C)$. For logits $(10, 0)$ the probabilities are $(0.9999546, 4.5398 \times 10^{-5})$ and the gradient is $(-4.5398\times10^{-5}, +4.5398\times10^{-5})$ — no cancellation, no overflow, no dependence on how confident the model is.
+    - **Backprop gives you one row of the Jacobian, not the Jacobian.** The loss is scalar, so $m = 1$ and the cost is independent of $n$; that asymmetry *is* reverse mode. Ask for the full Jacobian of a 1,000-dimensional output and you need 1,000 reverse passes (or 1,000 JVPs forward), and the advantage vanishes. The practical consequence: per-example gradients — for DP-SGD, influence functions, or gradient surgery — cost one backward pass *per example*, so a batch of 32 costs 32× a normal step. Libraries that do this well (`functorch`'s `vmap(grad(...))`, JAX's `jacrev`) are re-deriving exactly this paragraph.
+    - **Gradient checking has an optimal step size, and it is $6 \times 10^{-6}$ in float64.** Central differences have truncation error $O(\epsilon^2)$ and roundoff error $O(\epsilon_{\text{mach}}/\epsilon)$; minimising their sum gives $\epsilon = \epsilon_{\text{mach}}^{1/3} = 6.06 \times 10^{-6}$, with achievable relative error near $10^{-10}$. At $\epsilon = 10^{-8}$ roundoff dominates and you see $10^{-8}$ discrepancies that look like bugs; at $10^{-3}$ truncation dominates and a correct implementation reports $10^{-6}$. In float32 the optimum is $\epsilon_{\text{mach}}^{1/2} = 3.5\times10^{-4}$ and the best achievable relative error is only about $10^{-3}$ — **a float32 gradient check cannot distinguish a correct backward pass from a slightly wrong one**, which is why `torch.autograd.gradcheck` silently runs in float64.
+
+
+  derivations:
+    - title: "Reverse accumulation: one VJP per node"
+      latex: |
+        Let the graph compute $z_0 = x$, $z_k = f_k(z_{k-1})$ for $k = 1 \dots K$,
+        and $L = \ell(z_K)$. Define the adjoint
+        $\bar z_k = \partial L / \partial z_k$. Then, by the chain rule applied to
+        the composition,
+        $$\bar z_{k-1} = \bar z_k \, J_{f_k}(z_{k-1}), \qquad \bar z_K = \ell'(z_K),$$
+        and for any parameter $W$ appearing at node $k$,
+        $$\frac{\partial L}{\partial W} = \bar z_k \, \frac{\partial f_k}{\partial W}.$$
+        If $W$ appears at several nodes, sum over them. The total cost is one
+        matrix–vector product per node: $O(E)$ flops and $O(N)$ memory for the
+        cached forward values, independent of the number of parameters $P$.
+      prose: >-
+        The recursion is the chain rule read right to left: each step contracts one
+        incoming row vector against one local Jacobian. It never forms the product
+        $J_{f_K} \cdots J_{f_1}$ — that product has $P$ columns and would cost
+        $O(P)$ per node — which is exactly why the cost is independent of $P$.
+        Setting $\bar z_K = \ell'(z_K)$ seeds it; for a scalar loss that seed is
+        just the number $1.0$.
+
+    - title: "The two-layer MLP, differentiated line by line"
+      latex: |
+        Forward, with $X \in \mathbb{R}^{n\times d}$, $W_1 \in \mathbb{R}^{h\times d}$,
+        $w_2 \in \mathbb{R}^{h}$ and a mean-squared loss:
+        $$Z_1 = XW_1^\top + \mathbf{1}b_1^\top, \qquad H = \sigma(Z_1), \qquad
+          \hat y = Hw_2 + b_2, \qquad
+          L = \frac{1}{2n}\sum_{i=1}^{n}(\hat y_i - y_i)^2.$$
+        Backward, one line per node, right to left:
+        $$g_{\hat y} = \frac{\hat y - y}{n}, \qquad
+          g_{w_2} = H^\top g_{\hat y}, \qquad
+          g_{b_2} = \mathbf{1}^\top g_{\hat y},$$
+        $$g_H = g_{\hat y}\,w_2^\top, \qquad
+          g_{Z_1} = g_H \odot H \odot (1 - H),$$
+        $$g_{W_1} = g_{Z_1}^\top X, \qquad
+          g_{b_1} = \mathbf{1}^\top g_{Z_1}.$$
+      prose: >-
+        Substituting the worked example gives $g_{\hat y} = 1.0$,
+        $g_{w_2} = (0.5, 0.5)$, $g_H = (1, 2)$, $g_{Z_1} = (0.25, 0.5)$ and
+        $g_{W_1} = \begin{bmatrix}0.25 & 0.25\\ 0.5 & 0.5\end{bmatrix}$. Every shape
+        matches its parameter: $g_{W_1}$ is $(2,2)$ like $W_1$, $g_{b_1}$ is $(2,)$
+        like $b_1$. The factor $1/n$ enters exactly once, at the loss — a backward
+        pass that divides by $n$ a second time produces gradients that are too
+        small by a factor of $n$, which reads as a badly tuned learning rate
+        rather than as a bug.
+
+    - title: "Why tied weights sum, and by how much an overwrite is wrong"
+      latex: |
+        Let $W$ appear at uses $k \in \mathcal{K}$, so that the loss is a function
+        of the same array passed to each site: $L = F(W, W, \dots, W)$. Perturbing
+        a single entry $W_{ij}$ by $\delta$ perturbs every use simultaneously, so
+        the first-order change is the sum of the per-use changes:
+        $$L(W + \delta E_{ij}) - L(W)
+          = \delta \sum_{k \in \mathcal{K}}
+            \left.\frac{\partial L}{\partial W_{ij}}\right|_{k} + O(\delta^2).$$
+        Hence $\dfrac{dL}{dW} = \sum_k \left.\dfrac{\partial L}{\partial W}\right|_k$.
+      prose: >-
+        With $W$ used twice, the scalar example gives contributions $1$ and $1$ and
+        a total of $2$; an overwrite returns $1$, off by a factor of exactly the
+        number of uses. In the $2\times2$ example the correct gradient is
+        $\begin{bmatrix}3.75 & -9\\ 8.5 & 1\end{bmatrix}$ while keeping only the
+        second use gives $\begin{bmatrix}4.375 & -8.75\\ 1 & -2\end{bmatrix}$ — one
+        entry with the wrong sign and another $8.5\times$ too small. A gradient check
+        catches this immediately (150% relative error) provided it perturbs the
+        shared array rather than a copy at one call site.
+
+  implementations:
+    - language: python
+      title: "A 40-line reverse-mode engine: the algorithm with nothing hidden"
+      note: >-
+        This is numerically WRONG in three ways, all of them instructive. (1) `exp`
+        overflows to `inf` above 709 and everything downstream becomes `nan`; the
+        engine cannot detect it, so a model with large logits silently produces
+        garbage — real frameworks use a log-sum-exp form instead, and computing the
+        local derivative from the output (as both `exp` and `tanh` do here) fixes
+        the memory, not the overflow. (2) `visit` recurses once per node, so it
+        blows Python's default recursion limit at about 1,000 nodes deep — two
+        layers of a real model; production tape implementations iterate with an
+        explicit stack. (3) Every node is a scalar, so a width-4096 layer is 4,096
+        Python objects per sample; real engines put the whole tensor in one node,
+        which is why this is roughly four orders of magnitude slower than numpy on
+        the same maths. It is a teaching device, not a framework.
+      code: |
+        import math
+
+        class Var:
+            """One scalar node. `grad` is dL/d(self) and is ACCUMULATED."""
+            __slots__ = ("data", "grad", "parents", "local")
+
+            def __init__(self, data, parents=(), local=()):
+                self.data = float(data)
+                self.grad = 0.0
+                self.parents = parents          # tuple of Var
+                self.local = local              # d(self)/d(parent), same order
+
+            def backward(self):
+                # Post-order DFS visits every child before its parent, so
+                # reversing it gives reverse topological order: consumers first.
+                order, seen = [], set()
+
+                def visit(v):
+                    if id(v) in seen:
+                        return
+                    seen.add(id(v))
+                    for p in v.parents:
+                        visit(p)
+                    order.append(v)
+
+                visit(self)
+                self.grad = 1.0                 # dL/dL = 1, the seed
+                for v in reversed(order):
+                    for p, d in zip(v.parents, v.local):
+                        # += and not = : a parent with two children receives
+                        # both contributions. This single character is the
+                        # tied-weight bug in its purest form.
+                        p.grad += v.grad * d
+                return self
+
+        def add(a, b):
+            return Var(a.data + b.data, (a, b), (1.0, 1.0))
+
+        def mul(a, b):
+            # d(ab)/da = b, d(ab)/db = a -- the local Jacobian is the other value
+            return Var(a.data * b.data, (a, b), (b.data, a.data))
+
+        def tanh(a):
+            t = math.tanh(a.data)
+            return Var(t, (a,), (1.0 - t * t,))   # from the OUTPUT, not from a
+
+        def exp(a):
+            e = math.exp(a.data)
+            return Var(e, (a,), (e,))             # from the OUTPUT: no overflow
+
+        if __name__ == "__main__":
+            # f(a, b) = tanh(a*b) + a*b  -- the product is used twice
+            a, b = Var(0.5), Var(2.0)
+            ab = mul(a, b)
+            out = add(tanh(ab), ab)
+            out.backward()
+
+            # Analytic: d/da = (1 + 1 - tanh(1)^2) * b
+            expected = (2.0 - math.tanh(1.0) ** 2) * 2.0
+            print(out.data, a.grad, expected)     # 1.7616, 2.8399, 2.8399
+            # Replace `+=` with `=` in backward() and a.grad becomes 0.8399:
+            # the direct path from `ab` is silently overwritten by the tanh path.
+
+    - language: python
+      title: "A gradient check that survives weight tying"
+      note: >-
+        Numerically WRONG under three conditions. (1) In float32 the best achievable
+        relative error is about $10^{-3}$, so a correct backward pass reports a
+        discrepancy of $10^{-3}$ and a genuinely wrong one reports $10^{-2}$ — the
+        check cannot separate them. Run it in float64. (2) With `eps=1e-8` roundoff
+        dominates and correct gradients appear to disagree at $10^{-8}$. Use
+        $\epsilon_{\text{mach}}^{1/3} = 6.06\times10^{-6}$ for central differences.
+        (3) If you `copy()` a tied parameter before perturbing it, you silently untie
+        the weights and the numerical gradient measures one use: this function
+        returns a 150% error on a perfectly correct backward pass. Perturb the array
+        that is in the dict, in place.
+      code: |
+        import numpy as np
+
+        def gradcheck(f, params, eps=None):
+            """f(params) -> (loss, grads); grads keyed like params.
+
+            Perturbation happens IN PLACE on the arrays in `params`, which is what
+            makes this correct when one array is used at two places in the graph:
+            a single array has a single perturbation.
+            """
+            if eps is None:
+                eps = np.finfo(np.float64).eps ** (1.0 / 3.0)   # 6.055e-06
+            _, grads = f(params)
+            worst = 0.0
+            for name, P in params.items():
+                flat = P.reshape(-1)
+                num = np.empty(flat.size)
+                for i in range(flat.size):
+                    old = flat[i]
+                    flat[i] = old + eps
+                    lp, _ = f(params)
+                    flat[i] = old - eps
+                    lm, _ = f(params)
+                    flat[i] = old                       # restore, always
+                    num[i] = (lp - lm) / (2.0 * eps)
+                an = grads[name].ravel()
+                scale = np.maximum(1.0, np.maximum(np.abs(num), np.abs(an)))
+                worst = max(worst, float((np.abs(num - an) / scale).max()))
+            return worst
+
+        def make_tied(x, y):
+            """L = 0.5 * ||W(Wx) - y||^2 : W is used twice."""
+            def f(params):
+                W = params["W"]
+                h1 = W @ x
+                h2 = W @ h1                  # second use of the SAME array
+                r = h2 - y
+                L = 0.5 * float(r @ r)
+                dh2 = r
+                dh1 = W.T @ dh2              # cotangent through the lower use
+                dW = np.outer(dh2, h1) + np.outer(dh1, x)
+                return L, {"W": dW}
+            return f
+
+        if __name__ == "__main__":
+            W = np.array([[0.5, -1.0], [1.5, 0.25]])
+            x = np.array([1.0, -2.0])
+            y = np.array([0.5, 1.0])
+            f = make_tied(x, y)
+            print("correct   :", gradcheck(f, {"W": W.copy()}))   # 4.98e-11
+
+            # Now the bug: assign instead of accumulate.
+            def f_bug(params):
+                W = params["W"]
+                h1 = W @ x
+                h2 = W @ h1
+                r = h2 - y
+                L = 0.5 * float(r @ r)
+                return L, {"W": np.outer(W.T @ r, x)}   # second use only
+            print("overwritten:", gradcheck(f_bug, {"W": W.copy()}))  # 1.5e+00
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        For $y = x + f(x)$ with $x = 1$, $f(x) = x^2$ and incoming cotangent
+        $g_y = 3$, what is $g_x$ — and what would you get if you forgot the skip
+        path?
+      answerKind: short_text
+      hint: "$f'(x) = 2x$. The skip path contributes a derivative of exactly 1, so the local factor is $1 + f'(x)$."
+      solution: >-
+        $f'(1) = 2$, so $g_x = g_y (1 + f'(1)) = 3 \times 3 = 9$. Forgetting the
+        skip gives $3 \times 2 = 6$, i.e. one third of the gradient is lost at this
+        single block. Compose fifty such blocks and the missing term is the
+        difference between $0.9^{50} = 0.005$ and $1.0$.
+
+    - id: cp-2
+      question: >-
+        A parameter $W$ is used at two sites. The first site's cotangent product is
+        $\begin{bmatrix}-0.625 & -0.25\\ 7.5 & 3\end{bmatrix}$ and the second's is
+        $\begin{bmatrix}4.375 & -8.75\\ 1 & -2\end{bmatrix}$. What is
+        $\partial L/\partial W$, and what does keeping only the second give you?
+      answerKind: short_text
+      hint: "Sum, entry by entry. Then read the two candidate answers side by side."
+      solution: >-
+        $\partial L/\partial W = \begin{bmatrix}3.75 & -9\\ 8.5 & 1\end{bmatrix}$.
+        Keeping only the second gives $\begin{bmatrix}4.375 & -8.75\\ 1 & -2\end{bmatrix}$:
+        the $(1,1)$ entry has the wrong sign, and the $(1,0)$ entry is $8.5\times$ too
+        small. A gradient check reports a 150% relative error, which is the reason
+        the check exists.
+
+    - id: cp-3
+      question: >-
+        Why does Adam fail to notice that every gradient entry is exactly half of
+        what it should be, while SGD with a tuned learning rate does not?
+      answerKind: short_text
+      hint: "Write down what happens to $m$ and $v$ when $g \\to cg$."
+      solution: >-
+        Adam's direction is $\hat m/(\sqrt{\hat v} + \epsilon)$. Scaling $g$ by
+        $c > 0$ scales $m$ by $c$ and $v$ by $c^2$, so the ratio is unchanged and
+        the step is identical: the optimiser is scale-invariant by construction.
+        SGD's step is $\eta g$, so halving $g$ halves the step in that direction.
+        This is why a tied-weight bug can survive a year of Adam training and be
+        diagnosed in an afternoon of SGD.
+
+    - id: cp-4
+      question: >-
+        A block caches $H = \sigma(Z)$ for a batch of 8, sequence length 2,048 and
+        width 4,096 in bf16. How large is that one tensor, and should you cache $H$
+        or $Z$?
+      answerKind: short_text
+      hint: "Count elements first, then multiply by two bytes. Then ask which of the two you can reconstruct from the other."
+      solution: >-
+        $8 \times 2048 \times 4096 = 67{,}108{,}864$ elements, times 2 bytes =
+        **134 MB**. Across 32 blocks that one tensor is 4.3 GB. Cache one of the
+        pair only: $h = \sigma(z)$ costs one `exp` to recompute from $z$, and
+        $\sigma'(z) = h(1-h)$ costs one multiply to recompute from $h$. Since the
+        next layer needs $h$ anyway, keep $h$ and reconstruct the derivative —
+        caching both doubles the memory for a value you can derive in one flop.
+
+    - id: cp-5
+      question: >-
+        Your backward returns `gW` with shape $(64, 10)$ for a `W` with shape
+        $(10, 64)$. What are the two plausible causes, and which one would still
+        run without an error?
+      answerKind: short_text
+      hint: "There is a transpose bug and a reduction bug, and they are not the same bug."
+      solution: >-
+        Either you computed a JVP instead of a VJP (transposed the contraction:
+        $J^\top g$ rather than $gJ$), or you reduced over the wrong axis when the
+        layer had a batch dimension and the batched gradient happened to have the
+        transposed shape. The first usually fails a shape check downstream; the
+        second is the dangerous one, because $(64,10)$ against an input of shape
+        $(n,64)$ may broadcast cleanly and train to a slightly worse model. The
+        assertion `assert gW.shape == W.shape` costs nothing and kills both.
+
+    - id: cp-6
+      question: >-
+        You accumulate gradients over four microbatches. Where do `step()` and
+        `zero_grad()` go, and what does the loss curve look like if you get it
+        wrong in each direction?
+      answerKind: short_text
+      hint: "Gradients accumulate by design. Ask what each call would do if it were one line earlier."
+      solution: >-
+        All four forward/backward pairs first, then `step()` once, then
+        `zero_grad()` before the next batch. `step()` inside the loop gives four
+        steps on quarter-sized batches: the effective batch is 4× too small and the
+        loss curve is noisier than you think it should be, which reads as "needs
+        tuning" rather than "is wrong". `zero_grad()` inside the loop keeps only the
+        last microbatch's gradient — a 4× underestimate that Adam will partly
+        rescale away, so the run trains and is quietly worse. Both are the same
+        accumulate-by-design decision that makes tied weights work.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        You are not differentiating a formula, you are walking a graph backwards.
+        Each node holds one quantity: the derivative of the loss with respect to
+        that node's output. A node can compute its input's derivative from that
+        quantity plus its own local rule, without knowing anything about what came
+        before it. If two arrows leave a node, two quantities come back — and you
+        add them.
+      blocks:
+        - kind: checklist
+          body: |
+            For every node in the graph, answer four questions:
+            - What is its value in the forward pass?
+            - What is its local derivative (output with respect to input)?
+            - What cotangent arrived from downstream?
+            - What cotangent do I send upstream — and does it have the same shape
+              as the node's input?
+        - kind: warning
+          body: >-
+            Tier 1 must not give you the answer. It does not: it gives you the loop
+            structure, and the numbers still have to come from your own forward pass.
+      checkpoint: >-
+        Before reading on: which single quantity does a backward function need
+        before it can compute anything at all, and where does the very first one
+        come from?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work right to left and handle one op at a time. For each op ask only: what
+        is the local Jacobian, and how do I contract the incoming row vector
+        against it? Matmul transposes; elementwise multiplies by the derivative;
+        broadcast sums over the batch. Keep every parameter gradient in a dict
+        keyed by the parameter, and use `+=`.
+      blocks:
+        - kind: checklist
+          body: |
+            - Start from the loss: the seed is 1.0, always.
+            - Matmul: g_X = g_Z @ W.T, g_W = X.T @ g_Z.
+            - Elementwise: multiply by the derivative, computed from the cached output.
+            - Broadcast bias: sum over axis 0.
+            - Every parameter: g.shape == param.shape, asserted.
+            - A parameter seen twice: `dW += ...` at both sites.
+        - kind: warning
+          body: >-
+            `dW = ...` instead of `dW += ...` is the single most common bug in
+            hand-written backward passes, and it is invisible in every log.
+      checkpoint: >-
+        Which of those four rules is the one that has no analogue in scalar
+        calculus, and why does a batch dimension force it?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Two passes and one dict. The forward pass stores; the backward pass reads
+        what it stored and writes into the dict.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # forward  (n samples, d inputs, h hidden, scalar output)
+            Z1 = X @ W1.T + b1            # (n, h)
+            H  = sigmoid(Z1)              # (n, h)   cache this
+            yhat = H @ w2 + b2            # (n,)     cache this
+            L = 0.5 * mean((yhat - y)**2)
+
+            # backward, right to left
+            g_yhat = (yhat - y) / n                    # (n,)
+            g_w2   = H.T @ g_yhat                      # (h,)
+            g_b2   = sum(g_yhat)                       # scalar
+            g_H    = outer(g_yhat, w2)                 # (n, h)
+            g_Z1   = g_H * H * (1 - H)                 # (n, h)
+            g_W1   = g_Z1.T @ X                        # (h, d)
+            g_b1   = sum(g_Z1, axis=0)                 # (h,)
+
+            assert g_W1.shape == W1.shape and g_b1.shape == b1.shape
+      checkpoint: >-
+        Where exactly does the division by `n` enter, and what happens if it enters
+        in both the loss and the backward pass?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The chain rule for a composition of maps is a product of Jacobians. Reverse
+        mode evaluates that product right to left, one factor at a time, so the
+        intermediate objects are vectors rather than matrices.
+      blocks:
+        - kind: math
+          body: |
+            With $Z_1 = XW_1^\top + \mathbf{1}b_1^\top$, $H = \sigma(Z_1)$,
+            $\hat y = Hw_2 + b_2$ and $L = \frac{1}{2n}\sum_i(\hat y_i - y_i)^2$:
+
+            $$g_{\hat y} = \frac{\hat y - y}{n}, \qquad
+              g_{w_2} = H^\top g_{\hat y}, \qquad
+              g_{b_2} = \mathbf{1}^\top g_{\hat y}$$
+
+            $$g_H = g_{\hat y}\,w_2^\top, \qquad
+              g_{Z_1} = g_H \odot H \odot (1-H)$$
+
+            $$g_{W_1} = g_{Z_1}^\top X, \qquad
+              g_{b_1} = \mathbf{1}^\top g_{Z_1}$$
+
+            Worked example: $x=(1,1)$, $W_1=\begin{bmatrix}1&-1\\-1&1\end{bmatrix}$,
+            $b_1=(0,0)$, $w_2=(1,2)$, $b_2=0$, $y=0.5$.
+
+            $$z_1 = (0,0),\quad h = (0.5,0.5),\quad \hat y = 1.5,\quad L = 0.5$$
+            $$g_{\hat y} = 1.0,\quad g_{w_2} = (0.5,0.5),\quad g_H = (1,2)$$
+            $$g_{Z_1} = (1,2)\odot(0.25,0.25) = (0.25,0.5)$$
+            $$g_{W_1} = \begin{bmatrix}0.25\\0.5\end{bmatrix}(1,1)
+              = \begin{bmatrix}0.25&0.25\\0.5&0.5\end{bmatrix}$$
+      checkpoint: >-
+        $g_H = (1,2)$ came from multiplying the scalar $1.0$ by $w_2 = (1,2)$.
+        Why is that a transpose in the general case and a no-op here?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete backward pass for the two-layer net, plus the tied-weight
+        accumulator written the way a framework writes it.
+      blocks:
+        - kind: warning
+          body: >-
+            Read this only after you have written your own and compared it against
+            the worked example. The numbers are the test; the code is just notation.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def sigmoid(z):
+                z = np.asarray(z, float)
+                out = np.empty_like(z)
+                pos = z >= 0
+                out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+                ez = np.exp(z[~pos])
+                out[~pos] = ez / (1.0 + ez)      # stable for large negative z
+                return out
+
+            def solve(X, y, W1, b1, w2, b2):
+                X = np.asarray(X, float)
+                y = np.asarray(y, float).ravel()
+                W1 = np.asarray(W1, float)
+                b1 = np.asarray(b1, float)
+                w2 = np.asarray(w2, float).ravel()
+                b2 = float(b2)
+                n = X.shape[0]
+
+                # --- forward, caching exactly what backward needs ------------
+                Z1 = X @ W1.T + b1               # (n, h)
+                H = sigmoid(Z1)                  # (n, h)
+                yhat = H @ w2 + b2               # (n,)
+
+                # --- backward ------------------------------------------------
+                g = (yhat - y) / n               # (n,)   dL/dyhat
+                dw2 = H.T @ g                    # (h,)   same shape as w2
+                db2 = float(g.sum())             # ()
+                dH = np.outer(g, w2)             # (n, h) g_yhat w2^T
+                dZ1 = dH * H * (1.0 - H)         # (n, h) diagonal Jacobian
+                dW1 = dZ1.T @ X                  # (h, d) same shape as W1
+                db1 = dZ1.sum(axis=0)            # (h,)
+
+                assert dW1.shape == W1.shape and db1.shape == b1.shape
+                assert dw2.shape == w2.shape
+                return {"dW1": dW1, "db1": db1, "dw2": dw2, "db2": db2}
+
+            def accumulate(params, grads):
+                """The framework's rule: += into the buffer, never assignment."""
+                for k, g in grads.items():
+                    if k in params:
+                        params[k].grad = getattr(params[k], "grad", 0.0) + g
+      checkpoint: >-
+        If this function were called on four microbatches before a single
+        `step()`, what would have to change — the loss, the division by `n`, or the
+        accumulator? Exactly one of them.
+
+  problems:
+    - id: p-two-layer-backward
+      title: "Backward pass for a two-layer network"
+      difficulty: medium
+      prompt: >-
+        Implement `solve(X, y, W1, b1, w2, b2)` for the network
+        $\hat y = \sigma(XW_1^\top + b_1)w_2 + b_2$ with loss
+        $L = \frac{1}{2n}\sum_i (\hat y_i - y_i)^2$. Return a dict with keys
+        `dW1` (shape of $W_1$), `db1` (shape of $b_1$), `dw2`, `db2`.
+        $X$ is $(n, d)$, $W_1$ is $(h, d)$, $w_2$ is $(h,)$, and $y$ is $(n,)$.
+        Use a sigmoid that does not overflow.
+      starter: |
+        import numpy as np
+
+        def solve(X, y, W1, b1, w2, b2):
+            # your implementation here
+            pass
+      language: python
+      entry: solve
+      testCases:
+        - input: '{"X": [[1.0, 1.0]], "y": [0.5], "W1": [[1.0, -1.0], [-1.0, 1.0]], "b1": [0.0, 0.0], "w2": [1.0, 2.0], "b2": 0.0}'
+          expected: '{"dW1": [[0.25, 0.25], [0.5, 0.5]], "db1": [0.25, 0.5], "dw2": [0.5, 0.5], "db2": 1.0}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '{"X": [[1.0, 2.0], [-1.0, 0.5]], "y": [1.0, 0.0], "W1": [[0.5, -0.25], [1.0, 0.75]], "b1": [0.1, -0.2], "w2": [0.5, -1.5], "b2": 0.25}'
+          expected: '{"dW1": [[-0.11414941302678122, -0.2313950748444924], [0.11159281232928062, 0.23161222816318905]], "db1": [-0.11662641205952518, 0.11833409513298287], "dw2": [-0.48976483666469983, -0.8443184608615217], "db2": -0.9360195274322903}'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '{"X": [[2.0, -1.0]], "y": [-1.0], "W1": [[10.0, 10.0], [-10.0, -10.0]], "b1": [-800.0, 0.0], "w2": [1.0, 1.0], "b2": 0.0}'
+          expected: '{"dW1": [[0.0, 0.0], [9.079573721774184e-05, -4.539786860887092e-05]], "db1": [0.0, 4.539786860887092e-05], "dw2": [0.0, 4.539992966891712e-05], "db2": 1.0000453978687025}'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+
+        def sigmoid(z):
+            z = np.asarray(z, float)
+            out = np.empty_like(z)
+            pos = z >= 0
+            out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+            ez = np.exp(z[~pos])
+            out[~pos] = ez / (1.0 + ez)
+            return out
+
+        def solve(X, y, W1, b1, w2, b2):
+            X = np.asarray(X, float)
+            y = np.asarray(y, float).ravel()
+            W1 = np.asarray(W1, float)
+            b1 = np.asarray(b1, float)
+            w2 = np.asarray(w2, float).ravel()
+            b2 = float(b2)
+            n = X.shape[0]
+
+            Z1 = X @ W1.T + b1
+            H = sigmoid(Z1)
+            yhat = H @ w2 + b2
+
+            g = (yhat - y) / n
+            dw2 = H.T @ g
+            db2 = float(g.sum())
+            dH = np.outer(g, w2)
+            dZ1 = dH * H * (1.0 - H)
+            dW1 = dZ1.T @ X
+            db1 = dZ1.sum(axis=0)
+            return {"dW1": dW1, "db1": db1, "dw2": dw2, "db2": db2}
+      solutionExplanation: >-
+        Each line is one VJP, right to left. The gradient of the loss with respect
+        to the prediction is (yhat - y)/n — the 1/n belongs there and nowhere else.
+        `H.T @ g` contracts over the batch axis, so dw2 has the shape of w2; the
+        outer product `np.outer(g, w2)` is the transpose VJP that turns a (n,)
+        cotangent into the (n, h) cotangent on the hidden layer. The activation's
+        diagonal Jacobian becomes an elementwise multiply by H*(1-H), and the final
+        `dZ1.T @ X` contracts over the batch to give W1's shape. The third case
+        saturates one unit at z = -800, where sigmoid is exactly 0 and its
+        derivative is exactly 0 — so an entire row of dW1 is exactly zero, which is
+        the vanishing gradient in its purest form.
+      complexity: "O(n d h) time, O(n h) space for the cached activations"
+      tags: [backpropagation, mlp, vjp, sigmoid]
+
+    - id: p-tied-weight-gradient
+      title: "A weight used twice"
+      difficulty: medium
+      prompt: >-
+        Implement `solve(W, x, y)` for the two-step linear recurrence
+        $h_1 = Wx$, $h_2 = Wh_1$ and $L = \tfrac12\|h_2 - y\|^2$. The matrix $W$
+        appears in both steps, so its gradient is the **sum** of both
+        contributions. Return $\partial L/\partial W$ as a 2-D list with the shape
+        of $W$. Use row-vector-free algebra: $W$ is $(k,k)$, $x$ and $y$ are $(k,)$.
+      starter: |
+        import numpy as np
+
+        def solve(W, x, y):
+            # your implementation here
+            pass
+      language: python
+      entry: solve
+      testCases:
+        - input: '{"W": [[2.0]], "x": [0.5], "y": [1.0]}'
+          expected: '[[2.0]]'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '{"W": [[0.5, -1.0], [1.5, 0.25]], "x": [1.0, -2.0], "y": [0.5, 1.0]}'
+          expected: '[[3.75, -9.0], [8.5, 1.0]]'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '{"W": [[0.5, -1.0], [1.5, 0.25]], "x": [1.0, -2.0], "y": [-0.5, -1.0]}'
+          expected: '[[9.75, -15.0], [13.0, 4.0]]'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+
+        def solve(W, x, y):
+            W = np.asarray(W, float)
+            x = np.asarray(x, float).ravel()
+            y = np.asarray(y, float).ravel()
+
+            h1 = W @ x
+            h2 = W @ h1
+            r = h2 - y
+
+            dh2 = r                 # dL/dh2
+            dh1 = W.T @ dh2         # dL/dh1, through the SECOND use only
+            # Two uses of the same array -> two contributions -> sum.
+            return (np.outer(dh2, h1) + np.outer(dh1, x)).tolist()
+      solutionExplanation: >-
+        The cotangent on h2 is r. From h2 = W h1 come two things: the gradient with
+        respect to h1, which is W^T r, and one contribution to W, which is the outer
+        product r h1^T. Propagating on to h1 = W x gives a second contribution,
+        (W^T r) x^T. They must be added: the first case has 1 + 1 = 2, and overwriting
+        returns exactly 1. In the 2×2 cases the two pieces partially cancel, so an
+        overwrite is not merely scaled — it has entries of the wrong sign.
+      complexity: "O(k^3) for the two matvecs plus O(k^2) for the outer products"
+      tags: [backpropagation, tied-weights, accumulation, rnn]
+
+    - id: p-softmax-ce-backward
+      title: "Fused softmax cross-entropy backward"
+      difficulty: medium
+      prompt: >-
+        Implement `solve(logits, labels)` returning
+        $\partial L/\partial Z$ for the mean cross-entropy over a batch, where
+        $Z$ is $(n, C)$ and `labels` are integer class indices in $[0, C)$.
+        Do **not** compute `log(softmax(z))` — the analytic form is
+        $g = (P - \text{onehot})/n$. Subtract the row max before exponentiating so
+        that a logit gap of 2,000 does not produce `inf`/`inf`.
+      starter: |
+        import numpy as np
+
+        def solve(logits, labels):
+            # your implementation here
+            pass
+      language: python
+      entry: solve
+      testCases:
+        - input: '{"logits": [[0.0, 0.0], [1.0, 0.0]], "labels": [0, 1]}'
+          expected: '[[-0.25, 0.25], [0.36552928931500245, -0.36552928931500245]]'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '{"logits": [[2.0, 0.0, -1.0]], "labels": [0]}'
+          expected: '[[-0.15620526551866054, 0.11419519938459449, 0.04201006613406605]]'
+          mode: json
+          tolerance: 1.0e-9
+        - input: '{"logits": [[1000.0, 0.0, -1000.0]], "labels": [2]}'
+          expected: '[[1.0, 0.0, -1.0]]'
+          mode: json
+          tolerance: 1.0e-9
+      solution: |
+        import numpy as np
+
+        def solve(logits, labels):
+            Z = np.asarray(logits, float)
+            lab = np.asarray(labels, int).ravel()
+            n = Z.shape[0]
+
+            Zs = Z - Z.max(axis=1, keepdims=True)   # stabilise: max logit -> 0
+            E = np.exp(Zs)
+            P = E / E.sum(axis=1, keepdims=True)
+
+            G = P.copy()
+            G[np.arange(n), lab] -= 1.0             # P - onehot
+            return (G / n).tolist()
+      solutionExplanation: >-
+        For a single example, CE = -log p_y, and dp_c/dz_j = p_c(delta_cj - p_j).
+        Contracting the two gives dz_j = p_j - delta_jy, which is exactly
+        `P - onehot` and is bounded in [-1, 1] no matter how confident the model is.
+        The max subtraction makes the exponentials safe: for logits (1000, 0, -1000)
+        the shifted row is (0, -1000, -2000), so p = (1, 0, 0) exactly and, with the
+        label on the wrong class, the gradient is (1, 0, -1) — large but finite.
+        Without the subtraction the first `exp` overflows to inf and the whole
+        backward pass becomes NaN.
+      complexity: "O(n C) time, O(n C) space"
+      tags: [backpropagation, softmax, cross-entropy, numerical-stability]
+
+  visualizers:
+    - id: vs-computation-graph
+      kind: computation_graph
+      title: "Walk the worked example backwards"
+      description: >-
+        A nine-node graph with the cotangent on every edge. Step forward to fill in
+        values, then step backward and watch each node compute its input's cotangent
+        from the incoming one — with the seed $g_L = 1.0$ and nothing else.
+      params:
+        graph: "mlp-2-2-1-sigmoid"
+        weights: { W1: [[1.0, -1.0], [-1.0, 1.0]], b1: [0.0, 0.0], w2: [1.0, 2.0], b2: 0.0 }
+        sample: { x: [1.0, 1.0], y: 0.5 }
+        showCotangents: true
+
+  try_it: >-
+    Hand-derive the gradient of $L = \tfrac12\|W_2\sigma(W_1 x) - y\|^2$ for
+    $W_1 \in \mathbb{R}^{2\times2}$, $W_2 \in \mathbb{R}^{1\times2}$ and logistic
+    $\sigma$, at $x = (1, -1)$, then check it against a central difference at
+    $h = 6\times10^{-6}$. Now imagine $W_1$ is shared by two layers: write down
+    both contributions and confirm they add rather than overwrite.
+  interview_questions:
+    - question: "Why does the backward pass cost about three forward passes no matter how many parameters there are?"
+      level: mid
+      key_points:
+        - "Forward is $O(E)$ over the graph's edges and backward is one vector–Jacobian product per edge, so both are linear in graph size."
+        - "The loss is scalar, so reverse mode needs a single pass for the full gradient — that asymmetry with the parameter count is the whole point."
+        - "The constant is roughly 2–3× a forward pass, dominated by the same matrix multiplies run transposed."
+        - "Memory, not flops, is the binding constraint: activations must be cached, and checkpointing trades recomputation for that memory."
+      follow_up: "Ask for the full Jacobian of a 1,000-dimensional output instead. What does the cost become, and why?"
+    - question: "You tie weights across two layers. What must the backward pass do, and why does Adam hide it when you get it wrong?"
+      level: senior
+      key_points:
+        - "A parameter used twice receives two contributions, and they add: fan-out is the multivariate chain rule over a DAG, not a special case."
+        - "The correct update is `dW += ...` at each use site; assigning at the second use silently discards the first contribution."
+        - "Adam is invariant to a uniform rescaling — $\\hat m \\to c\\hat m$ and $\\hat v \\to c^2\\hat v$ leave $\\hat m/(\\sqrt{\\hat v}+\\epsilon)$ unchanged."
+        - "So a gradient that is uniformly half of what it should be trains without error and converges to weights of the wrong magnitude; only a gradient check or a controlled comparison catches it."
+      follow_up: "SGD does not have that invariance. Why does the bug still survive there, just more slowly?"
+    - question: "Why must log-softmax be fused rather than composed from `log` and `softmax`?"
+      level: mid
+      key_points:
+        - "Composing gives a dense Jacobian and, worse, is undefined where the softmax underflows: in float32 $e^{-104}$ rounds to exactly 0.0."
+        - "Then `log(0)` is `-inf` and the gradient is `NaN`, on a prediction that is merely confidently wrong rather than numerically exceptional."
+        - "The stable form is $\\log\\text{softmax}(z) = z - \\log\\sum_j e^{z_j}$, computed with a max shift, so the largest term is always $e^0$."
+        - "Fusing is a numerical requirement first and a speed optimisation second; the flop saving is a side effect."
+  common_mistakes:
+    - "Assigning `dW = ...` instead of accumulating when a parameter is used twice, then shipping a model whose second layer converges to half the magnitude you derived on paper."
+    - "Blaming the optimiser for a gradient that is uniformly too small — Adam cannot see a constant factor, so the bug is upstream in the graph."
+    - "Gradient-checking at $h = 10^{-3}$ or $h = 10^{-12}$: the first is truncation-dominated, the second round-off-dominated, and central differences want about $6\times10^{-6}$ in float64."
+  further_reading:
+    - label: "Rumelhart, Hinton & Williams, Learning representations by back-propagating errors (Nature, 1986)"
+    - label: "Baydin, Pearlmutter, Radul & Siskind, Automatic Differentiation in Machine Learning: a Survey (JMLR 2018)"

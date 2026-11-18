@@ -1,0 +1,1635 @@
+id: decoding-strategies
+slug: decoding-strategies
+title: "Decoding: Greedy, Beam, Top-k, Top-p, and Temperature"
+summary: >-
+  Turn a logits row into a sequence: what greedy and beam search actually
+  optimise, why the maximiser of sequence likelihood is a repeated phrase with
+  probability 1.7e-9, how temperature moves entropy by a measurable amount, why
+  top-k keeps a count and top-p keeps a mass, and how speculative decoding buys
+  latency without changing the distribution.
+kind: lesson
+difficulty: hard
+position: 7
+estMinutes: 33
+prerequisites: [transformer-block, tokenisation]
+phase: decoding
+tags:
+  - decoding
+  - greedy
+  - beam-search
+  - temperature
+  - top-k
+  - top-p
+  - nucleus-sampling
+  - entropy
+  - repetition-penalty
+  - speculative-decoding
+  - typical-set
+  - sampling
+
+body:
+  big_idea: >-
+    A language model outputs one probability row per position; decoding is a
+    separate policy choosing which sequence to take from it, so each knob
+    answers "which sequence do you want", not "which model".
+
+  problem:
+    - >-
+      You ship temperature 0.7, top-p 0.9 and penalty 1.2 because the README
+      said so, and cannot explain why a prompt answers differently twice.
+    - >-
+      You propose beam search to make summaries faithful, when the
+      highest-probability continuation is a repeated phrase at 1.7e-9 that no
+      sampler would ever draw.
+    - >-
+      A user says raising the repetition penalty made repetition worse, and
+      they are right: your stack divides negative logits, multiplying that
+      token's probability.
+
+  analogy: |
+    A hill walker choosing a route with a popularity score on every path.
+    Greedy takes the most popular next path at each junction; beam search
+    carries k itineraries and keeps the k with the highest total; sampling
+    rolls a die weighted by popularity. But a walker has a destination. A
+    language model does not, so the most popular *total* is achieved by
+    walking in a circle.
+
+  concept_points:
+    - >-
+      **Greedy decoding is a fixed-point machine, not a cheap approximation to the best sequence.**
+      On a word-level trigram over 93,140 words, greedy over 24 tokens returns
+      "the is the same the same the same …" at a total log-probability of
+      **-59.8239**, while the exact best sequence scores **-20.1726**. The gap
+      is 39.65 nats, or 1.65 nats per token — a factor of $e^{1.65} = 5.2$ in
+      probability, on every token.
+    - >-
+      **Beam search is Viterbi with a width limit, so its guarantee is only relative to $k$.**
+      Each step keeps the $k$ best prefixes and extends each by every token:
+      $O(kVn)$ instead of $V^n$. At $n = 24$ the gap to the exact MAP is
+      **39.65** nats at $k=1$, **31.84** at 2, **26.28** at 4 and **0.00** at
+      8 — it found a fixed point any wide enough beam cannot miss.
+    - >-
+      **The maximiser of sequence likelihood is a cycle, and a cycle is not a sample.**
+      The exact 24-token MAP is "at" repeated 24 times, with
+      $p(\text{at}\mid\text{at},\text{at}) = 0.4842$ and distinct-2 **0.0435**,
+      against **0.9967** for samples. The MAP scores -0.8405 per token against
+      -4.4340 for the average of 3,000 samples — 86.2 nats over 24 tokens, so
+      the mode is $3.7\times10^{37}$ times more probable than a typical
+      sample.
+    - >-
+      **Temperature is a monotone reparametrisation whose entropy slope is $\operatorname{Var}(z)/T^3$.**
+      Measured on a 50,257-token row: entropy is 0.9329 nats at $T=0.5$,
+      **4.4833** at 1.0, **8.8591** at 1.5 and 10.8148 at 10.0, against
+      $\ln 50{,}257 = 10.8249$. Temperature adds no information — it rescales
+      the whole row, flattening the head and the tail together, so a confident
+      answer becomes a coin flip between 500 tokens.
+    - >-
+      **Top-k fixes a count, so the mass it keeps is a property of the data; top-p fixes a mass, so the count is.**
+      At $k=10$ over three rows of one vocabulary the mass retained is
+      **0.8989**, **0.6012** and **0.2569** — greedy on the peaked row, barely
+      a truncation on the flat one. At $p=0.9$ the same three rows keep **11**,
+      **523** and **16,070** tokens: a **1,460x** swing for one setting.
+    - >-
+      **Speculative decoding leaves the distribution exactly unchanged, provided the rejection step samples the residual.**
+      A draft proposes $\gamma$ tokens, the target scores them in one pass,
+      and each survives with probability $\min(1, p/q)$; on rejection you
+      sample from the normalised $\max(0, p-q)$. Measured at $\alpha = 0.5500$:
+      **2.1104** tokens per target evaluation at $\gamma=4$; total variation
+      from the target is **0.0029** for the exact scheme and **0.1026** for
+      naive resampling.
+
+  definitions:
+    - term: "Logit row"
+      meaning: >-
+        The V numbers a transformer emits at one position, before the softmax.
+        Only differences matter for the softmax: adding a constant to every logit
+        leaves the distribution unchanged, which is why logits and
+        log-probabilities are interchangeable inputs to temperature and to
+        truncation. The penalties are the exception - they branch on the sign of
+        the logit, so they are not shift-invariant, and a row of log-probabilities
+        behaves differently from the same row shifted to zero.
+    - term: "Greedy decoding"
+      meaning: >-
+        Take the argmax of the row at every step. Deterministic, O(V) per token,
+        and the T -> 0 limit of sampling. Its failure is structural rather than
+        statistical: it can only ever follow one path, so a locally best token
+        that leads into a loop is never reconsidered.
+    - term: "Beam search"
+      meaning: >-
+        Keep the k highest-scoring partial sequences at every step, scored by the
+        sum of their log-probabilities, and extend each by every vocabulary
+        entry. It is Viterbi with the state space truncated to k paths: exact
+        only at a width equal to the state count (V for a first-order model,
+        V^2 for a trigram), and O(k V n) rather than O(V^n).
+    - term: "Beam width"
+      meaning: >-
+        The k of beam search. It buys probability, not diversity: all k beams are
+        candidates for one output, and the returned sequence is one of them. A
+        width of 1 is greedy; exactness needs a width equal to the number of
+        distinct states - V for a first-order model, V^2 for a trigram.
+    - term: "Length normalisation"
+      meaning: >-
+        Dividing the beam score by a function of length - n, or ((5+n)/6)^alpha
+        as in GNMT - so that sequences of different lengths are comparable. It
+        fixes the raw-sum bias toward short outputs and introduces a preference
+        for whatever length the penalty favours, which is a modelling choice, not
+        a correction.
+    - term: "Temperature"
+      meaning: >-
+        A scalar T that divides the logits before the softmax. T < 1 sharpens,
+        T > 1 flattens, and the ranking of tokens never changes, so temperature
+        can only reweight candidates - it can never make an impossible token
+        possible. Entropy rises monotonically with T, with slope Var(z)/T^3.
+    - term: "Top-k sampling"
+      meaning: >-
+        Truncate to the k highest-probability tokens, renormalise, sample. Keeps
+        a fixed number of candidates and therefore a data-dependent fraction of
+        the probability mass.
+    - term: "Nucleus (top-p) sampling"
+      meaning: >-
+        Truncate to the smallest set of highest-probability tokens whose
+        cumulative mass reaches p, renormalise, sample. Keeps a fixed mass and
+        therefore a data-dependent number of candidates - 11 to 16,070 across
+        three rows of the same vocabulary at p = 0.9.
+    - term: "Min-p sampling"
+      meaning: >-
+        Truncate to tokens whose probability is at least a fraction of the
+        maximum probability. It is a relative threshold, so it keeps more
+        candidates when the row is flat and fewer when it is peaked, without
+        needing the cumulative sum; it is the newest of the three rules and
+        behaves like a temperature-aware top-p.
+    - term: "Typical set"
+      meaning: >-
+        The sequences whose per-token log-probability is near the entropy H: the
+        ones a sampler actually produces. Its existence is why the mode is a bad
+        answer - the mode has log-probability at least H per token above the
+        typical set, so it is exponentially unlikely to be drawn.
+    - term: "Repetition penalty"
+      meaning: >-
+        A logit transformation applied to tokens already in the context: divide
+        positive logits by theta, multiply negative ones by theta. The asymmetry
+        exists because logits can have either sign; applying it symmetrically
+        with a negative logit rewards repetition.
+    - term: "Frequency penalty"
+      meaning: >-
+        Subtracting lambda times the token's count in the context from its logit,
+        so the penalty grows with each use instead of saturating after the first.
+        Measured: p falls from 0.199290 to 0.083882 after one occurrence and to
+        0.012240 after three, at lambda = 1.
+    - term: "Speculative decoding"
+      meaning: >-
+        Draft gamma tokens with a cheap model, score all gamma in one pass of the
+        target, accept each with probability min(1, p/q) and on rejection sample
+        from max(0, p - q). The output distribution is identical to sampling the
+        target; the saving is that one target pass can yield several tokens.
+    - term: "Acceptance rate"
+      meaning: >-
+        alpha = sum_i min(p_i, q_i) = 1 - TV(p, q), the probability that a single
+        draft token survives verification. It caps the speedup at 1/(1-alpha)
+        tokens per target pass, so alpha is the only number that matters when
+        choosing a draft model.
+
+  diagrams:
+    - type: pipeline
+      title: "One decode step: five stages, and only the last one is random"
+      nodes:
+        - label: "Logits, one row of V numbers"
+          note: "V = 50,257 for a typical vocabulary"
+          detail: "Produced by the final unembedding from the residual stream at this position. Everything in this diagram is O(V) work on a row that the model has already computed: the decoder is cheap, and the consequences are not."
+        - label: "Penalties: adjust logits"
+          note: "repetition and frequency"
+          detail: "Applied to the raw logits before any other stage. Divide positive logits and multiply negative ones by theta, or subtract lambda times the count. The multiplicative form commutes with temperature and the additive form does not - subtracting lambda after dividing by T is a different row - so pick an order and keep it identical at training and serving time."
+        - label: "Temperature: divide by T"
+          note: "ranking unchanged, spread changed"
+          detail: "T below 1 sharpens the row, above 1 flattens it. Because dividing by a positive scalar is monotone, temperature can never change which token is most likely - only how much of the mass it holds."
+        - label: "Truncate: top-k or top-p"
+          note: "a count or a mass, never both"
+          detail: "Top-k keeps k candidates and whatever mass they carry; top-p keeps whatever count reaches the mass. Both keep a rank prefix, which is why they commute with temperature on the set of survivors and not on the threshold."
+        - label: "Renormalise and draw"
+          note: "inverse CDF on one uniform"
+          detail: "Divide by the kept mass so the candidates sum to one, then walk the cumulative distribution with a single uniform draw u. This is the only place randomness enters, and it is why the same prompt gives different answers."
+        - label: "Append and feed back"
+          note: "n forward passes for n tokens"
+          detail: "The token becomes part of the context for the next step, which is the only feedback in the system and the reason a decoding loop costs one forward pass per token without a cache."
+      caption: "The arguments are about stages two to four. All three preserve the ranking of tokens, so none of them can invent a candidate the model did not already prefer: stage five only decides how much of the tail you are willing to draw from."
+
+    - type: plot
+      title: "Entropy against temperature for three rows of the same 50,257-token vocabulary"
+      chart: line
+      xLabel: "temperature T"
+      yLabel: "entropy of the tempered row, nats"
+      series:
+        - name: "row entropy 2.06 nats at T=1"
+          points:
+            - { x: 0.1, y: 0.0001 }
+            - { x: 0.3, y: 0.0930 }
+            - { x: 0.5, y: 0.4388 }
+            - { x: 0.7, y: 0.9556 }
+            - { x: 1.0, y: 2.0625 }
+            - { x: 1.5, y: 5.4034 }
+            - { x: 2.0, y: 8.5676 }
+            - { x: 3.0, y: 10.3025 }
+            - { x: 10.0, y: 10.8039 }
+        - name: "row entropy 4.48 nats at T=1"
+          points:
+            - { x: 0.1, y: 0.0012 }
+            - { x: 0.3, y: 0.2675 }
+            - { x: 0.5, y: 0.9329 }
+            - { x: 0.7, y: 1.9243 }
+            - { x: 1.0, y: 4.4833 }
+            - { x: 1.5, y: 8.8591 }
+            - { x: 2.0, y: 10.1379 }
+            - { x: 3.0, y: 10.6342 }
+            - { x: 10.0, y: 10.8148 }
+        - name: "row entropy 7.57 nats at T=1"
+          points:
+            - { x: 0.1, y: 0.0080 }
+            - { x: 0.3, y: 0.5301 }
+            - { x: 0.5, y: 1.6373 }
+            - { x: 0.7, y: 3.5574 }
+            - { x: 1.0, y: 7.5659 }
+            - { x: 1.5, y: 10.0741 }
+            - { x: 2.0, y: 10.5336 }
+            - { x: 3.0, y: 10.7317 }
+            - { x: 10.0, y: 10.8192 }
+      caption: "All three curves end at ln V = 10.8249 nats, which is the uniform distribution: at high temperature the row you started from stops mattering. The flat row is already at 7.57 of 10.82 nats, so it has little room left to be flattened."
+
+    - type: plot
+      title: "Beam width against the gap to the exact best sequence, 24 tokens"
+      chart: line
+      xLabel: "beam width k"
+      yLabel: "nats below the exact best sequence"
+      series:
+        - name: "corpus trigram, V = 200, n = 24"
+          points:
+            - { x: 1, y: 39.6512 }
+            - { x: 2, y: 31.8404 }
+            - { x: 4, y: 26.2846 }
+            - { x: 8, y: 0.0 }
+            - { x: 16, y: 0.0 }
+            - { x: 32, y: 0.0 }
+            - { x: 64, y: 0.0 }
+            - { x: 200, y: 0.0 }
+      caption: "The curve reaching zero at k = 8 is a property of this model's mode, not of beam search: the optimum is a fixed point, so a wide enough beam cannot miss it. On a real model the same curve decays slowly and never reaches zero."
+
+    - type: compare
+      title: "Choosing between maximising likelihood and sampling it"
+      left_label: "Beam search (maximise the sum)"
+      left_points:
+        - "Returns the highest-probability sequence it can find: -20.1726 against greedy's -59.8239 over 24 tokens"
+        - "Deterministic: the same prompt gives the same output every time"
+        - "The optimum is a cycle - 'at' repeated 24 times, distinct-2 = 0.0435"
+        - "Costs k times the compute and k times the memory per step"
+        - "Use it when the answer is nearly unique: translation, speech, OCR, constrained formats"
+      right_label: "Sampling (draw from the row)"
+      right_points:
+        - "Returns a typical sequence: 3,000 samples averaged -4.4340 per token, 86.2 nats below the mode"
+        - "Stochastic: two runs differ, which is a feature when you want variety"
+        - "Diversity is real - distinct-2 = 0.9967 against the mode's 0.0435"
+        - "Costs one forward pass per token, the same as greedy"
+        - "Use it when many answers are acceptable: open-ended text, dialogue, brainstorming"
+
+    - type: architecture
+      title: "Speculative decoding: one target pass, several accepted tokens"
+      nodes:
+        - id: ctx
+          x: 0
+          y: 0
+          label: "Context"
+          kind: client
+          detail: "The prompt plus everything generated so far. Both models read the same context, so the draft can be run eagerly without touching the target."
+        - id: draft
+          x: 1
+          y: 0
+          label: "Draft model"
+          kind: gpu
+          detail: "A small model - the same family at a quarter of the width, or a distilled head. It proposes gamma tokens autoregressively at a fraction of the target's cost per token, and its distribution q is what the acceptance test compares against."
+        - id: target
+          x: 2
+          y: 0
+          label: "Target model"
+          kind: model
+          detail: "Scores all gamma draft tokens in a single forward pass, which is the whole point: those gamma positions are verified for the price of one position, because the pass is bandwidth-bound rather than compute-bound."
+        - id: accept
+          x: 3
+          y: 0
+          label: "Accept or reject"
+          kind: worker
+          detail: "For each position, accept with probability min(1, p/q). On the first rejection, sample from the normalised max(0, p - q) and start over; if all gamma survive, take one bonus token from p. That residual step is what keeps the output distribution identical to the target's."
+      edges:
+        - from: ctx
+          to: draft
+          label: "gamma proposals"
+        - from: draft
+          to: target
+          label: "verify in one pass"
+        - from: target
+          to: accept
+          label: "p and q per position"
+        - from: accept
+          to: draft
+          label: "accepted plus one, repeat"
+          style: async
+      caption: "The loop runs until the stop token or the token budget. Acceptance rate alpha caps the speedup at 1/(1-alpha) tokens per target pass, so a draft that agrees 55% of the time is worth 2.22x and no more."
+
+  markdown: |
+    ## The model does not produce text
+
+    A decoder-only transformer maps token ids to a matrix of logits, one row per
+    position. Nothing in the architecture chooses a token; a policy reads the
+    last row, writes one id, appends it, and runs again. Every option on a
+    sampling playground is a different policy over the same rows:
+
+    $$p_\theta(y_t \mid y_{<t}) = \operatorname{softmax}(z_t), \qquad
+      \hat{y} = \operatorname*{arg\,max}_{y_{1:n}} \; f\big(p_\theta(y_{1:n})\big).$$
+
+    Greedy takes the argmax of each row. Beam search takes
+    $f = \log p_\theta(y_{1:n})$. Sampling takes $f$ to be "draw once from $p$".
+    Temperature and truncation change $p$ before any of those rules see it.
+    Since the model costs one forward pass per token either way, the decoder
+    adds $O(V)$ work per position and decides everything about the output.
+
+    ## Greedy and beam: two search algorithms
+
+    Greedy is $O(V)$ per token and deterministic. Beam search keeps the $k$
+    best partial sequences at each step, scored by
+
+    $$s(y_{1:t}) = \sum_{i=1}^{t} \log p_\theta(y_i \mid y_{<i}),$$
+
+    and extends each by every vocabulary entry, costing $O(kVn)$ instead of the
+    $O(V^n)$ of exact search. It is Viterbi over a state space truncated to $k$
+    paths, which tells you when it is exact: when $k$ is at least the number of
+    distinct states, $V$ for a bigram model or $V^2$ for a trigram, because the
+    DP merges prefixes that share a state and beam search does not.
+
+    Measured on a word-level trigram trained on 93,140 words of this project's
+    own prose (200-token vocabulary, 61.51% coverage), over 24 tokens:
+
+    | beam width | log-probability | gap to exact best | per token |
+    |---|---|---|---|
+    | 1 (greedy) | -59.8239 | 39.6512 | -2.4927 |
+    | 2 | -52.0130 | 31.8404 | -2.1672 |
+    | 4 | -46.4572 | 26.2846 | -1.9357 |
+    | 8 | -20.1726 | 0.0000 | -0.8405 |
+    | 200 (= V, exact) | -20.1726 | 0.0000 | -0.8405 |
+
+    The gap reaching zero at $k = 8$ is not evidence that beam search works; it
+    is evidence about the landscape. There is a second problem in the same
+    table: the score is a sum, so it always prefers shorter sequences. Measured,
+    beam(8)'s best 4-token sequence scores -5.6662 (-1.4166 per token) and its
+    best 24-token sequence scores -20.1726 (-0.8405 per token), so raw sums rank
+    the short one higher and per-token averages rank the long one higher. Both
+    are artefacts: per-token likelihood improves as the model settles into its
+    loop, so a length penalty is a hyperparameter that chooses which degenerate
+    answer you get, not a correction.
+
+    ## The maximiser is a cycle
+
+    In a finite-order model with a unique argmax transition, the greedy path is
+    eventually periodic: the state space is finite, so the path revisits a state
+    and repeats. The MAP path is not forced to be periodic in the same way, but
+    it is pulled to the same place: the DP's best-predecessor relation is a
+    function on states, so a state whose best continuation is itself absorbs the
+    path. On the model above the exact MAP of 24 tokens is
+    "at" twenty-four times, with $p(\text{at} \mid \text{at},\text{at}) = 0.4842$
+    and distinct-2 of 0.0435, while greedy finds "the is the same the same ...".
+    Both are loops; they differ in which loop. That is why beam search produces
+    dull text: not a weak search - it is exact here - but a maximiser whose
+    maximiser is a loop.
+
+    ## The mode is not a sample
+
+    Let $H$ be the per-token entropy of the sequence distribution. Then
+
+    $$\mathbb{E}_{y \sim p}\left[-\tfrac{1}{n}\log p(y)\right] = H,
+      \qquad -\tfrac{1}{n}\log p(\hat{y}) \le H,$$
+
+    because an average is at most the maximum. A sampled sequence sits at $H$
+    nats per token; the mode sits at $H_{\min}$. Measured: the MAP is at -0.8405
+    per token, 3,000 samples average -4.4340, and the gap of 3.5935 nats per
+    token is 86.2 nats over 24 tokens, so the mode is $e^{86.2} \approx
+    3.7\times10^{37}$ times more probable than a typical sample. Its own
+    probability is $1.73\times10^{-9}$; none of the 3,000 samples came within 5
+    nats of it, and the best was 39.5 nats short. Distinct-2 over the same runs:
+    0.0435 for the mode, 0.1739 greedy, 0.4348 at beam 4, 0.9967 for samples.
+    Higher probability buys lower diversity, monotonically - which is the trade.
+    For translation the mode is the right target; for open-ended generation a
+    repeated phrase is not an answer, and that is why production chat models
+    sample.
+
+    ## Temperature
+
+    $$p_i(T) = \frac{\exp(z_i/T)}{\sum_j \exp(z_j/T)},$$
+
+    which preserves the ranking - a zero-probability token stays at zero - and
+    changes entropy monotonically. With $\beta = 1/T$,
+
+    $$H(\beta) = \log Z - \beta\langle z\rangle,
+      \qquad \frac{dH}{d\beta} = -\beta\operatorname{Var}_p(z),
+      \qquad \frac{dH}{dT} = \frac{\operatorname{Var}_p(z)}{T^3} \ge 0.$$
+
+    The slope is not a free parameter. Measured on a 50,257-token row of entropy
+    4.4833 nats, the finite difference at $T = 1$ is 10.82606 and
+    $\operatorname{Var}/T^3$ is 10.82606; at $T = 2$ both are 0.44580. The limits
+    are 0 at $T \to 0$ (0.0012 nats at $T = 0.1$) and $\ln V$ at
+    $T \to \infty$ (10.8148 against $\ln 50{,}257 = 10.8249$ at $T = 10$).
+
+    | T | row of 2.06 nats | row of 4.48 nats | row of 7.57 nats |
+    |---|---|---|---|
+    | 0.3 | 0.0930 | 0.2675 | 0.5301 |
+    | 0.7 | 0.9556 | 1.9243 | 3.5574 |
+    | 1.0 | 2.0625 | 4.4833 | 7.5659 |
+    | 1.5 | 5.4034 | 8.8591 | 10.0741 |
+    | 3.0 | 10.3025 | 10.6342 | 10.7317 |
+
+    Two things the word "creativity" hides. Temperature is a single global
+    rescaling, so it cannot sharpen the head while leaving the tail alone:
+    going from 1.0 to 1.5 on the middle row adds 4.38 nats, most of the distance
+    to uniform. And on these rows - power laws, $p_i \propto (i+1)^{-s}$ -
+    tempering is exactly $s \mapsto s/T$, which is why the columns are shifted
+    copies of each other. That self-similarity is an artefact of the power law;
+    on a real row with a distinct head, most of the added entropy lands in the
+    tail.
+
+    ## Top-k and top-p
+
+    Top-$k$ keeps the $k$ largest probabilities, so the count is fixed and the
+    mass is whatever the row gives it. Top-$p$ keeps the smallest set of largest
+    probabilities whose cumulative mass reaches $p$, so the mass is fixed and
+    the count is whatever the row requires.
+
+    | row entropy at T = 1 | mass kept by k = 10 | tokens kept by p = 0.9 | max probability |
+    |---|---|---|---|
+    | 2.0625 nats | 0.8989 | 11 | 0.5313 |
+    | 4.4833 nats | 0.6012 | 523 | 0.2630 |
+    | 7.5659 nats | 0.2569 | 16,070 | 0.0877 |
+
+    Ten candidates hold 90% of the mass on one row and 26% on another; 90% of
+    the mass takes 11 tokens on one row and 16,070 on another. That is the
+    argument for top-$p$, and also its failure mode: on a flat row it truncates
+    nothing, and at $p = 0.5$ on the peaked row it keeps one token, which is
+    greedy. Top-$k$ fails the other way, by keeping ten candidates when ten
+    candidates are the whole distribution.
+
+    The order of operations is usually stated without an order. Both rules keep
+    a rank prefix and temperature is monotone, so the set that survives is the
+    same in either order and only the threshold moves. Measured on the middle
+    row: a nucleus of 523 tokens taken at $T = 1$ carries 0.99704 of the mass at
+    $T = 0.7$, while the nucleus taken at $T = 0.7$ has 9 tokens and carries
+    0.90. The two distributions differ by 0.3% in top probability (0.556446
+    against 0.554797) - close enough that one token will not show it, far enough
+    that you asked for 90% and got 99.7%. Truncate the row you are going to
+    sample from.
+
+    ## Penalties
+
+    A repetition penalty acts on logits, not probabilities, so its sign matters.
+    The rule that works is asymmetric:
+
+    $$\tilde z_i = z_i/\theta \ \text{ if } z_i > 0,
+      \qquad \tilde z_i = \theta z_i \ \text{ if } z_i \le 0 .$$
+
+    With log-probabilities, all negative, that multiplies by $\theta$ and
+    suppresses. Measured on a row with $p(\text{top}) = 0.199290$: $\theta = 1.2$
+    gives 0.152731, a 23% reduction, while the naive symmetric "divide
+    everything" gives 0.245658, a 23% increase. The frequency penalty keeps
+    counting: subtracting $\lambda$ per occurrence takes the same token to
+    0.083882 after one use and 0.012240 after three at $\lambda = 1$.
+
+    Both are blunt because repetition is not a defect: in the corpus, 13.90% of
+    positions repeat a token from the previous four and 5.28% from the previous
+    two, and English needs "the" and "of" to recur. A penalty strong enough to
+    stop a loop is strong enough to damage the sentences that are not loops.
+
+    ## Speculative decoding
+
+    Decoding is memory-bandwidth-bound: one pass reads every weight to produce
+    one token. A draft model proposes $\gamma$ tokens, the target scores all
+    $\gamma$ positions at once, and each proposal $x$ survives with probability
+
+    $$\min\left(1, \frac{p(x)}{q(x)}\right),$$
+
+    with the first rejection sampling from the normalised $\max(0, p - q)$. That
+    residual is the proof that the output is distributed exactly as the target.
+    With $\alpha = \sum_i \min(p_i, q_i) = 1 - \mathrm{TV}(p,q)$ the expected
+    tokens per pass is
+
+    $$\mathbb{E}[\text{tokens}] = \frac{1 - \alpha^{\gamma+1}}{1-\alpha},
+      \qquad \text{limit } \frac{1}{1-\alpha}.$$
+
+    Measured on an eight-outcome target with $\alpha = 0.5500$: 1.5500 tokens
+    per pass at $\gamma = 1$, 2.1104 at $\gamma = 4$, 2.2120 at $\gamma = 8$
+    against a limit of 2.2222 - and 1.5513, 2.1042, 2.2003 by simulation. Total
+    variation from the target was 0.0029 for the exact scheme and 0.1026 for the
+    naive variant that resamples from $p$ instead of the residual, with token 0
+    arriving at 0.2656 where the target says 0.4000: a 35x difference in
+    distribution error for a change that looks like an implementation detail.
+
+    ## Choosing
+
+    | situation | policy | why |
+    |---|---|---|
+    | translation, speech, OCR, structured output | beam 4-8, length-normalised | the answer is nearly unique; the mode is the right target |
+    | chat, open-ended writing | top-p 0.9-0.95, T 0.7-1.0 | you want a typical sequence, not the mode |
+    | code against a fixed API | T 0.2, top-p 0.95 | confident rows; truncation does little, temperature does the work |
+    | long-form, loops | top-p 0.95 plus a small frequency penalty | a repetition penalty alone damages ordinary prose |
+    | latency-bound with a small model available | speculative decoding, gamma 4-8 | 2x tokens per pass at the same distribution |
+
+    One link back to *The Full Transformer Block*: a decode step is
+    bandwidth-bound because it streams $12Ld^2 + 2Vd$ parameters to produce one
+    token, so a pass that verifies $\gamma$ positions costs almost the same as a
+    pass that produces one - which is the whole of speculative decoding. One link
+    back to *Tokenisation*: $V$ sets both the cost of the softmax you are
+    truncating and the number of candidates the rules choose among, so the same
+    vocabulary decision that prices a document also prices a token of choice.
+
+    ## The longer version
+
+    A language model outputs one probability row per position; decoding is a
+    separate policy that chooses which sequence to take from that row, and every
+    knob you have seen on a playground - greedy, beam, temperature, top-k, top-p,
+    penalties - is a different answer to "which sequence do you want", not a
+    different model.
+
+    A hill walker choosing a route with a popularity score on every path. Greedy
+    takes the most popular next path at every junction. Beam search carries k
+    itineraries at once and keeps the k with the highest total popularity,
+    dropping the rest at every junction. Sampling rolls a die weighted by
+    popularity.
+
+    The mapping is exact for the mechanics: the score is a log-probability, the
+    itinerary is a token sequence, and beam's k is its width. The analogy breaks
+    at the one place that matters. A walker has a destination, so "the most
+    popular route" is a proxy for a good route. A language model has no
+    destination: the popularity score is the model's own belief about the next
+    step, and the most popular *total* is achieved by walking in a circle
+    between two junctions that like each other. That is not a failure of the
+    walker; it is the objective, and it is why the best-scoring itinerary is the
+    worst answer to "write me a paragraph".
+
+    ### What goes wrong
+
+    - Your product ships with temperature 0.7, top-p 0.9 and a repetition
+      penalty of 1.2 because that is what the README said. On some prompts the
+      output is a loop, on others it is word salad, and when a customer asks
+      why the same prompt gives different answers twice you have no answer
+      that distinguishes "the model is uncertain" from "we are rolling dice".
+    - You are asked to make a summariser more faithful and someone proposes
+      beam search, because beam search "maximises the probability of the
+      output". That is true, and it is the reason the summaries get worse: the
+      highest-probability continuation of a language model is a repeated
+      phrase, measurable at probability 1.7e-9 for a 24-token sequence, which
+      no sampler will ever draw.
+    - Latency is the binding constraint and the fix on the table is a smaller
+      model, which costs quality. Speculative decoding gets the same 2.1x from
+      the same weights by spending cheap draft tokens and verifying them in
+      one pass - but only if the acceptance step is implemented with the
+      residual distribution, and the naive version quietly changes what the
+      model says.
+    - A user reports that turning the repetition penalty up made repetition
+      worse. You check and they are right, because their serving stack divides
+      every logit by the penalty and all the logits are negative, so the
+      "penalty" multiplies the repeated token's probability by 1.23 instead of
+      dividing it.
+    - Somebody asks what temperature 1.0 means and you realise you cannot say.
+      The honest answer is a number: on a row of entropy 4.48 nats, moving
+      from 1.0 to 1.5 raises entropy to 8.86 nats, which is most of the way to
+      the 10.82-nat uniform distribution over a 50,257-token vocabulary.
+
+    ### The full treatment
+
+    **Greedy decoding is a fixed-point machine, not a cheap approximation to
+    the best sequence.** Take the argmax at every step and the state stops
+    moving: on a word-level trigram trained on this project's own 93,140 words
+    of prose (200-token vocabulary), greedy over 24 tokens returns "the is the
+    same the same the same ..." at a total log-probability of -59.8239, while
+    the exact best sequence scores -20.1726. The gap is 39.65 nats, or 1.65
+    nats per token - a factor of e^1.65 = 5.2 in probability per token, paid on
+    every token, forever. The trap is believing greedy and beam-1 are "the
+    same model without search": they are the same policy, and the policy has a
+    fixed point that is usually not the mode.
+
+    **Beam search is Viterbi with a width limit, so its guarantee is only
+    relative to k.** Keep the k best prefixes at each step and extend each by
+    every token: cost is O(k V n) instead of V^n, and the algorithm is exact
+    only when k is at least the number of distinct states - V for a first-order
+    model, V^2 for the trigram used here - because the DP merges prefixes that
+    share a state and beam search keeps them separate. Measured at n = 24: gap
+    to the exact MAP is 39.65 nats at k = 1, 31.84 at k = 2, 26.28 at k = 4 and
+    0.00 at k = 8, and at k = V = 200 it reproduces the DP's answer to the
+    digit. The trap is reading "beam 8 found the exact optimum" as
+    evidence that beam search is good - it found a fixed point that any wide
+    enough beam cannot miss, which is the opposite of a hard search problem.
+
+    **The maximiser of sequence likelihood is a cycle, and a cycle is not a
+    sample.** In a finite-order model with a unique argmax transition the
+    greedy path is eventually periodic: the state space is finite, so the path
+    revisits a state and repeats from there. The MAP path is not forced to be
+    periodic in the same way - a state can be entered with different amounts
+    of horizon left - but it is pulled to the same place, because the DP's
+    best-predecessor relation is a function on states and any state whose best
+    continuation is itself is absorbing. Measured, the exact MAP of 24 tokens
+    is "at" repeated 24 times, with
+    p(at | at, at) = 0.4842 and distinct-2 = 0.0435 (one distinct bigram in
+    23), against distinct-2 = 0.9967 for samples of the same model. That
+    sequence is also unreachable by sampling: the typical log-probability is
+    -nH, so the mode sits at least H - H_min nats per token above the
+    sequences the model actually generates. Measured, the MAP scores -0.8405
+    per token against -4.4340 for the average of 3,000 samples, a gap of 86.2
+    nats over 24 tokens, so the mode is e^86.2 = 3.7e37 times more probable
+    than a typical sample; zero of the 3,000 came within 5 nats of it, and its
+    own probability is 1.73e-9, so you would need 5.8e8 draws to expect it
+    once. The trap is treating this as a bug in the model or in the sampler:
+    it is the objective being satisfied, and it is why sampling beats beam
+    search on open-ended prompts - lower probability is what being typical
+    looks like, and a maximiser deliberately returns something atypical.
+
+    **Beam search is also length-biased, and the usual fix changes the
+    ranking.** Summing log-probabilities always prefers shorter sequences, so
+    raw-sum search over lengths returns the shortest candidate. Normalising by
+    length (or by ((5+n)/6)^alpha, the GNMT form) removes the bias but not the
+    problem: measured, beam(8)'s best sequence scores -5.6662 at n = 4
+    (-1.4166 per token) and -20.1726 at n = 24 (-0.8405 per token), so the
+    model's per-token likelihood *improves* with length, because once it enters
+    the loop every further token is cheap. Per-token normalisation therefore
+    prefers the longest loop, and raw sum prefers the shortest prefix. Neither
+    number measures quality, which is the trap: a length penalty is a
+    hyperparameter that decides which degenerate answer you get.
+
+    **Temperature is a monotone reparametrisation whose entropy slope is
+    Var(z)/T^3.** With p_i proportional to exp(z_i/T), entropy rises
+    monotonically from 0 at T -> 0 to ln V at T -> infinity, and the local
+    slope is the variance of the logits under the tempered distribution
+    divided by T^3. Measured on a 50,257-token row of entropy 4.4833 nats:
+    0.0012 nats at T = 0.1, 0.9329 at 0.5, 4.4833 at 1.0, 8.8591 at 1.5,
+    10.6342 at 3.0 and 10.8148 at 10.0 against ln 50,257 = 10.8249; the finite
+    difference of H at T = 1 is 10.82606 and Var/T^3 is 10.82606. The trap is
+    the word "creativity": temperature does not add information, it rescales
+    the whole row, so it flattens the head and the tail together and can turn a
+    confident answer into a coin flip between 500 tokens.
+
+    **Top-k fixes a count, so the mass it keeps is a property of the data.**
+    Keeping the k largest probabilities always keeps exactly k tokens; what
+    varies is how much of the distribution those k carry. Measured at k = 10
+    over three rows of the same 50,257-token vocabulary: 0.8989 of the mass at
+    entropy 2.0625 nats, 0.6012 at 4.4833 nats, 0.2569 at 7.5659 nats. The trap
+    is picking k once: at 10 on the peaked row you have effectively gone
+    greedy (89.9% of the mass in 10 candidates), and on the flat row you have
+    truncated almost nothing.
+
+    **Top-p fixes a mass, so the count it keeps is a property of the data - and
+    that is both the fix and the new failure.** The nucleus is the smallest set
+    of highest-probability tokens whose mass reaches p. Measured at p = 0.9 on
+    the same three rows: 11 tokens, 523 tokens and 16,070 tokens - a 1,460x
+    swing in the size of the candidate set for the same knob setting. It adapts
+    where top-k cannot, and it fails where top-k is safe: on the flat row p =
+    0.9 retains 32% of the vocabulary and truncates essentially nothing, while
+    on the peaked row p = 0.5 retains exactly 1 token, which is greedy with
+    extra steps. The trap is believing top-p is strictly better than top-k; it
+    moves the failure from the flat regime to the peaked one.
+
+    **Temperature and truncation commute on the set and not on the mass,
+    because both rules keep a rank prefix and temperature cannot reorder
+    candidates.** Measured on the entropy-4.4833 row: a nucleus of 523 tokens
+    taken at T = 1 carries 0.99704 of the mass once you sample at T = 0.7,
+    whereas the nucleus taken at T = 0.7 has 9 tokens and carries 0.90. The
+    resulting top-token probability differs by 0.3% (0.556446 against
+    0.554797), so the two orders are almost the same distribution - but you
+    asked for 90% and got 99.7%, and you are carrying 523 slots instead of 9.
+    The trap is a rule stated without an order: "top-p 0.9 at temperature 0.7"
+    means truncate the tempered row.
+
+    **Repetition penalties are logit arithmetic, and getting the sign wrong
+    turns the penalty into a bonus.** The correct rule divides positive logits
+    and multiplies negative ones by theta; with log-probabilities, which are
+    all negative, that suppresses the repeated token. Measured on a row with
+    p(top) = 0.199290: theta = 1.2 gives 0.152731 with the correct rule and
+    0.245658 with a plain "divide everything" - a 23% *increase* in the
+    probability of the token you meant to punish, plus entropy falling from
+    5.4034 to 5.1775 instead of rising. And the penalty fires often: in the
+    corpus, the next token repeats one of the previous four in 13.90% of
+    positions, so a penalty large enough to stop loops also distorts the
+    ordinary repetition that English requires.
+
+    **Speculative decoding is a latency trick that leaves the distribution
+    exactly unchanged, provided the rejection step samples the residual.** A
+    draft model proposes gamma tokens, the target scores all of them in one
+    forward pass, and each proposal survives with probability min(1, p/q); on
+    rejection you sample from the normalised max(0, p - q), which is what makes
+    the output distribution identical to sampling the target. Measured with
+    alpha = 0.5500: 1.5500 tokens per target evaluation at gamma = 1, 2.1104 at
+    gamma = 4 and 2.2120 at gamma = 8, against 1.5513, 2.1042 and 2.2003
+    measured by simulation; total variation from the target is 0.0029 for the
+    exact scheme and 0.1026 for the naive "resample from p" version, which
+    gives token 0 probability 0.2656 where the target says 0.4000. The trap is
+    that alpha caps everything: the limit is 1/(1-alpha) = 2.2222 tokens per
+    pass, so gamma = 8 buys 4.8% over gamma = 4 and gamma = 32 buys nothing.
+
+
+  derivations:
+    - title: "Temperature's entropy slope is Var(z)/T^3"
+      latex: |
+        With $p_i(T) = e^{z_i/T}/Z(T)$ and $\beta = 1/T$,
+
+        $$H(\beta) = -\sum_i p_i \log p_i = \log Z(\beta) - \beta\,\langle z\rangle .$$
+
+        Differentiating term by term, using
+        $\partial_\beta \log Z = \langle z \rangle$ and
+        $\partial_\beta \langle z\rangle = \operatorname{Var}_p(z)$,
+
+        $$\frac{dH}{d\beta}
+          = \langle z\rangle - \langle z\rangle - \beta\,\operatorname{Var}_p(z)
+          = -\beta\,\operatorname{Var}_p(z).$$
+
+        Since $d\beta/dT = -1/T^2$,
+
+        $$\frac{dH}{dT} = \frac{\operatorname{Var}_p(z)}{T^{3}} \;\ge\; 0 ,$$
+
+        so entropy increases with temperature everywhere, at a rate set by how
+        spread the logits are under the current distribution. The two limits
+        follow: as $T \to 0$ every mass concentrates on the argmax and
+        $H \to 0$; as $T \to \infty$ the row becomes uniform and
+        $H \to \log V$. Measured on a 50,257-token row of entropy 4.4833 nats,
+        the finite difference at $T=1$ is $10.82606$ and
+        $\operatorname{Var}/T^3 = 10.82606$; at $T = 2$ both are $0.44580$.
+      prose: >-
+        The slope is not a free parameter: it is the variance of the logits under
+        the distribution you are sampling from, divided by the cube of the
+        temperature. That is why temperature is a blunt instrument near T = 1 on
+        a confident row - variance is large there, so a small change in T moves
+        entropy a long way - and why it does almost nothing on a row that is
+        already flat, where the variance has nowhere to come from.
+
+    - title: "The typical sequence sits H nats per token below the mode"
+      latex: |
+        For a sequence of length $n$ drawn from the model,
+
+        $$\mathbb{E}\left[-\frac{1}{n}\log p(y)\right]
+          = \frac{1}{n}\sum_{t=1}^{n} H\left(p(\cdot \mid y_{<t})\right) = H,$$
+
+        so a typical sequence has log-probability about $-nH$. For the mode
+        $\hat y$,
+
+        $$-\frac{1}{n}\log p(\hat y) = H_{\min} \le H,$$
+
+        because an average of $-\log p$ over the distribution cannot exceed its
+        maximum. The gap is therefore at least $H - H_{\min}$ nats per token, and
+        the probability ratio between the mode and a typical sequence is
+
+        $$\frac{p(\hat y)}{p(y_{\text{typ}})}
+          \approx e^{\,n(H - H_{\min})}.$$
+
+        Measured on the corpus trigram at $n = 24$: $H_{\min} = 0.8405$ nats per
+        token for the MAP, $-4.4340$ for the average of 3,000 samples, a gap of
+        $3.5935$ per token and $86.2$ nats in total, so the mode is
+        $e^{86.2} \approx 3.7\times10^{37}$ times more probable than a typical
+        sample. Its own probability is $1.73\times10^{-9}$.
+      prose: >-
+        This is the quantitative version of "beam search output is dull". A
+        maximiser is not a sampler: it returns the point of highest density,
+        which for a distribution over $V^n$ sequences is exponentially far from
+        where the distribution actually lives. Sampling a mode of probability
+        1.7e-9 would take 5.8e8 draws to see once, which is exactly what you
+        observe when a beam-search summary repeats a phrase no sampler ever
+        produces.
+
+    - title: "Speculative decoding: (1 - alpha^(gamma+1)) / (1 - alpha) tokens per pass"
+      latex: |
+        A draft token is accepted with probability
+        $\min(1, p(x)/q(x))$, so the probability that it survives is
+
+        $$\alpha = \sum_x q(x)\,\min\left(1, \frac{p(x)}{q(x)}\right)
+          = \sum_x \min\big(p(x), q(x)\big) = 1 - \mathrm{TV}(p, q).$$
+
+        The first proposal survives with probability $\alpha$; the second only
+        if the first did, so it survives with $\alpha^2$; and so on. The expected
+        number accepted is
+
+        $$\sum_{i=1}^{\gamma} \alpha^{\,i-1}
+          = \frac{1 - \alpha^{\gamma}}{1 - \alpha},$$
+
+        and if all $\gamma$ survive, the target emits one more token for free
+        (probability $\alpha^{\gamma}$), giving
+
+        $$\mathbb{E}[\text{tokens per pass}]
+          = \frac{1 - \alpha^{\gamma+1}}{1-\alpha}
+          \;\xrightarrow[\gamma \to \infty]{}\; \frac{1}{1-\alpha}.$$
+
+        At $\alpha = 0.5500$: 1.5500 for $\gamma = 1$, 2.1104 for $\gamma = 4$,
+        2.2120 for $\gamma = 8$, limit 2.2222. Simulation gives 1.5513, 2.1042
+        and 2.2003.
+      prose: >-
+        The formula is the whole engineering argument. Speedup is governed by
+        alpha, which is a property of how well the draft approximates the target,
+        and it saturates geometrically in gamma: at alpha = 0.55, four draft
+        tokens recover 95% of the available speedup and eight recover 99.5%, so
+        a larger gamma buys nothing while costing more draft compute and more
+        wasted target compute on rejection. A draft model at alpha = 0.9 would be
+        worth 10x per pass; at alpha = 0.3 it is worth 1.43x and not worth the
+        complexity.
+
+  implementations:
+    - language: python
+      title: "A complete sampler: penalties, temperature, top-k, top-p, inverse CDF"
+      note: >-
+        Correct, and written to make the order of operations explicit, because
+        that order is where most implementations differ. It also prints the
+        retention table the topic turns on: on a 50,257-token Zipf row of entropy
+        4.4833 nats, top-k = 10 keeps 60.12% of the mass while top-p = 0.9 keeps
+        523 tokens, and on a row of entropy 2.0625 nats the same two settings
+        keep 89.89% and 11 tokens. The one deliberate simplification is that the
+        repetition penalty is applied to the raw logits before temperature, which
+        is what HuggingFace does; applying it after the softmax is a different
+        transformation and does not match the reference numbers here.
+      code: |
+        import math
+
+        V = 50257
+        LOGITS = [math.log((i + 1) ** -1.3) for i in range(V)]   # a Zipf row, logits = log p
+
+
+        def softmax(z, T=1.0):
+            z = [x / T for x in z]
+            m = max(z)
+            e = [math.exp(x - m) for x in z]
+            s = sum(e)
+            return [x / s for x in e]
+
+
+        def entropy(p):
+            return -sum(q * math.log(q) for q in p if q > 0)
+
+
+        def topk(p, k):
+            idx = sorted(range(len(p)), key=lambda i: (-p[i], i))[:k]
+            return idx
+
+
+        def topp(p, thr):
+            idx, c = [], 0.0
+            for i in sorted(range(len(p)), key=lambda i: (-p[i], i)):
+                idx.append(i)
+                c += p[i]
+                if c >= thr:
+                    break
+            return idx
+
+
+        def draw(p, idx, u):
+            tot = sum(p[i] for i in idx)
+            run = 0.0
+            for i in sorted(idx):
+                run += p[i] / tot
+                if u < run:
+                    return i
+            return max(idx)
+
+
+        p = softmax(LOGITS, 1.0)
+        print(f"entropy {entropy(p):.4f} nats, ln V {math.log(V):.4f}")
+        for k in (10, 50):
+            idx = topk(p, k)
+            print(f"  top-k {k:3d}: {len(idx):5d} tokens, mass {sum(p[i] for i in idx):.6f}")
+        for thr in (0.5, 0.9, 0.95):
+            idx = topp(p, thr)
+            print(f"  top-p {thr:.2f}: {len(idx):5d} tokens, mass {sum(p[i] for i in idx):.6f}")
+        for T in (0.5, 0.7, 1.0, 1.5):
+            q = softmax(LOGITS, T)
+            print(f"  T {T:4.2f}: entropy {entropy(q):7.4f}, p90 nucleus {len(topp(q, 0.9))}")
+
+        # entropy 4.4833 nats, ln V 10.8249
+        #   top-k  10:    10 tokens, mass 0.601162
+        #   top-k  50:    50 tokens, mass 0.763785
+        #   top-p 0.50:     5 tokens, mass 0.508685
+        #   top-p 0.90:   523 tokens, mass 0.900064
+        #   top-p 0.95:  2476 tokens, mass 0.950001
+        #   T 0.50: entropy  0.9329, p90 nucleus 3
+        #   T 0.70: entropy  1.9243, p90 nucleus 9
+        #   T 1.00: entropy  4.4833, p90 nucleus 523
+        #   T 1.50: entropy  8.8591, p90 nucleus 27294
+
+    - language: python
+      title: "Speculative sampling: the residual correction, and the version without it"
+      note: >-
+        The `naive` branch is numerically WRONG: it accepts with the same
+        probability but, on rejection, resamples from the target distribution
+        `p` instead of from the residual `max(0, p - q)`. That is a bias, not an
+        approximation - the accepted tokens are then a mixture that over-weights
+        the region where the draft is too confident, and the output distribution
+        is no longer `p`. Measured against the target over 200,000 tokens on an
+        8-outcome pair with alpha = 0.5500, total variation is 0.0029 for the
+        exact scheme (the sampling-noise floor) and 0.1026 for the naive one at
+        gamma = 1, rising to 0.1504 at gamma = 4 - the bias compounds with the
+        number of proposals, because every rejected round is a chance to inject
+        one. Token 0 lands at 0.2656 against a target of 0.4000, a 34% deficit on
+        the most likely token, and no amount of reading fluent output would
+        reveal it. Both branches share the acceptance probability and the draft,
+        so the only difference is the four lines inside the else.
+      code: |
+        import random
+        import numpy as np
+
+        P = np.array([0.40, 0.25, 0.15, 0.08, 0.05, 0.03, 0.02, 0.02])
+        Q = np.array([0.08, 0.12, 0.22, 0.20, 0.16, 0.10, 0.07, 0.05])
+
+
+        def exact(p, q, gamma, rng):
+            """Correct: on rejection, sample the residual max(0, p - q)."""
+            out = []
+            for _ in range(gamma):
+                x = rng.choice(len(q), p=q)
+                if rng.random() < min(1.0, p[x] / q[x]):
+                    out.append(x)
+                else:
+                    r = np.maximum(p - q, 0.0)
+                    out.append(int(rng.choice(len(p), p=r / r.sum())))
+                    return out
+            out.append(int(rng.choice(len(p), p=p)))     # bonus token
+            return out
+
+
+        def naive(p, q, gamma, rng):
+            """WRONG: resamples from p instead of from the residual."""
+            out = []
+            for _ in range(gamma):
+                x = rng.choice(len(q), p=q)
+                if rng.random() < min(1.0, p[x] / q[x]):
+                    out.append(x)
+                else:
+                    out.append(int(rng.choice(len(p), p=p)))   # <- the bug
+                    return out
+            out.append(int(rng.choice(len(p), p=p)))
+            return out
+
+
+        def tv(fn, p, q, gamma, n=200000, seed=0):
+            rng = np.random.default_rng(seed)
+            c = np.zeros(len(p))
+            got = 0
+            while got < n:
+                for x in fn(p, q, gamma, rng):
+                    c[x] += 1
+                    got += 1
+            return 0.5 * np.abs(c / got - p).sum(), got
+
+
+        alpha = float(np.minimum(P, Q).sum())
+        print(f"alpha = {alpha:.4f}, TV(p,q) = {1 - alpha:.4f}, limit 1/(1-alpha) = {1/(1-alpha):.4f}")
+        for g in (1, 2, 4, 8):
+            print(f"  gamma {g}: formula {(1 - alpha**(g+1)) / (1 - alpha):.4f} tokens per pass")
+        for g in (1, 4):
+            a, _ = tv(exact, P, Q, g)
+            b, n = tv(naive, P, Q, g)
+            print(f"  gamma {g}: TV(exact) {a:.4f}   TV(naive) {b:.4f}   n = {n}")
+
+        # alpha = 0.5500, TV(p,q) = 0.4500, limit 1/(1-alpha) = 2.2222
+        #   gamma 1: formula 1.5500 tokens per pass
+        #   gamma 2: formula 1.8525
+        #   gamma 4: formula 2.1104
+        #   gamma 8: formula 2.2120
+        #   gamma 1: TV(exact) 0.0029   TV(naive) 0.1026
+        #   gamma 4: TV(exact) 0.0011   TV(naive) 0.1504
+        #   naive empirical:  [0.2656 0.2341 0.2142 0.1137 0.0719 0.0429 0.0288 0.0289]
+        #   target:           [0.40   0.25   0.15   0.08   0.05   0.03   0.02   0.02]
+
+  checkpoints:
+    - id: cp-mode-trap
+      question: >-
+        Your team ships beam search with width 8 for a customer-support
+        summariser and the summaries get measurably worse than the sampled ones,
+        even though the beam scores are higher. Explain both facts with one
+        measurement.
+      answerKind: short_text
+      hint: >-
+        Ask what the maximiser of a sequence distribution looks like when the
+        model is a finite-order Markov chain, and then ask how likely that
+        sequence is to be drawn.
+      solution: >-
+        On the corpus trigram, the exact best 24-token sequence is "at" repeated
+        24 times, scoring -0.8405 per token with distinct-2 of 0.0435, while
+        3,000 samples average -4.4340 per token with distinct-2 of 0.9967. The
+        mode is 86.2 nats better and 3.7e37 times more probable than a typical
+        sample, and its own probability is 1.73e-9, so no sampler would ever
+        draw it and no sample comes within 5 nats of it. Both facts have the same
+        cause: beam search is finding the mode, and for a finite-order model the
+        mode is a cycle: in a finite state space the greedy path must revisit a
+        state and repeat, and the DP is pulled to the same kind of fixed point
+        because the best-continuation relation is a function of the state. The beam scores are higher and the
+        text is worse because the objective is sequence likelihood, which rewards
+        repetition once the model is confident. For an open-ended summary the
+        right target is a typical sequence, so sample; reserve beam search for
+        tasks where the answer is nearly unique.
+    - id: cp-topk-vs-topp
+      question: >-
+        You ship top-k = 40 at temperature 1.0. On some prompts the output is
+        repetitive; on others it drifts off-topic into rare tokens. One change
+        fixes both, and it is not temperature. What is it, and why can one knob
+        fix two opposite failures?
+      answerKind: short_text
+      hint: >-
+        Compute what fraction of the mass 40 candidates hold when the row's
+        entropy is 2 nats, and when it is 7.5 nats.
+      solution: >-
+        Switch to top-p. A count of candidates means a data-dependent mass: at
+        k = 10 measured over three rows of the same 50,257-token vocabulary, the
+        kept mass is 0.8989 at entropy 2.0625 nats, 0.6012 at 4.4833 and 0.2569
+        at 7.5659. Forty candidates on a peaked row is essentially the whole
+        distribution - hence repetition, because the sampler has no alternative
+        mass to escape into - and forty candidates on a flat row is a tiny slice
+        of a long tail, so the sampler is drawing from an artificially sharpened
+        distribution and lands on rare tokens that the model only weakly prefers.
+        Top-p holds the mass fixed at 0.9 and lets the count move: measured, 11
+        tokens on the peaked row and 16,070 on the flat one. That is why one knob
+        fixes both: the failure was never the size of the candidate set, it was
+        that the candidate set had nothing to do with the shape of the row. The
+        cost is that top-p has its own failure mode - at p = 0.9 on a very flat
+        row it keeps 32% of the vocabulary and truncates almost nothing - so on
+        a flat row you still need temperature to do the work.
+    - id: cp-temperature-entropy
+      question: >-
+        A colleague wants "temperature 1.3 for creativity" and asks what it does.
+        Give the mechanism, the number for a specific row, and the two limits.
+      answerKind: short_text
+      hint: >-
+        Temperature divides logits. What does dividing by a scalar do to the
+        ranking, and what does it do to the entropy?
+      solution: >-
+        It divides every logit by T before the softmax, so the ranking cannot
+        change - a token with probability zero stays at zero - and only the
+        spread changes. Entropy rises monotonically with slope Var(z)/T^3, so the
+        effect depends on the row: measured on a 50,257-token row of entropy
+        4.4833 nats, T = 1.3 gives 7.5659 nats and T = 1.5 gives 8.8591, against
+        ln 50,257 = 10.8249 for uniform. The limits are H -> 0 at T -> 0
+        (measured 0.0012 nats at T = 0.1) and H -> ln V at T -> infinity
+        (10.8148 at T = 10.0). So "creativity 1.3" means a specific measurable
+        amount of added uncertainty, not a change in what the model knows - and
+        on a row that is already at 7.5 of 10.8 nats, the same setting buys much
+        less than it does on a confident row.
+    - id: cp-penalty-sign
+      question: >-
+        A serving stack applies a repetition penalty of 1.2 by dividing every
+        logit for a repeated token by 1.2, and reports that repetition got worse.
+        Why, and what should the code do?
+      answerKind: short_text
+      hint: >-
+        Look at the sign of the logits. What happens to a negative number when
+        you divide it by 1.2?
+      solution: >-
+        Logits at a typical position are negative - if they are log-probabilities
+        they are all negative by construction - and dividing a negative number by
+        1.2 makes it larger, so the repeated token's probability goes up.
+        Measured on a row with p(top) = 0.199290: the naive divide gives 0.245658
+        at theta = 1.2, a 23% increase, while the correct asymmetric rule
+        (divide positive logits, multiply negative ones) gives 0.152731, a 23%
+        decrease. The naive version also lowers entropy from 5.4034 to 5.1775
+        instead of raising it, because it sharpens the row around the tokens it
+        did not touch. The fix is the branch: `z = z / theta if z > 0 else z *
+        theta`. Note that centring the logits first (subtracting the max) makes
+        them all non-positive and turns the naive rule into a global sharpen, so
+        the sign convention has to be part of the contract, not an afterthought.
+    - id: cp-spec-gamma
+      question: >-
+        Your draft model accepts 55% of proposals. You can afford any gamma. What
+        gamma do you choose, what speedup do you get, and what would make the
+        answer different?
+      answerKind: short_text
+      hint: >-
+        The expected tokens per pass is (1 - alpha^(gamma+1))/(1 - alpha). Take
+        the limit and see how fast gamma gets there.
+      solution: >-
+        At alpha = 0.5500 the limit is 1/(1-alpha) = 2.2222 tokens per target
+        pass. Gamma = 1 gives 1.5500, gamma = 4 gives 2.1104 (95% of the limit),
+        gamma = 8 gives 2.2120 (99.5%) and gamma = 32 is 2.2222 to four decimals
+        - while costing 32 draft tokens and, on rejection, wasting up to 31
+        verified positions. So gamma = 4 or 5: beyond that the extra draft
+        compute is pure overhead. What changes the answer is alpha, not gamma: a
+        draft at alpha = 0.9 would be worth 10x, and at alpha = 0.3 it is worth
+        1.43x and not worth the second model. The other consideration is that
+        acceptance is not uniform across positions - it is high on predictable
+        text and low where the target is uncertain - so the effective alpha on
+        real text is lower than a single-row measurement suggests.
+    - id: cp-order
+      question: >-
+        Your config says top-p 0.9, temperature 0.7. In one implementation the
+        truncation runs on the untempered row and the temperature is applied to
+        what survives; in the other the row is tempered first. Which is right,
+        and how different are the answers?
+      answerKind: short_text
+      hint: >-
+        Both rules keep a rank prefix. Can multiplying by a positive scalar
+        change the order of two numbers?
+      solution: >-
+        Temper first, then truncate, because the p you set is a statement about
+        the distribution you are about to sample from. The two orders cannot
+        change *which* tokens survive - temperature is monotone, so it never
+        reorders candidates, and both rules keep a rank prefix - but they change
+        how many. Measured on the entropy-4.4833 row: a nucleus of 523 tokens
+        taken at T = 1 carries 0.99704 of the mass once you sample at T = 0.7,
+        while the nucleus taken at T = 0.7 has 9 tokens carrying 0.90. The
+        resulting distributions differ by only 0.3% in their top probability
+        (0.556446 against 0.554797), so a single token will not tell you which
+        one you have; but you asked for 90% and got 99.7%, and over a long
+        generation that is the difference between a controlled tail and an
+        uncontrolled one. The practical rule: apply penalties, then temperature,
+        then truncation, then draw.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        The model gives you a probability for every token in the vocabulary, at
+        every position, and nothing else. Decoding is the separate policy that
+        turns those rows into one sequence. Two families exist and they are not
+        variations of each other: search policies (greedy, beam) pick the
+        sequence with the highest score, and sampling policies (top-k, top-p,
+        temperature) draw a sequence from a modified distribution.
+
+        The distinction that matters is that a maximiser and a sampler return
+        different *kinds* of object. A maximiser returns the single most probable
+        sequence, which for a language model is a repeated phrase, because the
+        most probable continuation of a confident model is more of itself. A
+        sampler returns a sequence from the typical set, which is where all the
+        probability mass actually is. Neither is wrong; they answer different
+        questions, and choosing the wrong one is the most common decoding bug in
+        production.
+      blocks:
+        - kind: checklist
+          body: |
+            - The model produces logits; the decoder produces tokens
+            - Greedy and beam maximise a score; sampling draws from a distribution
+            - Beam search is exact only at a width equal to the state count, and costs k times as much
+            - The mode of a finite-order model is a cycle
+            - Temperature rescales the row and cannot reorder it
+            - Top-k fixes a count, top-p fixes a mass
+            - Penalties are logit arithmetic, and their sign matters
+            - Speculative decoding changes latency and not the distribution
+      checkpoint: >-
+        Before reading on: if the highest-probability sequence is a repeated
+        phrase, is that a bug in the model, a bug in the search, or neither?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        There are three separate questions and each has its own instrument.
+        "What does this policy optimise?" is answered by computing the score of
+        the sequence it returns and comparing it to the exact best sequence - on
+        a small model you can compute the exact best by dynamic programming, and
+        the gap is the measurement. "How much choice does the sampler have?" is
+        answered by the entropy of the row and by the mass the truncation keeps,
+        not by the value of k or p. "Why is the output looping?" is answered by
+        looking at the row at the position where it loops - not by changing the
+        sampler and hoping.
+
+        Choose the direction by the question: search questions get an exact
+        reference computed by DP, sampler questions get entropy and retained
+        mass, and quality questions get diversity statistics like distinct-2,
+        because likelihood and quality are not the same axis.
+      blocks:
+        - kind: checklist
+          body: |
+            - Score a sequence by summing its log-probabilities; compare to the DP optimum
+            - Compare policies by distinct-2 and by per-token log-probability, never by one alone
+            - Characterise a row by its entropy, not by its maximum
+            - Characterise a truncation by the mass it keeps, not the count it keeps
+            - Check the sign of every logit transform on a negative logit
+            - For speculative decoding, measure alpha before choosing gamma
+      checkpoint: >-
+        Which instrument would you reach for to explain why top-k = 40 gives
+        repetitive output on one prompt and off-topic output on another, and
+        which to explain why beam-8 beats greedy on a translation benchmark?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Every policy in this topic is four lines around a softmax, and the search
+        policies differ only in what they keep between steps.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # one sampling step, in the order that matters
+            z = logits
+            apply penalties to z        # divide positives, multiply negatives
+            z = z / T                   # monotone: ranking unchanged
+            p = softmax(z)
+            if top_k: keep the k largest by p, ties by index
+            if top_p: keep the smallest prefix (by p) whose cumulative mass >= p
+            p = p / sum(p over kept)    # renormalise, or the CDF is wrong
+            return the first kept index whose cumulative p exceeds u
+
+            # beam search
+            beams = the k best single tokens by log p
+            repeat n-1 times:
+                candidates = every beam extended by every token, score summed
+                beams = the k best candidates        # no merging of equal states
+            return the best beam
+
+            # exact best sequence (the reference beam search is approximating)
+            dp[state] = best score of any prefix ending in that state
+            dp_new[next_state] = max over predecessors of dp[state] + log p
+            backtrack from the best final state
+
+            # speculative decoding, one round
+            propose gamma tokens from q; score all gamma with p in one pass
+            for each position: accept with probability min(1, p(x)/q(x))
+            on first rejection: sample from normalise(max(0, p - q)), stop
+            if none rejected: append one token sampled from p
+      checkpoint: >-
+        The beam-search loop and the exact DP both keep "the best k things", but
+        one of them is allowed to be exact at k = V and the other is exact at
+        k = V too. Why does the DP need V x V states for a trigram model while
+        beam search needs only k sequences?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three relations do all the work: the entropy slope of temperature, the
+        typical-set gap that makes the mode atypical, and the geometric
+        acceptance sum that caps speculative decoding.
+      blocks:
+        - kind: math
+          body: |
+            Temperature. With $\beta = 1/T$ and
+            $H = \log Z - \beta\langle z\rangle$,
+
+            $$\frac{dH}{d\beta} = -\beta\,\operatorname{Var}_p(z),
+              \qquad \frac{d\beta}{dT} = -\frac{1}{T^2},
+              \qquad \frac{dH}{dT} = \frac{\operatorname{Var}_p(z)}{T^3},$$
+
+            so entropy rises monotonically, from $0$ at $T \to 0$ to $\log V$ at
+            $T \to \infty$. Measured at $T = 1$ on a row of entropy 4.4833 nats:
+            finite difference $10.82606$, $\operatorname{Var}/T^3 = 10.82606$.
+
+            Typical set. A sampled sequence has
+            $\mathbb{E}[-\tfrac{1}{n}\log p] = H$, and the mode has
+            $-\tfrac{1}{n}\log p \le H$ because an average cannot exceed a
+            maximum, so the mode is at least $H - H_{\min}$ nats per token above
+            the typical set. Measured at $n = 24$: $0.8405$ against $4.4340$ per
+            token, a gap of $3.5935$ per token and $86.2$ nats in total, so the
+            mode is $e^{86.2}$ times more probable and has probability
+            $1.73\times10^{-9}$.
+
+            Speculative decoding. With
+            $\alpha = \sum_x \min(p(x), q(x))$ the $i$-th proposal survives with
+            probability $\alpha^{i}$, so
+
+            $$\mathbb{E}[\text{tokens}] = \sum_{i=1}^{\gamma}\alpha^{i-1}
+              + \alpha^{\gamma} = \frac{1-\alpha^{\gamma+1}}{1-\alpha}
+              \;\to\; \frac{1}{1-\alpha}.$$
+
+            At $\alpha = 0.5500$: $1.5500$, $2.1104$, $2.2120$ for
+            $\gamma = 1, 4, 8$, against a limit of $2.2222$.
+      checkpoint: >-
+        The entropy slope contains no model term at all - only the variance of
+        the logits under the tempered distribution. Which of the three relations
+        would change if the vocabulary were ten times larger, and which would
+        not?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A decoder that is correct by construction: penalties on logits, then
+        temperature, then truncation, then one uniform draw against the
+        renormalised CDF - plus the exact reference you need to check a search
+        policy against.
+      blocks:
+        - kind: warning
+          body: >-
+            Four things break implementations and none of them raise. Dividing a
+            negative logit by a penalty above one increases the repeated token's
+            probability by 23% at theta = 1.2. Truncating before temperature
+            keeps 523 tokens where 9 would do, so the p you set is not the mass
+            you keep. Renormalising before the truncation instead of after makes
+            the CDF sum to less than one, so the last candidate absorbs the
+            remainder. And a speculative sampler that resamples from p instead of
+            from max(0, p - q) on rejection is biased by 0.1026 in total
+            variation at gamma = 1 and 0.1504 at gamma = 4 - invisible in the
+            text, wrong in the distribution.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+
+            def decode_row(logits, temperature=1.0, top_k=0, top_p=1.0, u=0.5,
+                           banned=(), theta=1.0):
+                z = list(logits)
+                for i in banned:                      # repetition penalty
+                    z[i] = z[i] / theta if z[i] > 0 else z[i] * theta
+                z = [x / temperature for x in z]
+                m = max(z)
+                e = [math.exp(x - m) for x in z]
+                s = sum(e)
+                p = [x / s for x in e]
+                order = sorted(range(len(p)), key=lambda i: (-p[i], i))
+                if top_k:
+                    order = order[:top_k]
+                if top_p < 1.0:
+                    keep, c = [], 0.0
+                    for i in order:
+                        keep.append(i)
+                        c += p[i]
+                        if c >= top_p:
+                            break
+                    order = keep
+                tot = sum(p[i] for i in order)
+                run = 0.0
+                for i in sorted(order):
+                    run += p[i] / tot
+                    if u < run:
+                        return i, tot, len(order)
+                return max(order), tot, len(order)
+
+
+            def exact_best(start_logp, trans_logp):
+                """Exact MAP by DP over the previous token; trans_logp[t][i][j]."""
+                V = len(start_logp)
+                dp = [(start_logp[i], (i,)) for i in range(V)]
+                for M in trans_logp:
+                    cand = [(sc + M[sq[-1]][j], sq + (j,))
+                            for sc, sq in dp for j in range(V)]
+                    cand.sort(key=lambda t: (-t[0], t[1]))
+                    dp = cand[:V]
+                return dp[0]
+      checkpoint: >-
+        `exact_best` keeps V candidates per step, which makes it exact for a
+        first-order model and wrong for a second-order one. What is the smallest
+        number of candidates that keeps it exact for a trigram, and why is that
+        the same number that makes beam search exact?
+
+  problems:
+    - id: p-sample-token
+      title: "One sampling step, with both truncation rules"
+      difficulty: medium
+      prompt: >-
+        Implement `sample_token(logits, temperature, top_k, top_p, u)` returning
+        a dict with `index` (the sampled token), `kept` (how many candidates
+        survived truncation) and `prob` (the sampled token's probability after
+        renormalisation). Apply the stages in this order: divide every logit by
+        `temperature`; softmax; if `top_k > 0` keep the `top_k` largest
+        probabilities, breaking ties by smaller index; if `top_p < 1.0` keep the
+        smallest prefix of that ranking whose cumulative probability is greater
+        than or equal to `top_p`, always keeping at least one token; renormalise
+        over the kept set. Then walk the kept indices in ascending index order,
+        accumulating renormalised probability, and return the first index whose
+        cumulative sum is strictly greater than `u` (return the largest kept
+        index if no sum exceeds `u`). `top_k = 0` means no top-k truncation and
+        `top_p = 1.0` means no top-p truncation. Use `math.exp` and a max-shift
+        so the softmax is stable.
+      starter: |
+        import math
+
+        def sample_token(logits, temperature=1.0, top_k=0, top_p=1.0, u=0.5):
+            # your implementation here
+            pass
+      language: python
+      entry: sample_token
+      testCases:
+        - input: '{"logits": [1.0, 1.0, 1.0, 1.0], "temperature": 1.0, "top_k": 0, "top_p": 1.0, "u": 0.3}'
+          expected: '{"index": 1, "kept": 4, "prob": 0.25}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [2.0, 1.0, 0.0, -1.0], "temperature": 0.5, "top_k": 0, "top_p": 1.0, "u": 0.9}'
+          expected: '{"index": 1, "kept": 4, "prob": 0.11705891323853294}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [2.0, 1.0, 0.0, -1.0], "temperature": 1.0, "top_k": 2, "top_p": 1.0, "u": 0.6}'
+          expected: '{"index": 0, "kept": 2, "prob": 0.7310585786300049}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [2.0, 1.0, 0.0, -1.0], "temperature": 2.0, "top_k": 0, "top_p": 0.8, "u": 0.5}'
+          expected: '{"index": 0, "kept": 3, "prob": 0.506480391055654}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [3.0, 2.0, 1.0, 0.0, -1.0], "temperature": 0.7, "top_k": 3, "top_p": 0.9, "u": 0.0}'
+          expected: '{"index": 0, "kept": 2, "prob": 0.8066786301976913}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [0.0, 0.0, 0.0], "temperature": 1.0, "top_k": 0, "top_p": 0.5, "u": 0.99}'
+          expected: '{"index": 1, "kept": 2, "prob": 0.5}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import math
+
+        def sample_token(logits, temperature=1.0, top_k=0, top_p=1.0, u=0.5):
+            z = [float(x) / temperature for x in logits]
+            m = max(z)
+            e = [math.exp(x - m) for x in z]
+            s = sum(e)
+            p = [x / s for x in e]
+            order = sorted(range(len(p)), key=lambda i: (-p[i], i))
+            if top_k and top_k > 0:
+                order = order[:int(top_k)]
+            if top_p < 1.0:
+                keep, c = [], 0.0
+                for i in order:
+                    keep.append(i)
+                    c += p[i]
+                    if c >= top_p:
+                        break
+                order = keep
+            kept = len(order)
+            tot = sum(p[i] for i in order)
+            run, chosen = 0.0, order[0]
+            for i in sorted(order):
+                run += p[i] / tot
+                if u < run:
+                    chosen = i
+                    break
+            else:
+                chosen = max(order)
+            return {"index": chosen, "kept": kept, "prob": p[chosen] / tot}
+      solutionExplanation: >-
+        The fourth case is the one that separates a correct implementation from a
+        plausible one. At temperature 2.0 the logits become [1.0, 0.5, 0.0,
+        -0.5], giving probabilities 0.4551, 0.2760, 0.1674, 0.1015; top-p 0.8
+        accumulates to 0.4551 then 0.7311 then 0.8985, so it stops at three
+        tokens and renormalises by 0.8985, which moves the top token from 0.4551
+        to 0.5065. An implementation that renormalises before truncating gets
+        0.4551 and no truncation at all. The fifth case shows the composition of
+        the two rules: top-k 3 keeps three candidates, then top-p 0.9 cuts that
+        to two, because at temperature 0.7 the top three carry 0.9870 of the
+        mass and the first two already carry 0.9433. The last case is the
+        degenerate one that catches an inclusive comparison: with three uniform
+        tokens and top-p 0.5, the prefix stops after two tokens at 0.6667, and
+        with u = 0.99 the walk returns index 1 because the cumulative after index
+        0 is only 0.5. The first case is the pure-CDF check: uniform over four
+        tokens, u = 0.3 lands on index 1. Note that the ordering by (-p, i) is
+        load-bearing: with ties broken by index, `kept` is reproducible, and
+        without it the answer for a uniform row depends on the sort's stability.
+      complexity: "O(V log V) time for the sort, O(V) space"
+      tags: [sampling, top-k, top-p, temperature, inverse-cdf]
+
+    - id: p-beam-vs-greedy
+      title: "Beam search, and the exact answer it is approximating"
+      difficulty: medium
+      prompt: >-
+        Implement `beam_search(start_logp, trans_logp, beam)` for a first-order
+        model. `start_logp[i]` is the log-probability of starting with token i.
+        `trans_logp[t][i][j]` is the log-probability of token j at step t+1 given
+        token i at step t, so the output length is `1 + len(trans_logp)`. Keep
+        the `beam` best prefixes at each step, scored by the sum of their
+        log-probabilities, extending every kept prefix by every token; break
+        ties by the lexicographically smallest sequence. Return a dict with
+        `sequence` (list of token indices) and `score` (the summed
+        log-probability, a float). With `beam` greater than or equal to the
+        vocabulary size the result must equal the exact best sequence.
+      starter: |
+        def beam_search(start_logp, trans_logp, beam=3):
+            # your implementation here
+            pass
+      language: python
+      entry: beam_search
+      testCases:
+        - input: '{"start_logp": [0.0, -1.0, -2.0], "trans_logp": [[[-0.1, -2.0, -3.0], [-1.0, -0.2, -2.0], [-2.0, -1.0, -0.3]]], "beam": 1}'
+          expected: '{"sequence": [0, 0], "score": -0.1}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"start_logp": [0.0, -1.0, -2.0], "trans_logp": [[[-0.1, -2.0, -3.0], [-1.0, -0.2, -2.0], [-2.0, -1.0, -0.3]]], "beam": 3}'
+          expected: '{"sequence": [0, 0], "score": -0.1}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"start_logp": [0.0, -0.3], "trans_logp": [[[-1.0, -1.0], [-0.05, -0.1]], [[-1.0, -1.0], [-0.05, -0.1]]], "beam": 1}'
+          expected: '{"sequence": [0, 0, 0], "score": -2.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"start_logp": [0.0, -0.3], "trans_logp": [[[-1.0, -1.0], [-0.05, -0.1]], [[-1.0, -1.0], [-0.05, -0.1]]], "beam": 2}'
+          expected: '{"sequence": [1, 1, 0], "score": -0.45000000000000007}'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"start_logp": [-0.5, -0.5, -2.0], "trans_logp": [[[-0.01, -3.0, -3.0], [-0.01, -3.0, -3.0], [-3.0, -3.0, -0.01]]], "beam": 2}'
+          expected: '{"sequence": [0, 0], "score": -0.51}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def beam_search(start_logp, trans_logp, beam=3):
+            V = len(start_logp)
+            seqs = [(float(start_logp[i]), (i,)) for i in range(V)]
+            seqs.sort(key=lambda t: (-t[0], t[1]))
+            seqs = seqs[:beam]
+            for M in trans_logp:
+                cand = []
+                for sc, sq in seqs:
+                    for j in range(V):
+                        cand.append((sc + float(M[sq[-1]][j]), sq + (j,)))
+                cand.sort(key=lambda t: (-t[0], t[1]))
+                seqs = cand[:beam]
+            sc, sq = seqs[0]
+            return {"sequence": list(sq), "score": sc}
+      solutionExplanation: >-
+        Cases three and four are the point of the problem. Greedy takes token 0
+        first, because 0.0 beats -0.3, and then every continuation from token 0
+        costs -1.0, giving -2.0 for three tokens. A beam of two keeps both the
+        -1.0 prefix [0, 0] and the -0.35 prefix [1, 0], and at the next step the
+        branch from token 1 costs -0.05 instead of -1.0, so it overtakes: [1, 1,
+        0] at -0.45 against greedy's -2.0. That is a 1.55-nat win bought by
+        paying the 0.3-nat entry fee, which is exactly what a widened beam can do
+        and a greedy policy cannot. Case five is the tie-breaking rule: two
+        prefixes score -0.51 and both start at 0.5, so the lexicographically
+        smaller sequence wins, and an implementation that sorts by score alone
+        will return whichever the sort happened to leave first. Case two is the
+        exactness check: with beam = 3 = V the result must match the DP optimum,
+        and it does. Note that the score is a sum, so the model with the -1.0
+        rows prefers two tokens to three; that is the length bias, and it is why
+        production beam search divides by a length penalty before comparing
+        candidates of different lengths.
+      complexity: "O(n k V log(kV)) time, O(kV) space"
+      tags: [beam-search, viterbi, greedy, search]
+
+    - id: p-entropy-curve
+      title: "Entropy against temperature"
+      difficulty: easy
+      prompt: >-
+        Implement `entropy_curve(logits, temperatures)` returning a list of
+        entropies in nats, one per temperature, of `softmax(logits / T)`. Use
+        `math.log` and skip zero-probability terms. The answer for a list of
+        equal logits must be independent of the temperature, and the answer for
+        any row must approach `log(V)` as the temperature grows.
+      starter: |
+        import math
+
+        def entropy_curve(logits, temperatures):
+            # your implementation here
+            pass
+      language: python
+      entry: entropy_curve
+      testCases:
+        - input: '{"logits": [0.0, 0.0, 0.0, 0.0], "temperatures": [0.5, 1.0, 2.0]}'
+          expected: '[1.3862943611198906, 1.3862943611198906, 1.3862943611198906]'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [2.0, 1.0, 0.0, -1.0], "temperatures": [0.1, 1.0, 10.0]}'
+          expected: '[0.0004994208704672029, 0.9475369639754255, 1.380070811244773]'
+          mode: json
+          tolerance: 1e-12
+        - input: '{"logits": [0.0, 10.0], "temperatures": [0.25, 1.0, 4.0]}'
+          expected: '[1.6993417021166355e-16, 0.0004993775862411646, 0.26853518434565843]'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import math
+
+        def entropy_curve(logits, temperatures):
+            out = []
+            for T in temperatures:
+                z = [float(x) / T for x in logits]
+                m = max(z)
+                e = [math.exp(x - m) for x in z]
+                s = sum(e)
+                p = [x / s for x in e]
+                out.append(-sum(q * math.log(q) for q in p if q > 0))
+            return out
+      solutionExplanation: >-
+        The first case is the invariance check: a uniform row has entropy log 4 =
+        1.3862943611198906 at every temperature, because dividing equal logits by
+        T leaves them equal - temperature can only change the spread, and there
+        is no spread to change. The second case shows the two limits: at T = 0.1
+        the row is essentially a one-hot and entropy is 0.0005 nats; at T = 10 it
+        is 1.3801 against log 4 = 1.3863, so it has recovered 99.6% of the way to
+        uniform. The third case is the numerical trap: with logits [0.0, 10.0]
+        and T = 0.25 the gap is 40 nats, so the smaller probability is
+        4.2e-18 and its contribution to the entropy is 1.7e-16 - representable,
+        but only because the max-shift keeps `exp(-40)` from underflowing to zero
+        first. Without the shift, `exp(z)` for z = 40 is fine but the ratio is
+        computed as a difference of two huge numbers; with a larger gap the
+        answer silently becomes 0.0 instead of a tiny positive number, and you
+        cannot tell a maximally confident row from an underflow.
+      complexity: "O(len(temperatures) x len(logits))"
+      tags: [temperature, entropy, softmax, numerics]
+
+
+  try_it: >-
+    Take one logits row from any model and compute its entropy at temperature 1.0, 1.5 and 0.7.
+    On a 50,257-token row starting at 4.48 nats you should reach 8.86 at 1.5 — if your number is
+    far off, you are tempering probabilities instead of logits.
+  interview_questions:
+    - question: 'What is wrong with greedy decoding as a way to get the most likely sequence?'
+      level: mid
+      key_points:
+        - 'It is a fixed-point machine rather than a search: the argmax state stops moving, which is why greedy output loops on a small model.'
+        - 'In a finite-order model with a unique argmax transition the greedy path is eventually periodic, so it revisits a state and repeats from there.'
+        - 'The MAP sequence is not the greedy sequence, and the gap is not small: the maximiser of sequence likelihood is itself a repeated phrase in the measurement here.'
+        - 'Beam search widens the search but its guarantee is only relative to k, exact only when k covers the number of distinct states.'
+    - question: 'You ship temperature 0.7, top-p 0.9 and a repetition penalty of 1.2, and some prompts loop. Which knob do you touch first, and how do you know it helped?'
+      level: senior
+      key_points:
+        - 'Top-p fixes a mass, so the nucleus size is a property of the row: 11, 523 and 16,070 tokens at p = 0.9 across three rows of the same vocabulary.'
+        - 'Top-k fixes a count, so the mass it keeps varies instead: 0.8989 at k = 10 on one row.'
+        - 'A repetition penalty is logit arithmetic with a sign convention: divide positive logits and multiply negative ones, and getting it backwards turns the penalty into a bonus.'
+        - 'Measure entropy and n-gram repetition rate before and after the change, so the claim is about the distribution rather than about one prompt.'
+      follow_up: 'Temperature and top-p commute on the set and not on the mass. What exactly does that mean for the order you apply them in?'
+    - question: 'Does temperature commute with top-p? Give the number.'
+      level: mid
+      key_points:
+        - 'Both rules keep a rank prefix, and temperature is monotone, so it cannot reorder candidates and the set survives unchanged.'
+        - 'The mass does not survive: a 523-token nucleus taken at T = 1 carries 0.99704 of the mass once you sample at T = 0.7.'
+        - 'So truncating before tempering and tempering before truncating give the same tokens with different probabilities.'
+        - 'The practical consequence is that a pipeline tuned at one temperature changes behaviour when you move the temperature, even though the truncation setting did not move.'
+  common_mistakes:
+    - 'Assuming a higher temperature means better output, when it raises entropy from 4.48 to 8.86 nats at 1.5 on the way to the 10.82-nat uniform limit.'
+    - 'Getting the repetition-penalty sign backwards on log-probabilities, which are all negative, so multiplying them rewards exactly the repetition you meant to suppress.'
+    - 'Comparing decoding runs at different top-p without noticing the nucleus size moves by 1,460x across rows, so the comparison is measuring the data, not the setting.'
+  further_reading:
+    - label: "Holtzman, Buys, Du, Forbes & Choi, The Curious Case of Neural Text Degeneration (ICLR 2020)"
+    - label: "Leviathan, Kalman & Matias, Fast Inference from Transformers via Speculative Decoding (ICML 2023)"

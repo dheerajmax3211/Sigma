@@ -1,0 +1,392 @@
+id: llama-3-scale
+title: "Llama 3 at 405B: 15 trillion tokens, 16,000 GPUs, and a data recipe nobody can copy from a paper"
+summary: >-
+  Llama 3 is the clearest public account of what a frontier pretrain actually
+  costs. The 405B model was trained on 15.6 trillion tokens across up to 16,384
+  H100s, using four-dimensional parallelism, in a run the paper reports as about
+  30.8 million GPU-hours. The interesting part is not the size. It is the data
+  pipeline, the annealing phase that spends the last few percent of the budget
+  on the best tokens, and the operational discipline that kept a 16,000-GPU job
+  at roughly 90% effective training time.
+kind: case_study
+date: "2024-07-23"
+actors: [Meta AI]
+key_facts:
+  - "Llama 3 8B and 70B shipped on 18 April 2024, trained on 15 trillion tokens with an 8k context, a step change from Llama 2's 2T."
+  - "Llama 3.1 405B shipped on 23 July 2024 with 15.6 trillion tokens and a 128k context, under the Llama 3.1 Community Licence."
+  - "The 405B run used four-dimensional parallelism: tensor, pipeline, context and data parallel, on up to 16,384 H100-80GB GPUs."
+  - "Meta reports roughly 30.8 million H100 GPU-hours for the 405B pretrain, which at $2 per GPU-hour is about $62M of compute."
+  - "The data mixture is roughly half web text, a quarter code, and a double-digit share of multilingual and mathematical data, after aggressive deduplication and classifier-based quality filtering."
+  - "The final phase of training anneals the learning rate toward zero while up-weighting the highest-quality sources, which is where a disproportionate share of benchmark quality is bought."
+  - "The paper reports 466 job interruptions in 54 days, 419 of them unexpected, with about 90% effective training time after detection and recovery."
+timeline:
+  - when: Jul 2023
+    what: "Llama 2 — 2T tokens, 4k context, and the licence that made open weights a strategy rather than a gesture."
+  - when: 18 Apr 2024
+    what: "Llama 3 8B and 70B: 15T tokens, 8k context, a 128k vocabulary, and a much larger data budget than Llama 2."
+  - when: 23 Jul 2024
+    what: "Llama 3.1 405B: 15.6T tokens, 128k context, 4D parallelism across 16K GPUs."
+  - when: Jul 2024
+    what: "The Llama 3 herd paper publishes the infrastructure detail: interruption rates, parallelism layout, and annealing recipe."
+  - when: 2025
+    what: "Llama 4 moves to a mixture-of-experts shape and a much longer context, inheriting the pipeline rather than the architecture."
+decisions:
+  - choice: "Spend the compute budget on data rather than on parameters"
+    why: "The compute-optimal ratio from the Chinchilla line of work says that for a fixed FLOP budget you should grow tokens and parameters together. Llama 3 went further on tokens than most: 15T for an 8B model is roughly 1,875 tokens per parameter, dramatically past the classic 20-tokens-per-parameter rule."
+    cost: "Training an 8B model on 15T tokens costs the same as training a much larger model on fewer, which means the small model becomes expensive to produce and must be amortised over enormous serving volume."
+  - choice: "Build the data pipeline as the core asset, not the model code"
+    why: "The architecture is a standard decoder-only transformer. The difference between a good and a great model at this scale is which tokens it saw. Deduplication, quality classifiers, domain mixing and decontamination are where the moat actually is."
+    cost: "It is unglamorous, hard to publish reproducibly, and requires a data engineering organisation that most labs do not have. The paper describes the pipeline but not the classifiers, so the result is not reproducible from the text."
+  - choice: "Four-dimensional parallelism rather than a simpler topology"
+    why: "At 405B the model does not fit any single parallelism strategy. Tensor parallel handles the per-layer sharding, pipeline parallel splits depth, context parallel splits the sequence for 128k training, and data parallel replicates across pods. Each dimension is used where its communication pattern is cheapest."
+    cost: "Four interacting dimensions is a large failure surface. A hang can be in any of them, and the debugging tools have to attribute a stall to a specific collective."
+  - choice: "Train the 405B at 128k context during pretraining rather than only in post-training"
+    why: "Long context is a capability that has to be learned, not bolted on. Training a fraction of the run at long sequence lengths means the model learns to use distant tokens rather than merely tolerate them."
+    cost: "Context parallelism multiplies the communication volume for attention, and the long-context phase is the least efficient part of the run in MFU terms."
+  - choice: "Release the weights under a community licence with a monthly-active-user clause"
+    why: "It builds an ecosystem and a tooling stack around the model while retaining a commercial lever against the largest distributors."
+    cost: "Not OSI-approved, so it is open weight rather than open source. The clause is a legal review for every large company, and it makes the model unsuitable for some procurement processes."
+lessons:
+  - "Tokens per parameter is the number to argue about. At 1,875 tokens per parameter, the old 20-tokens rule is off by two orders of magnitude."
+  - "Data quality beats data quantity once you are past a few trillion tokens. Deduplication and classifier filtering are the highest-leverage work in the pipeline."
+  - "Annealing is where quality is bought cheaply. The last few percent of the run, on the best data with a decaying learning rate, moves benchmarks more than the preceding half."
+  - "At 16,000 GPUs the job is an operations problem. Effective training time, not MFU, is the metric that decides whether the run finishes on schedule."
+  - "Four-dimensional parallelism is a communication-budget allocation, not a configuration choice."
+mistakes:
+  - "Copying the architecture and expecting the result. The transformer is public; the data mixture and the filtering classifiers are not."
+  - "Assuming 405B is the model to deploy. It costs roughly $62M to train and needs eight H200s per replica; the 8B and 70B models are what actually ship in products."
+  - "Ignoring context parallelism. At 128k training, the attention communication is a first-order cost that a 4k-context plan does not model."
+  - "Reading 30.8M GPU-hours as the cost of the model. It excludes the ablation runs, the failed attempts, the data pipeline compute and the 8B and 70B siblings trained on the same recipe."
+problem_statement: >-
+  Meta's problem was to produce a model that could compete with closed frontier
+  systems while being given away, which means the training cost has to be
+  amortised over an ecosystem rather than recovered from an API. That pushes in
+  two directions at once: the flagship has to be genuinely frontier, and the
+  small models have to be cheap enough to serve that the ecosystem can build on
+  them. The answer was a data-heavy recipe: train an 8B model on 15 trillion
+  tokens so that the small model is disproportionately good, and train a 405B on
+  the same pipeline so that the flagship exists. The engineering problem is then
+  purely operational, because a 16,000-GPU job that runs for 54 days will
+  experience hundreds of failures, and every hour of downtime is money spent on
+  nothing. The system is therefore designed around effective training time:
+  fast failure detection, deterministic replay, and a parallelism layout whose
+  communication cost is understood at every dimension.
+requirements:
+  functional:
+    - "Train a family of dense decoder-only models at 8B, 70B and 405B from one pipeline and one tokeniser, so that recipes transfer across scales."
+    - "Support a 128k context window at inference and train on long sequences so the capability is learned rather than adapted."
+    - "Produce a model that can be fine-tuned by third parties on a single node for the 8B size and a small cluster for 70B."
+    - "Cover eight languages at production quality, which requires a multilingual share of the pretraining mixture."
+    - "Ship weights under a licence that permits commercial use below a monthly-active-user threshold."
+  non_functional:
+    - "Hold effective training time above 90% across a 54-day run on 16,384 GPUs, which is an operations target rather than a modelling one."
+    - "Detect silent data corruption, because a corrupted gradient at step 400,000 is invisible until the loss curve moves weeks later."
+    - "Keep checkpointing overhead below a few percent, which at 4.86 TB per replica is a bandwidth problem."
+    - "Serve the 405B from a single 8-GPU node at BF16, which requires 810 GB of weights to fit in 1.128 TB."
+    - "Keep the 8B servable on a single GPU at 8-bit, because the ecosystem's ability to experiment depends on it."
+clarifying_questions:
+  - question: "Is the goal a flagship or a family?"
+    why_it_matters: "A flagship optimises for capability per dollar of training; a family optimises for capability per dollar of serving at the small end. The two lead to different token budgets, because the small model needs far more tokens per parameter to be worth shipping."
+  - question: "What is the inference distribution?"
+    why_it_matters: "A 405B at BF16 needs 810 GB of weights, so one replica is eight H200s. If 95% of traffic is short chat, the 8B at 8-bit on one GPU is a hundred times cheaper per token and the flagship is a loss leader."
+  - question: "How long can the run take before the result is obsolete?"
+    why_it_matters: "A 54-day run has a 54-day window in which a competitor can ship. That pressure pushes toward larger clusters and worse MFU, which is a business trade rather than an engineering one."
+  - question: "What is the failure budget?"
+    why_it_matters: "At 16,000 GPUs, hardware failure is continuous rather than exceptional. If you plan for a clean run you will lose weeks; if you plan for 400 interruptions you design checkpointing and replay around them."
+  - question: "Does the licence have to permit resale as a service?"
+    why_it_matters: "The monthly-active-user clause decides whether a cloud provider can host the model commercially. That determines whether the ecosystem builds on your weights or on a competitor's API."
+capacity_estimation:
+  assumptions:
+    - "405B parameters, 126 layers, 8 KV heads at head dimension 128, 128,256-token vocabulary."
+    - "BF16 training: 2 bytes per parameter for weights and gradients, 8 bytes per parameter for Adam first and second moments in FP32."
+    - "An H100-80GB has 80 GB of HBM at 3.35 TB/s and 989 TFLOPS BF16 dense; an H200 has 141 GB at 4.8 TB/s."
+    - "The run is taken at 16,384 GPUs and 30.84M GPU-hours, both as reported by Meta."
+    - "Serving assumes 40% MFU for compute-bound batched decode and $30 per hour for an 8-GPU H200 node."
+  arithmetic:
+    - label: "Weight memory at BF16"
+      calculation: "405e9 params x 2 bytes = 810 GB; 8 x H200 at 141 GB = 1.128 TB leaves 318 GB for KV and activations"
+      conclusion: "The 405B fits exactly one replica on an 8-GPU H200 node. There is no room for a second replica and very little room for a large batch, which is why long-context serving on it is expensive."
+    - label: "Full training state per replica"
+      calculation: "weights 810 GB + gradients 810 GB + Adam moments 405e9 x 8 bytes = 3.24 TB, total 4.86 TB"
+      conclusion: "4.86 TB does not fit on any node. Distributed optimiser state is mandatory, and the parallelism layout is chosen to keep that state sharded rather than replicated."
+    - label: "Parallelism layout arithmetic"
+      calculation: "4.86 TB / 128 GPUs = 38 GB per GPU, which fits in 80 GB with room for activations; 128 GPUs = TP8 x PP16"
+      conclusion: "Tensor parallel 8 within a node plus pipeline parallel 16 across nodes gives a workable per-GPU footprint. Data parallel then replicates that 128-GPU group across the cluster."
+    - label: "Wall clock of the reported run"
+      calculation: "30.84e6 GPU-hours / 16,384 GPUs = 1,882 hours = 78.4 days"
+      conclusion: "The 405B pretrain is a two-and-a-half-month campaign. At 90% effective training time, 7.8 days of that is downtime, which is the operational cost of scale."
+    - label: "Rental cost"
+      calculation: "30.84e6 GPU-hours x $2/GPU-hour = $61.7M; at $2.50 for H200-class hardware it is $77M"
+      conclusion: "A single pretrain is a nine-figure programme once you add data, ablations and the 8B and 70B siblings. The compute line alone is $62M."
+    - label: "Implied model FLOPs utilisation"
+      calculation: "6 x 405e9 x 15.6e12 = 3.79e25 FLOPs; 16,384 x 9.89e14 x (78.4 x 86,400 s) = 1.10e26 available; 3.79e25 / 1.10e26 = 34.5%"
+      conclusion: "All-in MFU including downtime is about 35%. That is a good number for a run this size and a reminder that 50% MFU is a marketing figure, not an operational one."
+    - label: "Tokens per GPU-hour"
+      calculation: "15.6e12 tokens / 30.84e6 GPU-hours = 505,800 tokens per GPU-hour; / 3,600 = 140 tokens/s per GPU"
+      conclusion: "140 tokens per second per GPU is the throughput to compare against any other pretrain. It normalises away cluster size and lets you compare recipes directly."
+    - label: "KV cache at 128k context"
+      calculation: "8 KV heads x 128 dim x 2 for K and V x 2 bytes x 126 layers = 516 KB/token; x 131,072 = 67.6 GB per sequence"
+      conclusion: "One 128k sequence consumes 67.6 GB, which is half a node's spare memory. At FP8 the cache is 33.8 GB, which is why quantised KV is standard for long-context deployment of this model."
+    - label: "Cost per million output tokens, 405B at BF16"
+      calculation: "405e9 x 2 FLOPs/token = 810 GFLOP; 8 x H200 x 9.89e14 x 0.4 = 3.16e15 FLOP/s; 3.16e15 / 8.1e11 = 3,900 tokens/s; $30/h node / (3,900 x 3,600) = $2.14 per million tokens"
+      conclusion: "About $2.14 per million output tokens at cost, before margin, redundancy or idle capacity. That floor is why the 405B is rarely the model behind a high-volume product."
+    - label: "Cost per million output tokens, 8B at FP8"
+      calculation: "8e9 x 2 FLOPs/token = 16 GFLOP; one H200 at 0.4 MFU = 3.96e14 FLOP/s; 3.96e14 / 1.6e10 = 24,750 tokens/s; ($30/8 per GPU-hour) / (24,750 x 3,600) = $0.042 per million tokens"
+      conclusion: "The 8B is roughly 50x cheaper per token than the 405B. That ratio, not the benchmark gap, is what determines which model most products actually run."
+architecture_summary: >-
+  The model is a dense decoder-only transformer with pre-norm residual blocks,
+  rotary position embeddings, grouped-query attention with 8 KV heads, and a
+  128,256-token vocabulary. The vocabulary matters more than it looks: at model
+  dimension 8,192 the embedding table alone is 2.1 GB in BF16, which is larger
+  than several transformer layers and has to be sharded separately. Training runs
+  on 16,384 H100s organised as a three-level network: NVLink inside a node,
+  InfiniBand between nodes within a pod, and a second InfiniBand tier between
+  pods. Tensor parallelism is confined to a node because it needs an all-reduce
+  per layer; pipeline parallelism spans nodes because it only needs point-to-point
+  sends at stage boundaries; context parallelism splits the sequence for 128k
+  training and needs a ring exchange for attention; data parallelism replicates
+  the whole 128-GPU group and needs a gradient all-reduce per step, which is
+  overlapped with the backward pass. The run is checkpointed sharded, resharded
+  on restart, and continuously audited for silent data corruption by comparing
+  loss traces across replicas.
+deep_dives:
+  - topic: "The data mixture is the model"
+    explanation: >-
+      Llama 3's architecture is unremarkable and deliberately so. The paper's
+      contribution is the pipeline: raw web crawl, language identification,
+      deduplication at document and paragraph level, heuristic filters for
+      boilerplate and adult content, then a model-based quality classifier that
+      scores each document and keeps the top slice. Code is treated as a
+      first-class domain rather than an afterthought, because code teaches
+      structured reasoning and it is also what makes the model useful to
+      developers. Maths gets the same treatment. Multilingual data is sampled at
+      a rate well above its natural web frequency, because otherwise English
+      dominates by two orders of magnitude and the model is monolingual in
+      practice. The mixture is roughly half web text, a quarter code, and a
+      double-digit share of multilingual and mathematical data, and it is tuned
+      by ablation rather than by principle: train a small model on a candidate
+      mixture, measure the downstream suite, adjust. The critical point is that
+      this is an empirical loop running over months, and it is the part of the
+      paper that cannot be reproduced from the text, because the classifiers
+      themselves are not published.
+    tradeoffs:
+      - option: "Heavy classifier-based filtering"
+        pros: "Raises quality per token substantially, which is the cheapest quality available once you are past a few trillion tokens."
+        cons: "The classifier encodes its own biases; over-filtering removes minority dialects and domains, and the loss is invisible on aggregate benchmarks."
+      - option: "Train on everything, filter nothing"
+        pros: "Maximum diversity and no classifier bias; simplest pipeline; the model sees the long tail."
+        cons: "Quality per token collapses; you spend FLOPs on spam, and the model learns the distribution of the web rather than the distribution you want."
+      - option: "Synthetic data at scale"
+        pros: "Cheap, controllable, and can target exactly the capability you want; increasingly how maths and code data are produced."
+        cons: "Model collapse and mode narrowing when the generator and the student share a family; needs careful mixing with human data to stay diverse."
+  - topic: "Annealing: buying the last ten points cheaply"
+    explanation: >-
+      The final phase of the run decays the learning rate toward zero and
+      simultaneously changes the data mixture to up-weight the highest-quality
+      sources: curated web, textbook-style prose, verified code, synthetic maths.
+      The learning-rate decay is standard cosine behaviour, but the data change
+      is the interesting part. Late in training the model is close to its final
+      loss basin, so the tokens it sees in the last few percent have an
+      outsized effect on where it settles. Feeding it the best data at that
+      moment is like revising for an exam in the last week rather than the first.
+      The arithmetic is compelling: if the final 5% of a 15T-token run is 750B
+      tokens, and the annealing phase lifts the benchmark suite by several points,
+      those points cost 5% of the budget rather than the 100% a dedicated run
+      would need. The technique is now standard, and it has a subtle
+      consequence for evaluation: a model's benchmark score reflects its
+      annealing data as much as its pretraining corpus, which is why
+      contamination checks on the annealing set matter more than on the bulk
+      corpus.
+    tradeoffs:
+      - option: "Annealing with curated data and LR decay"
+        pros: "Large benchmark gains for a few percent of the budget; no change to the architecture or the bulk recipe."
+        cons: "Creates contamination risk if the curated set overlaps the evaluation; the gain can be narrow and benchmark-specific rather than general."
+      - option: "Constant learning rate to the end"
+        pros: "No phase transition to tune; simpler to reason about; the model stays plastic for longer."
+        cons: "Leaves loss on the table; the final model is noisier and the last tokens do not get the benefit of a settled basin."
+      - option: "Separate high-quality model trained from scratch"
+        pros: "Clean separation between the bulk model and the quality model; the annealing effect can be measured independently."
+        cons: "Costs a full pretrain for a gain that annealing achieves with a few percent of one."
+  - topic: "Four-dimensional parallelism as a communication budget"
+    explanation: >-
+      Each parallelism dimension trades a different communication pattern for
+      memory. Tensor parallel splits every weight matrix column-wise and needs
+      an all-reduce per layer, which is why it is confined to NVLink inside a
+      node; at TP8 the all-reduce is fast enough to hide. Pipeline parallel
+      splits the 126 layers into 16 stages and needs only a point-to-point send
+      of activations at each boundary, but it introduces a bubble: with 16 stages
+      and a micro-batch count that is not a multiple of the stage count, some
+      GPUs idle while waiting. Context parallel splits the sequence and needs a
+      ring exchange for attention, which is cheap at 8k and expensive at 128k.
+      Data parallel replicates the 128-GPU group and needs a gradient all-reduce
+      per step, which is overlapped with the backward pass so that the
+      communication for layer N happens while layer N-1 is still computing. The
+      art is choosing the split so that the most frequent communication stays on
+      the fastest link: all-reduce on NVLink, point-to-point on InfiniBand, and
+      the ring only for the long-context phase where it is unavoidable.
+    tradeoffs:
+      - option: "TP8 x PP16 within a 128-GPU group"
+        pros: "Fits 4.86 TB of training state at 38 GB per GPU; keeps the expensive all-reduce on NVLink; pipeline bubbles are manageable with enough micro-batches."
+        cons: "Pipeline bubbles still cost 10 to 15% at this depth; a stage failure restarts the whole group."
+      - option: "Pure data parallel"
+        pros: "No model sharding, simplest correctness story, best per-GPU efficiency when it fits."
+        cons: "405B does not fit on one GPU at any precision; the optimiser state alone is 3.24 TB."
+      - option: "Fully sharded data parallel (ZeRO-3 style)"
+        pros: "Shards weights, gradients and optimiser state across all ranks; no pipeline bubbles."
+        cons: "Every layer needs an all-gather of weights before the matmul, which is a lot of communication per layer over InfiniBand rather than NVLink."
+  - topic: "Operations at 16,000 GPUs: the run is a reliability problem"
+    explanation: >-
+      Meta reports 466 job interruptions over 54 days, 419 of them unexpected,
+      with roughly 90% effective training time. That means the difference between
+      a 78-day run and a 70-day run is not a better kernel, it is faster failure
+      detection. The mechanisms are unglamorous. Every rank writes a heartbeat;
+      a missed heartbeat triggers a collective timeout rather than a hang.
+      Checkpoints are sharded and written to local NVMe with a background upload,
+      so a restart reads only the shard it needs. On restart the checkpoint is
+      resharded to the new topology, because the failed node may be replaced by a
+      different rank count. Silent data corruption is the nastier failure: a GPU
+      that computes the wrong answer without erroring produces a loss curve that
+      drifts slowly, so the run compares loss traces across data-parallel
+      replicas and flags a divergence beyond a threshold. The last line of defence
+      is the loss-curve forecast: if the observed loss is outside the predicted
+      band, the run stops rather than continuing to spend money on a model that
+      is already broken.
+    tradeoffs:
+      - option: "Aggressive failure detection with fast restart"
+        pros: "90% effective training time, which is worth more than any kernel optimisation at this scale."
+        cons: "False positives restart healthy jobs; the detection thresholds are a tuning problem and a restart costs 20 to 40 minutes."
+      - option: "Fewer, larger checkpoints"
+        pros: "Less I/O overhead during normal operation; simpler checkpoint management."
+        cons: "A failure loses more work; at 4.86 TB per replica the write itself is a bandwidth event that stalls training."
+      - option: "Ignore silent corruption, trust ECC"
+        pros: "No extra monitoring infrastructure; ECC catches most memory errors."
+        cons: "The failures ECC does not catch are the expensive ones: weeks of training produce a model with a subtle degradation that cannot be attributed to a cause."
+  - topic: "Serving economics: why the flagship is rarely the product"
+    explanation: >-
+      The 405B costs about $2.14 per million output tokens at raw GPU cost, and
+      the 8B costs about $0.04. That is a 50x ratio for a benchmark gap that is
+      usually a few points on most tasks. The consequence is a barbell: the 8B
+      serves the volume, the 70B serves the quality-sensitive middle, and the
+      405B serves the cases where the extra points are worth 50x, which is a
+      small share of traffic. At BF16 the 405B needs 810 GB of weights, so a
+      replica is eight H200s and there is no such thing as a cheap deployment.
+      At FP8 it fits in four, which halves the floor, and at 4-bit it fits in
+      two, at a quality cost that has to be measured rather than assumed. The
+      second-order effect is that the 405B's 128k context needs 67.6 GB of KV at
+      BF16 per sequence, so long-context traffic on the flagship is bounded by
+      memory rather than by compute. This is why the family exists at all: the
+      architecture is the same, the recipe is the same, and only the serving
+      economics differ.
+    tradeoffs:
+      - option: "Serve the 405B at BF16"
+        pros: "No quantisation risk; full quality; simplest evaluation story."
+        cons: "810 GB of weights means eight H200s per replica and roughly $2 per million tokens at cost."
+      - option: "Serve the 405B at FP8"
+        pros: "Halves the weight footprint to 405 GB, so four H200s per replica; quality loss is small and measurable."
+        cons: "Requires per-channel scaling and validation; some long-context retrieval degrades before aggregate benchmarks show it."
+      - option: "Route by difficulty to the 8B"
+        pros: "Most traffic at 1/50th the cost; the flagship handles only the hard tail."
+        cons: "The router is a new failure surface, and a misroute is a visible quality cliff that is hard to explain to a user."
+bottlenecks:
+  - failure: "Silent data corruption"
+    symptom: "Loss drifts above the forecast band without any reported hardware error; the divergence is small at first and grows over tens of thousands of steps."
+    mitigation: "Cross-replica loss comparison with a divergence threshold, periodic deterministic replay of a fixed batch and comparison against a stored reference, and a stop-the-run policy when the forecast band is breached."
+  - failure: "Straggler GPUs"
+    symptom: "Step time oscillates and the whole cluster waits on one rank; utilisation is high everywhere except one node, and the median step is fine while the p99 doubles."
+    mitigation: "Per-rank step-time histograms, automatic identification and draining of the slow rank, and elastic training that continues with a smaller world size rather than waiting for a replacement."
+  - failure: "Checkpoint storms"
+    symptom: "Every checkpoint causes a multi-minute stall across the cluster, and at a 30-minute cadence that is 10% of the run."
+    mitigation: "Asynchronous sharded checkpointing to local NVMe with a background upload, staggered writes across ranks, and a checkpoint cadence tied to the measured failure rate rather than to a fixed interval."
+  - failure: "Pipeline bubble at stage boundaries"
+    symptom: "MFU falls as pipeline depth increases; the first and last micro-batches leave most stages idle and the average utilisation is well below the steady-state number."
+    mitigation: "Increase the micro-batch count so the bubble is amortised, use interleaved stages to shorten the fill and drain, and choose pipeline depth from the measured bubble cost rather than from memory alone."
+  - failure: "Data pipeline starvation"
+    symptom: "GPUs idle waiting for tokens; the loader is the bottleneck and the cluster is being paid for while it waits on storage."
+    mitigation: "Pre-tokenise and shard the corpus, stream from local NVMe rather than object storage, and measure tokens per second per loader against tokens per second per GPU so the pipeline is provisioned for the cluster rather than for a single node."
+interview_questions:
+  - question: "Why did Llama 3 train an 8B model on 15 trillion tokens? That is 1,875 tokens per parameter."
+    level: senior
+    key_points:
+      - "Compute-optimal scaling says grow tokens and parameters together for a fixed FLOP budget; Llama 3 went much further on tokens than the classic 20-tokens-per-parameter rule."
+      - "A small model trained on far more tokens is disproportionately capable, which matters when the model is given away and served by third parties."
+      - "The cost is that producing the small model is expensive even though serving it is cheap, so it only pays off at high volume."
+      - "Data quality has to support the token count; 15T tokens of unfiltered web would not produce the same result."
+    follow_up: "How would you decide the token budget for a new 30B model if you had $20M of compute?"
+  - question: "Walk me through 4D parallelism for a 405B model. Why not just use FSDP?"
+    level: staff
+    key_points:
+      - "Training state is 4.86 TB: 810 GB weights, 810 GB gradients, 3.24 TB of Adam moments."
+      - "TP8 keeps the per-layer all-reduce on NVLink; PP16 spans nodes with point-to-point sends; CP handles 128k sequences; DP replicates the group."
+      - "FSDP would all-gather weights before every layer, which is a per-layer communication over InfiniBand rather than NVLink."
+      - "The choice is a communication-budget allocation: put the most frequent collective on the fastest link."
+    follow_up: "What would change if the cluster had NVLink across the whole pod instead of only inside a node?"
+  - question: "Your 16,000-GPU run has 90% effective training time. Where does the other 10% go, and what do you do?"
+    level: staff
+    key_points:
+      - "Roughly 400 unexpected interruptions over 54 days, each costing a detection delay plus a restart, typically 20 to 40 minutes."
+      - "Checkpoint writes, pipeline fill and drain, and data loader stalls are the other contributors."
+      - "Mitigations: heartbeat-based detection, sharded async checkpoints, and elastic restart with a smaller world size."
+      - "At this scale, effective training time is worth more than MFU; a 5% improvement is days of cluster time."
+    follow_up: "How would you distinguish a straggler from a slow collective when the symptom is identical?"
+  - question: "What is annealing and why does it work?"
+    level: senior
+    key_points:
+      - "The final phase decays the learning rate toward zero while up-weighting the highest-quality data sources."
+      - "Late in training the model is near its final basin, so the last tokens have an outsized effect on where it settles."
+      - "The gain costs a few percent of the budget rather than a full pretrain."
+      - "The risk is contamination: if the curated set overlaps the evaluation, the benchmark gain is not real."
+    follow_up: "How would you measure the annealing gain separately from contamination?"
+  - question: "Size the serving deployment for 405B and tell me what it costs per million tokens."
+    level: senior
+    key_points:
+      - "BF16 weights are 810 GB, so one replica is eight H200s with 318 GB left for cache."
+      - "At 40% MFU the node produces about 3,900 tokens/s, and at $30/hour that is roughly $2.14 per million output tokens."
+      - "At FP8 the weights halve to 405 GB, so four H200s per replica and roughly half the cost per token."
+      - "128k context needs 67.6 GB of BF16 KV per sequence, so long-context traffic is memory-bound rather than compute-bound."
+    follow_up: "At what traffic level does it become cheaper to distil the 405B into a smaller model than to serve it directly?"
+  - question: "Why is the data pipeline harder to copy than the architecture?"
+    level: senior
+    key_points:
+      - "The architecture is published and standard: pre-norm, RoPE, GQA, SwiGLU."
+      - "The pipeline is deduplication, quality classifiers, domain mixing ratios and decontamination, and the classifiers are not published."
+      - "The mixture is tuned by ablation over months, which is an empirical loop rather than a design."
+      - "Classifier bias and over-filtering are invisible on aggregate benchmarks, so a copied pipeline can look correct and underperform."
+    follow_up: "If you had to rebuild the pipeline from scratch with a 1% compute budget, what would you do first?"
+  - question: "Should a startup fine-tune the 405B or the 8B? Argue with numbers."
+    level: mid
+    key_points:
+      - "Full fine-tuning of 405B needs the 4.86 TB training state, so a multi-node cluster; LoRA reduces that but still needs the frozen weights resident."
+      - "Serving the 405B costs about 50x the 8B per token, which dominates the total cost of ownership for any high-volume product."
+      - "The 8B fine-tunes on a single node and serves on one GPU, so iteration is hours rather than weeks."
+      - "The right answer is usually to fine-tune the smallest model that clears the quality bar, and to use the flagship only for the hard tail."
+    follow_up: "What evaluation would convince you that the 8B is good enough for your task?"
+what_to_steal:
+  - "Budget tokens before parameters. Tokens per parameter is the number that decides whether a small model is worth shipping."
+  - "Treat data filtering as model work. It is the highest-leverage and least glamorous part of the pipeline."
+  - "Anneal. The last few percent of the run, on the best data, is the cheapest quality you will ever buy."
+  - "Design for effective training time, not for peak MFU. At 16,000 GPUs, reliability is the performance metric."
+  - "Put the most frequent collective on the fastest link. That single rule explains the whole 4D layout."
+  - "Ship a family, not a flagship. The 8B is what makes the ecosystem, and the ecosystem is what makes the weights matter."
+further_reading:
+  - label: "The Llama 3 Herd of Models"
+    url: "https://arxiv.org/abs/2407.21783"
+  - label: "Llama 3.1 405B announcement"
+    url: "https://ai.meta.com/blog/meta-llama-3-1/"
+  - label: "Training Compute-Optimal Large Language Models (Chinchilla)"
+    url: "https://arxiv.org/abs/2203.15556"
+  - label: "Megatron-LM — tensor parallelism and the communication cost of TP"
+    url: "https://arxiv.org/abs/1909.08053"
+  - label: "Ring Attention — the context-parallel primitive for 128k training"
+    url: "https://arxiv.org/abs/2310.01889"
+  - label: "ZeRO — memory-efficient large-model training"
+    url: "https://arxiv.org/abs/1910.02054"
+sources:
+  - label: "The Llama 3 Herd of Models (arXiv 2407.21783)"
+    url: "https://arxiv.org/abs/2407.21783"
+  - label: "Meta — Llama 3.1 announcement, 23 July 2024"
+    url: "https://ai.meta.com/blog/meta-llama-3-1/"
+  - label: "Meta — Llama 3 announcement, 18 April 2024"
+    url: "https://ai.meta.com/blog/meta-llama-3/"
+  - label: "Chinchilla scaling laws (arXiv 2203.15556)"
+    url: "https://arxiv.org/abs/2203.15556"
+tags: [pretraining, data-quality, parallelism, annealing, serving, open-weights]

@@ -1,0 +1,576 @@
+id: build-diffusion-sampler
+slug: build-diffusion-sampler
+title: "Build a Diffusion Sampler: DDIM, Euler Flow Matching, and CFG"
+summary: >-
+  Implement the three lines that actually generate an image — a DDIM update that
+  predicts x0 and re-noises to the previous level, an Euler step along a learned
+  velocity field, and the classifier-free guidance combine — then prove each one
+  against a closed-form 1-D Gaussian path where the right answer is known.
+kind: lesson
+difficulty: hard
+position: 6
+estMinutes: 21
+prerequisites: []
+phase: build-systems
+tags: [diffusion, ddim, flow-matching, classifier-free-guidance, sampling, euler]
+
+body:
+  big_idea: >-
+    A sampler is a numerical integrator with a learned derivative: DDIM is a
+    first-order update on the probability-flow ODE, flow matching the same
+    update in velocity form, and guidance one line of extrapolation.
+  problem:
+    - "You can describe DDPM's forward process and still cannot write the 20-line loop that turns noise into an image."
+    - "Your 50-step sampler is blurry and your 1,000-step sampler is slow, and you cannot say whether the schedule, the update rule or guidance is responsible."
+    - "You set guidance to 7.5 because everyone does, and cannot say what it multiplies or why it doubles the forward passes."
+  analogy: >-
+    A hiking guide who knows the slope but not the map. Each step you ask
+    which way is downhill and how steep, then take a fixed-size step — Euler
+    integration. DDIM is the same walk in different coordinates: ask where the
+    summit is, then walk a fraction of the remaining distance to that guess.
+    At the start the guess is worthless.
+  concept_points:
+    - "**The forward process is closed form, and the schedule decides where the signal dies.** $x_t = \\sqrt{\\bar\\alpha_t}x_0 + \\sqrt{1-\\bar\\alpha_t}\\epsilon$ with $\\bar\\alpha_t = \\prod_{s\\le t}(1-\\beta_s)$. For $\\beta = 10^{-4}\\ldots0.02$ over 1,000 steps the SNR at $t = 999$ is **0.00635**, 0.29 at 500 and 1.04 at 250: half the trajectory has noise larger than signal."
+    - "**DDIM is four lines, and $\\eta = 0$ makes it deterministic.** Invert the forward process for $\\hat x_0 = (x_t - \\sqrt{1-\\bar\\alpha_t}\\epsilon_\\theta)/\\sqrt{\\bar\\alpha_t}$, then re-noise with the *same* $\\epsilon$: $x_{t-1} = \\sqrt{\\bar\\alpha_{t-1}}\\hat x_0 + \\sqrt{1-\\bar\\alpha_{t-1}}\\epsilon_\\theta$. With $\\eta = 0$ the map is invertible; with $\\eta = 1$ you recover DDPM. The milestone gets **1.78e-15** over ten steps."
+    - "**The $x_0$ prediction divides by $\\sqrt{\\bar\\alpha_t}$, and that is the numerical hazard.** At $t = 999$, $1/\\sqrt{\\bar\\alpha} = 157.4$: a 1% error in $\\epsilon$ becomes a 1.6-unit error in $\\hat x_0$, and later steps inherit it. That is why samplers clip $\\hat x_0$ to the data range and why a schedule driving $\\bar\\alpha_T$ to zero is dangerous."
+    - "**Fifty steps suffice because the ODE is smooth, and the count is a discretisation budget.** DDIM at 50 steps makes 20x fewer network calls than DDPM at 1,000 — at 2 ms per call, 100 ms against 2 s — and its error is first order in step size. The subsampled timesteps keep $\\bar\\alpha$ roughly geometric between steps."
+    - "**Flow matching is the same integrator in a different parameterisation.** A rectified-flow model learns $v_\\theta = x_1 - x_0$ along $x_t = (1-t)x_0 + tx_1$, and the sampler is $x_{t-\\Delta t} = x_t - \\Delta t\\,v_\\theta$. For a linear path Euler is **exact in one step** (0.0 at 25 steps); for a curved one the error is linear: 0.0766 at 10 steps, 0.00750 at 100."
+    - "**Guidance is an extrapolation, and the algebra is one line.** $\\tilde\\epsilon = (1+w)\\epsilon_c - w\\epsilon_u$: at $w = 0$ unconditional, at $w = 1$ conditional, and at $w = 7.5$ the conditional direction is amplified 8.5x. In score terms it samples the score of $p(x|c)^{1+w}/p(x)^w$ — sharper, and off the manifold at large $w$. It costs two forward passes."
+  definitions:
+    - { term: "ᾱ (alpha bar)", meaning: "The cumulative product of 1 − β over the schedule. It sets the signal-to-noise ratio at each timestep: x_t = √ᾱ x₀ + √(1−ᾱ) ε." }
+    - { term: "DDIM", meaning: "Denoising diffusion implicit model: a deterministic (η = 0) sampler that predicts x₀ from ε and re-noises to the previous level, allowing 20–50 steps instead of 1,000." }
+    - { term: "η (DDIM stochasticity)", meaning: "The dial between deterministic DDIM (η = 0) and DDPM (η = 1). It controls how much fresh noise is injected at each step." }
+    - { term: "Velocity field", meaning: "The learned derivative dx/dt in flow matching. Euler integration steps x by Δt·v; a linear path has constant v and is integrated exactly." }
+    - { term: "Classifier-free guidance (CFG)", meaning: "ε̃ = ε_uncond + w(ε_cond − ε_uncond). It extrapolates away from the unconditional prediction to sharpen conditioning, at the cost of two forward passes and reduced diversity." }
+    - { term: "Euler step", meaning: "x_{t+Δt} = x_t + Δt·v(x_t, t). First-order: the local error is O(Δt²) and the global error is O(Δt)." }
+    - { term: "x₀-prediction", meaning: "The model's estimate of the clean sample, obtained by inverting the forward process. It is what DDIM interpolates toward, and it amplifies ε errors by 1/√ᾱ." }
+
+  diagrams:
+    - type: pipeline
+      title: "One DDIM step, and where the guidance enters"
+      nodes:
+        - label: "x_t and t"
+          note: "the noisy sample and its level"
+          detail: "At t = 999 the sample is 99.996% noise: ᾱ = 4.04e-5, SNR = 0.00635."
+        - label: "ε_θ(x_t, t, c)"
+          note: "conditional prediction"
+          detail: "One forward pass. With guidance this is the batch-2 row that sees the prompt."
+        - label: "ε_θ(x_t, t, ∅)"
+          note: "unconditional prediction"
+          detail: "The same network with a null token. Together with the conditional pass this is the 2× cost of guidance."
+        - label: "CFG combine"
+          note: "ε̃ = ε_u + w(ε_c − ε_u)"
+          detail: "w = 0 gives ε_u exactly; w = 7.5 amplifies the conditional direction by 8.5×."
+        - label: "x̂₀"
+          note: "(x_t − √(1−ᾱ_t) ε̃)/√ᾱ_t"
+          detail: "The division by √ᾱ is 157.4 at t = 999, which is why x̂₀ is clipped."
+        - label: "x_{t−1}"
+          note: "√ᾱ_{t−1} x̂₀ + √(1−ᾱ_{t−1}) ε̃"
+          detail: "Deterministic: the same ε̃ is reused, so no fresh noise enters. Repeat for the subsampled timesteps."
+      caption: "Fifty iterations of this loop, 20× fewer than DDPM's 1,000, and the trajectory error against the closed form is 1.78e-15 because the update is algebraically exact when the model is."
+
+    - type: compare
+      title: "Three samplers, one integrator"
+      left_label: "DDIM / probability-flow ODE"
+      left_points:
+        - "Predict x₀, then re-noise to the previous level with the same ε; η = 0 is deterministic and invertible"
+        - "50 steps is standard; each step is one (or two, with guidance) network calls"
+        - "Error is first order in the step size; the schedule's curvature sets the constant"
+        - "Same code path serves image, video and audio diffusion models"
+      right_label: "Euler flow matching"
+      right_points:
+        - "Learn v = x₁ − x₀ along a straight path and integrate dx/dt = v with a fixed step"
+        - "A linear path has constant velocity, so Euler is exact; a curved path converges at O(Δt)"
+        - "Measured error 0.0766 at 10 steps and 0.00750 at 100 — a ratio of 10.2, as first order predicts"
+        - "Fewer steps in practice because the path is straighter, which is the point of rectified flow"
+
+  markdown: |
+    ## What you are building
+
+    A working image sampler in about sixty lines of NumPy. It starts from noise and takes fifty small steps, each removing a little of it, until a clean sample appears. You will build the step, the loop, and the guidance line that makes the sample follow a prompt. Every piece is checked against a one-dimensional example where the exact answer is a formula. A bug then shows up as a number, not as a blurry picture.
+
+    ## Why this exists
+
+    A diffusion model's network does one small thing: it predicts the noise inside a sample. The sampler is the loop that turns those predictions into an image, and most tutorials hide it. Get the loop wrong and nothing throws — you get a blurry result you cannot debug. The cost is real too. A thousand-step sampler makes a thousand network calls; at 2 ms each that is 2 seconds per image. A good fifty-step sampler makes fifty calls, which is 100 ms. Same model, same weights, twenty times faster.
+
+    ## Step 1 — Build the noise schedule
+
+    The model is trained on a fixed recipe for adding noise, called the noise schedule. It gives one number, beta, per timestep: how much fresh noise enters at that step. Alpha is one minus beta, so it is the fraction of signal that survives one step. Alpha-bar is the product of every alpha up to t, so it is the fraction of the original signal still there at t.
+
+    $$\bar\alpha_t = \prod_{s=1}^{t}(1-\beta_s)$$
+
+    > **Say it aloud:** "alpha-bar sub t equals the product, from s equals one up to t, of one minus beta sub s."
+
+    ```python
+    import numpy as np
+
+    betas = np.linspace(1e-4, 0.02, 1000)   # a thousand steps, barely noisy to almost pure noise
+    abar = np.cumprod(1.0 - betas)
+    print(abar[0], abar[500], abar[999])
+    # 0.9999  0.0778  4.04e-05
+    ```
+
+    > **Check:** at t = 999 only 0.004% of the signal is left. What does that say about the array you start sampling from?
+
+    ## Step 2 — Write the forward process
+
+    You need to reach any noise level in one jump, without simulating a thousand small steps. Because each step adds independent bell-curve noise, the whole chain collapses into one line. It says: scale the clean sample by the signal that survives, then add noise scaled to fill the rest.
+
+    $$x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon$$
+
+    > **Say it aloud:** "x sub t equals the square root of alpha-bar sub t times x zero, plus the square root of one minus alpha-bar sub t times epsilon."
+
+    Here x-zero is the clean sample and x-sub-t is the noisy one. Epsilon is the noise that was mixed in: one draw from a bell curve centred on zero.
+
+    ```python
+    x0, eps = 0.7, -1.3     # a clean sample, and one noise draw
+    x_t = np.sqrt(abar[500]) * x0 + np.sqrt(1 - abar[500]) * eps
+    print(round(float(x_t), 4))    # -1.0532
+    ```
+
+    > **Check:** at t = 500 the signal term is 0.195 and the noise term is -1.248. Which one dominates, and what does that mean for a network trying to see the sample?
+
+    ## Step 3 — Invert the line to guess the clean image
+
+    The network is trained to output epsilon: given a noisy sample, it says which noise was mixed in. With that guess, the forward line has one unknown left, x-zero, so you can solve for it by rearranging. Dividing by the surviving signal undoes the scaling. The result is written x-zero-hat, and it is the one place where a small error becomes a large one.
+
+    $$\hat x_0 = \frac{x_t - \sqrt{1-\bar\alpha_t}\,\epsilon_\theta}{\sqrt{\bar\alpha_t}}$$
+
+    > **Say it aloud:** "x zero hat equals x sub t minus the square root of one minus alpha-bar sub t, times epsilon sub theta, all divided by the square root of alpha-bar sub t."
+
+    Epsilon-sub-theta is the network's prediction; theta is shorthand for the network's weights.
+
+    ```python
+    def x0_hat(x_t, eps, a):
+        return (x_t - np.sqrt(1.0 - a) * eps) / np.sqrt(a)
+
+    print(x0_hat(x_t, eps, abar[500]))   # 0.7 — exact, because eps really is the noise
+    ```
+
+    > **Check:** at t = 999 the square root of alpha-bar is 0.00635. If the network's epsilon is 1% wrong, how wrong is x-zero-hat?
+
+    ## Step 4 — Re-noise to the previous level
+
+    A guess of the clean image is not a sample; it is a single point. The next step needs a sample at the previous noise level, so you rebuild one. Scale the guess by that level's signal, then add back the same epsilon, scaled for that level. Reusing the same epsilon is the whole trick: no fresh randomness enters, so the path from noise to image is deterministic. This is DDIM, short for denoising diffusion implicit model, and this one line is the entire method. DDIM also has a dial, eta, for injecting fresh noise; here eta is zero. Turn eta above zero and you re-inject noise, which recovers DDPM. Every bit of noise buys variety and costs determinism.
+
+    $$x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,\hat x_0 + \sqrt{1-\bar\alpha_{t-1}}\,\epsilon_\theta$$
+
+    > **Say it aloud:** "x sub t minus one equals the square root of alpha-bar sub t minus one times x zero hat, plus the square root of one minus alpha-bar sub t minus one times epsilon sub theta."
+
+    ```python
+    def ddim_step(x_t, eps, a_t, a_prev):
+        x0 = (x_t - np.sqrt(1 - a_t) * eps) / np.sqrt(a_t)     # step 3
+        return np.sqrt(a_prev) * x0 + np.sqrt(1 - a_prev) * eps
+
+    print(ddim_step(x_t, eps, abar[500], abar[450]))
+    # (-0.9671, 0.7): the step lands on the exact value at t = 450
+    ```
+
+    > **Check:** with the true epsilon this step lands on the closed-form value with an error of 0.0. Which swap breaks that: using alpha-bar at t where alpha-bar at t minus one belongs, or the other way round?
+
+    ## Step 5 — Subsample the timesteps
+
+    A thousand steps means a thousand network calls, and most of them barely move the sample. The deterministic path is smooth, so you can take bigger jumps and still land on it. Pick fifty timesteps and run the same step between them. This is a budget choice, not a new algorithm: the same line, twenty times fewer calls. The spacing is not arbitrary either; production samplers choose steps so that alpha-bar falls by a roughly constant factor.
+
+    $$\frac{N_{\text{ddim}}}{N_{\text{ddpm}}} = \frac{50}{1000} = \frac{1}{20}$$
+
+    > **Say it aloud:** "N sub d-d-i-m over N sub d-d-p-m equals fifty over one thousand, which equals one twentieth."
+
+    ```python
+    def sample_ddim(eps_fn, x_T, abar, steps=50):
+        idx = np.linspace(len(abar) - 1, 0, steps + 1).astype(int)
+        x = x_T
+        for i in range(steps):
+            t, t_next = idx[i], idx[i + 1]
+            x = ddim_step(x, eps_fn(t), abar[t], abar[t_next])
+        return x
+    ```
+
+    > **Check:** at 2 ms per call, what is the wall-clock cost of fifty steps against a thousand?
+
+    ## Step 6 — Steer the sample with guidance
+
+    A prompt is just an extra input to the network. So the same sample can be scored twice: once with the prompt, once with an empty one. The two predictions differ by the direction the prompt pushes. Classifier-free guidance multiplies that difference before adding it back. With w at 0 you keep the unconditional prediction, with w at 1 the conditional one, and above 1 you overshoot the prompt. The cost is a second forward pass, usually batched alongside the first. The case to test first is w at 0, which must return the unconditional prediction exactly, or guidance never switches off.
+
+    $$\tilde\epsilon = \epsilon_u + w\,(\epsilon_c - \epsilon_u)$$
+
+    > **Say it aloud:** "epsilon tilde equals epsilon sub u, plus w times, open bracket, epsilon sub c minus epsilon sub u, close bracket."
+
+    Epsilon-sub-u is the prediction with an empty prompt, epsilon-sub-c is the prediction with the real one, and w is the guidance scale.
+
+    ```python
+    def cfg(eps_u, eps_c, w):
+        return eps_u + w * (eps_c - eps_u)
+
+    print(cfg(0.5, 1.5, 0.0))   # 0.5 — guidance off, exactly
+    print(cfg(0.5, 1.5, 1.0))   # 1.5 — plain conditional
+    print(cfg(0.5, 1.5, 3.0))   # 3.5 — pushed past the prompt
+    ```
+
+    > **Check:** at w = 7.5 the conditional prediction is multiplied by 8.5 and the unconditional one by -7.5. Why does that sharpen the image and shrink variety?
+
+    ## Step 7 — Swap in the flow-matching sampler
+
+    Flow matching trains the network to predict a velocity instead of noise: the arrow from a noise point to a data point. Generating is then walking along that arrow. Euler's rule is the simplest walk — look at the arrow here, step along it, look again. On a straight path the arrow never changes, so one step is exact. On a curved one the error falls in proportion to the step size, which is why ten times more steps gave 10.2 times less error.
+
+    $$x_{t-\delta t} = x_t - \delta t\,v_\theta(x_t, t)$$
+
+    > **Say it aloud:** "x sub t minus delta t equals x sub t, minus delta t times v sub theta of x sub t and t."
+
+    Here v-sub-theta is the predicted velocity and delta-t is the step size, a small positive number.
+
+    ```python
+    def sample_euler(v_fn, x0, steps=50):
+        ts = np.linspace(0.0, 1.0, steps + 1)
+        x = x0
+        for t, t_next in zip(ts[:-1], ts[1:]):
+            x = x + (t_next - t) * v_fn(t)
+        return x
+
+    print(sample_euler(lambda t: 2.0, 0.0, 25))   # 2.0 — exact on a straight path
+    ```
+
+    > **Check:** on a curved path the error is 0.0766 at ten steps and 0.00750 at a hundred. What does halving the step size do to the error?
+
+    ## Step 8 — Prove it against a formula
+
+    A real network cannot tell you whether your loop is right, because its errors and the loop's errors mix. So test with an oracle: a stand-in network that returns the exact epsilon that built the sample. The trajectory is then a formula, and every deviation is yours. Run ten steps from t = 999 and compare each intermediate with the closed form. The largest gap over the run should sit at float noise. This is the only test that separates a bad sampler from a bad model.
+
+    $$e = |x_t - \hat x_t|$$
+
+    > **Say it aloud:** "e equals the absolute difference between x sub t and x hat sub t."
+
+    Here x-sub-t is what the sampler produced and x-hat-sub-t is what the formula says it should be.
+
+    ```python
+    oracle = lambda t: eps                     # the noise that actually built x_t
+    idx10 = np.linspace(999, 0, 11).astype(int)
+    x = np.sqrt(abar[999]) * x0 + np.sqrt(1 - abar[999]) * eps
+    worst = 0.0
+    for t, t_next in zip(idx10[:-1], idx10[1:]):
+        x = ddim_step(x, oracle(t), abar[t], abar[t_next])
+        truth = np.sqrt(abar[t_next]) * x0 + np.sqrt(1 - abar[t_next]) * eps
+        worst = max(worst, abs(x - truth))
+    print(worst)                               # 1.78e-15
+    ```
+
+    > **Check:** the worst gap is 1.78e-15, which is float noise. If it were 0.05, what would that tell you — that the model is bad, or that the step is wrong?
+
+    ## Putting it together
+
+    Sampling is steps 1 to 8 in one loop. Build the schedule (1), then start from the noisy sample at t = 999 (2). For each pair of subsampled timesteps (5): predict epsilon, apply guidance (6), and take one DDIM step (4), which inverts the forward process (3) internally. The last step returns the sample, and step 8 tells you whether to believe it. Flow matching swaps step 4 for step 7 and leaves everything else alone.
+
+    ```python
+    x0, eps = 0.7, -1.3
+    idx = np.linspace(999, 0, 51).astype(int)
+    x = np.sqrt(abar[999]) * x0 + np.sqrt(1 - abar[999]) * eps
+
+    for t, t_next in zip(idx[:-1], idx[1:]):
+        x = ddim_step(x, eps, abar[t], abar[t_next])
+
+    truth = np.sqrt(abar[0]) * x0 + np.sqrt(1 - abar[0]) * eps
+    print(round(float(x - truth), 12))      # 0.0
+    ```
+
+    Fifty forward passes, no fresh noise, and a trajectory that matches the closed form to two parts in a hundred trillion.
+
+    ## What breaks
+
+    - **Blurry samples at fifty steps, sharp at a thousand** -> the steps are spaced evenly in index, so alpha-bar jumps unevenly -> space them so alpha-bar falls by a roughly constant factor.
+    - **Output that never stops looking like static** -> the loop walks t from 0 up to 999 instead of down -> iterate the timestep array in reverse.
+    - **Guidance that never switches off** -> the combine is written as conditional plus w times the gap -> write unconditional plus w times the gap, which returns 0.5 exactly at w = 0.
+    - **Values that blow up near t = 999** -> x-zero-hat divides by 0.00635, so a small epsilon error becomes 157 times larger -> clip x-zero-hat to the data range before re-noising.
+
+  try_it: >-
+    Implement all four pieces, then run the ablation that matters: DDIM with the
+    same $x_T$ at 10, 25, 50 and 100 steps against the closed-form trajectory,
+    and the same for Euler on the curved path. Record the error at each count and
+    the wall-clock time. Then set guidance to 0, 1, 3 and 7.5 on a fixed noise
+    vector and look at what the image does — the endpoint identities are exact,
+    and the extrapolation between them is the aesthetic.
+  interview_questions:
+    - question: "Derive the DDIM update and explain why it can use 50 steps when DDPM uses 1,000."
+      level: senior
+      key_points:
+        - "Invert the forward process to get x̂₀ = (x_t − √(1−ᾱ_t) ε_θ)/√ᾱ_t, then re-noise to the previous level with the same ε."
+        - "With η = 0 the sampler is deterministic and integrates the probability-flow ODE, so the trajectory is smooth and can be subsampled."
+        - "DDPM's stochastic step injects fresh noise, which is what forces small steps and 1,000 iterations; DDIM removes it and trades diversity for speed."
+        - "The error is first order in the step size, so 50 steps is a discretisation budget, not a different model."
+      follow_up: "What does η between 0 and 1 buy you, and when would you use it?"
+    - question: "What does classifier-free guidance compute, and why does w = 0 mean unconditional?"
+      level: mid
+      key_points:
+        - "ε̃ = ε_u + w(ε_c − ε_u); at w = 0 the conditional term vanishes exactly and you are sampling the unconditional model."
+        - "At w = 1 it is exactly the conditional model; w > 1 extrapolates past it, amplifying the conditioning direction."
+        - "In score terms it samples (1+w)∇log p(x|c) − w∇log p(x), i.e. p(x|c)^(1+w)/p(x)^w — sharper and off-manifold at large w."
+        - "It costs two forward passes per step, usually batched as a 2× batch with a null token."
+      follow_up: "Why does large guidance reduce diversity, and what does that do to FID?"
+    - question: "Your 50-step DDIM samples are blurry but your 1,000-step ones are sharp. What do you change first?"
+      level: senior
+      key_points:
+        - "Check the timestep spacing: 50 linearly spaced indices are not the same as 50 chosen to keep ᾱ geometric, and the mismatch shows up as blur."
+        - "Check x̂₀ clipping and the schedule's ᾱ_T; a sampler that starts at a level where 1/√ᾱ is 157 amplifies model error."
+        - "Distinguish discretisation error from model error with the closed-form test: if the oracle trajectory is exact, the sampler is fine and the step count is a model-capacity issue."
+        - "Try a higher-order or flow-matching sampler before raising the step count; the error is O(Δt), so halving the error costs 2× the steps."
+      follow_up: "How would you choose between a 50-step DDIM and a 4-step distilled sampler for a latency-critical product?"
+    - question: "Flow matching with a linear path is exact under Euler integration. Why is that, and what breaks it in practice?"
+      level: mid
+      key_points:
+        - "For x_t = (1−t)x₀ + t x₁ the velocity x₁ − x₀ is constant in t, so any Euler step integrates it exactly."
+        - "A learned velocity is not exactly constant — the model approximates it, and the path is curved where the model is wrong."
+        - "The error becomes first order in Δt, so the measured 10.2 ratio for a 10× step count is the expected behaviour."
+        - "In practice the model error dominates the discretisation error at small step counts, which is why distillation beats more steps."
+      follow_up: "What would a second-order (Heun) step cost, and when would it pay for itself?"
+
+  common_mistakes:
+    - "Swapping ᾱ_t and ᾱ_{t−1} in the re-noising term, which produces a plausible-looking trajectory with the wrong variance."
+    - "Adding fresh noise at η = 0, which turns deterministic DDIM back into a stochastic sampler and breaks invertibility."
+    - "Writing guidance as c + w(c − u), which does not reduce to the unconditional prediction at w = 0."
+    - "Calling the model twice sequentially for guidance instead of batching the conditional and null rows."
+    - "Judging a sampler from a single seed, when DDIM is deterministic and DDPM is not — the comparison is between draws, not methods."
+  further_reading:
+    - label: "Song, Meng & Ermon, Denoising Diffusion Implicit Models (ICLR 2021)"
+    - label: "Ho & Salimans, Classifier-Free Diffusion Guidance (NeurIPS 2021 workshop)"
+    - label: "Lipman et al., Flow Matching for Generative Modeling (ICLR 2023)"
+    - label: "Song et al., Score-Based Generative Modeling through Stochastic Differential Equations (ICLR 2021)"
+
+  implementations:
+    - language: python
+      title: "Reference solution"
+      note: >-
+        The samplers and the closed-form checks in about 60 lines. Three things
+        are deliberately simplified. (1) The model is an oracle returning the
+        exact ε, which is the only way to separate sampler error from model
+        error; with a real network every number here is dominated by the network.
+        (2) The DDIM timestep subsampling is `linspace` over indices, which is
+        the common shortcut and not the schedule-aware spacing that production
+        samplers use — the difference is small at 50 steps and visible at 10.
+        (3) Guidance is implemented as the algebraic combine only; the two
+        forward passes are the caller's problem, and batching them is the
+        optimisation that halves the cost.
+      code: |
+        import numpy as np
+
+
+        def schedule(T=1000, b0=1e-4, b1=0.02):
+            betas = np.linspace(b0, b1, T)
+            return betas, np.cumprod(1.0 - betas)
+
+
+        def ddim_step(x_t, eps, abar_t, abar_prev):
+            """eta = 0: predict x0 from eps, then re-noise to the previous level."""
+            x0 = (x_t - np.sqrt(1.0 - abar_t) * eps) / np.sqrt(abar_t)
+            x_prev = np.sqrt(abar_prev) * x0 + np.sqrt(1.0 - abar_prev) * eps
+            return x_prev, x0
+
+
+        def cfg(eps_u, eps_c, w):
+            """w=0 unconditional, w=1 conditional, w>1 extrapolates."""
+            return eps_u + w * (eps_c - eps_u)
+
+
+        def euler_step(x, v, t, t_next):
+            return x + (t_next - t) * v
+
+
+        def sample_ddim(eps_fn, x_T, abar, steps=50):
+            idx = np.linspace(len(abar) - 1, 0, steps + 1).astype(int)
+            x, traj = x_T, [x_T]
+            for i in range(steps):
+                t, tp = idx[i], idx[i + 1]
+                x, _ = ddim_step(x, eps_fn(t), abar[t], abar[tp])
+                traj.append(x)
+            return x, traj
+
+
+        def sample_euler(v_fn, x0, steps=50):
+            ts = np.linspace(0.0, 1.0, steps + 1)
+            x = x0
+            for t, tn in zip(ts[:-1], ts[1:]):
+                x = euler_step(x, v_fn(t), t, tn)
+            return x
+
+
+        if __name__ == "__main__":
+            betas, abar = schedule()
+            x0, eps = 0.7, -1.3
+            xt = np.sqrt(abar[500]) * x0 + np.sqrt(1 - abar[500]) * eps
+            xp, x0h = ddim_step(xt, eps, abar[500], abar[450])
+            print("M1", abs(xp - (np.sqrt(abar[450]) * x0 + np.sqrt(1 - abar[450]) * eps)), abs(x0h - x0))
+            idx = np.linspace(len(abar) - 1, 0, 11).astype(int)
+            x, worst = np.sqrt(abar[idx[0]]) * x0 + np.sqrt(1 - abar[idx[0]]) * eps, 0.0
+            for i in range(10):
+                x, _ = ddim_step(x, eps, abar[idx[i]], abar[idx[i + 1]])
+                truth = np.sqrt(abar[idx[i + 1]]) * x0 + np.sqrt(1 - abar[idx[i + 1]]) * eps
+                worst = max(worst, abs(x - truth))
+            print("M2", worst)
+            print("M3", cfg(0.5, 1.5, 0.0), cfg(0.5, 1.5, 1.0), cfg(0.5, 1.5, 3.0))
+            e10 = abs(sample_euler(lambda t: -1.5 * np.sin(1.5 * t), 1.0, 10) - np.cos(1.5))
+            e100 = abs(sample_euler(lambda t: -1.5 * np.sin(1.5 * t), 1.0, 100) - np.cos(1.5))
+            print("M4 linear", abs(sample_euler(lambda t: 2.0, 0.0, 25) - 2.0), "curved ratio", e10 / e100)
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        You have a model that predicts the noise in a sample. To generate, you
+        need a rule that turns "the noise I think is here" into "a slightly
+        cleaner sample". DDIM's rule is: guess the clean sample, then re-noise it
+        to the previous level. Everything else — the schedule, the step count,
+        the guidance — is a parameter of that one rule.
+      blocks:
+        - kind: checklist
+          body: |
+            - What does the model predict, and what does the forward process let you do with it?
+            - Which two ᾱ values does one step need?
+            - Is there fresh randomness in the update? Should there be?
+            - Where does guidance enter, and on what quantity does it operate?
+        - kind: warning
+          body: >-
+            If your step cannot be checked against a closed-form trajectory, you
+            are debugging by looking at pictures, which is not debugging.
+      checkpoint: >-
+        Given x_t, ε and ᾱ_t, what is the clean sample, and what would make that
+        estimate unreliable?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Write the forward process first, then the update as its algebraic
+        inverse. Test with an oracle ε on a 1-D Gaussian before touching a
+        network: the trajectory is then a formula, and any error is yours.
+      blocks:
+        - kind: checklist
+          body: |
+            - schedule: β linear, ᾱ cumulative product.
+            - forward: x_t = sqrt(ᾱ_t) x0 + sqrt(1−ᾱ_t) ε.
+            - step: x̂₀ = (x_t − sqrt(1−ᾱ_t) ε)/sqrt(ᾱ_t); x_prev = sqrt(ᾱ_prev) x̂₀ + sqrt(1−ᾱ_prev) ε.
+            - loop: subsample indices, run the step, record the trajectory.
+            - guidance: u + w(c − u), then check w = 0 and w = 1 exactly.
+        - kind: warning
+          body: >-
+            Test the reversed direction too. A loop that runs t from 0 to T still
+            produces numbers and they are all wrong.
+      checkpoint: >-
+        Which two values in the update are easy to swap, and which milestone
+        catches the swap?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Five lines for the step, five for the loop. The guidance combine is one
+        line, and Euler is one more.
+      blocks:
+        - kind: pseudocode
+          body: |
+            x0_hat = (x_t - sqrt(1 - abar_t) * eps) / sqrt(abar_t)
+            x_prev = sqrt(abar_prev) * x0_hat + sqrt(1 - abar_prev) * eps
+
+            for t, t_prev in reversed_pairs(indices):
+                eps = model(x, t)                      # 2x batch with guidance
+                x, _ = ddim_step(x, eps, abar[t], abar[t_prev])
+
+            eps = eps_u + w * (eps_c - eps_u)
+            x = x + (t_next - t) * v
+      checkpoint: >-
+        Why does DDIM reuse ε rather than drawing a new one for the re-noising
+        term?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The forward process is linear in (x₀, ε), so inverting it is algebra, and
+        the guidance identity is a rearrangement.
+      blocks:
+        - kind: math
+          body: |
+            Forward: $x_t = \sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\epsilon$.
+
+            Solve for $x_0$:
+            $\hat x_0 = \dfrac{x_t - \sqrt{1-\bar\alpha_t}\epsilon}{\sqrt{\bar\alpha_t}}$.
+
+            Re-noise at the previous level with the same $\epsilon$:
+            $x_{t-1} = \sqrt{\bar\alpha_{t-1}}\hat x_0 + \sqrt{1-\bar\alpha_{t-1}}\epsilon$.
+
+            Guidance:
+            $\tilde\epsilon = \epsilon_u + w(\epsilon_c - \epsilon_u)
+            = (1+w)\epsilon_c - w\epsilon_u$, so $w=0 \Rightarrow \tilde\epsilon =
+            \epsilon_u$ and $w=1 \Rightarrow \tilde\epsilon = \epsilon_c$.
+
+            Euler error: local $O(\Delta t^2)$, global $O(\Delta t)$, so a 10×
+            step count gives a ~10× error reduction — measured 10.2.
+      checkpoint: >-
+        What happens to the DDIM update at $\bar\alpha_t = 1$ and at
+        $\bar\alpha_t = 0$?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The reference is below: schedule, DDIM step and loop, the guidance
+        combine, and Euler on both a linear and a curved path.
+      blocks:
+        - kind: warning
+          body: >-
+            The equality at $w = 0$ is the test that catches most guidance bugs.
+            If your implementation computes `c + w*(c-u)`, it fails and the
+            failure is invisible in an image.
+      checkpoint: >-
+        Which milestone would still pass if the sampler ran the timesteps in the
+        wrong direction, and why is that a warning about the test suite?
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        At t = 999, ᾱ = 4.04e-5. What is 1/√ᾱ, and why does it matter?
+      answerKind: short_text
+      hint: "sqrt(4.04e-5) ≈ 0.00635."
+      solution: >-
+        $1/\sqrt{4.04\times10^{-5}} = 157.4$. The x₀ prediction divides the
+        residual by $\sqrt{\bar\alpha_t}$, so a 1% error in ε becomes a 1.6-unit
+        error in $\hat x_0$. That is why $\hat x_0$ is clipped to the data range
+        and why a schedule whose $\bar\alpha_T$ is exactly zero is numerically
+        hostile.
+    - id: cp-2
+      question: >-
+        Why is DDIM with η = 0 invertible, and what does that buy you?
+      answerKind: short_text
+      hint: "Is there any randomness in the update?"
+      solution: >-
+        With η = 0 the update reuses the same ε and adds no noise, so the map
+        from $x_t$ to $x_{t-1}$ is deterministic and, because each step is an
+        affine map with a known inverse, the whole trajectory is invertible. It
+        buys reproducible samples from a fixed $x_T$, exact interpolation between
+        two latents, and the ability to use the sampler as an encoder for
+        inversion-based editing.
+    - id: cp-3
+      question: >-
+        Your guidance scale is 7.5. What is the coefficient on the conditional
+        and unconditional predictions, and what happens to diversity?
+      answerKind: short_text
+      hint: "Expand (1+w)c − w u."
+      solution: >-
+        $\tilde\epsilon = 8.5\epsilon_c - 7.5\epsilon_u$. The conditional
+        direction is amplified 8.5× and the unconditional term subtracted, which
+        sharpens adherence to the prompt and reduces diversity: the effective
+        distribution is $p(x|c)^{8.5}/p(x)^{7.5}$, which is more peaked than the
+        conditional. At very large $w$ samples leave the data manifold and the
+        artifacts are the symptom.
+    - id: cp-4
+      question: >-
+        Euler on a curved path gives 0.0766 error at 10 steps. What do you expect
+        at 40 steps, and what would make the answer different?
+      answerKind: short_text
+      hint: "First order means error ∝ 1/n."
+      solution: >-
+        About $0.0766/4 = 0.019$, because Euler's global error is $O(\Delta t)$
+        and quadrupling the step count quarters it. It would be different if the
+        velocity were smoother than assumed (the constant matters, not the
+        order), or if you switched to a second-order step, where the error would
+        fall as $1/n^2$ — 16× rather than 4×.
+
+  visualizers: []

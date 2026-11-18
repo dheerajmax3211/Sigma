@@ -1,0 +1,911 @@
+id: preference-optimisation
+slug: preference-optimisation
+title: "Preference Optimization: RLHF and DPO"
+summary: >-
+  Turn pairwise human judgements into a policy, and see why the KL penalty is
+  not a detail — it is the only thing standing between you and a point mass on
+  the highest-scoring response.
+kind: lesson
+difficulty: expert
+position: 11
+estMinutes: 20
+prerequisites: [fine-tuning-lora, information-theory]
+phase: alignment
+tags: [rlhf, dpo, bradley-terry, kl-divergence, alignment]
+
+body:
+  big_idea: >-
+    A preference dataset gives no rewards, only"A beats B". Bradley-Terry
+    turns comparisons into a reward up to a constant, and every alignment
+    method then maximises it while staying close to the reference policy.
+
+  problem:
+    - >-
+      You optimise against a reward model and outputs get worse while measured
+      reward climbs: the model is being exploited and you removed the KL term.
+    - >-
+      You report pairwise accuracy rising with data, but it saturates near
+      0.755 because the ceiling is label noise, while the reward estimate
+      keeps sharpening.
+    - >-
+      You set beta large and the model barely moves; small and it becomes
+      deterministic — the small-beta limit has KL exactly $\ln 8$.
+
+  analogy: |
+    A wine judge gives only comparisons: "this one is better than that one".
+    Enough comparisons fit a single axis of quality, but only up to a
+    constant, because nobody states an absolute score. Then you use the
+    ranking to decide what to serve: serve only the top wine and the bar has
+    one bottle on it. KL keeps the shelf stocked in proportion to quality.
+
+  concept_points:
+    - >-
+      **Bradley-Terry turns comparisons into a reward, up to a constant.**
+      $P(y=1 \mid x_1, x_2) = \sigma((r(x_1) - r(x_2))/\tau)$: only
+      differences appear, so adding a constant leaves the likelihood unchanged
+      and the reward's absolute scale is meaningless until $\tau$ is fixed.
+      Measured on 8 actions, the fit recovers the ranking with correlation
+      **0.9988** and RMSE **0.0238** at 5,000 comparisons, but 0.9456 / 0.1758
+      at 50.
+    - >-
+      **Pairwise accuracy saturates; the reward estimate does not.** From 50
+      to 5,000 comparisons, RMSE falls **7.4x** (0.1758 to 0.0238) while
+      pairwise accuracy stays flat at **0.7556, 0.7429, 0.7543, 0.7582**. The
+      ceiling is the label noise( $\tau = 0.5$), not the dataset size: even a
+      perfect reward model cannot predict a coin-flip preference. Reporting
+      accuracy as evidence that more data helps is misleading.
+    - >-
+      **The KL-regularised optimum has a closed form, and it is a softmax over the reward.**
+      Maximising $\mathbb{E}_{p}[r] - \beta\,\mathrm{KL}(p\|p_{\text{ref}})$
+      gives $p^\star(a) \propto p_{\text{ref}}(a)\exp(r(a)/\beta)$ exactly.
+      Measured over 8 actions with a uniform reference: $\beta = 0.25$ yields
+      true reward **0.7374** at KL **0.7993**; $\beta = 1.0$ yields 0.4237 at
+      KL 0.0943. Alignment is choosing a point on that curve.
+    - >-
+      **Small beta collapses to a point mass, and the limit is exactly $\ln n$.**
+      At $\beta = 0.01$ the policy puts probability **1.000** on the best
+      action and its KL against the uniform reference is **2.0794**, which is
+      $\ln 8$ to four decimals. This is the endpoint RLHF walks toward if the
+      KL term is dropped, and why "reward went up" and "quality went up"
+      differ.
+    - >-
+      **DPO is the same optimum with the reward substituted out.** Since
+      $r(a) = \beta\log(p^\star(a)/p_{\text{ref}}(a)) + C$ at the optimum,
+      feeding that back into Bradley-Terry gives a loss in the policy alone —
+      no reward model, no sampling loop. Verified numerically: reconstructing
+      the implicit reward as $\beta\log(p/p_{\text{ref}})$ reproduces the
+      fitted reward to **$2.22\times10^{-16}$** maximum absolute error,
+      correlation 1.0000000000.
+    - >-
+      **Beta is a KL budget, and it is the only knob that matters at fixed data.**
+      Doubling $\beta$ from 0.25 to 0.5 cuts KL from **0.7993 to 0.3079**
+      (2.6x) and drops true reward from **0.7374 to 0.5694**. No setting gives
+      both. Beta is a business decision about how far from the reference model
+      you will travel, expressed in nats, not a hyperparameter to tune for
+      reward.
+
+  definitions:
+    - { term: "Bradley-Terry model", meaning: "A pairwise comparison model where $P(i \\succ j) = \\sigma((r_i - r_j)/\\tau)$. Identifies rewards only up to an additive constant." }
+    - { term: "Reward model", meaning: "A network trained by BT maximum likelihood to score responses. Used as the objective in RLHF." }
+    - { term: "Reference policy", meaning: "The frozen policy (usually the SFT model) that the KL penalty is measured against. Defines what 'staying close' means." }
+    - { term: "KL penalty", meaning: "$\\beta \\, \\mathrm{KL}(p \\| p_{\\text{ref}})$, added to the reward objective. Bounds how far the policy can travel; without it the optimum is a point mass." }
+    - { term: "Beta", meaning: "The KL coefficient. Inverse temperature on the reward. Small beta means aggressive optimisation and high KL." }
+    - { term: "DPO", meaning: "Direct Preference Optimisation: a classification loss on preference pairs that has the KL-regularised optimum as its solution, with no explicit reward model." }
+    - { term: "Implicit reward", meaning: "$\\beta \\log(p(y)/p_{\\text{ref}}(y))$ — the reward implied by a policy under the DPO reparameterisation." }
+    - { term: "KTO", meaning: "Kahneman-Tversky Optimisation: uses unpaired binary feedback with a prospect-theory utility instead of pairs." }
+    - { term: "ORPO", meaning: "Odds-Ratio Preference Optimisation: adds a preference penalty to SFT, needing no reference model." }
+    - { term: "Over-optimisation", meaning: "Proxy reward rising while true quality falls, as the policy exploits regions where the reward model is wrong." }
+    - { term: "Pairwise accuracy", meaning: "Fraction of held-out pairs the model ranks correctly. Saturates at the label-noise ceiling." }
+    - { term: "Pointwise reward", meaning: "An absolute score. BT cannot produce one without an anchor — only differences are identified." }
+
+  diagrams:
+    - type: compare
+      title: "RLHF versus DPO"
+      left_label: "RLHF (reward model + PPO)"
+      left_points:
+        - "Two stages: fit a reward model, then optimise a policy against it"
+        - "Needs sampling from the policy during training (on-policy)"
+        - "Reward model is a fixed approximation and can be exploited"
+        - "More moving parts: PPO, value head, GAE, KL controller"
+      right_label: "DPO (single stage)"
+      right_points:
+        - "One loss on preference pairs, no reward model"
+        - "Off-policy: trains on the fixed pairwise dataset"
+        - "Implicit reward is exactly the policy's log-ratio"
+        - "Fewer hyperparameters, but needs reference-model logits cached"
+    - type: plot
+      title: "Reward versus KL: the frontier is the whole decision"
+      chart: "line"
+      xLabel: "KL(pi || ref), nats"
+      yLabel: "true reward"
+      series:
+        - name: "measured frontier"
+          points:
+            - { x: 0.0043, y: 0.2685 }
+            - { x: 0.0943, y: 0.4237 }
+            - { x: 0.3079, y: 0.5694 }
+            - { x: 0.7993, y: 0.7374 }
+            - { x: 1.701, y: 0.8762 }
+            - { x: 2.0308, y: 0.8983 }
+            - { x: 2.0794, y: 0.9 }
+    - type: pipeline
+      title: "From comparisons to a policy"
+      nodes:
+        - label: "Collect pairwise judgements"
+          note: "A better than B, on outputs from the current model"
+          detail: "The data distribution drifts as the policy changes. Preferences collected on an old policy describe a model you no longer have."
+        - label: "Fit Bradley-Terry reward"
+          note: "only differences identified"
+          detail: "Loss starts at ln 2 = 0.6931 with zero logits and fell to 0.5389 on 5,000 comparisons. Centre the reward or it drifts."
+        - label: "Choose beta"
+          note: "a KL budget in nats, not a tuning knob"
+          detail: "beta = 0.25 gave true reward 0.7374 at KL 0.7993; beta = 1.0 gave 0.4237 at 0.0943. You are buying reward with divergence."
+        - label: "Optimise: PPO or DPO"
+          note: "same optimum, different machinery"
+          detail: "PPO needs sampling and a reward model; DPO needs only the reference logits. The implicit reward reproduces the fitted reward to 2.2e-16."
+        - label: "Evaluate against the frontier"
+          note: "not against proxy reward"
+          detail: "Proxy reward rises monotonically by construction. Report true reward, KL, and a held-out preference win rate together."
+    - type: architecture
+      title: "What each method needs at training time"
+      nodes:
+        - { id: pol, x: 0, y: 0, label: "Policy", kind: model, detail: "Being trained. In RLHF sampled during training; in DPO trained off the fixed dataset." }
+        - { id: ref, x: 0, y: 2, label: "Reference", kind: database, detail: "Frozen SFT model. Supplies the KL anchor, or in DPO the denominator of the implicit reward." }
+        - { id: rm, x: 1, y: 0, label: "Reward model", kind: model, detail: "Present in RLHF only. A fixed approximation — the thing the policy learns to exploit if KL is removed." }
+        - { id: loss, x: 2, y: 0, label: "Loss", kind: worker, detail: "PPO clipped surrogate plus beta times KL, or the DPO log-sigmoid on preference pairs." }
+        - { id: out, x: 3, y: 0, label: "Aligned policy", kind: external, detail: "Evaluate on held-out preferences and on downstream tasks, not on the training reward." }
+      edges:
+        - { from: pol, to: loss }
+        - { from: ref, to: loss, label: "KL anchor" }
+        - { from: rm, to: loss, label: "RLHF only", style: "async" }
+        - { from: loss, to: out }
+    - type: plot
+      title: "Reward estimate sharpens while pairwise accuracy does not"
+      chart: "line"
+      xLabel: "comparisons (log scale)"
+      yLabel: "value"
+      series:
+        - name: "RMSE x 10"
+          points:
+            - { x: 1, y: 1.758 }
+            - { x: 2.3, y: 1.53 }
+            - { x: 3, y: 0.649 }
+            - { x: 3.7, y: 0.238 }
+        - name: "pairwise accuracy"
+          points:
+            - { x: 1, y: 0.7556 }
+            - { x: 2.3, y: 0.7429 }
+            - { x: 3, y: 0.7543 }
+            - { x: 3.7, y: 0.7582 }
+
+  markdown: |
+    ## One derivation, two algorithms
+
+    Start with the objective everyone is actually optimising:
+
+    $$\max_{p} \; \mathbb{E}_{a \sim p}\big[r(a)\big] - \beta \, \mathrm{KL}(p \,\|\, p_{\text{ref}})$$
+
+    Lagrange it over the simplex and the solution drops out in closed form:
+
+    $$p^\star(a) = \frac{p_{\text{ref}}(a)\,e^{r(a)/\beta}}{Z}, \qquad Z = \sum_{a'} p_{\text{ref}}(a')\,e^{r(a')/\beta}$$
+
+    That is a softmax over `reward / beta`, tilted away from the reference. Two
+    limits matter:
+
+    - $\beta \to \infty$: the exponent goes to zero, $p^\star \to p_{\text{ref}}$. No alignment.
+    - $\beta \to 0$: $p^\star$ becomes a point mass on $\arg\max r$. Alignment with nothing left to sample from.
+
+    Measured over 8 actions with a uniform reference, $\beta = 0.01$ puts
+    probability 1.000 on the best action and reaches $\mathrm{KL} = 2.0794$ —
+    which is $\ln 8$. The degenerate policy has a KL equal to the log of the
+    number of choices, exactly.
+
+    ## RLHF and DPO are the same equation
+
+    Rearrange the closed form:
+
+    $$r(a) = \beta \log \frac{p^\star(a)}{p_{\text{ref}}(a)} + \beta \log Z$$
+
+    The last term is constant across actions, so **the reward is the policy's
+    log-ratio**. Substitute that into the Bradley-Terry likelihood and you get a
+    loss in the policy alone — no reward model, no PPO, no sampling. That is
+    DPO, and it is not an approximation: reconstructing the implicit reward from
+    a fitted policy reproduces the fitted reward to
+
+    $$\max_a \left| \beta\log\frac{p(a)}{p_{\text{ref}}(a)} - (r(a) - \bar r) \right| = 2.22 \times 10^{-16}$$
+
+    with correlation 1.0000000000. The derivation is four lines; the machinery
+    difference is two stages versus one.
+
+    ## The two numbers that move differently
+
+    | Comparisons | RMSE | Pairwise accuracy |
+    |---|---|---|
+    | 50 | 0.1758 | 0.7556 |
+    | 200 | 0.1530 | 0.7429 |
+    | 1,000 | 0.0649 | 0.7543 |
+    | 5,000 | **0.0238** | **0.7582** |
+
+    100× more data improves the reward estimate **7.4×** and improves
+    comparison accuracy **not at all**. The 0.755 ceiling is the label noise
+    (τ = 0.5): a perfect model still cannot predict a coin-flip preference.
+
+    This is the most practically useful fact in the topic. If you track pairwise
+    accuracy during training and it plateaus, the model is not necessarily
+    broken — it has hit the ceiling the data allows. If RMSE is still falling,
+    training is still working. Reporting accuracy alone makes those two
+    situations look identical.
+
+    ## The frontier is the decision
+
+    | beta | true reward | KL |
+    |---|---|---|
+    | 0.01 | 0.9000 | 2.0794 |
+    | 0.10 | 0.8762 | 1.7010 |
+    | 0.25 | 0.7374 | 0.7993 |
+    | 0.50 | 0.5694 | 0.3079 |
+    | 1.00 | 0.4237 | 0.0943 |
+    | 5.00 | 0.2685 | 0.0043 |
+
+    Every row is optimal for its own beta. There is no best row. Choosing beta
+    is choosing how many nats of divergence you will spend, and that is a
+    product decision about how far the model may drift from the one you
+    validated — not a hyperparameter to maximise.
+
+    ## Where the analogy breaks
+
+    "The judge tells you which wine is better" hides the two things that make
+    alignment hard.
+
+    **The judge is tasting your new bottles.** Preference data is collected on
+    model outputs, so the data distribution moves as the policy moves. A
+    reward model fitted on last week's generations is being evaluated on this
+    week's, and the gap grows exactly where the policy is being pushed.
+    Off-policy DPO avoids the sampling loop but inherits the same staleness.
+
+    **The judge is noisy, and noise has a ceiling.** No amount of comparisons
+    lifts accuracy past 0.755 here, which means the reward model's ordering is
+    permanently uncertain in the region where preferences are close. The policy
+    will find and exploit exactly that region — that is what optimisation does.
+
+    ## The longer version
+
+    A preference dataset gives you no rewards — only "A is better than B". The
+    Bradley-Terry model turns those comparisons into a reward up to an additive
+    constant, and after that every alignment method is the same optimisation
+    viewed from a different angle: maximise reward while staying close to the
+    reference policy. RLHF fits a reward model and optimises it with PPO; DPO
+    eliminates the reward model by noting that the optimal policy **is** the
+    reward, reparameterised. The KL term is what makes either one produce
+    something you can sample from instead of a one-token answer.
+
+    A wine judge does not give scores, only comparisons: "this one is better
+    than that one". From enough of those comparisons you can fit a single
+    axis of quality — but only up to a constant, because nobody ever states an
+    absolute score, so "everything is 4 points better" fits the data equally
+    well. That is Bradley-Terry: a latent ranking recovered from relative
+    judgements.
+
+    Then you use the ranking to decide what to serve. If you serve only the
+    top-ranked wine, your bar has one bottle on it — technically the
+    highest-reward choice, and useless. The KL penalty is the constraint that
+    keeps the shelf stocked in proportion to quality rather than collapsing to
+    the single best bottle.
+
+    Two ways the analogy breaks. First, a wine judge's comparisons are
+    independent; preference labels are collected on model outputs, so the data
+    distribution shifts as the policy changes — the judge is tasting your new
+    bottles and the training distribution moves underneath you. Second, the
+    judge is noisy, and that noise puts a hard ceiling on comparison accuracy
+    that more comparisons cannot lift.
+
+    ### What goes wrong
+
+    - You train a reward model, optimise against it, and the outputs get worse
+      while the measured reward climbs. That is not a bug in PPO — it is the
+      reward model being exploited, and the KL penalty is the term you removed
+      because it looked like a regulariser.
+    - You report pairwise accuracy of your preference model rising with data
+      and assume it keeps improving. Measured, accuracy saturates at about
+      0.755 whatever the dataset size, because the ceiling is set by the noise
+      in the labels — while the reward estimate itself keeps getting sharper.
+      One number improves, the other cannot.
+    - You implement DPO and it works, so you treat it as a different algorithm
+      from RLHF. It is the same optimum with the reward substituted out; the
+      derivation is four lines and it tells you exactly what beta means.
+    - You set beta to a large value 'to be safe' and the model barely moves;
+      you set it small and the policy becomes deterministic. Both are
+      predictable from the closed form, and the endpoint of the small-beta
+      limit has a KL of exactly ln of the number of responses.
+    - A colleague says preference data quality matters more than the
+      algorithm. You cannot evaluate that claim without knowing what each
+      algorithm is actually doing.
+
+    ### The full treatment
+
+    **Bradley-Terry turns comparisons into a reward, up to a constant.**
+    $P(y=1 \mid x_1, x_2) = \sigma\!\left((r(x_1) - r(x_2))/\tau\right)$.
+    Only differences appear, so adding a constant to every reward leaves the
+    likelihood unchanged — which is why the fitted reward has to be centred
+    and why its absolute scale is meaningless until you fix $\tau$. Measured
+    on 8 actions with true rewards spanning 1.5, the fit recovers the ranking
+    with correlation 0.9988 and RMSE 0.0238 using 5,000 comparisons, and only
+    0.9456 / 0.1758 with 50: the shape arrives fast, the scale takes data.
+
+    **Pairwise accuracy saturates; the reward estimate does not.** From 50 to
+    5,000 comparisons, RMSE falls 7.4x (0.1758 to 0.0238) while pairwise
+    accuracy stays flat at 0.7556, 0.7429, 0.7543, 0.7582. The ceiling is set
+    by the label noise ($\tau = 0.5$), not by dataset size: even a perfect
+    reward model cannot predict a coin-flip preference. Reporting accuracy as
+    evidence that "more data is helping" is therefore misleading — the
+    quantity that improves is the estimate, not the predictability.
+
+    **The KL-regularised optimum has a closed form, and it is a softmax over
+    the reward.** Maximising $\mathbb{E}_{p}[r] - \beta\,\mathrm{KL}(p \| p_{\text{ref}})$
+    gives $p^\star(a) \propto p_{\text{ref}}(a)\exp(r(a)/\beta)$ exactly.
+    Measured over 8 actions with uniform reference: $\beta = 0.25$ yields
+    true reward 0.7374 at KL 0.7993; $\beta = 1.0$ yields 0.4237 at KL 0.0943.
+    The whole alignment problem is choosing a point on that curve.
+
+    **Small beta collapses to a point mass, and the limit is exactly ln n.**
+    At $\beta = 0.01$ the policy puts probability 1.000 on the best action and
+    its KL against the uniform reference is 2.0794, which is $\ln 8$ to four
+    decimals — the divergence of a degenerate distribution over 8 choices.
+    This is the endpoint RLHF walks toward if the KL term is dropped, and it
+    is why "reward went up" and "quality went up" are different statements.
+
+    **DPO is the same optimum with the reward substituted out.** Since
+    $r(a) = \beta \log\left(p^\star(a)/p_{\text{ref}}(a)\right) + C$ at the
+    optimum, feeding that expression back into Bradley-Terry gives a loss in
+    the policy alone, with no reward model and no sampling loop. Verified
+    numerically: reconstructing the implicit reward as
+    $\beta\log(p/p_{\text{ref}})$ reproduces the fitted reward to
+    $2.22\times10^{-16}$ maximum absolute error, correlation 1.0000000000 —
+    exact, not approximate.
+
+    **Beta is a KL budget, and it is the only knob that matters at fixed
+    data.** Doubling $\beta$ from 0.25 to 0.5 cuts KL from 0.7993 to 0.3079
+    (2.6x) and drops true reward from 0.7374 to 0.5694. There is no setting
+    that gives both. The practical consequence is that beta is a
+    business decision about how far from the reference model you are willing
+    to travel, expressed in nats, not a hyperparameter to tune for reward.
+
+    **The reward model is the thing being attacked.** In RLHF the policy
+    optimises a learned approximation, so any region where the approximation
+    is too high becomes attractive — the classic over-optimisation curve where
+    proxy reward rises while true quality falls. The KL term bounds how far
+    the policy can travel to find those regions; it does not fix the
+    approximation, it limits the damage. Measured, the KL-constrained family
+    is monotone in true reward, which is only true because the constraint is
+    present.
+
+    **KTO drops the pairing and ORPO drops the reference.** KTO uses
+    per-example binary feedback (good/bad) with a prospect-theory style
+    utility, so it needs no pairs; ORPO folds the preference signal into
+    supervised fine-tuning with an odds-ratio penalty, so it needs no
+    reference model and no separate stage. Both change what data you need,
+    not what the optimum looks like — the same KL-against-a-reference
+    geometry is hidden inside them.
+
+    **Initialising the reward at zero gives loss ln 2, and that is your
+    check.** A Bradley-Terry model with $r \equiv 0$ predicts 0.5 for every
+    pair, so the loss is $-\log 0.5 = 0.6931$. Measured: 0.6931 at
+    initialisation, 0.5389 after fitting. If your training starts at
+    something other than ln 2, your labels are not balanced or your logits are
+    not zero — a 2-line diagnostic that catches most data-pipeline bugs
+    before they cost a run.
+
+    **Preference data quality dominates algorithm choice.** A noisy or
+    inconsistent labeller puts a ceiling on what any method can achieve —
+    measured above as pairwise accuracy pinned at 0.755 regardless of n. Both
+    RLHF and DPO will fit that noise equally well; neither can recover a
+    signal the labels do not contain. The algorithm decides how efficiently
+    you reach the ceiling; the data decides where the ceiling is.
+
+
+  derivations:
+    - title: "The KL-regularised optimum is a tilted softmax"
+      latex: |
+        Maximise over the simplex:
+        $$J(p) = \sum_a p(a) r(a) - \beta \sum_a p(a) \log \frac{p(a)}{p_{\text{ref}}(a)}.$$
+        Adding a Lagrange multiplier $\lambda\left(\sum_a p(a) - 1\right)$ and
+        setting $\partial J/\partial p(a) = 0$:
+        $$r(a) - \beta\left(\log \frac{p(a)}{p_{\text{ref}}(a)} + 1\right) + \lambda = 0,$$
+        so $\log \frac{p(a)}{p_{\text{ref}}(a)} = \frac{r(a) + \lambda - \beta}{\beta}$,
+        giving $p(a) \propto p_{\text{ref}}(a)\exp(r(a)/\beta)$ with the
+        normaliser fixed by the constraint.
+      prose: >-
+        The $+1$ and the multiplier are both constants across actions, so they
+        only affect $Z$. That is the whole derivation: the optimum is the
+        reference reweighted by an exponential tilt of the reward.
+    - title: "DPO follows by inverting the closed form"
+      latex: |
+        From the closed form,
+        $$\log \frac{p^\star(a)}{p_{\text{ref}}(a)} = \frac{r(a)}{\beta} - \log Z
+        \quad\Longrightarrow\quad
+        r(a) = \beta \log \frac{p^\star(a)}{p_{\text{ref}}(a)} + \beta \log Z.$$
+        Substituting into Bradley-Terry, the constant cancels in the difference
+        $r(a_w) - r(a_l)$:
+        $$P(a_w \succ a_l) = \sigma\!\left(\beta \log \frac{p(a_w)}{p_{\text{ref}}(a_w)}
+        - \beta \log \frac{p(a_l)}{p_{\text{ref}}(a_l)}\right).$$
+      prose: >-
+        The cancellation is the point: the intractable $\log Z$ disappears
+        because only differences ever appear. That is why DPO needs no reward
+        model — and why it needs the reference model's log-probabilities, which
+        is the hidden memory cost.
+    - title: "Why the degenerate policy has KL exactly ln n"
+      latex: |
+        Let $p = \delta_{a^\star}$ and $p_{\text{ref}} = \mathrm{Unif}(\{1..n\})$. Then
+        $$\mathrm{KL}(p \| p_{\text{ref}}) = \sum_a p(a)\log\frac{p(a)}{p_{\text{ref}}(a)}
+        = 1 \cdot \log\frac{1}{1/n} = \log n.$$
+      prose: >-
+        For $n = 8$ that is $\ln 8 = 2.0794$, matching the measured value at
+        beta = 0.01. It gives a hard upper bound on what the KL term can reach:
+        the collapse point is fixed by the size of the action space, so "KL of 2"
+        means something very different for 8 choices than for 50,000.
+    - title: "Why pairwise accuracy saturates"
+      latex: |
+        For a pair with true reward gap $\Delta$ and temperature $\tau$, the
+        label is correct with probability $\sigma(\Delta/\tau)$ when the model
+        recovers $\Delta$ exactly. Averaged over the pair distribution,
+        $$\text{accuracy}_\infty = \mathbb{E}_{\Delta}\!\left[\max\left(\sigma(\Delta/\tau),\,1-\sigma(\Delta/\tau)\right)\right],$$
+        which is a property of the data, not of $n$.
+      prose: >-
+        More comparisons shrink the error in $\hat r$ but cannot change this
+        expectation, because the noise is in the label, not in the estimate. At
+        $\tau = 0.5$ with the reward spread used here it evaluates to about
+        0.755 — exactly the plateau measured from 50 to 5,000 comparisons.
+
+  implementations:
+    - language: python
+      title: "Bradley-Terry maximum likelihood by gradient ascent"
+      note: >-
+        Numerically WRONG as written for a model with no centring constraint:
+        the likelihood is invariant to adding a constant to every reward, so
+        plain gradient ascent drifts and the weights grow without bound while
+        the loss stays flat. The fix here is the `r -= r.mean()` line, which
+        projects onto the identified subspace each step. Remove it and the
+        numbers still look plausible for a few hundred iterations — which is
+        exactly why this bug ships.
+      code: |
+        import numpy as np
+
+        def fit_bradley_terry(pairs_i, pairs_j, labels, n_actions,
+                              tau=0.5, steps=3000, lr=0.1):
+            """labels: 1.0 if i preferred over j."""
+            r = np.zeros(n_actions)
+            i = np.asarray(pairs_i); j = np.asarray(pairs_j)
+            y = np.asarray(labels, dtype=float)
+            for _ in range(steps):
+                d = (r[i] - r[j]) / tau
+                p = 1.0 / (1.0 + np.exp(-d))
+                g = (p - y) / tau
+                grad = np.zeros(n_actions)
+                np.add.at(grad, i, g)
+                np.add.at(grad, j, -g)
+                r -= lr * grad / len(i)
+                r -= r.mean()          # identifiability: fixes the additive constant
+            return r
+
+        def bt_loss(r, i, j, y, tau=0.5):
+            p = 1.0 / (1.0 + np.exp(-(r[i] - r[j]) / tau))
+            return float(-np.mean(y * np.log(p + 1e-12)
+                                  + (1 - y) * np.log(1 - p + 1e-12)))
+    - language: python
+      title: "The KL-regularised policy and the DPO implicit reward"
+      note: >-
+        This is the closed form, not an optimiser, so it is exact — but it is
+        numerically WRONG as a recipe for real models: it assumes the action
+        space is small enough to normalise over. For a language model the sum
+        over $a$ is over all sequences, so the normaliser is intractable and
+        every real implementation works with the log-ratio instead. The
+        `1e-12` guard also changes the answer when a probability is genuinely
+        zero.
+      code: |
+        import numpy as np
+
+        def optimal_policy(reward, p_ref, beta):
+            """p*(a) ∝ p_ref(a) * exp(reward(a)/beta). Exact for small A."""
+            z = reward / beta
+            w = np.exp(z - z.max())          # stabilise before normalising
+            p = p_ref * w
+            return p / p.sum()
+
+        def dpo_implicit_reward(p, p_ref, beta):
+            """beta * log(p/p_ref): the reward DPO implies, up to a constant."""
+            return beta * np.log(np.maximum(p, 1e-12) / np.maximum(p_ref, 1e-12))
+
+        def dpo_loss(p_chosen, p_ref_chosen, p_rejected, p_ref_rejected, beta):
+            """-log sigmoid of the implicit-reward margin."""
+            margin = beta * (np.log(p_chosen / p_ref_chosen)
+                             - np.log(p_rejected / p_ref_rejected))
+            return float(-np.log(1.0 / (1.0 + np.exp(-margin))))
+
+  checkpoints:
+    - id: cp-1
+      question: "Why can Bradley-Terry never give you an absolute reward score?"
+      answerKind: short_text
+      hint: "What happens to the likelihood if you add 5 to every reward?"
+      solution: >-
+        Because only differences $r(x_1) - r(x_2)$ enter the likelihood, so
+        adding a constant to all rewards leaves it exactly unchanged. The
+        reward is identified only up to an additive constant, which is why the
+        fit needs a centring constraint (the `r -= r.mean()` projection) and why
+        an uncentred optimiser drifts while the loss stays flat.
+    - id: cp-2
+      question: "Your preference model's pairwise accuracy has plateaued at 0.75 while RMSE keeps falling. Is training broken?"
+      answerKind: short_text
+      hint: "Where does the noise live — in the estimate or in the label?"
+      solution: >-
+        No. Measured, going from 50 to 5,000 comparisons cut RMSE 7.4x (0.1758
+        to 0.0238) while accuracy stayed at 0.7556, 0.7429, 0.7543, 0.7582. The
+        plateau is the label-noise ceiling: at temperature 0.5 even a perfect
+        reward model cannot predict a near-tie. Accuracy is bounded by the data;
+        RMSE measures the estimate, which is still improving.
+    - id: cp-3
+      question: "State the optimal policy for the KL-regularised objective, and what happens at beta = 0."
+      answerKind: short_text
+      hint: "Lagrange over the simplex, then look at the limit."
+      solution: >-
+        $p^\star(a) \propto p_{\text{ref}}(a)\exp(r(a)/\beta)$. As beta goes to
+        zero the exponential becomes arbitrarily peaked, so $p^\star$ tends to a
+        point mass on the highest-reward action. Measured at beta = 0.01 the
+        policy puts probability 1.000 on the best action with KL exactly
+        $\ln 8 = 2.0794$ against a uniform reference over 8 choices.
+    - id: cp-4
+      question: "Derive the DPO implicit reward and explain why no reward model is needed."
+      answerKind: short_text
+      hint: "Invert the closed form for r, then substitute into Bradley-Terry."
+      solution: >-
+        From $p^\star \propto p_{\text{ref}}e^{r/\beta}$ you get
+        $r(a) = \beta\log(p^\star(a)/p_{\text{ref}}(a)) + \beta\log Z$. The
+        constant cancels in $r(a_w) - r(a_l)$, so the preference probability is
+        a function of policy log-ratios alone. Verified: reconstructing that
+        expression reproduces the fitted reward to 2.22e-16 with correlation
+        1.0000000000. No reward model is required, only the reference log-probs.
+    - id: cp-5
+      question: "Why is dropping the KL penalty dangerous rather than merely aggressive?"
+      answerKind: short_text
+      hint: "What does the policy look like at the beta → 0 endpoint, and what is the reward model at that point?"
+      solution: >-
+        Without the penalty the optimum is a point mass on the argmax of the
+        learned reward — measured KL exactly $\ln n$, probability 1.000 on one
+        action. Since the reward is an approximation, that argmax is wherever the
+        approximation is most wrong, so proxy reward climbs while sampling
+        collapses to one output. The KL term bounds how far the policy may travel
+        to reach those regions; it does not fix the approximation.
+    - id: cp-6
+      question: "What is the diagnostic value of a Bradley-Terry loss of exactly 0.6931 at step 0?"
+      answerKind: short_text
+      hint: "What does a model predicting 0.5 for every pair score?"
+      solution: >-
+        It is $\ln 2$, the loss of a model that predicts 0.5 everywhere — which
+        is what zero-initialised logits give. If your first loss is not 0.6931,
+        either the labels are not balanced or the logits are not zero, so you
+        have a data or initialisation bug before spending a run. Measured: 0.6931
+        at init, 0.5389 after fitting.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Every alignment method optimises the same thing: reward minus beta times
+        divergence from a reference. RLHF learns the reward and optimises it;
+        DPO notices the optimal policy *is* the reward reparameterised, so it
+        optimises the policy directly. The KL term is what keeps the answer
+        sampleable.
+      blocks:
+        - kind: checklist
+          body: |
+            - Bradley-Terry: comparisons give a reward, but only up to a constant
+            - Optimal policy = reference tilted by exp(reward / beta)
+            - DPO = that identity substituted back into Bradley-Terry
+            - beta = a KL budget in nats, not a tuning knob
+            - beta → 0 gives a point mass with KL = ln(number of actions)
+      checkpoint: >-
+        If the reward is only identified up to a constant, what does that force
+        you to do when fitting it, and what breaks if you skip that step?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Two decisions: how to get the reward (fit it, or imply it), and how much
+        KL you will spend. For the first, DPO removes a whole training stage at
+        the cost of storing reference log-probs. For the second, remember beta is
+        a product decision — you are buying reward with divergence.
+      blocks:
+        - kind: checklist
+          body: |
+            - Have preference pairs and want simplicity → DPO
+            - Need an explicit scalar reward for other uses → fit Bradley-Terry
+            - Need to control drift tightly → raise beta, accept lower reward
+            - Reporting results → give true reward, KL, and held-out win rate together
+            - Debugging → check the first loss is ln 2 = 0.6931
+      checkpoint: >-
+        Why can you not report "reward improved" as evidence that alignment
+        worked, and what must accompany it?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Both algorithms in about fifteen lines. The subtle parts are centring the
+        reward and remembering that beta divides.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # --- reward modelling ---
+            r = zeros(n_actions)
+            repeat steps:
+                p = sigmoid((r[i] - r[j]) / tau)
+                grad = scatter_add(i, (p - y)/tau) - scatter_add(j, (p - y)/tau)
+                r -= lr * grad / n_pairs
+                r -= r.mean()                  # identifiability
+
+            # --- policy (closed form, small action space) ---
+            p_star = normalise(p_ref * exp(r / beta))
+            KL = sum(p_star * log(p_star / p_ref))
+
+            # --- DPO loss, no reward model ---
+            margin = beta * (log pi(y_w)/log pi_ref(y_w) - log pi(y_l)/log pi_ref(y_l))
+            loss = -log(sigmoid(margin))
+      checkpoint: >-
+        In the DPO loss, what happens to the gradient if the policy and reference
+        are identical, and why is that the correct behaviour?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The two derivations worth owning: the tilted-softmax optimum, and the
+        inversion that produces DPO.
+      blocks:
+        - kind: math
+          body: |
+            **Tilted softmax.** With $J(p) = \sum_a p(a)r(a) - \beta\sum_a p(a)\log\frac{p(a)}{p_{\text{ref}}(a)}$
+            and a simplex multiplier, stationarity gives
+            $$p^\star(a) \propto p_{\text{ref}}(a)\exp\!\left(\frac{r(a)}{\beta}\right).$$
+
+            **DPO by inversion.** Rearranged,
+            $$r(a) = \beta\log\frac{p^\star(a)}{p_{\text{ref}}(a)} + \beta\log Z,$$
+            and the constant cancels in $r(a_w) - r(a_l)$, so
+            $$P(a_w \succ a_l) = \sigma\!\left(\beta\log\frac{p(a_w)}{p_{\text{ref}}(a_w)}
+            - \beta\log\frac{p(a_l)}{p_{\text{ref}}(a_l)}\right).$$
+
+            **Collapse bound.** For $p = \delta_{a^\star}$ and uniform $p_{\text{ref}}$
+            over $n$ actions, $\mathrm{KL} = \log n$.
+      checkpoint: >-
+        Why does the intractable log Z disappear, and what would happen to DPO if
+        Bradley-Terry used absolute scores instead of differences?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete pipeline: fit a reward, sweep beta to trace the frontier,
+        and verify the implicit reward matches — the check that proves DPO and
+        RLHF are the same optimum.
+      blocks:
+        - kind: warning
+          body: >-
+            The frontier sweep is the deliverable, not the single model. One beta
+            gives you one point; you need the curve to know what you paid.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def fit_bt(i, j, y, A, tau=0.5, steps=3000, lr=0.1):
+                r = np.zeros(A)
+                for _ in range(steps):
+                    p = 1/(1+np.exp(-((r[i]-r[j])/tau)))
+                    g = (p-y)/tau
+                    grad = np.zeros(A)
+                    np.add.at(grad, i, g); np.add.at(grad, j, -g)
+                    r -= lr*grad/len(i); r -= r.mean()
+                return r
+
+            def frontier(r_hat, r_true, p_ref, betas=(0.01,0.1,0.25,0.5,1.0,5.0)):
+                rows=[]
+                for beta in betas:
+                    z = r_hat/beta; w = np.exp(z-z.max())
+                    p = p_ref*w; p /= p.sum()
+                    rows.append(dict(
+                        beta=beta,
+                        true_reward=float(p@r_true),
+                        proxy_reward=float(p@r_hat),
+                        kl=float(np.sum(p*np.log(p/p_ref))),
+                        max_prob=float(p.max())))
+                return rows
+
+            def check_implicit(r_hat, p, p_ref, beta):
+                imp = beta*np.log(p/p_ref)
+                return float(np.max(np.abs((imp-imp.mean()) - (r_hat-r_hat.mean()))))
+      checkpoint: >-
+        You measure a beta that gives high true reward at KL 1.7, and a second at
+        KL 0.1 with much lower reward. What additional information decides which
+        one to ship, and why is it not a modelling question?
+
+  problems:
+    - id: p-bt-loss
+      title: "Bradley-Terry negative log-likelihood"
+      difficulty: easy
+      prompt: >-
+        Implement `bt_loss(r, i, j, y, tau=1.0)` returning the mean Bradley-Terry
+        negative log-likelihood for rewards `r`, index arrays `i` and `j`
+        (challenger and reference), labels `y` (1.0 if `i` is preferred) and
+        temperature `tau`. Use `P = sigmoid((r[i] - r[j]) / tau)` and average
+        over pairs.
+      starter: |
+        import numpy as np
+
+        def bt_loss(r, i, j, y, tau=1.0):
+            # your implementation here
+            pass
+      language: python
+      entry: bt_loss
+      testCases:
+        - input: '[[0,0],[0],[1],[1]]'
+          expected: '0.6931471805599453'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[1,-1],[0],[1],[1]]'
+          expected: '0.12692801104297263'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0,0],[0,1],[1,0],[0,1]]'
+          expected: '0.6931471805599453'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[2,0],[0],[1],[1],0.5]'
+          expected: '0.01814992791780973'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def bt_loss(r, i, j, y, tau=1.0):
+            r = np.asarray(r, dtype=float)
+            i = np.asarray(i, dtype=int)
+            j = np.asarray(j, dtype=int)
+            y = np.asarray(y, dtype=float)
+            p = 1.0 / (1.0 + np.exp(-(r[i] - r[j]) / tau))
+            return float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
+      solutionExplanation: >-
+        Zero rewards give p = 0.5 for every pair, so the loss is exactly ln 2 =
+        0.6931 — the diagnostic value from the lesson. The asymmetric case with
+        r = [1, -1] at tau = 1 gives a gap of 2, p = 0.8808 and loss 0.1269. The
+        third case has both pairs at zero reward but opposite labels, so the mean
+        is still ln 2. The last case halves the temperature, doubling the
+        effective gap to 4 and dropping the loss to 0.0181.
+      complexity: "O(n) time, O(n) space"
+      tags: [bradley-terry, reward-model]
+
+    - id: p-optimal-policy
+      title: "The KL-regularised optimal policy"
+      difficulty: medium
+      prompt: >-
+        Implement `optimal_policy(r, p_ref, beta)` returning the exact optimum
+        p*(a) proportional to p_ref(a) * exp(r(a)/beta), normalised to sum to 1.
+        Return a list of floats.
+      starter: |
+        import numpy as np
+
+        def optimal_policy(r, p_ref, beta):
+            # your implementation here
+            pass
+      language: python
+      entry: optimal_policy
+      testCases:
+        - input: '[[0,1],[0.5,0.5],1.0]'
+          expected: "[0.2689414213699951, 0.7310585786300049]"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0,0],[0.3,0.7],1.0]'
+          expected: "[0.3, 0.7]"
+          mode: json
+          tolerance: 1e-12
+        - input: '[[1,0,0],[0.3333333333333333,0.3333333333333333,0.3333333333333333],0.5]'
+          expected: "[0.7869860421615985, 0.10650697891920076, 0.10650697891920076]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[0,0],[0.5,0.5],0.25]'
+          expected: "[0.5, 0.5]"
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def optimal_policy(r, p_ref, beta):
+            r = np.asarray(r, dtype=float)
+            p_ref = np.asarray(p_ref, dtype=float)
+            z = r / beta
+            w = np.exp(z - z.max())          # stabilise before normalising
+            p = p_ref * w
+            p = p / p.sum()
+            return [float(v) for v in p]
+      solutionExplanation: >-
+        The optimum is the reference tilted by an exponential of reward over beta.
+        A flat reward leaves the reference untouched (case 2 and case 4), which
+        is the check that beta scales the reward rather than the reference. Case 3
+        shows beta = 0.5 giving a 7.4:1 ratio from a uniform reference.
+      complexity: "O(A) time, O(A) space"
+      tags: [kl-regularisation, closed-form]
+
+    - id: p-dpo-margin
+      title: "The DPO implicit-reward margin"
+      difficulty: easy
+      prompt: >-
+        Implement `dpo_margin(p_c, p_ref_c, p_r, p_ref_r, beta)` returning
+        beta * (log(p_c / p_ref_c) - log(p_r / p_ref_r)) — the margin whose
+        sigmoid is the DPO preference probability. Any log base is fine as long
+        as it is consistent.
+      starter: |
+        import numpy as np
+
+        def dpo_margin(p_c, p_ref_c, p_r, p_ref_r, beta):
+            # your implementation here
+            pass
+      language: python
+      entry: dpo_margin
+      testCases:
+        - input: '[0.6, 0.5, 0.4, 0.5, 0.1]'
+          expected: '0.04054651081081643'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.9, 0.5, 0.1, 0.5, 0.5]'
+          expected: '1.0986122886681096'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.5, 0.5, 0.5, 0.5, 1.0]'
+          expected: '0.0'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+        def dpo_margin(p_c, p_ref_c, p_r, p_ref_r, beta):
+            return float(beta * (np.log(p_c / p_ref_c) - np.log(p_r / p_ref_r)))
+      solutionExplanation: >-
+        With the policy equal to the reference everywhere the margin is exactly
+        zero (case 3), so the preference probability is 0.5 — the correct
+        behaviour for an untrained policy. Case 2 has a 9x ratio against a 0.2x
+        ratio, giving a margin of ln 3 = 1.0986 at beta = 0.5, which is the
+        implicit reward difference the policy has learned.
+      complexity: "O(1) time"
+      tags: [dpo, implicit-reward]
+
+
+  try_it: >-
+    Build eight actions with a known reward, set $\beta = 0.01$, and compute the KL-regularised
+    optimum by hand. You should get probability 1.000 on the best action and a KL against the
+    uniform reference of exactly $\ln 8 = 2.0794$ — that is the failure the KL term exists to
+    prevent.
+  interview_questions:
+    - question: 'What does Bradley-Terry assume, and what can you not recover from it?'
+      level: mid
+      key_points:
+        - 'It assumes P(y = 1 | x1, x2) = sigma((r(x1) - r(x2)) / tau), so only reward differences enter the likelihood.'
+        - 'Adding a constant to every reward leaves the likelihood unchanged, so absolute reward is not identified and has to be centred.'
+        - 'Tau sets the label-noise ceiling, which is why pairwise accuracy saturates at about 0.755 regardless of dataset size.'
+        - 'A reward model initialised at zero must give loss ln 2 = 0.6931, because it predicts 0.5 for every pair — that is the check.'
+    - question: 'Your proxy reward climbs while quality falls. Diagnose it and say what you would change.'
+      level: senior
+      key_points:
+        - 'The policy is optimising a learned approximation, so any region where the approximation is too high becomes attractive.'
+        - 'The KL term bounds how far the policy can drift, and removing it because it looks like a regulariser is what produces the point mass.'
+        - 'Beta is the budget: doubling it from 0.25 to 0.5 cuts KL from 0.7993 to 0.3079 (2.6x) and drops true reward from 0.7374 to 0.5694.'
+        - 'There is no setting that gives both, so the fix is a business decision about how far from the reference policy you are willing to sit, plus more or cleaner preference data.'
+      follow_up: 'If every point on that frontier is a choice, what measurement would you put in front of a product owner to let them make it?'
+    - question: 'Derive the DPO loss from the KL-regularised optimum.'
+      level: mid
+      key_points:
+        - 'Maximising E_p[r] - beta KL(p || p_ref) gives p_star(a) proportional to p_ref(a) exp(r(a)/beta) exactly.'
+        - 'Invert it: r(a) = beta log(p_star(a) / p_ref(a)) + C, so the reward is a reparameterisation of the policy.'
+        - 'Substituting into Bradley-Terry makes the constant cancel, because it appears in both arguments of the difference.'
+        - 'The result is a loss in the policy alone: no reward model, no sampling loop, and it was verified numerically to reach the same optimum.'
+  common_mistakes:
+    - 'Dropping the KL term because it looks like a regulariser, which turns the optimum into a point mass with KL exactly ln 8 over eight actions.'
+    - 'Reading a rising proxy reward as progress, when in RLHF the policy optimises the approximation and true quality can fall while it climbs.'
+    - 'Expecting a better algorithm to beat noisy labels, when pairwise accuracy is pinned at 0.755 by label noise regardless of dataset size.'
+  further_reading:
+    - label: "Rafailov, Sharma, Mitchell, Ermon, Manning & Finn, Direct Preference Optimization: Your Language Model is Secretly a Reward Model (NeurIPS 2023)"
+    - label: "Ouyang, Wu, Jiang, Almeida, Wainwright, Mishkin, Zhang, Agarwal, Slama & Ray, Training Language Models to Follow Instructions with Human Feedback (NeurIPS 2022)"

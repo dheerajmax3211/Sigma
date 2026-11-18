@@ -1,0 +1,692 @@
+id: cs-reasoning-infra
+slug: cs-reasoning-infra
+title: "Case Study: Test-Time Compute Infrastructure"
+summary: >-
+  Serve a reasoning model where the answer is bought with tokens: 8,000 tokens
+  per attempt, 6.4 GPU-seconds each, and a verifier that decides whether
+  best-of-n is a 10x cost increase or a break-even.
+kind: lesson
+difficulty: expert
+position: 16
+estMinutes: 20
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [reasoning, inference, kv-cache, batching, cost, search]
+
+body:
+  big_idea: >-
+    Test-time compute is a purchase, not a feature: every sample, verifier
+    pass and search node is bought with GPU-seconds, and the number that
+    matters is cost per solved problem — which best-of-n can never improve.
+  problem:
+    - "You add best-of-16 and ship it: cost per request rises 16x and cost per solved problem 6.7x, since 16 x 0.42 is 6.7."
+    - "You score full solutions with a process reward model and the verifier is 4.4% of the bill; step-level scoring makes it 54%."
+    - "Your p99 is 76 seconds because 8,000 tokens at 104 tokens per second is arithmetic, not scheduling: batching helps throughput, never the tail."
+  analogy: >-
+    A student allowed several attempts, handing in the one a marker likes
+    best. Each attempt costs the same. If she solves 42% of problems first
+    try, sixteen attempts cannot earn more than one solve per problem — and
+    you have paid sixteen times for it. The marker is the verifier, and a
+    perfect marker makes the sixteenth attempt worth exactly one.
+  concept_points:
+    - "**Decode is bandwidth-bound, and the number is per-token weight reads.** A 32B model in bf16 is 64 GB; with tensor parallelism 2 each device reads 32 GB per token, so at 3.35 TB/s a token takes **9.55 ms** and one sequence generates **104.7 tokens/s**. That single number sets latency for every request."
+    - "**Batching buys throughput, never latency.** At batch 24 the aggregate rate is 104.7 x 24 = **2,512 tokens/s** because the weight read is amortised, but each sequence still advances one token per 9.55 ms. 8,000 tokens is **76 s** whether the batch is 1 or 24."
+    - "**Tensor parallelism is the only latency lever that scales.** Four devices halve the per-device weight read to 16 GB, so a token takes 4.8 ms and the same 8,000 tokens take **38 s**. Latency is inversely proportional to TP degree until communication dominates — which is why interactive reasoning uses more GPUs per replica, not fewer."
+    - "**KV cache is the batching ceiling.** With 64 layers, 8 KV heads and head dim 128, a token costs $2 \\times 64 \\times 8 \\times 128 \\times 2 =$ **256 KiB**, so 8,000 tokens is **2 GiB per sequence**. Twenty-four sequences need 48 GiB, which is what actually limits batch size against 64 GB of weights on 2 devices."
+    - "**A full-solution PRM pass is cheap; a step-level one is not.** Scoring 8,192 tokens with a 7B verifier is $2 \\times 7e9 \\times 8{,}192 = 115$ TFLOP, or **0.38 s** — 6% of a 6.4 GPU-second attempt. Rescoring 40 prefixes of average length 4,000 is 160,000 tokens, **19.5x** the work, and costlier than the generation it judges."
+    - "**Best-of-n can only break even, never win, on cost per solve.** Cost per solved problem is $nc/p_n$ against $c/p_1$, so sampling needs $p_n > n p_1$; with independent samples $p_n \\le n p_1$ always. At $p_1 = 0.42$ and $n = 16$ the ratio is **6.7x**; at $p_1 = 0.02$ it is **1.16x**. Sampling buys accuracy per request, not cheaper answers."
+  definitions:
+    - { term: "pass@1", meaning: "Probability a single sample is correct. The baseline every test-time method is priced against." }
+    - { term: "pass@n", meaning: "Probability at least one of n samples is correct; the ceiling for best-of-n with a perfect verifier." }
+    - { term: "PRM", meaning: "Process reward model: scores intermediate steps rather than only the final answer, giving a denser selection signal." }
+    - { term: "ORM", meaning: "Outcome reward model: scores only the final answer, which is cheap but gives one bit per sample." }
+    - { term: "Best-of-n", meaning: "Sample n completions in parallel and select with a verifier; cost is n times one attempt." }
+    - { term: "MCTS", meaning: "Monte Carlo tree search: expand promising prefixes, score with a value or process model, allocate budget by visit count." }
+    - { term: "KV cache", meaning: "Per-token keys and values retained during decode; its size bounds batch size and therefore throughput." }
+    - { term: "GQA", meaning: "Grouped-query attention: fewer KV heads than query heads, shrinking the cache proportionally." }
+    - { term: "Continuous batching", meaning: "Admitting and retiring sequences at token granularity so a batch is never blocked by its longest member." }
+    - { term: "Speculative decoding", meaning: "A draft model proposes tokens that the target verifies in one pass; cuts latency when acceptance is high." }
+    - { term: "Cost per solved problem", meaning: "GPU-seconds divided by solve rate. The only comparable metric across test-time strategies." }
+
+  diagrams:
+    - type: pipeline
+      title: "One problem, four budgets"
+      nodes:
+        - label: "Sample"
+          note: "8,000 tokens, 6.4 GPU-s"
+          detail: "Decode at 104.7 tokens/s per sequence, 2,512 tokens/s at batch 24. Latency is 76 s and does not improve with batching."
+        - label: "Verify"
+          note: "0.38 s full-pass, 7.5 s step-level"
+          detail: "A 7B PRM over 8,192 tokens is 115 TFLOP. Step-level rescoring is 19.5x that and can exceed the generation bill."
+        - label: "Search"
+          note: "MCTS 6.4 attempts"
+          detail: "64 simulations x 4 children x 200 tokens = 51,200 tokens. Search multiplies generation; it does not replace it."
+        - label: "Select"
+          note: "argmax or vote"
+          detail: "Selection quality is the whole return on the extra compute. A verifier no better than chance makes best-of-n pure loss."
+    - type: plot
+      title: "Cost per solved problem for best-of-16, relative to pass@1 (independent samples, perfect verifier)"
+      chart: "line"
+      xLabel: "pass@1"
+      yLabel: "cost per solve, multiple of pass@1"
+      series:
+        - name: "best-of-16"
+          points:
+            - { x: 0.02, y: 1.16 }
+            - { x: 0.05, y: 1.43 }
+            - { x: 0.10, y: 1.96 }
+            - { x: 0.20, y: 3.29 }
+            - { x: 0.42, y: 6.72 }
+    - type: compare
+      title: "Two ways to spend 100 GPU-seconds"
+      left_label: "Best-of-16, full-solution PRM"
+      left_points:
+        - "16 attempts x 6.4 GPU-s = 102 GPU-s"
+        - "16 verifier passes x 0.38 = 6.1 GPU-s"
+        - "Ceiling p16 = 1.0, so cost per solve = 108 GPU-s"
+        - "Pays only where p1 is under 1/16"
+      right_label: "MCTS, branching 4, 64 simulations"
+      right_points:
+        - "51,200 tokens = 6.4 attempts = 40.8 GPU-s"
+        - "Verifier on 256 nodes, ~2.4 GPU-s"
+        - "Better per-token allocation on hard problems"
+        - "Sequential depth: 8 levels of latency, not parallel"
+
+  problem_statement: >-
+    Design a test-time compute service for a mathematical reasoning model: accept
+    a problem, spend a per-request token budget, and return the best answer with a
+    confidence score. The service must support three modes — single sample,
+    best-of-n with a process verifier, and tree search — under a shared GPU fleet,
+    with per-request cost attribution and an interactive latency target that
+    cannot be met by batching alone.
+
+  requirements:
+    functional:
+      - "Accept a problem and a compute budget (max tokens, max samples, or max search nodes)."
+      - "Run single-sample, best-of-n, and tree-search modes behind one API."
+      - "Return the selected answer, the verifier score, and the token accounting per request."
+      - "Support a batch mode for offline evaluation with no latency SLO."
+    non_functional:
+      - "Interactive p99 under 90 s at an 8,000-token budget, streaming tokens as they are produced."
+      - "Cost per request attributable to the mode and to generation versus verification."
+      - "KV cache must not exceed 80% of device memory; requests that would exceed it queue rather than OOM."
+      - "Queueing must degrade gracefully: no request starves while others are admitted."
+
+  clarifying_questions:
+    - question: "Is the SLO latency or throughput?"
+      why_it_matters: "At 104.7 tokens/s, 8,000 tokens is 76 s of decode on two GPUs. Throughput batching does not change that; only more tensor parallelism, a smaller model, or speculative decoding does."
+    - question: "What is pass@1 on the target distribution, and how was it measured?"
+      why_it_matters: "It decides whether sampling can pay at all. Best-of-n needs p_1 < 1/n to beat pass@1 on cost per solve, so 16 samples is only viable below 6.25% pass@1."
+    - question: "Which verifier, and is it trained on this distribution?"
+      why_it_matters: "Verifier quality is the entire return on sampling. A PRM that is 60% accurate on in-distribution steps and 55% out-of-distribution turns best-of-16 into a coin flip with a 16x bill."
+    - question: "Is step-level verification required for the product, or is final-answer checking enough?"
+      why_it_matters: "Step-level scoring is 19.5x the verifier work and can dominate the bill; final-answer checking for math is nearly free when the answer is checkable."
+    - question: "How variable are output lengths, and what is the maximum?"
+      why_it_matters: "A 32,000-token tail at 2 GiB per 8,000 tokens is 8 GiB per sequence; a handful of them can evict the rest of the batch and collapse throughput."
+
+  capacity_estimation:
+    assumptions:
+      - "32B dense model in bf16 (64 GB weights), tensor parallelism 2 across 80 GB devices."
+      - "8,000 output tokens per attempt average; 32,000 maximum; 2,000-token shared prompt."
+      - "64 layers, 8 KV heads (GQA), head dimension 128, fp16 KV cache."
+      - "3.35 TB/s HBM bandwidth per device; 400 TFLOP/s effective for prefill-scale matmuls, 300 TFLOP/s for the 7B verifier."
+      - "Target 60% fleet utilisation; GPU cost 2.50 USD per GPU-hour."
+    arithmetic:
+      - label: "Per-token decode time"
+        calculation: "64 GB weights / 2 devices = 32 GB read per token; 32e9 B / 3.35e12 B/s = 9.55e-3 s; 1 / 9.55e-3 = 104.7 tokens/s"
+        conclusion: "9.55 ms per token, 104.7 tokens/s per sequence. Aggressive batching cannot improve this — it is a bandwidth floor."
+      - label: "KV cache per sequence"
+        calculation: "2 x 64 layers x 8 KV heads x 128 dims x 2 B = 262,144 B/token; x 8,192 tokens = 2.147e9 B"
+        conclusion: "256 KiB per token and 2 GiB per 8,000-token sequence. With 32 GB of weights per device, 24 sequences need 48 GiB of cache against 48 GiB of remaining memory — the batch is sized by cache, not by compute."
+      - label: "GPU-seconds per attempt"
+        calculation: "8,000 tokens / 2,512 tokens/s (batch 24) = 3.18 s wall; x 2 devices = 6.37 GPU-s"
+        conclusion: "6.37 GPU-seconds per 8,000-token attempt at batch 24, or 4.42 USD per 1,000 attempts at 2.50 USD/GPU-hour."
+      - label: "Full-solution verifier cost"
+        calculation: "2 x 7e9 params x 8,192 tokens = 1.147e14 FLOP; / 3e14 FLOP/s = 0.382 s; on 1 device = 0.382 GPU-s"
+        conclusion: "0.38 GPU-s per scored solution — 6% of generation. Scoring all 16 candidates adds 6.1 GPU-s to 102, which is tolerable."
+      - label: "Step-level verifier cost"
+        calculation: "40 steps x 4,000 average prefix = 160,000 tokens; / 8,192 = 19.5x a full pass; 19.5 x 0.382 = 7.5 GPU-s per candidate; x 16 = 120 GPU-s"
+        conclusion: "120 GPU-s of verification against 102 GPU-s of generation. At step granularity the verifier is more than half the bill — the measurement apparatus costs more than the measured."
+      - label: "MCTS search cost"
+        calculation: "64 simulations x 4 children x 200 tokens = 51,200 tokens; / 8,000 = 6.4 attempts; x 6.37 GPU-s = 40.8 GPU-s"
+        conclusion: "6.4 attempts per problem before verification, and 8 levels of sequential depth — cheaper in total than best-of-16, but far worse for latency."
+      - label: "Break-even condition"
+        calculation: "cost per solve = n x 6.37 / p_n; beat pass@1 (6.37 / p_1) iff p_n > n x p_1; at n=16, p_1=0.42: need p_16 > 6.72"
+        conclusion: "Impossible, since p_16 <= 1. The method can only break even below 6.25% pass@1, and because independent samples give p_16 <= 16 p_1, it approaches parity only as p_1 approaches zero."
+
+  architecture_summary: >-
+    Requests arrive with an explicit compute budget and are routed by mode.
+    Single-sample traffic goes to a latency-optimised pool with tensor parallelism
+    4; best-of-n goes to a throughput pool at TP 2 with continuous batching, since
+    the samples are independent and their latency is amortised. The generator
+    streams tokens, keeps a per-request KV block table, and preempts the youngest
+    sequence when cache pressure exceeds 80%. Verification runs as a separate
+    service on its own GPUs so that a slow verifier cannot steal decode slots, and
+    the scheduler decides per request whether to verify all candidates, the top-k,
+    or none. Search mode runs a controller that issues expansion requests to the
+    same generator pool, so tree search and sampling share capacity instead of
+    needing a dedicated fleet.
+
+  deep_dives:
+    - topic: "The token budget as an economic decision"
+      explanation: >-
+        Every mode is a different allocation of the same resource. A single
+        8,000-token attempt costs 6.37 GPU-s; best-of-16 costs 102 plus 6 for
+        verification; MCTS at branching 4 costs 41 before verification but takes
+        eight sequential steps. Choosing between them requires knowing p_1, the
+        verifier's accuracy, and the latency SLO — three inputs that are usually
+        measured once and then assumed forever. The discipline is to compute cost
+        per solved problem per mode on the actual deployment distribution and
+        re-measure whenever the distribution moves.
+      tradeoffs:
+        - option: "Best-of-n with a verifier"
+          pros: "Embarrassingly parallel, so latency equals one attempt; simple to schedule; scales to any n without new infrastructure."
+          cons: "Cost is exactly n times generation; can only break even when p_1 < 1/n, and independent samples never actually win; selection quality is capped by the verifier."
+        - option: "Tree search with a process verifier"
+          pros: "Reallocates budget toward promising prefixes; better on problems where early steps determine success."
+          cons: "Sequential depth multiplies latency; verifier calls per node multiply cost; harder to attribute and to debug."
+        - option: "Single long attempt with self-correction"
+          pros: "Cheapest per request; one sequence, no verifier, latency equal to token count."
+          cons: "Self-correction without external signal tends to entrench errors; no selection mechanism to fall back on."
+
+    - topic: "KV cache, batching, and preemption"
+      explanation: >-
+        At 256 KiB per token, an 8,000-token sequence costs 2 GiB of cache. The
+        weights leave 48 GiB per device on a 2-device replica, so 24 sequences fit
+        and the 25th must wait or evict someone. Continuous batching means the
+        batch is not a fixed set — sequences arrive and leave at token
+        granularity — so the scheduler needs a block allocator that can grow a
+        sequence's cache and reclaim a finished one's immediately. When the
+        allocator cannot satisfy a growth request, the choice is to preempt
+        (recompute later) or to reject; preemption is cheaper for short sequences
+        and pathological for long ones, which is why length caps exist.
+      tradeoffs:
+        - option: "Cap output length at 8,000"
+          pros: "Bounds cache per sequence and makes the batch predictable; the p99 latency is derivable."
+          cons: "Truncates the hard problems, which are exactly the ones test-time compute is for; a truncated reasoning trace is worse than a short one."
+        - option: "Preempt and recompute the youngest sequence"
+          pros: "Keeps the batch full and the GPU busy; no request is rejected outright."
+          cons: "Recomputation wastes 10-60% of decode work under pressure, and a repeatedly preempted request can miss its SLO indefinitely."
+        - option: "Reserve a long-context lane"
+          pros: "Protects 32,000-token requests from evicting the batch, and isolates their latency."
+          cons: "Stranded capacity when the lane is idle; utilisation drops unless the mix is stable."
+
+    - topic: "Latency: tensor parallelism versus speculation"
+      explanation: >-
+        Decode latency is set by weight reads, so the two ways to cut it are to
+        read less per device (more tensor parallelism) or to make fewer passes
+        (speculative decoding). Going from TP 2 to TP 4 halves per-device weights
+        and halves per-token time to 4.8 ms, at the cost of doubling the GPUs per
+        replica and adding an all-reduce per layer. Speculative decoding with a
+        small draft model and 70% acceptance yields roughly 2.3 tokens per target
+        pass, cutting latency without extra devices but adding a draft model to
+        serve and a workload-dependent win.
+      tradeoffs:
+        - option: "Increase tensor parallelism"
+          pros: "Deterministic latency reduction proportional to device count; no extra model to train or serve."
+          cons: "Doubles GPU cost per replica and adds per-layer communication, which dominates past 8-way at these sizes."
+        - option: "Speculative decoding"
+          pros: "Cuts latency with the same hardware; acceptance is high on predictable reasoning boilerplate."
+          cons: "Win collapses when acceptance is low, which is exactly on the creative or high-entropy steps; draft model costs memory and a rollout."
+        - option: "Smaller model, more attempts"
+          pros: "Cheapest per token by far; may match a larger model's pass@n with more samples."
+          cons: "Shifts cost into sampling and verification, and requires the verifier to be strong enough to select among weaker candidates."
+
+    - topic: "Verifier placement and cost attribution"
+      explanation: >-
+        The verifier is a second model with its own latency and its own failure
+        mode. Running it inline serialises generation and verification, adding a
+        full model round trip to the critical path; running it as a separate
+        service on separate GPUs decouples the two but adds a network hop and a
+        queue. For math, answer checking is nearly free and exact, so a full PRM
+        is only justified when the answer is not checkable or when step-level
+        credit is needed for search. Cost attribution has to be per component from
+        day one, because the first question in every review is "how much of this
+        bill is the verifier".
+      tradeoffs:
+        - option: "Exact answer checking where possible"
+          pros: "Zero cost, zero false positives; for math and code the answer is verifiable by comparison or execution."
+          cons: "Gives one bit per sample, so it cannot guide search or rank near-misses; useless for open-ended tasks."
+        - option: "ORM on final answers"
+          pros: "One cheap forward pass per candidate; trains on abundant outcome labels."
+          cons: "No signal about where a solution went wrong; selects lucky final answers with flawed reasoning."
+        - option: "Step-level PRM"
+          pros: "Dense signal, best selection and search quality; enables pruning during generation."
+          cons: "19.5x the scoring work per candidate; label collection is expensive; can be gamed by plausible-looking steps."
+
+  bottlenecks:
+    - failure: "KV cache exhaustion causes preemption thrash"
+      symptom: "Throughput drops 40% while GPU utilisation stays high; logs show repeated preempt and recompute events, and p99 grows without a matching rise in queue depth."
+      mitigation: "Cap max tokens per request at admission, size the batch from cache budget rather than from FLOPs, and give long requests a separate lane. Track cache utilisation as a first-class metric and alarm at 80%, not at OOM."
+    - failure: "Verifier becomes the dominant cost"
+      symptom: "Cost per request doubles after enabling step-level scoring; generation and verification GPU-seconds are within 20% of each other and the verifier's queue is longer than the generator's."
+      mitigation: "Score top-k candidates only, use exact answer checking where available, and cache verifier scores for shared prefixes. Make the mode's cost visible per request so the product owner sees the split."
+    - failure: "Length tail collapses effective batch size"
+      symptom: "Most requests finish at 3,000 tokens but a few run to 32,000; the batch's throughput tracks the longest member and short requests wait behind it."
+      mitigation: "Continuous batching with per-sequence block allocation, a length-aware admission policy that schedules long requests last, and chunked prefill so a long prompt does not stall decode for everyone."
+
+  what_to_steal:
+    - "Derive decode latency from weight reads: 32 GB per device at 3.35 TB/s is 9.55 ms per token, and no amount of batching improves it."
+    - "Size the batch from KV cache, not from FLOPs: 256 KiB per token means 2 GiB per 8,000-token sequence."
+    - "Price every mode as cost per solved problem: best-of-n can only break even when p_n > n p_1, which requires p_1 < 1/n."
+    - "Keep the verifier off the critical path and on its own GPUs — at step granularity it can cost more than generation."
+
+  markdown: |
+    ## Decode is a bandwidth problem with a fixed price
+
+    A 32B model in bf16 is 64 GB of weights. Split across two devices, each reads
+    32 GB to produce one token:
+
+    $$\frac{32\times10^{9}\ \text{B}}{3.35\times10^{12}\ \text{B/s}}
+    = 9.55\times10^{-3}\ \text{s}
+    \quad\Longrightarrow\quad 104.7\ \text{tokens/s}.$$
+
+    Eight thousand tokens is therefore **76 seconds** of decode. Batching does not
+    change it: at batch 24 the aggregate rate is 2,512 tokens/s because the weight
+    read is amortised, but each sequence still advances one token per 9.55 ms. If
+    the SLO is 90 s, you are one model-size decision away from missing it.
+
+    | TP degree | Weight read/device | ms/token | 8k tokens |
+    |---|---|---|---|
+    | 2 | 32 GB | 9.55 | 76 s |
+    | 4 | 16 GB | 4.77 | 38 s |
+    | 8 | 8 GB | 2.39 | 19 s |
+
+    Latency is inversely proportional to tensor parallelism, and the price is
+    linear in devices per replica. That is the entire interactive-latency story.
+
+    ## KV cache is the batch ceiling
+
+    With 64 layers, 8 KV heads (GQA) and head dimension 128:
+
+    $$2 \times 64 \times 8 \times 128 \times 2\ \text{B} = 262{,}144\ \text{B
+    per token} = 256\ \text{KiB}.$$
+
+    An 8,000-token sequence is **2 GiB**; twenty-four of them are 48 GiB. On a
+    two-device replica, 64 GB of weights leave 96 GB, so the batch that fits is
+    set by cache, not by compute. Going from 64 KV heads to 8 is an **8x**
+    reduction: the same memory would hold three sequences at full multi-head
+    attention, which is why GQA is not an optimisation but a prerequisite for
+    serving long reasoning traces at all.
+
+    ## The economics: cost per solved problem
+
+    Cost per solve for best-of-$n$ is $n c / p_n$; for pass@1 it is $c / p_1$.
+    Sampling wins exactly when
+
+    $$\frac{n c}{p_n} < \frac{c}{p_1}
+    \quad\Longleftrightarrow\quad p_n > n\,p_1.$$
+
+    Since $p_n \le 1$, this requires $p_1 < 1/n$ — 6.25% for sixteen samples. The
+    bound is tighter than that. Independent samples satisfy
+    $p_n = 1-(1-p_1)^n$, and the union bound gives $p_n \le n\,p_1$, so
+
+    $$\frac{n\,p_1}{p_n} \ge 1 \quad\text{always.}$$
+
+    Best-of-$n$ with a perfect verifier can never be cheaper per solve than
+    pass@1. The best it can do is approach parity as $p_1 \to 0$.
+
+    | pass@1 | pass@16 | cost per solve vs pass@1 |
+    |---|---|---|
+    | 0.42 | 0.9998 | **6.72x** |
+    | 0.20 | 0.9719 | 3.29x |
+    | 0.10 | 0.8147 | 1.96x |
+    | 0.05 | 0.5599 | 1.43x |
+    | 0.02 | 0.2762 | 1.16x |
+
+    What sampling actually buys is **accuracy per request**: at pass@1 of 0.02,
+    sixteen samples turn a 2% success rate into 28% for 1.16x the cost per solve.
+    That is a legitimate product decision — a much better answer for 16% more per
+    solved problem — and it is not the same decision as "cheaper inference". A
+    single global reasoning budget is always wrong, because the ratio spans 1.16
+    to 6.72 across one benchmark.
+
+    ## Verification can cost more than generation
+
+    A 7B PRM scoring a full 8,192-token solution:
+
+    $$2 \times 7\times10^{9} \times 8{,}192 = 1.15\times10^{14}\ \text{FLOP}
+    \quad\Longrightarrow\quad 0.38\ \text{s at } 300\ \text{TFLOP/s}.$$
+
+    That is 6% of a 6.4 GPU-second attempt. Now score every step: 40 prefixes
+    averaging 4,000 tokens is 160,000 tokens, **19.5x** the work, or 7.5 GPU-s per
+    candidate — **120 GPU-s across sixteen candidates, against 102 GPU-s of
+    generation.** The measurement apparatus is now the majority of the bill.
+
+    ## What the fleet looks like
+
+    For 100,000 problems a day at 6.37 GPU-seconds per attempt:
+
+    $$10^{5} \times 6.37 = 6.37\times10^{5}\ \text{GPU-s}
+    = 7.37\ \text{GPU-days per day},$$
+
+    which is **13 GPUs at 60% utilisation** for the single-sample tier and
+    **442 USD/day** at 2.50 USD per GPU-hour. Add best-of-16 and the same traffic
+    needs 200 GPUs and 7,000 USD/day — a 16x gap between two modes of the same
+    product. That gap is the reason a global "reasoning on/off" switch is
+    indefensible: the mode has to be chosen per request.
+
+    The scheduling consequence is that the two tiers cannot share a fleet well.
+    Single-sample traffic wants TP 4 for latency; best-of-n wants TP 2 and large
+    batches for throughput. Mixing them on one pool means every request is either
+    over-provisioned or under-latency, and the p99 of the interactive tier becomes
+    whatever the batch tier happens to be doing.
+
+    ## Batching is a scheduling problem, not a kernel problem
+
+    Reasoning outputs are long and variable, so a step-synchronous batch wastes
+    capacity in proportion to the spread of its members. A batch with one 32,000-token
+    request and fifteen 2,000-token requests runs for 32,000 steps while fifteen
+    slots idle after step 2,000 — an 88% utilisation loss on that batch, computed
+    as $1 - (15 \times 2{,}000 + 32{,}000)/(16 \times 32{,}000) = 1 - 62{,}000/512{,}000$.
+
+    Continuous batching fixes the utilisation and not the latency: a short request
+    admitted mid-flight still advances one token per 9.55 ms. The two things that
+    change latency are tensor parallelism and speculative decoding, and both cost
+    something real — devices per replica, or a draft model whose acceptance rate
+    is a distribution you do not control.
+
+    ## Where the analogy breaks
+
+    The student's attempts are independent; these share a 2,000-token prompt, so
+    prefix caching makes samples two through sixteen cheaper than the first. That
+    helps prefill and does nothing for decode, which is 90% of the cost.
+
+    And the marker is a model. It has an accuracy, a cost, and a distribution it
+    was trained on — and if it is 55% accurate out of distribution, best-of-16 is
+    a sixteen-times-more-expensive coin flip with better marketing.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Test-time compute is **a purchase, not a feature**. Every extra sample, every verifier pass, and every search node is bought with GPU-seconds, and the only number that matters is cost per *solved* problem — which improves only when the accuracy gain outruns the multiplier. Because a perfect verifier gives $p_n \le 1$, sampling can never beat pass@1 on cost per solve unless $p_1 < 1/n$. That inequality is the whole economics of reasoning infrastructure.
+
+    ### The analogy, in full
+
+    A student sitting an exam who is allowed to write several attempts and hand in the one a marker likes best. Each attempt costs the same. If the student solves 42% of problems on the first try, sixteen attempts cannot earn more than one solve per problem — and you have paid sixteen times for it. The marker is the verifier. A perfect marker makes the sixteenth attempt worth exactly one problem, no more; an imperfect one is worse than that. Two ways the analogy breaks. First, attempts are not independent: they share a prefix, so the marginal cost of an extra sample is lower than a full attempt if you cache the prompt and share the early reasoning. Second, the marker is itself a model with a cost, and at step granularity it is called on every prefix — so the measurement apparatus can cost more than the thing it measures.
+
+    ### Failure modes, in full
+
+    - You add best-of-16 and the demo gets better, so it ships. Cost per request rises 16x and cost per solved problem rises 6.7x, because the problem set where you measured was already at 42% pass@1 — and 16 x 0.42 is 6.7, which no verifier can beat.
+    - You score every candidate with a process reward model over the full solution and the verifier becomes 4.4% of the bill. You switch to step-level scoring to get a better signal and the verifier becomes 54% of the bill.
+    - You size the fleet on tokens per second and discover the real constraint is KV cache: 256 KiB per token at 8,000 tokens is 2 GiB per sequence, and a batch of 24 needs 48 GiB that must fit alongside 64 GB of weights.
+    - Your p99 latency is 76 seconds because 8,000 tokens at 104 tokens per second is arithmetic, not a scheduling problem. Batching improves throughput and does nothing for the tail.
+    - You run MCTS with branching factor 4 and 64 simulations and it costs 6.4 single attempts per problem — before the verifier, which is called on every node and doubles the bill again.
+
+    ### The mechanisms, in full
+
+    - **Decode is bandwidth-bound, and the number is per-token weight reads.** A 32B model in bf16 is 64 GB; with tensor parallelism 2 each device reads 32 GB per token, so at 3.35 TB/s a token takes **9.55 ms** and one sequence generates **104.7 tokens/s**. That single number sets latency for every request.
+    - **Batching buys throughput, never latency.** At batch 24 the aggregate rate is 104.7 x 24 = **2,512 tokens/s** because the weight read is amortised, but each sequence still advances one token per 9.55 ms. 8,000 tokens is **76 s** whether the batch is 1 or 24.
+    - **Tensor parallelism is the only latency lever that scales.** Four devices halve the per-device weight read to 16 GB, so a token takes 4.8 ms and the same 8,000 tokens take **38 s**. Latency is inversely proportional to TP degree until communication dominates — which is why interactive reasoning uses more GPUs per replica, not fewer.
+    - **KV cache is the batching ceiling.** With 64 layers, 8 KV heads and head dim 128, a token costs 2 x 64 x 8 x 128 x 2 B = **256 KiB**, so 8,000 tokens is **2 GiB per sequence**. Twenty-four sequences need 48 GiB, which is what actually limits batch size against 64 GB of weights on 2 devices.
+    - **GQA cuts the cache by the head ratio.** Going from 64 KV heads to 8 is an 8x reduction: 2 MiB per token becomes 256 KiB, and the batch that fits goes from 3 sequences to 24. Multi-head attention at 8,000 tokens does not fit a single 80 GB device alongside the weights.
+    - **A full-solution PRM pass is cheap; a step-level one is not.** Scoring 8,192 tokens with a 7B verifier is 2 x 7e9 x 8,192 = **115 TFLOP**, or **0.38 s** — 6% of a 6.4 GPU-second attempt. Rescoring 40 prefixes of average length 4,000 is 160,000 tokens, **19.5x** the work, and costlier than the generation it is judging.
+    - **MCTS is priced by generated tokens per problem.** Branching 4, depth 8, 64 simulations with 200-token children is 64 x 4 x 200 = **51,200 tokens = 6.4 attempts**, or **40.8 GPU-seconds**, before verifier cost. Search is a multiplier on generation, not a replacement for it.
+    - **Best-of-n can only break even, never win, on cost per solve.** Cost per solved problem is $n c / p_n$ against $c/p_1$, so sampling needs $p_n > n\,p_1$; with independent samples $p_n = 1-(1-p_1)^n \le n p_1$, so the ratio $n p_1 / p_n$ is **always at least 1** and approaches it only as $p_1 \to 0$. At $p_1 = 0.42$ and $n = 16$ the ratio is **6.7x**; at $p_1 = 0.02$ it is **1.16x**. Sampling buys accuracy per request, not cheaper answers.
+    - **Prompt prefix caching is the free multiplier.** All n samples share the problem statement and system prompt; caching that prefix removes its prefill from every sample after the first. At 2,000 shared tokens of an 8,000-token attempt, that is 25% of prefill — small next to decode, which is why speculative decoding matters more.
+  derivations:
+    - title: "Decode time per token"
+      latex: |
+        With $W$ bytes of weights per device and bandwidth $B$, a token takes
+        $\tau = W/B$, so the per-sequence rate is $B/W$. With tensor parallelism
+        $k$ and total parameters $N$ at $b$ bytes:
+        $$\tau = \frac{N b}{k B}, \qquad \text{tok/s} = \frac{k B}{N b}.$$
+        At $N = 32\times10^{9}$, $b = 2$, $k = 2$, $B = 3.35\times10^{12}$:
+        $$\tau = 9.55\ \text{ms},\qquad \text{tok/s} = 104.7.$$
+      prose: >-
+        The formula is bandwidth-bound and assumes batch 1. At larger batches the
+        weight read is shared, so aggregate throughput rises by the batch factor
+        while per-sequence latency stays at $\tau$.
+    - title: "KV cache per token"
+      latex: |
+        For $L$ layers, $H_{kv}$ KV heads and head dimension $d$, in $b$ bytes:
+        $$m = 2 L H_{kv} d\, b.$$
+        At $L = 64$, $H_{kv} = 8$, $d = 128$, $b = 2$:
+        $$m = 2 \times 64 \times 8 \times 128 \times 2 = 262{,}144\ \text{B}.$$
+      prose: >-
+        256 KiB per token. The factor 2 is keys and values. Batch capacity is the
+        free memory after weights divided by $m \times$ sequence length, which is
+        why halving $H_{kv}$ doubles the batch and why long-context serving is
+        mostly a cache-engineering problem.
+    - title: "Break-even sample count"
+      latex: |
+        Setting $n c / p_n < c / p_1$ gives $p_n > n p_1$. With the trivial bound
+        $p_n \le 1$:
+        $$n < \frac{1}{p_1}.$$
+        At $p_1 = 0.05$: $n < 20$, so 16 samples is the largest useful budget. At
+        $p_1 = 0.42$: $n < 2.4$, so only $n = 2$ is even admissible.
+      prose: >-
+        This is why reasoning budgets must be per-problem. A fixed $n = 16$ is
+        value-destroying on the 42% subset and value-creating on the 5% subset,
+        and a router that predicts difficulty is worth more than a better verifier.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Test-time compute is bought, not configured. Decode latency is weight
+        reads per token; batch size is KV cache; and the only metric that compares
+        strategies is cost per solved problem, which improves only when the
+        accuracy gain beats the multiplier.
+      blocks:
+        - kind: checklist
+          body: |
+            - 32 GB per device / 3.35 TB/s = 9.55 ms per token
+            - 256 KiB per token x 8,000 = 2 GiB per sequence
+            - 8,000 tokens at 104.7 tok/s = 76 s, batch-independent
+            - Best-of-n beats pass@1 iff p_n > n x p_1
+            - Step-level PRM costs 19.5x a full pass
+      checkpoint: >-
+        Why does doubling the batch not halve the latency of a single request?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Measure pass@1 and the verifier's accuracy first. Then decide the mode per
+        difficulty band, then size the fleet from decode bandwidth and cache, then
+        worry about kernels.
+      blocks:
+        - kind: checklist
+          body: |
+            - p1 by difficulty band, not in aggregate
+            - Verifier accuracy in and out of distribution
+            - Mode per band: single, best-of-n, or search
+            - Cache budget sets batch; bandwidth sets latency
+            - Cost attribution per component from day one
+      checkpoint: >-
+        If the verifier is only 60% accurate, what is best-of-16 actually buying?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The routing decision and the decode loop.
+      blocks:
+        - kind: pseudocode
+          body: |
+            def mode(p1, n_max=16, verifier_acc=0.9):
+                if p1 >= 1 / n_max: return "single"     # sampling cannot pay
+                return "best_of_n" if verifier_acc > 0.7 else "single"
+
+            def solve(prompt, budget):
+                cands = [generate(prompt, max_tokens=budget.tokens)
+                         for _ in range(budget.n)]
+                scores = [verify(c) for c in cands]     # 0.38 s each
+                return cands[argmax(scores)]
+
+            # decode: one token per 9.55 ms per sequence, regardless of batch
+      checkpoint: >-
+        Where does the budget go if the verifier is step-level rather than
+        final-answer?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three results: decode rate, cache per token, break-even n.
+      blocks:
+        - kind: math
+          body: |
+            **Decode.** $\tau = Nb/(kB)$; 32e9 x 2 / (2 x 3.35e12) = 9.55 ms.
+
+            **Cache.** $m = 2LH_{kv}db$ = 262,144 B per token.
+
+            **Break-even.** $p_n > np_1$ and $p_n \le 1$ imply $n < 1/p_1$.
+      checkpoint: >-
+        At p1 = 0.05, what is the largest n that can break even, and what does
+        that say about a fixed budget of 32 samples?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The capacity model, the routing rule, and the cost report.
+      blocks:
+        - kind: warning
+          body: >-
+            The classic mistake is shipping best-of-n because it improved a demo,
+            on a benchmark whose pass@1 was already high. Compute cost per solved
+            problem before and after, per difficulty band, or you are buying
+            variance rather than accuracy.
+        - kind: code
+          language: python
+          body: |
+            def attempt_gpu_s(tokens=8000, params=32e9, tp=2, bw=3.35e12):
+                per_tok = params * 2 / (tp * bw)
+                return tokens * per_tok * tp          # wall x devices
+
+            def cost_per_solve(p, n, gpu_s, usd_per_h=2.5):
+                return n * gpu_s / p / 3600 * usd_per_h
+
+            def breakeven_ok(p1, pn, n):
+                return pn > n * p1
+      checkpoint: >-
+        Your p1 is 0.3 and someone proposes n=8. What do you tell them, with
+        numbers?
+  try_it: >-
+    Compute decode: 32 GB of weights per device at 3.35 TB/s is 9.55 ms per token,
+    so 8,000 tokens is 76 s and batching cannot improve it. Then compute KV cache
+    at 256 KiB per token — 2 GiB for one 8,000-token sequence — and finally test
+    the break-even rule: at pass@1 of 0.42, best-of-16 would need pass@16 above
+    6.7 to pay for itself.
+  interview_questions:
+    - question: "Why does batching not improve the latency of a single reasoning request?"
+      level: senior
+      key_points:
+        - "Decode reads the whole weight matrix per token, so a 32B model at TP 2 reads 32 GB per device per token: 9.55 ms at 3.35 TB/s."
+        - "Batching amortises that read across sequences, raising aggregate throughput to 2,512 tokens/s at batch 24, but each sequence still advances one token per 9.55 ms."
+        - "So 8,000 tokens is 76 s at any batch size; latency is improved by more tensor parallelism, a smaller model, or speculative decoding."
+        - "Moving from TP 2 to TP 4 halves the per-device read and halves latency to 38 s, at double the GPUs per replica."
+      follow_up: "What does that imply about mixing interactive and batch traffic on the same pool?"
+    - question: "When is best-of-16 worth 16x the compute?"
+      level: staff
+      key_points:
+        - "Cost per solved problem is n c / p_n against c / p_1, so sampling wins only when p_n > n p_1."
+        - "Since p_n <= 1, that requires p_1 < 1/n — below 6.25% for n = 16."
+        - "At p_1 = 0.42 a perfect verifier gives p_16 = 0.9998 against the 6.72 needed, so the ratio is 6.72x; at p_1 = 0.02 it falls to 1.16x."
+        - "The implication is per-difficulty routing: spend samples on the hard tail, single-shot the easy head."
+      follow_up: "How would you build the difficulty router, and what data would it need?"
+    - question: "Your verifier bill is bigger than your generation bill. How?"
+      level: staff
+      key_points:
+        - "A full-solution PRM pass over 8,192 tokens is 115 TFLOP, about 0.38 s — only 6% of a 6.4 GPU-second attempt."
+        - "Step-level scoring of 40 prefixes averaging 4,000 tokens is 160,000 tokens, 19.5x the work, or 7.5 GPU-s per candidate."
+        - "Across sixteen candidates that is 120 GPU-s of verification against 102 GPU-s of generation."
+        - "Mitigations: score only top-k, use exact answer checking for math, cache scores for shared prefixes, and report the split per request."
+      follow_up: "Where would you put the verifier in the request path, and what does that do to p99?"
+    - question: "How much KV cache does one 8,000-token request need, and why does it matter?"
+      level: senior
+      key_points:
+        - "With 64 layers, 8 GQA KV heads and head dim 128 in fp16, a token is 2 x 64 x 8 x 128 x 2 = 262,144 bytes, or 256 KiB."
+        - "8,000 tokens is 2 GiB per sequence; 24 sequences is 48 GiB, which is the memory left after 32 GB of weights per device."
+        - "Batch size is set by cache, not by compute, which is why long-context traces collapse throughput."
+        - "GQA from 64 to 8 KV heads is an 8x reduction and is what makes long reasoning servable at all."
+      follow_up: "What would you do when a request needs 32,000 tokens and the cache cannot fit it alongside the batch?"
+  common_mistakes:
+    - "Shipping best-of-n because a demo improved, without checking that pass@1 was low enough for sampling to beat it on cost per solve."
+    - "Sizing the batch from FLOPs when the binding constraint is 2 GiB of KV cache per 8,000-token sequence."
+    - "Using step-level PRM scoring everywhere: 19.5x the verifier work, which can exceed the generation bill outright."
+    - "Expecting batching to fix latency — it improves throughput only, because decode is bandwidth-bound per token."
+  further_reading:
+    - label: "Wei et al., Chain-of-Thought Prompting Elicits Reasoning in Large Language Models, NeurIPS 2022"
+    - label: "Lightman et al., Let's Verify Step by Step, ICLR 2024"
+    - label: "Snell, Klein, Zhong, Pope, Richardson, Stroh, Sun, Scaling LLM Test-Time Compute Optimally Can Be More Effective Than Scaling Model Parameters, 2024"
+    - label: "Kwon et al., Efficient Memory Management for Large Language Model Serving with PagedAttention, SOSP 2023"
+  implementations:
+    - language: python
+      title: "Decode latency, verifier cost, and best-of-n break-even"
+      note: >-
+        Decode is weight bytes over bandwidth, so TP=2 gives 9.55 ms/token and TP=4 halves it; 8,000 tokens is 76 s at TP=2. Best-of-n raises pass@n but cost per solved problem rises with n, because independent samples can never satisfy p_n > n*p_1. The verifier pass is 0.38 s, 6% of a 6.4 GPU-second attempt, which is why full-solution reranking is cheap and step-level search is not.
+      code: |
+        PARAMS_B, BYTES, BW_TBPS, TP = 32e9, 2, 3.35, 2
+        TOKENS, ATTEMPT_GPU_S = 8_000, 6.4
+        VERIFIER_PARAMS, VERIFIER_TFLOPS = 7e9, 300e12
+
+
+        def token_ms(tp=TP):
+            """Bandwidth-bound decode: each device reads its shard of the weights."""
+            return (PARAMS_B * BYTES / tp) / (BW_TBPS * 1e12) * 1e3
+
+
+        def attempt_seconds(tokens=TOKENS, tp=TP):
+            return token_ms(tp) * tokens / 1e3
+
+
+        def pass_at_n(p1, n):
+            """Independent samples: 1 - (1 - p1)^n."""
+            return 1 - (1 - p1) ** n
+
+
+        def cost_per_solve(p1, n, verifier=0.0):
+            return n * (1.0 + verifier) / pass_at_n(p1, n)
+
+
+        def main():
+            print(f"decode: {token_ms():.2f} ms/token; 8,000 tokens: {attempt_seconds():.1f} s")
+            print(f"TP=4: {token_ms(tp=4):.2f} ms/token; {attempt_seconds(tp=4):.1f} s")
+
+            kv = 2 * 64 * 8 * 128 * 2
+            print(f"KV per token: {kv/1024:.0f} KiB; 8,000 tokens: {kv*8000/2**30:.1f} GiB")
+
+            ver = 2 * VERIFIER_PARAMS * 8_192 / VERIFIER_TFLOPS
+            print(f"full-solution verifier pass: {ver:.2f} s ({ver/ATTEMPT_GPU_S:.0%} of an attempt)")
+
+            p1 = 0.42
+            for n in (1, 4, 16):
+                print(f"n={n:2d} pass@{n}={pass_at_n(p1, n):.3f} "
+                      f"cost/solve={cost_per_solve(p1, n):.2f}x")
+
+            assert abs(token_ms() - 9.55) < 0.05
+            assert abs(attempt_seconds() - 76.4) < 0.2
+            assert abs(kv / 1024 - 256) < 1
+            assert cost_per_solve(p1, 16) > cost_per_solve(p1, 1)
+            assert pass_at_n(p1, 16) < 16 * p1
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-reasoning-best-of-n
+      title: "Cost per solved problem under best-of-n"
+      difficulty: easy
+      prompt: >-
+        With independent samples, pass@n is `1 - (1-p1)**n`. Return the cost per solved problem
+        in units of one attempt, sampling `n` times and paying `verifier` extra per sample.
+      language: python
+      entry: cost_per_solve
+      testCases:
+        - input: '{}'
+          expected: "16.002624"
+          tolerance: 1e-6
+        - input: '{"p1": 0.5, "n": 1}'
+          expected: "2.0"
+          tolerance: 1e-6
+        - input: '{"p1": 0.5, "n": 2}'
+          expected: "2.666667"
+          tolerance: 1e-6
+      solution: |
+        def cost_per_solve(p1=0.42, n=16, verifier=0.0):
+            return n * (1.0 + verifier) / (1 - (1 - p1) ** n)
+      solutionExplanation: >-
+        At p1 = 0.42, best-of-16 solves almost everything but costs 16 attempts per solve
+        against 2.38 for one sample. Sampling cannot beat pass@1 on cost per solve.
+      tags: [reasoning, economics]

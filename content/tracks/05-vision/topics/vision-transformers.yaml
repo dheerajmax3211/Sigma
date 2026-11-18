@@ -1,0 +1,1362 @@
+id: vision-transformers
+slug: vision-transformers
+title: "Vision Transformers: Patches, Inductive Bias, and Scale"
+summary: >-
+  Cut an image into patches, embed each one with a single shared matrix, and the
+  vision transformer is an ordinary transformer over 196 tokens. You derive the
+  patch-embedding equivalence to a strided convolution, price the attention bill
+  in tokens rather than pixels, and measure what deleting the locality prior
+  actually costs.
+kind: lesson
+difficulty: hard
+position: 1
+estMinutes: 26
+prerequisites: [transformer-block, convolutions]
+phase: vision-foundations
+tags:
+  - vision-transformer
+  - patch-embedding
+  - inductive-bias
+  - positional-embedding
+  - attention-cost
+  - class-token
+  - resolution
+  - data-efficiency
+  - conv-equivalence
+
+body:
+  big_idea: >-
+    A vision transformer is a convolution with locality deleted: cut the image
+    into 16×16 patches, project each with the same matrix a strided
+    convolution would use, and hand the set to the block.
+
+  problem:
+    - >-
+      You write the patch embedding as rearrange, flatten, linear, then find
+      `nn.Conv2d(3, 768, 16, 16)` in the reference and cannot say if they
+      match.
+    - >-
+      Your ViT reaches 71% on 50,000 images and a ResNet 84%, and
+      "transformers need more data" does not say which prior you deleted.
+    - >-
+      You fine-tune at 384, interpolate the positional table, every shape
+      passes, and accuracy drops two points because two axes are in the wrong
+      order.
+
+  analogy: |
+    A jigsaw puzzle posted as separate tiles. The transformer receives a bag
+    of tiles, each with a slot number on the back; that number is the
+    positional embedding, and without it the bag is a set of textures. A
+    convolution is the same picture with the tiles glued down, so a corner is
+    recognisable anywhere on the page.
+
+  concept_points:
+    - >-
+      **The patch embedding is a convolution whose stride equals its kernel.**
+      Flatten each 16×16×3 patch into a 768-vector and multiply by a 768×768
+      matrix: **590,592** numbers. Write it as `Conv2d(3, 768, 16, 16)`:
+      768·3·16·16 weights plus 768 biases — the same 590,592. Identical, not
+      similar: measured maximum difference **4.9e-15** over all 196 tokens.
+      The trap is flattening order; a transposed reshape gives the same shapes
+      and different numbers.
+    - >-
+      **Every cost in a ViT is a function of $N = HW/P^2$, not of pixels.** At
+      224 with patch 16, $N = 196$ and attention owns one $N \times N$ matrix
+      per head: 38,416 entries, 150 KiB in float32, 1.76 MiB across twelve
+      heads. Double the side to 448 and $N$ quadruples while that matrix
+      multiplies by sixteen — 2.4 MiB per head.
+    - >-
+      **Attention is 4% of the block at 224 and 47% at 1024, so "quadratic" is a regime, not a constant.**
+      Per layer the block costs $12Nd^2 + 2N^2d$ multiply-adds and attention's
+      share is $N/(6d+N)$: **1.05%** at 49 tokens, **4.08%** at 196, 18.2% at
+      1024 and **47.1%** at 4096. The terms are equal at $N = 6d = 4{,}608$.
+    - >-
+      **The positional embedding is the only thing in the model that knows where anything is.**
+      Attention is permutation-equivariant, so measured, permuting 196 tokens
+      changes the CLS readout by **8.4e-16**, and adding the 196×768 table
+      makes the same permutation change it by **1.0e-3**. The table is 151,296
+      numbers — 0.17% of ViT-B's parameters — carrying the whole spatial
+      prior.
+    - >-
+      **Locality is absent at initialisation and has to be learned from data.**
+      With ViT's truncated-normal init the first layer's attention entropy is
+      **5.2832 nats against a ceiling of $\log 197 = 5.2832$** — uniform to
+      four decimals, maximum weight $1/197 = 0.51\%$. Under uniform attention
+      the expected Manhattan distance between a query and a key is
+      **9.29 patch widths, 149 pixels**; a 3×3 convolution's mean tap distance
+      is **1.33 pixels**.
+    - >-
+      **The data-efficiency gap is 10.65 points, and the recipe recovers about 4 of them at 1/234th of the data.**
+      ViT-B/16 from scratch on ImageNet-1k (1.28M images) sits near **77.9%**,
+      while the same family at 300M images reaches **87.76%** (ViT-L/16) and
+      **88.55%** (ViT-H/14). DeiT then reached **81.8%**, and **83.4%** with a
+      convolutional teacher, on ImageNet-1k alone — +6.3 points with the block
+      unchanged.
+
+  definitions:
+    - term: "Patch"
+      meaning: >-
+        A $P \times P \times C$ block of pixels taken on a fixed grid with no
+        overlap. At $P = 16$ and $C = 3$ it holds 768 numbers, and it is the
+        atomic unit of everything downstream: two pixels in the same patch are
+        combined by the embedding matrix, two pixels in different patches are
+        not.
+    - term: "Visual token"
+      meaning: >-
+        One patch after projection — a $d$-dimensional vector that enters the
+        transformer exactly as a word embedding would. 196 of them at 224 with
+        $P = 16$, plus one class token. The token count, not the pixel count, is
+        what every cost in the model is written in.
+    - term: "Patch embedding"
+      meaning: >-
+        The linear map from a flattened patch to a token, $W \in
+        \mathbb{R}^{d \times CP^2}$. It is exactly a convolution with kernel and
+        stride both equal to $P$: 590,592 parameters either way at $C=3$,
+        $P=16$, $d=768$, and numerically identical to 4.9e-15.
+    - term: "Class token (CLS)"
+      meaning: >-
+        A learned vector prepended to the token sequence whose final state is
+        the image representation. It costs 768 parameters and 393 attention
+        entries (+1.02%), and it is the only token not anchored to a position —
+        which is what lets it act as a learned query rather than a summary.
+    - term: "Positional embedding"
+      meaning: >-
+        A table of $N \times d$ numbers added to the tokens once, before the
+        first block. 151,296 numbers at 224/patch 16 — 0.17% of ViT-B and the
+        only source of spatial information in the model. Because it is a table
+        indexed by position, it is also the thing that breaks when the
+        resolution changes.
+    - term: "Inductive bias"
+      meaning: >-
+        The assumptions a architecture makes before it sees any data.
+        Convolution assumes locality and translation equivariance and gets both
+        for free; a ViT assumes neither and pays for them in samples. "Large
+        scale training trumps inductive bias" is a statement about the exchange
+        rate, not about the bias being unnecessary.
+    - term: "Translation equivariance"
+      meaning: >-
+        $f(\text{shift}_\delta x) = \text{shift}_\delta f(x)$. Exact for
+        convolution under circular padding (measured error 0.0), approximate
+        under zero padding, and absent in a ViT with absolute positional
+        embeddings: a one-pixel shift rewrites every patch and lands in
+        positions the table has never described.
+    - term: "Permutation equivariance"
+      meaning: >-
+        $f(PX) = P f(X)$ for a permutation matrix $P$. Attention satisfies it
+        exactly — $A(PX) = P A(X) P^{\top}$ — which is why a ViT without a
+        positional term is a set function and cannot tell a shuffled image from
+        the original (measured difference 8.4e-16).
+    - term: "Resolution interpolation"
+      meaning: >-
+        Resizing the positional table when the input resolution changes:
+        14×14 → 24×24 for 224 → 384 at patch 16. It must be done as a 2-D
+        bilinear resize of the grid, with `align_corners=False` semantics;
+        treating the 196 vectors as a 1-D sequence is wrong by up to 6.1σ of the
+        table.
+    - term: "Attention distance"
+      meaning: >-
+        The average pixel distance between a query patch and the keys it
+        attends to, per head. It is the measurable form of "does this model look
+        locally". At initialisation with uniform attention on a 14×14 grid it is
+        9.29 patch widths — 149 pixels — and it changes as the model learns.
+    - term: "Hybrid (conv stem) architecture"
+      meaning: >-
+        A ViT whose patch embedding is replaced by a small convolutional stack
+        that downsamples to the same token grid. It re-inserts locality at layer
+        zero and costs a handful of convolutions; the token count, and therefore
+        the whole cost model, is unchanged.
+
+  diagrams:
+    - type: architecture
+      title: "One ViT-B/16 forward pass, and where the numbers live"
+      caption: >-
+        The stem is 590,592 parameters and the positional table is 151,296; the
+        twelve blocks are 85,054,464. Everything after the first node is a
+        sequence of 196 vectors, and nothing in the model after that knows the
+        picture was two-dimensional.
+      nodes:
+        - id: img
+          x: 0
+          y: 0
+          label: "image 3 x 224 x 224"
+          kind: client
+          detail: "50,176 numbers. Identical to what a ResNet's stem receives; the difference between the two models starts at the next node."
+        - id: patch
+          x: 1
+          y: 0
+          label: "14 x 14 grid of 16 x 16 patches"
+          kind: storage
+          detail: "196 patches of 768 numbers each. Non-overlapping, so 5.83% of axis-adjacent pixel pairs are cut by a boundary and can only meet through attention."
+        - id: embed
+          x: 2
+          y: 0
+          label: "patch embedding 768 -> 768"
+          kind: model
+          detail: "590,592 parameters, identical to Conv2d(3, 768, 16, 16). Output 196 x 768. The flatten order inside a patch is what makes the two implementations agree."
+        - id: pos
+          x: 2
+          y: 1
+          label: "+ positional table 196 x 768"
+          kind: storage
+          detail: "151,296 numbers added once. The only spatial information in the model: remove it and the block commutes with any permutation of the tokens."
+        - id: cls
+          x: 3
+          y: 0
+          label: "CLS token, 197 x 768"
+          kind: storage
+          detail: "One learned vector prepended. 768 parameters and 393 extra attention entries; its final state is what the head reads."
+        - id: blocks
+          x: 3
+          y: 1
+          label: "12 blocks, d = 768"
+          kind: gpu
+          detail: "1.446 G multiply-adds per image per layer, 17.36 G for the stack at 196 tokens. Attention is 4.08% of that; the MLP is two thirds of the parameters."
+        - id: head
+          x: 3
+          y: 2
+          label: "MLP head 768 -> 1000"
+          kind: server
+          detail: "Reads the CLS row only. 769,000 parameters, and the reason the readout choice matters: a pooled head would read all 196 rows instead."
+      edges:
+        - { from: img, to: patch, label: "cut into 16 x 16 blocks" }
+        - { from: patch, to: embed, label: "flatten + one matrix" }
+        - { from: embed, to: pos, label: "add, do not concatenate" }
+        - { from: pos, to: cls, label: "prepend" }
+        - { from: cls, to: blocks, label: "197 tokens" }
+        - { from: blocks, to: head, label: "CLS row" }
+
+    - type: compare
+      title: "What a convolution gets for free, and what a ViT has to buy"
+      left_label: "Convolution (ResNet stem)"
+      left_points:
+        - "Translation equivariance is architectural: exact under circular padding (measured error 0.0), approximate under zeros (0.522 for a 7-pixel shift)"
+        - "Locality is baked in: a 3x3 filter's mean tap distance is 1.33 pixels, and no data was needed to set it"
+        - "36,928 parameters for a 3x3, 64 -> 64 layer, reused at all 1,024 positions of a 32x32 map"
+        - "Receptive field grows linearly with depth (2L + 1 for 3x3, stride 1), so context is a design choice"
+        - "Reaches useful accuracy on 1.28M images; that is the property the prior buys"
+      right_label: "Patch embedding (ViT)"
+      right_points:
+        - "No equivariance at all: a one-pixel shift rewrites every patch boundary and moves tokens into positions the table never described"
+        - "Locality is learned: attention starts uniform over 197 tokens (entropy 5.2832 nats, the maximum), mean span 9.29 patch widths"
+        - "590,592 parameters for the 16x16 stem at d = 768, and 151,296 more for the positional table"
+        - "Global mixing from layer 1: every token attends to all 196, so a 1-pixel relation across the image costs the same as a neighbour"
+        - "Needs 300M images, or a recipe like DeiT's, to reach what a conv reaches on 1.28M"
+
+    - type: plot
+      title: "Attention's share of block compute, as a fraction of tokens"
+      chart: line
+      xLabel: "tokens N"
+      yLabel: "attention share of block multiply-adds (%)"
+      series:
+        - name: "d = 768 (ViT-B)"
+          points:
+            - { x: 49, y: 1.05 }
+            - { x: 196, y: 4.08 }
+            - { x: 576, y: 11.11 }
+            - { x: 1024, y: 18.18 }
+            - { x: 2304, y: 33.33 }
+            - { x: 4608, y: 50.0 }
+        - name: "d = 1024 (ViT-L)"
+          points:
+            - { x: 49, y: 0.79 }
+            - { x: 196, y: 3.09 }
+            - { x: 576, y: 8.57 }
+            - { x: 1024, y: 14.29 }
+            - { x: 2304, y: 27.27 }
+            - { x: 6144, y: 50.0 }
+        - name: "d = 1280 (ViT-H)"
+          points:
+            - { x: 196, y: 2.49 }
+            - { x: 576, y: 6.98 }
+            - { x: 1024, y: 11.76 }
+            - { x: 2304, y: 23.08 }
+            - { x: 4608, y: 37.5 }
+            - { x: 7680, y: 50.0 }
+
+    - type: plot
+      title: "The attention matrix per head: 38 thousand entries at 224, 16.8 million at 1024"
+      chart: bar
+      xLabel: "input resolution (patch 16)"
+      yLabel: "attention entries per head (millions)"
+      series:
+        - name: "N x N entries, float32"
+          points:
+            - { x: 224, y: 0.038 }
+            - { x: 384, y: 0.332 }
+            - { x: 512, y: 1.049 }
+            - { x: 768, y: 5.308 }
+            - { x: 1024, y: 16.777 }
+
+    - type: mermaid
+      title: "Patch embedding: one map, two implementations, one set of numbers"
+      code: |
+        flowchart LR
+          X["image 3 x 224 x 224"] --> R["reshape to 196 x 768<br/>channel-major inside a patch"]
+          R --> L["Linear 768 to 768<br/>590,592 parameters"]
+          X --> C["Conv2d(3, 768, 16, 16)<br/>590,592 parameters"]
+          L --> T["196 tokens x 768<br/>max abs diff 4.9e-15"]
+          C --> T
+          T --> P["+ positional table<br/>196 x 768"]
+
+  markdown: |
+    ## The layer everyone skips
+
+    Every ViT figure draws a box labelled "patch embedding" and moves on to the
+    interesting part. The box is the interesting part: it is a convolution with
+    stride equal to its kernel size, and once you see that, the rest of the
+    model's cost is arithmetic you can do on paper.
+
+    Take a 224×224 RGB image and a patch size $P = 16$. The image becomes a
+    $14 \times 14$ grid of patches, each patch a vector of $3 \cdot 16^2 = 768$
+    numbers, and every vector is multiplied by the same $768 \times 768$ matrix:
+
+    $$\mathbf{t}_{ab} = W \operatorname{vec}\left(x_{:,\,aP:(a+1)P,\;bP:(b+1)P}\right) + \mathbf{b},
+      \qquad W \in \mathbb{R}^{d \times CP^2}.$$
+
+    That is 196 tokens of width 768 and $768 \cdot 768 + 768 = 590{,}592$
+    parameters.
+
+    ## The same map, written as a convolution
+
+    A convolution with $C_{\text{in}} = 3$, $C_{\text{out}} = 768$, kernel
+    $16 \times 16$ and stride 16 does exactly this and nothing else: it visits
+    non-overlapping $16 \times 16$ windows, flattens them, and applies one
+    matrix. Its parameter count is $768 \cdot 3 \cdot 16 \cdot 16 + 768 =
+    590{,}592$ — the same number, because it is the same map. Run both on one
+    image and the maximum absolute difference is $4.9 \times 10^{-15}$, which is
+    float64 round-off.
+
+    The identity is exact only if the flattening order matches the kernel
+    layout: channel-major inside a patch, row-major inside a channel. Get it
+    wrong and every shape still checks out — 196 by 768 either way — while the
+    model sees a permuted patch, trains, converges, and lands somewhere slightly
+    worse for no visible reason.
+
+    | $P$ | grid | tokens $N$ | patch dim | stem parameters | ViT-B at 224 |
+    |---|---|---|---|---|---|
+    | 32 | 7×7 | 49 | 3,072 | 2,360,064 | 4.21 G MACs |
+    | 16 | 14×14 | 196 | 768 | 590,592 | 17.36 G MACs |
+    | 8 | 28×28 | 784 | 192 | 148,224 | 77.92 G MACs |
+
+    ## The cost model is one expression
+
+    Per layer, with width $d$ and $N$ tokens, the block performs
+
+    $$\text{MACs} = \underbrace{12Nd^2}_{\text{QKV, projection, MLP}}
+      + \underbrace{2N^2d}_{\text{attention}}.$$
+
+    The first term is linear in the token count and the second is quadratic, so
+    the share of compute spent on the attention matrix is $N/(6d + N)$ — the one
+    number you need in order to know what to optimise:
+
+    | $N$ | 49 | 196 | 576 | 1,024 | 4,096 |
+    |---|---|---|---|---|---|
+    | attention share, $d = 768$ | 1.05% | 4.08% | 11.1% | 18.2% | 47.1% |
+
+    At ImageNet resolution the attention matrix is **4% of the block**. At 1024
+    pixels it is **47%**, and the same twelve-layer model costs 657 G
+    multiply-adds per image against 17.36 G. The two terms are equal at
+    $N = 6d = 4{,}608$ tokens: a $68 \times 68$ grid, an image of about 1,088
+    pixels. Everything you have read about quadratic attention is true above
+    that line and irrelevant below it.
+
+    ## Position is the only thing that knows where anything is
+
+    Attention is permutation-equivariant. For any permutation matrix $P$,
+
+    $$A(PX) = P\,A(X)\,P^{\top},$$
+
+    so a block with no positional term commutes with a relabelling of the
+    tokens, and a permutation-invariant readout returns the same vector for a
+    shuffled image. Measured: permute the 196 tokens of a randomly initialised
+    block and the CLS readout moves by $8.4 \times 10^{-16}$; add the
+    $196 \times 768$ table and the same permutation moves it by
+    $1.0 \times 10^{-3}$ — small only because an untrained block has not yet
+    learned to use position.
+
+    The patch embedding cannot supply this. It is applied identically to every
+    patch, so it is translation-equivariant by construction and blind to where
+    the patch came from. The 151,296 numbers of the positional table are 0.17%
+    of ViT-B and carry the entire spatial prior.
+
+    ## What the missing prior costs
+
+    A convolution's prior is architectural and free: one 3×3 filter is reused at
+    every position, its mean tap distance is 1.33 pixels, and translation
+    equivariance holds to machine precision. A ViT starts with none of it. At
+    initialisation attention is uniform — measured entropy 5.2832 nats against a
+    ceiling of $\log 197 = 5.2832$, maximum weight $1/197 = 0.51\%$ — and under
+    uniform attention the expected Manhattan distance between a query patch and
+    a key is 9.29 patch widths, 149 pixels at $P = 16$. Locality has to be
+    learned.
+
+    The measured price of learning it is the data-efficiency gap. ViT-B/16
+    trained from scratch on ImageNet-1k (1.28M images) sits near 77.9%; the same
+    family at 300M images reaches 87.76% (ViT-L/16) and 88.55% (ViT-H/14) —
+    234× the data for +10.65 points. DeiT later recovered much of it at 1.28M
+    images: 81.8% for DeiT-B and 83.4% with a convolutional teacher, no external
+    data, by changing the recipe rather than the block.
+
+    ## The readout
+
+    The class token costs 393 extra attention entries (197² against 196²,
+    +1.02%) and 768 parameters. Global average pooling costs nothing, spreads
+    $1/196 = 0.51\%$ of the readout gradient to each token, and is exactly
+    permutation-invariant given the token set. CLS is a learned query that can
+    weight one patch a hundred times another. The paper reports no significant
+    difference between them on ImageNet; the structural difference is that GAP
+    forces the spatial information into the tokens, while CLS decides where to
+    look.
+
+    ## Resolution is an interpolation problem
+
+    Fine-tuning at 384 keeps $P = 16$ and moves from 196 to 576 tokens, so the
+    positional table must be resized from a $14 \times 14$ grid to
+    $24 \times 24$. Resampling the 196 rows as a one-dimensional sequence
+    produces correct shapes and wrong positions: on an iid table with
+    $\sigma = 0.02$ the maximum error is $0.1219$, which is $6.1\sigma$ and
+    $1.45\times$ the table's own RMS. `F.interpolate` on a $(1, 196, 768)$
+    tensor does exactly that, because it treats 196 as a spatial axis; you need
+    $(1, 768, 14, 14)$ and bilinear mode.
+
+    ## What to take away
+
+    Three questions, in order. How many tokens is this image? That decides the
+    attention bill, and it is $HW/P^2$, not the pixel count. What carries
+    position? One table, added once, interpolated by hand when the resolution
+    changes. What did the architecture assume? A convolution assumes locality
+    and equivariance; a ViT assumes neither and buys both with data. Nearly
+    every vision paper since 2020 is a different answer to the third question.
+
+    ## The longer version
+
+    A vision transformer is a convolution with the locality deleted: cut the
+    image into 16×16 patches, project every patch with the same matrix a 16×16
+    stride-16 convolution would use, and hand the resulting set of tokens to the
+    block you already know — after which the only thing left that knows where
+    anything is, is a positional table you have to learn.
+
+    A jigsaw puzzle posted as separate tiles. The transformer receives a bag of
+    tiles, each with a slot number written on the back; the number is the
+    positional embedding, and without it the bag is just a set of textures. A
+    convolution is the same picture with the tiles glued down: you can still
+    recognise a corner anywhere on the page because the same stamp is pressed at
+    every position, and moving the whole sheet moves the impressions with it.
+
+    The analogy breaks in two places, and both are the content of this topic.
+    First, jigsaw tiles do not overlap, and neither do ViT patches — so a patch
+    boundary is a genuine information barrier: at patch 16, 5,824 of the 99,904
+    axis-adjacent pixel pairs (5.83%) straddle a boundary and can only meet
+    through attention. Second, the analogy implies the picture is reassembled
+    somewhere. It is not: after layer 0 there is no pixel grid left, only 196
+    vectors of 768 numbers, and the "image" the deep layers see is a set.
+
+    ### What goes wrong
+
+    - You write the patch embedding in three lines — rearrange, flatten,
+      linear — then open the reference implementation and find a single
+      `nn.Conv2d(3, 768, 16, 16)`. Both are called "patch embedding". You
+      cannot say whether they are the same function, and the answer decides
+      whether the pretrained checkpoint's stem weights load into your model at
+      all.
+    - Your ViT reaches 71% on 50,000 images and a ResNet reaches 84% on the
+      same data, and the internet says "transformers need more data". That is
+      true and useless: it does not tell you which prior you deleted, what it
+      would cost to add it back, or whether your failure is the architecture
+      or the augmentation.
+    - You fine-tune at 384 and the positional table no longer fits — 196
+      positions against 576 tokens. You interpolate it, every shape assertion
+      passes, and accuracy drops by two points for a reason no stack trace
+      will ever show you, because the bug is in the *order* of two axes.
+    - Everyone on the team says attention is quadratic, so you spend a week on
+      the attention kernel. At 224 with patch 16 the attention matrix is 4.1%
+      of the block's multiply-adds and the MLP is 67% of the parameters. You
+      optimised the wrong third of the model, and the profiler would have told
+      you in a minute.
+    - Two implementations of the readout — a class token and global average
+      pooling — score the same on your benchmark and behave differently under
+      every augmentation that moves content around the frame. You have no
+      framework for choosing between them, so you copy whichever the last
+      paper used.
+
+    ### The full treatment
+
+    **The patch embedding is a convolution whose stride equals its kernel.**
+    Flatten each 16×16×3 patch into a 768-vector and multiply by a
+    768×768 matrix: 590,592 numbers. Write the same layer as
+    `Conv2d(3, 768, 16, 16)`: 768·3·16·16 weights plus 768 biases = 590,592
+    numbers. Identical, not merely similar — measured maximum absolute
+    difference 4.9e-15 over all 196 tokens. The identity holds because
+    flattening a patch row-major inside each channel and indexing the kernel
+    as $W[o,\,cP^2 + iP + j]$ is the same sum in the same order. The trap is
+    the flattening order: `reshape(C, gh, P, gw, P).transpose(1, 3, 0, 2, 4)`
+    and `reshape(gh, gw, C, P, P)` produce the same 196×768 shape, the same
+    parameter count, and different numbers — the model trains, converges, and
+    is quietly worse forever.
+
+    **Every cost in a ViT is a function of $N = HW/P^2$, not of pixels.** At
+    224 with patch 16, $N = 196$. Attention owns one $N \times N$ matrix per
+    head: 38,416 entries, 150 KiB in float32, 1.76 MiB across twelve heads.
+    Double the side to 448 and $N$ quadruples to 784 while that matrix
+    multiplies by sixteen — 2.4 MiB per head, 28 MiB per layer. The trap is
+    quoting the three numbers interchangeably: a 2× resolution change is 4×
+    the pixels, 4× the tokens, and 16× the attention entries, and only the
+    middle one appears in the token count.
+
+    **Attention is 4% of the block at 224 and 47% at 1024, so "quadratic" is a
+    regime, not a constant.** Per layer the block costs $12Nd^2 + 2N^2d$
+    multiply-adds and attention's share is $N/(6d+N)$. At $d = 768$ that is
+    1.05% at 49 tokens, 4.08% at 196, 11.1% at 576, 18.2% at 1024 and 47.1%
+    at 4096. The terms are equal at $N = 6d = 4{,}608$ tokens — a 68×68 grid,
+    roughly a 1,088-pixel image at patch 16. Below that line you are
+    optimising an MLP; above it you are optimising a matmul you cannot avoid.
+    The trap is reading $O(N^2)$ as an instruction to optimise attention at
+    ImageNet resolution, where it is 4% of the work and the MLP is two thirds
+    of the parameters.
+
+    **The positional embedding is the only thing in the model that knows where
+    anything is.** Attention is permutation-equivariant,
+    $A(PX) = P\,A(X)\,P^{\top}$, so a block with no positional term commutes
+    with any relabelling of the tokens. Measured on a randomly initialised
+    block: permute the 196 tokens and the CLS readout changes by
+    **8.4e-16** — machine zero; add the 196×768 table and the same permutation
+    changes it by **1.0e-3**, which is small only because an untrained block
+    has not learned to use position yet. The table is 151,296 numbers, 0.17%
+    of ViT-B's 86,566,888 parameters, and it carries the entire spatial prior.
+    The trap is believing the patch embedding supplies position — it is
+    applied identically to every patch and is translation-equivariant by
+    construction.
+
+    **Locality is absent at initialisation and has to be learned from data.**
+    With ViT's truncated-normal init the first layer's attention entropy is
+    **5.2832 nats against a ceiling of $\log 197 = 5.2832$** — uniform to four
+    decimals, maximum weight $1/197 = 0.51\%$. Under uniform attention the
+    expected Manhattan distance between a query patch and a key is
+    **9.29 patch widths, 149 pixels** at patch 16; a 3×3 convolution's mean
+    tap distance is **1.33 pixels**. Nothing in the architecture prefers a
+    nearby patch. The published consequence is that attention distance in
+    early layers grows during training, and models trained on small data keep
+    it short — the prior is being learned, and learning it is what the data
+    pays for.
+
+    **The data-efficiency gap is 10.65 points, and the recipe recovers about
+    4 of them at 1/234th of the data.** ViT-B/16 trained from scratch on
+    ImageNet-1k (1.28M images) sits near **77.9%** — the paper's own
+    arithmetic: 79.9% with self-supervised pretraining, which it describes as
+    2 points better than from scratch. The same family at 300M images reaches
+    **87.76%** (ViT-L/16) and **88.55%** (ViT-H/14), 234× the data for
+    +10.65 points. DeiT then reached **81.8%** for DeiT-B and **83.4%** with a
+    convolutional teacher on ImageNet-1k alone, no external data, +6.3 points
+    over the previous ViT number with the block unchanged. The trap is
+    quoting 88.55 against 77.9 as a measurement of inductive bias when
+    augmentation, epoch count and distillation move 3–4 points on their own.
+
+    **Patch size is a compute dial, and the token count moves opposite to the
+    stem's parameter count.** Patch 32 gives 49 tokens, 16 gives 196, 8 gives
+    784. Attention entries scale as $N^2$, so patch 8 costs 256× patch 32 in
+    the attention matrix and **18.5×** the whole model at 224: 4.21 G
+    multiply-adds at patch 32, 17.36 G at 16, 77.92 G at 8. But the stem moves
+    the other way, because it owns $3P^2d$ numbers: **2,360,064** at patch 32
+    against **148,224** at patch 8. The cheap-looking configuration (few
+    tokens) has a 2.36M-parameter stem and a 7×7 grid; the expensive one has a
+    148k stem. The trap is "smaller patches are always better" — they are
+    cheaper per token and quadratically dearer per image.
+
+    **A patch boundary is a real barrier, and its size is countable.** A
+    224-pixel image has 99,904 axis-adjacent pixel pairs; at patch 16, 5,824
+    of them straddle a boundary ($2 \cdot 224 \cdot 13$), which is **5.83%**.
+    At patch 32 it is 2.69%, at patch 8 it is 12.11%. Inside a patch, two
+    neighbours are combined by one linear map; across the border they can only
+    meet through attention, which starts uniform over 197 tokens. This single
+    number is why overlapping patches, convolutional stems and shifted windows
+    exist: each is a way to stop paying attention for a 1-pixel relation. The
+    trap is assuming a 16×16 patch behaves like a 16×16 convolution — inside
+    the patch it does, across its border it does not exist.
+
+    **The class token and global average pooling differ by 393 attention
+    entries and one structural property.** A CLS token makes the attention
+    matrix 197×197 instead of 196×196: 393 more entries, **+1.02%**, plus 768
+    parameters for the vector. GAP has no parameters, spreads $1/196 = 0.51\%$
+    of the readout gradient to every token, and is exactly
+    permutation-invariant given the token set. CLS is a learned query and can
+    weight one patch a hundred times another; it is also the only token whose
+    output is not tied to a spatial position. The paper reports no significant
+    difference between them on ImageNet. The trap is treating that as "they are
+    the same": GAP forces the spatial information into the tokens, CLS lets the
+    model decide where to look, and the two behave differently the moment your
+    augmentation moves objects around the frame.
+
+    **A resolution change is an interpolation of a 2-D grid, and doing it in
+    1-D is silently wrong.** 224 → 384 keeps patch 16 and moves the table from
+    14×14 to 24×24, 196 vectors to 576. Resample the 196 rows as a 1-D
+    sequence and every shape is correct while every position is misplaced: on
+    an iid table with σ = 0.02 the maximum error is **0.1219**, which is
+    **6.1σ** and **1.45×** the table's own RMS. `F.interpolate` on a
+    $(1, 196, 768)$ tensor does precisely that — it treats 196 as a spatial
+    axis. You need $(1, 768, 14, 14)$ and bilinear mode. The trap is that the
+    model runs, returns logits, and is simply worse, so nothing in the stack
+    reports a problem.
+
+
+  derivations:
+    - title: "The patch embedding is a stride-P convolution"
+      latex: |
+        Flatten the patch at grid position $(a,b)$ and apply one matrix:
+
+        $$u_{ab} = \operatorname{vec}\left(x_{:,\,aP:(a+1)P,\;bP:(b+1)P}\right)
+          \in \mathbb{R}^{CP^2}, \qquad \mathbf{t}_{ab} = W u_{ab} + \mathbf{b}.$$
+
+        A convolution with kernel $W' \in \mathbb{R}^{d \times C \times P \times P}$
+        and stride $P$ computes
+
+        $$y_{:ab} = \sum_{c=0}^{C-1} \sum_{i=0}^{P-1} \sum_{j=0}^{P-1}
+          W'_{:cij}\; x_{c,\;aP+i,\;bP+j}.$$
+
+        Set $W'_{o c i j} = W_{o,\;cP^2 + iP + j}$. Then the triple sum is the
+        dot product of $u_{ab}$ with row $o$ of $W$, for every $(a,b)$, so
+        $y = \mathbf{t}$. The parameter counts are the same expression,
+
+        $$d\,CP^2 + d = 768 \cdot 768 + 768 = 590{,}592,$$
+
+        and the outputs agree to $4.9 \times 10^{-15}$ on a 224×224×3 image.
+      prose: >-
+        The only degree of freedom in the proof is the index map
+        $(c,i,j) \mapsto cP^2 + iP + j$, which is what "flatten the patch
+        channel-major, row-major within a channel" means. Change it to
+        $iP + j + cP^2$ with a different axis order and you have described a
+        different matrix that happens to have the same shape — which is exactly
+        the bug that survives every assertion.
+
+    - title: "Block cost and the crossover at N = 6d"
+      latex: |
+        Per layer, count multiply-adds. The projections and the MLP are linear
+        in the token count:
+
+        $$\text{QKV} = 3Nd^2, \quad \text{projection} = Nd^2, \quad
+          \text{MLP} = 2 \cdot 4Nd^2 = 8Nd^2
+          \quad\Longrightarrow\quad 12Nd^2.$$
+
+        Attention is two matmuls of shape $N \times d$ by $d \times N$ and
+        $N \times N$ by $N \times d$:
+
+        $$QK^{\top} = N^2 d, \qquad AV = N^2 d
+          \quad\Longrightarrow\quad 2N^2 d.$$
+
+        So
+
+        $$\text{MACs}(N,d) = 12Nd^2 + 2N^2d = Nd\,(12d + 2N),$$
+
+        and attention's share is
+
+        $$\frac{2N^2d}{12Nd^2 + 2N^2d} = \frac{N}{6d + N}.$$
+
+        Setting the two terms equal gives $N = 6d$: 4,608 tokens at $d = 768$,
+        a $68 \times 68$ grid, about 1,088 pixels at $P = 16$.
+      prose: >-
+        The share depends on $N/d$ and nothing else, which is why a wide model
+        tolerates more tokens before attention dominates: ViT-H at $d = 1280$
+        crosses at 7,680 tokens rather than 4,608. The practical reading is that
+        at 224 every published ViT is an MLP with a small attention term, and
+        the quadratic story only becomes the story at around a megapixel.
+
+    - title: "Permutation equivariance, and why position must be added"
+      latex: |
+        Let $P$ be a permutation matrix and $X \in \mathbb{R}^{N \times d}$ the
+        token matrix. Row-wise softmax commutes with row permutation, and
+
+        $$\left(PX\right)\left(PX\right)^{\top} = P X X^{\top} P^{\top},$$
+
+        so
+
+        $$A(PX) = \operatorname{softmax}\!\left(\frac{PX X^{\top}P^{\top}}{\sqrt{d_k}}\right)
+          = P\,A(X)\,P^{\top},$$
+
+        and therefore
+
+        $$A(PX)\,(PV) = P\,A(X)V, \qquad \text{block}(PX) = P\,\text{block}(X).$$
+
+        A permutation-invariant readout — a mean over tokens, or a CLS query
+        whose attention is uniform — satisfies $f(PX) = f(X)$ for every $P$. The
+        model cannot distinguish an image from a shuffled image unless some term
+        depends on the index, which is exactly what
+        $t_{ab} \mapsto t_{ab} + e_{ab}$ provides.
+      prose: >-
+        This is the formal reason the positional table is not optional, and also
+        the reason it is the only place where inductive bias can enter the model
+        at all. It also tells you what to expect when the table is removed: not
+        a worse model, but a different function class — one whose output is
+        invariant to the arrangement of the picture.
+
+  implementations:
+    - language: python
+      title: "Patch embedding two ways: the linear map and the strided convolution"
+      note: >-
+        Both paths are numerically correct and agree to **4.9e-15** on a
+        224×224×3 image. The point of the exercise is the second line of
+        `patch_embed_linear`: the reshape/transpose pair
+        `(C, gh, P, gw, P) -> (gh, gw, C, P, P)` is the whole content of "flatten
+        a patch", and it is the only place the two implementations can disagree.
+        Two hazards. First, `np.reshape` on the transposed view is fine because
+        `reshape` copies when it must, but `.reshape` on a sliced array in a
+        different order silently reinterprets memory — use `np.ascontiguousarray`
+        if you ever pass a non-contiguous view. Second, the convolution path
+        below is written as an explicit loop over grid positions for clarity and
+        is therefore ~40× slower than the GEMM path at 196 tokens; it is
+        included to show the equivalence, not to be used.
+      code: |
+        import numpy as np
+
+
+        def patch_embed_linear(image, weight, bias, patch):
+            """image (C,H,W); weight (d, C*P*P); bias (d,). Returns (N, d)."""
+            x = np.asarray(image, dtype=np.float64)
+            w = np.asarray(weight, dtype=np.float64)
+            c, h, wd = x.shape
+            d = w.shape[0]
+            gh, gw = h // patch, wd // patch
+            # (C, gh, P, gw, P) -> (gh, gw, C, P, P): channel-major inside a patch
+            patches = x.reshape(c, gh, patch, gw, patch).transpose(1, 3, 0, 2, 4)
+            flat = patches.reshape(gh * gw, c * patch * patch)
+            return flat @ w.T + np.asarray(bias, dtype=np.float64)
+
+
+        def patch_embed_conv(image, weight, bias, patch):
+            """Same map, written as a stride-P convolution."""
+            x = np.asarray(image, dtype=np.float64)
+            w = np.asarray(weight, dtype=np.float64)
+            c = x.shape[0]
+            d = w.shape[0]
+            wk = w.reshape(d, c, patch, patch)
+            _, h, wd = x.shape
+            gh, gw = h // patch, wd // patch
+            out = np.zeros((gh, gw, d))
+            for i in range(gh):
+                for j in range(gw):
+                    p = x[:, i * patch:(i + 1) * patch, j * patch:(j + 1) * patch]
+                    out[i, j] = np.einsum("cij,ocij->o", p, wk)
+            out += np.asarray(bias, dtype=np.float64)
+            return out.reshape(gh * gw, d)
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            x = rng.normal(size=(3, 224, 224))
+            w = rng.normal(size=(768, 3 * 16 * 16)) * 0.02
+            b = rng.normal(size=(768,)) * 0.02
+            a = patch_embed_linear(x, w, b, 16)
+            c = patch_embed_conv(x, w, b, 16)
+            print(a.shape, c.shape)                 # (196, 768) (196, 768)
+            print(np.abs(a - c).max())              # 4.88e-15
+            print(w.size + b.size)                  # 590592
+
+    - language: python
+      title: "Positional interpolation: the 1-D version is numerically WRONG"
+      note: >-
+        `resize_pos_1d` is **numerically wrong** and is included because nothing
+        about it looks wrong. It takes the 196×768 table, treats the 196 rows as
+        one axis, and linearly resamples them to 576 — which is what
+        `F.interpolate((1, 196, 768), size=576)` does in PyTorch, because the
+        tensor has no spatial axes left to interpolate. Every shape is correct,
+        the model runs, and every position is misplaced: on an iid table with
+        σ = 0.02 the maximum error against the correct 2-D resize is **0.1219**,
+        6.1σ of the table, and the RMS error is 1.45× the table's own RMS. On a
+        trained table the numbers are smaller and the error is still structural:
+        row 3, column 4 of the new grid receives an interpolation of rows that
+        were never its neighbours. The correct path reshapes to
+        (14, 14, d), resamples both spatial axes, and reshapes back.
+      code: |
+        import numpy as np
+
+
+        def _resample_axis(a, n_out, axis):
+            """align_corners=False linear resampling along one axis."""
+            n_in = a.shape[axis]
+            s = (np.arange(n_out) + 0.5) * (n_in / n_out) - 0.5
+            s = np.clip(s, 0.0, n_in - 1.0)
+            lo = np.floor(s).astype(int)
+            hi = np.minimum(lo + 1, n_in - 1)
+            f = (s - lo).reshape([n_out if i == axis else 1 for i in range(a.ndim)])
+            return np.take(a, lo, axis=axis) * (1 - f) + np.take(a, hi, axis=axis) * f
+
+
+        def resize_pos_2d(pos, src_grid, dst_grid):
+            """CORRECT: resize the grid, not the sequence."""
+            p = np.asarray(pos, dtype=np.float64)
+            d = p.shape[1]
+            g = p.reshape(src_grid, src_grid, d)
+            g = _resample_axis(g, dst_grid, 0)
+            g = _resample_axis(g, dst_grid, 1)
+            return g.reshape(dst_grid * dst_grid, d)
+
+
+        def resize_pos_1d(pos, src_grid, dst_grid):
+            """WRONG: treats the 196 position vectors as one axis."""
+            p = np.asarray(pos, dtype=np.float64)
+            return _resample_axis(p, dst_grid * dst_grid, 0)
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(11)
+            pos = rng.normal(size=(14 * 14, 768)) * 0.02
+            right = resize_pos_2d(pos, 14, 24)
+            wrong = resize_pos_1d(pos, 14, 24)
+            err = np.abs(wrong - right)
+            print(right.shape, wrong.shape)          # (576, 768) (576, 768)
+            print(err.max())                         # 0.1219
+            print(np.sqrt((err ** 2).mean()))        # 0.0201
+            print(np.sqrt((right ** 2).mean()))      # 0.0139
+
+  checkpoints:
+    - id: cp-1
+      question: "Your patch embedding is `Linear(768, 768)` on flattened 16×16×3 patches. A colleague's is `Conv2d(3, 768, 16, 16)`. Are they the same function, and how many parameters does each have?"
+      answerKind: short_text
+      hint: "Count the entries in each. Then ask what the convolution does with a window that does not overlap its neighbour."
+      solution: >-
+        Yes — identical functions, 590,592 parameters each. The convolution owns
+        $768 \cdot 3 \cdot 16 \cdot 16 + 768$ numbers, the linear map owns
+        $768 \cdot (3 \cdot 16^2) + 768$; the products are the same expression.
+        With stride 16 and kernel 16 the windows do not overlap, so the
+        convolution is exactly "cut, flatten, multiply" with no sharing across
+        positions. Measured difference on a 224×224×3 image: 4.9e-15. The only
+        way they can differ is the flatten order inside a patch — channel-major
+        then row-major — which changes no shape and every number.
+    - id: cp-2
+      question: "At 224 with patch 16, attention is 4.08% of a ViT-B block's multiply-adds. What resolution makes it half the block, and why is the answer not simply 'when N is large'?"
+      answerKind: short_text
+      hint: "Set the two terms of 12Nd² + 2N²d equal and solve. Then convert N back to pixels at patch 16."
+      solution: >-
+        Equal when $2N^2d = 12Nd^2$, i.e. $N = 6d = 4{,}608$ tokens for
+        $d = 768$ — a 68×68 grid, about 1,088 pixels at patch 16. It is not
+        simply "large N" because the crossover is at $N = 6d$: a wider model
+        pushes it out (ViT-H at $d = 1280$ crosses at 7,680 tokens), so the same
+        image can be attention-bound in a narrow model and MLP-bound in a wide
+        one. At 224 the block costs 1.446 G multiply-adds per layer and the
+        attention matrix is 59 M of it.
+    - id: cp-3
+      question: "You remove the positional embedding from a ViT with a CLS readout and fine-tune. Training loss falls, validation accuracy collapses to chance. What did you actually build?"
+      answerKind: short_text
+      hint: "Write down what attention does to a permuted token matrix."
+      solution: >-
+        A set function. Attention satisfies $A(PX) = P A(X) P^{\top}$, so every
+        block commutes with a permutation of the tokens; the CLS readout then
+        sees the same multiset of patches regardless of their arrangement, and
+        the labels depend on the arrangement. Measured on a randomly
+        initialised block: permuting the 196 tokens changes the CLS readout by
+        8.4e-16 with no positional table and by 1.0e-3 with one. The model can
+        still memorise the training set — hence the falling loss — but it has no
+        feature that could distinguish a cat from the same patches shuffled.
+    - id: cp-4
+      question: "Patch 8 raises accuracy by 1.5 points over patch 16 and someone asks for the compute delta on ViT-B at 224. What do you tell them, and which single number drives it?"
+      answerKind: short_text
+      hint: "Tokens at patch 8 versus 16, then square the ratio for attention and leave it linear for everything else."
+      solution: >-
+        77.92 G multiply-adds per image against 17.36 G — 4.5× the whole model,
+        and 18.5× against patch 32. The driver is the token count: 784 against
+        196, a factor of 4. Attention entries go as $N^2$, so the attention
+        matrix grows 16× (from 38,416 to 614,656 entries per head), while the
+        projections and MLP grow 4×. Note the parameters move the other way: the
+        stem falls from 590,592 to 148,224 because it owns $3P^2d$. "Smaller
+        patches" is cheaper in weights and dearer in arithmetic.
+    - id: cp-5
+      question: "You fine-tune a 224-trained ViT at 384 and lose 2 points. Shapes are all correct. Where do you look first, and what is the failure mode?"
+      answerKind: short_text
+      hint: "The positional table is indexed by position. What happened to the positions?"
+      solution: >-
+        The positional interpolation. 224 → 384 at patch 16 moves the grid from
+        14×14 to 24×24, so the 196×768 table has to be resized as a 2-D grid.
+        If it is resized as a 1-D sequence — which is what
+        `F.interpolate` on `(1, 196, 768)` does, since 196 is the last spatial
+        axis — every vector lands somewhere plausible and no vector lands where
+        it belongs. Measured on an iid table with σ = 0.02: max error 0.1219,
+        6.1σ, RMS error 1.45× the table's own RMS. The fix is to reshape to
+        `(1, d, 14, 14)`, bilinear-resize to `(1, d, 24, 24)`, and flatten back.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A vision transformer does not see an image. It sees a set of vectors,
+        each of which was produced by multiplying one patch by a matrix that is
+        shared across patches — which is exactly what a convolution with stride
+        equal to its kernel does. Everything expensive or fragile about the
+        architecture follows from that one sentence: the token count sets the
+        cost, the shared matrix throws away position, and position has to be put
+        back by hand with a table that is indexed rather than learned from
+        pixels.
+      blocks:
+        - kind: checklist
+          body: |
+            - The stem is a convolution; count its parameters both ways before believing any comparison
+            - The cost is a function of the token count N = HW/P^2, never of the pixel count
+            - Two terms: 12Nd^2 linear, 2N^2d quadratic; their ratio is N/(6d+N)
+            - Attention is permutation-equivariant, so position must be added
+            - A positional table is indexed by position, so it breaks when the grid changes
+      checkpoint: >-
+        Before reading on: if the patch embedding is shared across all 196
+        patches, what information has the model *never* been given, and what is
+        the cheapest object that could supply it?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in tokens, not pixels, and answer three questions in order. How
+        many tokens? That is $HW/P^2$ and it prices everything. What supplies
+        position? Exactly one additive table, and it is the only term that can
+        break permutation symmetry. What did the architecture assume? A
+        convolution assumes locality and equivariance for free; a patch
+        embedding assumes neither, so both must be learned, and the learning is
+        what the extra data buys. When a number surprises you, convert it back
+        into a token count and see whether it is linear or quadratic in $N$.
+      blocks:
+        - kind: checklist
+          body: |
+            - Tokens: N = (H/P)(W/P), plus one for CLS
+            - Stem parameters: 3P^2 d + d, identical to the Linear layer
+            - Block cost: 12Nd^2 + 2N^2d, attention share N/(6d+N)
+            - Position: one additive table of N x d; removing it makes the model a set function
+            - Resolution: the table is a 2-D grid, so resize it as one
+      checkpoint: >-
+        Which of those five quantities changes when you double the batch size,
+        and which changes when you double the image side?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three procedures cover the whole topic: patching, the convolutional
+        form of the embedding, and the positional resize. The patch order is the
+        only subtle line in any of them.
+      blocks:
+        - kind: pseudocode
+          body: |
+            def patchify(x, P):                      # x: (C, H, W)
+                gh, gw = H // P, W // P
+                v = x.reshape(C, gh, P, gw, P)        # channel, grid-row, patch-row, ...
+                v = v.transpose(1, 3, 0, 2, 4)        # (gh, gw, C, P, P)
+                return v.reshape(gh * gw, C * P * P)
+
+            def patch_embed_conv(x, W, b, P):         # W: (d, C*P*P)
+                Wk = W.reshape(d, C, P, P)
+                for a, bb in grid(gh, gw):
+                    out[a, bb] = sum(Wk * x[:, aP:(a+1)P, bP:(b+1)P]) + b
+                return out.reshape(gh * gw, d)        # == patchify(x) @ W.T + b
+
+            def resize_pos(pos, src, dst):            # pos: (src*src, d)
+                g = pos.reshape(src, src, d)
+                g = interp_axis(g, dst, axis=0)
+                g = interp_axis(g, dst, axis=1)
+                return g.reshape(dst * dst, d)
+      checkpoint: >-
+        Why does `patchify` transpose before reshaping rather than reshaping the
+        raw `(C, H, W)` array directly? What would the direct reshape produce,
+        and which shape would still be correct?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Two countings and one symmetry argument produce every number in the
+        topic.
+      blocks:
+        - kind: math
+          body: |
+            Patch embedding, both forms:
+
+            $$u_{ab} = \operatorname{vec}(x_{:,\,aP:(a+1)P,\,bP:(b+1)P}), \qquad
+              \mathbf{t}_{ab} = W u_{ab} + b,$$
+
+            $$y_{:ab} = \sum_{c,i,j} W'_{:cij}\, x_{c,\,aP+i,\,bP+j}
+              \quad\text{with}\quad W'_{ocij} = W_{o,\,cP^2+iP+j}.$$
+
+            Parameters: $dCP^2 + d = 590{,}592$ either way.
+
+            Block cost per layer:
+
+            $$12Nd^2 \;(\text{QKV } 3Nd^2 + \text{proj } Nd^2 + \text{MLP } 8Nd^2)
+              \;+\; 2N^2d \;(\text{QK}^{\top} + AV),$$
+
+            $$\text{attention share} = \frac{2N^2d}{12Nd^2 + 2N^2d}
+              = \frac{N}{6d + N}, \qquad N = 6d \text{ at the crossover}.$$
+
+            Symmetry:
+
+            $$A(PX) = P\,A(X)\,P^{\top} \;\Longrightarrow\;
+              \text{block}(PX) = P\,\text{block}(X),$$
+
+            so without an index-dependent term the readout is invariant to any
+            permutation of the patches.
+      checkpoint: >-
+        The share N/(6d+N) depends only on N/d. What does that imply about
+        comparing the "efficiency" of two ViTs with different widths at the same
+        resolution?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A correct patch embedding in both forms, a correct positional resize,
+        and the two measurements that separate them from the plausible-looking
+        wrong versions. Compare your numbers before you compare code.
+      blocks:
+        - kind: warning
+          body: >-
+            Three failure modes, none of which raises. Reshaping `(C, H, W)`
+            straight to `(N, C*P*P)` gives the right shape and interleaves
+            channels with patch rows. Resampling a `(N, d)` table as if N were a
+            spatial axis gives the right shape and wrong positions. Computing
+            the attention share as $2N^2d / 12Nd^2$ without adding the quadratic
+            term to the denominator gives 100% at large N — an easy error that
+            makes attention look catastrophic at 224.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def patchify(x, P):
+                x = np.asarray(x, dtype=np.float64)
+                c, h, w = x.shape
+                gh, gw = h // P, w // P
+                v = x.reshape(c, gh, P, gw, P).transpose(1, 3, 0, 2, 4)
+                return v.reshape(gh * gw, c * P * P)
+
+
+            def patch_embed(x, W, b, P):
+                return patchify(x, P) @ np.asarray(W, float).T + np.asarray(b, float)
+
+
+            def block_macs(N, d):
+                return 12 * N * d * d + 2 * N * N * d
+
+
+            def attention_share(N, d):
+                return (2 * N * N * d) / block_macs(N, d)
+
+
+            def _resample(a, n_out, axis):
+                n_in = a.shape[axis]
+                s = (np.arange(n_out) + 0.5) * (n_in / n_out) - 0.5
+                s = np.clip(s, 0.0, n_in - 1.0)
+                lo = np.floor(s).astype(int)
+                hi = np.minimum(lo + 1, n_in - 1)
+                f = (s - lo).reshape([n_out if i == axis else 1 for i in range(a.ndim)])
+                return np.take(a, lo, axis=axis) * (1 - f) + np.take(a, hi, axis=axis) * f
+
+
+            def resize_pos(pos, src, dst):
+                p = np.asarray(pos, float)
+                g = p.reshape(src, src, p.shape[1])
+                g = _resample(g, dst, 0)
+                g = _resample(g, dst, 1)
+                return g.reshape(dst * dst, p.shape[1])
+
+
+            if __name__ == "__main__":
+                rng = np.random.default_rng(1)
+                x = rng.normal(size=(3, 224, 224))
+                print(patchify(x, 16).shape)              # (196, 768)
+                print(round(attention_share(196, 768), 4))  # 0.0408
+                print(round(attention_share(4608, 768), 4)) # 0.5
+                pos = rng.normal(size=(196, 768)) * 0.02
+                print(resize_pos(pos, 14, 24).shape)      # (576, 768)
+      checkpoint: >-
+        In `attention_share`, what happens to the number as N grows without
+        bound, and why is that limit exactly the statement "attention is
+        quadratic"?
+
+  problems:
+    - id: p-patchify
+      title: "Patchify: the cut that defines the token sequence"
+      difficulty: easy
+      prompt: >-
+        Implement `patchify(image, patch)` for a channels-first image. `image`
+        has shape `(C, H, W)` and both spatial sides are divisible by `patch`.
+        Return the tokens as nested lists of shape `(N, C * patch * patch)`,
+        where the patches are ordered row-major over the grid (left to right,
+        then top to bottom) and each token is the patch flattened
+        channel-major, row-major within a channel — that is, channel 0's
+        `patch × patch` block first, then channel 1's, and so on. Do not use any
+        library patch-extraction helper; the index arithmetic is the exercise.
+      starter: |
+        import numpy as np
+
+        def patchify(image, patch):
+            # your implementation here
+            pass
+      language: python
+      entry: patchify
+      testCases:
+        - input: '[[[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]]], 2]'
+          expected: "[[1.0, 2.0, 5.0, 6.0], [3.0, 4.0, 7.0, 8.0], [9.0, 10.0, 13.0, 14.0], [11.0, 12.0, 15.0, 16.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]], 2]'
+          expected: "[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]], [[10.0, 20.0, 30.0, 40.0], [50.0, 60.0, 70.0, 80.0], [90.0, 100.0, 110.0, 120.0], [130.0, 140.0, 150.0, 160.0]], [[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0], [3.0, 3.0, 3.0, 3.0]]], 2]'
+          expected: "[[1.0, 2.0, 5.0, 6.0, 10.0, 20.0, 50.0, 60.0, 0.0, 0.0, 1.0, 1.0], [3.0, 4.0, 7.0, 8.0, 30.0, 40.0, 70.0, 80.0, 0.0, 0.0, 1.0, 1.0], [9.0, 10.0, 13.0, 14.0, 90.0, 100.0, 130.0, 140.0, 2.0, 2.0, 3.0, 3.0], [11.0, 12.0, 15.0, 16.0, 110.0, 120.0, 150.0, 160.0, 2.0, 2.0, 3.0, 3.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]], [[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0]]], 2]'
+          expected: "[[1.0, 2.0, 5.0, 6.0, 0.0, 1.0, 1.0, 0.0], [3.0, 4.0, 7.0, 8.0, 0.0, 1.0, 1.0, 0.0], [9.0, 10.0, 13.0, 14.0, 0.0, 1.0, 1.0, 0.0], [11.0, 12.0, 15.0, 16.0, 0.0, 1.0, 1.0, 0.0]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def patchify(image, patch):
+            x = np.asarray(image, dtype=float)
+            if x.ndim != 3:
+                raise ValueError("image must be (C, H, W)")
+            c, h, w = x.shape
+            if patch <= 0:
+                raise ValueError("patch must be positive")
+            gh, gw = h // patch, w // patch
+            if gh * patch != h or gw * patch != w:
+                raise ValueError("H and W must be divisible by the patch size")
+
+            # (C, gh, P, gw, P) -> (gh, gw, C, P, P): grid first, channel inside
+            patches = x.reshape(c, gh, patch, gw, patch).transpose(1, 3, 0, 2, 4)
+            return patches.reshape(gh * gw, c * patch * patch).tolist()
+      solutionExplanation: >-
+        The reshape splits H into `gh` grid rows of `patch` pixels and W into
+        `gw` grid columns of `patch` pixels, giving axes
+        `(C, gh, P, gw, P)`. The transpose moves the two grid axes to the front,
+        which is what makes the following reshape enumerate whole patches rather
+        than rows of pixels: `(gh, gw, C, P, P)` flattens to `C·P·P` numbers per
+        patch with the channel outermost. Skipping the transpose and reshaping
+        directly produces the right shape and the wrong order — pixel rows from
+        different patches interleaved — which is the same bug that makes a
+        hand-written patch embedding disagree with `Conv2d(3, d, P, P)`. Test
+        case 2 is the one that catches a channel/layout swap for a single-patch
+        image: with C=2 and P=2 all eight numbers must appear with channel 0
+        first.
+      complexity: "O(C·H·W) time and space; two reshapes and one transpose, no copies beyond the final flatten"
+      tags: [vit, patch-embedding, reshape, indexing]
+
+    - id: p-patch-embed-conv
+      title: "The patch embedding, written as a strided convolution"
+      difficulty: medium
+      prompt: >-
+        Implement `patch_embed_conv(image, weight, bias, patch)` for a single
+        image, channels-first. `image` has shape `(C, H, W)`, `weight` is the
+        linear embedding matrix as nested lists of shape `(d, C * patch *
+        patch)`, `bias` has length `d`. Return the tokens as nested lists of
+        shape `(N, d)`, where token `a * gw + b` is the embedding of the patch at
+        grid position `(a, b)`. Compute it as a convolution — slide the reshaped
+        kernel over non-overlapping windows with stride `patch` — not as a
+        matmul against a flattened patch matrix. Do not call any library
+        convolution routine.
+      starter: |
+        import numpy as np
+
+        def patch_embed_conv(image, weight, bias, patch):
+            # your implementation here
+            pass
+      language: python
+      entry: patch_embed_conv
+      testCases:
+        - input: '[[[[1.0, 2.0], [3.0, 4.0]]], [[1.0, 1.0, 1.0, 1.0]], [0.0], 2]'
+          expected: "[[10.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]]], [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], [0.5, -1.0], 2]'
+          expected: "[[1.5, 4.0], [3.5, 6.0], [9.5, 12.0], [11.5, 14.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]], [[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]], [0.0], 2]'
+          expected: "[[36.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]], [[1.0, -1.0, 2.0, -2.0]], [1.0], 2]'
+          expected: "[[-2.0], [-2.0]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def patch_embed_conv(image, weight, bias, patch):
+            x = np.asarray(image, dtype=float)
+            w = np.asarray(weight, dtype=float)
+            b = np.asarray(bias, dtype=float)
+            if x.ndim != 3:
+                raise ValueError("image must be (C, H, W)")
+            d, k = w.shape
+            c, h, wd = x.shape
+            if k != c * patch * patch:
+                raise ValueError("weight has %d columns, expected C*P*P = %d"
+                                 % (k, c * patch * patch))
+            if b.shape != (d,):
+                raise ValueError("bias must have length %d" % d)
+
+            wk = w.reshape(d, c, patch, patch)
+            gh, gw = h // patch, wd // patch
+            out = np.zeros((gh, gw, d))
+            for i in range(gh):
+                for j in range(gw):
+                    p = x[:, i * patch:(i + 1) * patch, j * patch:(j + 1) * patch]
+                    # (C, P, P) against (d, C, P, P) -> (d,)
+                    out[i, j] = np.einsum("cij,ocij->o", p, wk) + b
+            return out.reshape(gh * gw, d).tolist()
+      solutionExplanation: >-
+        Reshaping `weight` from `(d, C·P·P)` to `(d, C, P, P)` is the
+        convolutional reading of the same matrix: row `o` becomes a `C × P × P`
+        filter, and the columns of the linear layer become the taps of that
+        filter in channel-major, row-major order. Sliding it with stride `P`
+        visits every non-overlapping patch exactly once, so the loop runs
+        `gh·gw` times and produces the same `N × d` matrix the matmul would — to
+        4.9e-15 on a real image. Test case 2 is the one that catches a transposed
+        filter: rows 0 and 1 select different taps of the patch and carry
+        different biases, so a layout error gives `[1.5, 3.0]` instead of
+        `[1.5, 1.5]`-style coincidences. Test case 4 is the one that catches a
+        missing bias, since every expected value would shift by 1.
+      complexity: "O(gh·gw·C·P²·d) time, O(gh·gw·d) space"
+      tags: [vit, patch-embedding, convolution, stride]
+
+    - id: p-interpolate-pos
+      title: "Positional interpolation for a new resolution"
+      difficulty: hard
+      prompt: >-
+        Implement `interpolate_pos_embed(pos, src_grid, dst_grid)`. `pos` is a
+        positional table as nested lists of shape `(src_grid * src_grid, d)`,
+        flattened row-major over the grid. Return the table resized to
+        `(dst_grid * dst_grid, d)`, also flattened row-major, using bilinear
+        interpolation with `align_corners=False` semantics: the source
+        coordinate for destination index `i` along an axis of length `n_out` is
+        `(i + 0.5) * n_in / n_out - 0.5`, clamped to `[0, n_in - 1]`, and the
+        value is the linear blend of the two nearest source samples. Interpolate
+        the two grid axes; never resample the flattened sequence.
+      starter: |
+        import numpy as np
+
+        def interpolate_pos_embed(pos, src_grid, dst_grid):
+            # your implementation here
+            pass
+      language: python
+      entry: interpolate_pos_embed
+      testCases:
+        - input: '[[[0.0], [1.0], [2.0], [3.0]], 2, 3]'
+          expected: "[[0.0], [0.5], [1.0], [1.0], [1.5], [2.0], [2.0], [2.5], [3.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.0], [1.0], [2.0], [3.0]], 2, 4]'
+          expected: "[[0.0], [0.25], [0.75], [1.0], [0.5], [0.75], [1.25], [1.5], [1.5], [1.75], [2.25], [2.5], [2.0], [2.25], [2.75], [3.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.0], [1.0], [2.0], [3.0], [4.0], [5.0], [6.0], [7.0], [8.0]], 3, 2]'
+          expected: "[[1.0], [2.5], [5.5], [7.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]], 2, 2]'
+          expected: "[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def interpolate_pos_embed(pos, src_grid, dst_grid):
+            p = np.asarray(pos, dtype=float)
+            if p.ndim != 2:
+                raise ValueError("pos must be (src_grid*src_grid, d)")
+            if p.shape[0] != src_grid * src_grid:
+                raise ValueError("pos has %d rows, expected %d"
+                                 % (p.shape[0], src_grid * src_grid))
+
+            d = p.shape[1]
+            g = p.reshape(src_grid, src_grid, d)
+            g = _resample_axis(g, dst_grid, 0)
+            g = _resample_axis(g, dst_grid, 1)
+            return g.reshape(dst_grid * dst_grid, d).tolist()
+
+
+        def _resample_axis(a, n_out, axis):
+            n_in = a.shape[axis]
+            s = (np.arange(n_out) + 0.5) * (n_in / n_out) - 0.5
+            s = np.clip(s, 0.0, n_in - 1.0)
+            lo = np.floor(s).astype(int)
+            hi = np.minimum(lo + 1, n_in - 1)
+            f = (s - lo).reshape([n_out if i == axis else 1 for i in range(a.ndim)])
+            return np.take(a, lo, axis=axis) * (1 - f) + np.take(a, hi, axis=axis) * f
+      solutionExplanation: >-
+        Reshaping to `(src, src, d)` recovers the grid that the flat table
+        encodes; the two `_resample_axis` calls then apply the same
+        one-dimensional interpolation along rows and along columns, which is
+        exactly bilinear interpolation because the two operators act on
+        different axes and commute. The `-0.5` offset and the clamp are what
+        make it `align_corners=False`: destination index 0 maps to source
+        coordinate `0.5 * n_in/n_out - 0.5`, which is negative for any upsampling
+        and therefore clamps to the first sample. Test case 1 is small enough to
+        check by hand: 2 → 3 gives source coordinates `-1/6, 0.5, 7/6`, so the
+        first and last rows are copied and the middle one is an average, which
+        produces `[[0, 0.5, 1], [1, 1.5, 2], [2, 2.5, 3]]`. Test case 3 checks
+        downsampling, where the weights are 0.75/0.25 rather than 0.5/0.5, and
+        test case 4 checks that a same-size grid is returned untouched.
+      complexity: "O(dst_grid²·d) time and space; no dependence on the patch count"
+      tags: [vit, positional-embedding, interpolation, resolution]
+
+  visualizers:
+    - id: vs-vit-tokens
+      kind: shape_flow
+      title: "Patch size as a dial: watch the token count and the cost diverge"
+      description: >-
+        Feed a 224×224 image through patch sizes 32, 16, 8 and watch
+        $N = HW/P^2$ go 49 → 196 → 784 while the attention matrix, which is
+        $N^2$, goes 2,401 → 38,416 → 614,656 entries per head. The stem's
+        parameter count moves the other way, because it owns $3P^2d$.
+      params:
+        input: [3, 224, 224]
+        stages:
+          - { patch: 32, d_model: 768 }
+          - { patch: 16, d_model: 768 }
+          - { patch: 8, d_model: 768 }
+    - id: vs-vit-attention
+      kind: attention
+      title: "196 tokens, uniform at initialisation, 149 pixels apart"
+      description: >-
+        Inspect one layer of a ViT-B/16 before training: the attention entropy
+        is 5.2832 nats against a ceiling of log 197, the maximum weight is
+        1/197, and the mean distance between a query patch and its keys is 9.29
+        patch widths. Then train and watch the heads split into local and global
+        populations.
+      params:
+        tokens: 196
+        heads: 12
+        layers: 12
+        grid: 14
+
+  try_it: >-
+    Take a 224×224 image at patch 16 and write down N = 196. Compute attention's share of the
+    block's multiply-adds from N/(6d+N) at d = 768 for N = 196 and N = 1024, then build both
+    patch embeddings in torch — Conv2d(3, 768, 16, 16) and unfold plus Linear — and print the
+    maximum absolute difference over the 196 tokens. It should be about 5e-15, not 0.
+  interview_questions:
+    - question: "Why is nn.Conv2d(3, 768, 16, 16) exactly the same function as flattening 16×16 patches and applying a Linear, and what implementation detail still makes two correct implementations disagree?"
+      level: mid
+      key_points:
+        - "Both carry 768·3·16·16 + 768 = 590,592 parameters; a patch is a 768-vector and the shared matrix computes the same sum in the same order."
+        - "The identity requires the flatten order to match the kernel indexing, i.e. channel-major inside each patch; reshape plus transpose variants give the right shape and different numbers."
+        - "Measured maximum absolute difference is 4.9e-15 over all 196 tokens when the order matches, which is float round-off rather than a modelling difference."
+        - "Because the two are identical, a pretrained convolutional stem loads directly into a patch-embedding Linear with no conversion."
+      follow_up: "If you move from patch 16 to patch 8, which of the two objects changes size, and by how much?"
+    - question: "At 224 a ViT's attention matrix is 4% of the block's work. Where does the compute actually go, and at what resolution does the quadratic term take over?"
+      level: senior
+      key_points:
+        - "Per layer the block costs 12Nd² + 2N²d multiply-adds, so attention's share is N/(6d+N): 4.08% at N = 196 with d = 768, but 47.1% at N = 4096."
+        - "The two terms are equal at N = 6d = 4,608 tokens, a 68×68 grid, roughly a 1,088-pixel image at patch 16."
+        - "Below that line the MLP dominates — two thirds of the parameters — so kernel-level attention work at ImageNet resolution optimises the wrong third of the model."
+        - "Doubling the image side quadruples N and multiplies the attention entries by sixteen, so the regime changes faster than the pixel count suggests."
+      follow_up: "Your product wants 1024×1024 inputs. What does that do to the attention share, and what would you change first?"
+    - question: "You fine-tune a ViT from 224 to 384 and lose two points. Every shape assertion passes. What did you do wrong?"
+      level: mid
+      key_points:
+        - "The positional table is 196×768 and must become 576×768, which is a resampling problem on a 14×14 grid, not on a sequence of 196 rows."
+        - "Resampling the 196 rows as one spatial axis keeps every shape correct and misplaces every position; on an iid table with σ = 0.02 the maximum error is 0.1219, which is 6.1σ and 1.45× the table's own RMS."
+        - "The fix is to reshape to (1, 768, 14, 14), interpolate bilinearly, and flatten back — the patch embedding itself needs no change because it is resolution-free."
+        - "Attention entries grow 16× at the same time, so the fine-tune also costs more memory for the same batch."
+      follow_up: "Could you drop the positional table entirely and let the patch embedding carry position? Why not?"
+  common_mistakes:
+    - "Assuming attention is the expensive part at 224 — it is 4.08% of block multiply-adds while the MLP holds about two thirds of the parameters."
+    - "Interpolating the positional table as a 1-D sequence of 196 rows: shapes pass, checkpoints load, and accuracy drops with nothing in the stack to report it."
+    - "Reordering the flatten in a hand-written patch embedding, which keeps the parameter count identical and silently changes every number the stem produces."
+  further_reading:
+    - label: "Dosovitskiy et al., An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale (ViT), ICLR 2021"
+    - label: "Touvron et al., Training data-efficient image transformers and distillation through attention (DeiT), ICML 2021"

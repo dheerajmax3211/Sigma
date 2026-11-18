@@ -1,0 +1,1428 @@
+id: transformer-block
+slug: transformer-block
+title: "The Full Transformer Block"
+summary: >-
+  Assemble attention, normalisation, and position into the object a language
+  model actually repeats, then price it: 7,080,960 parameters and 12d^2 + 2nd
+  multiply-adds per token, an MLP that is two thirds of the block, a residual
+  stream that grows 3.3x across twelve layers, and a KV cache that turns decode
+  into a bandwidth problem instead of an arithmetic one.
+kind: lesson
+difficulty: hard
+position: 5
+estMinutes: 24
+prerequisites: [multi-head-attention, normalisation-layers, positional-encoding]
+phase: attention-core
+tags: [transformer-block, residual-stream, pre-norm, swiglu, mlp, flops, parameter-count, kv-cache, prefill, decoding, scaling]
+
+body:
+  big_idea: >-
+    A transformer block is two pre-normalised sublayers writing additively
+    into one unnormalised residual stream, and every cost — parameters, FLOPs
+    per token, bytes per decode step — follows from that wiring plus the
+    width.
+
+  problem:
+    - >-
+      Every shape fits, the loss falls, and the logits are wrong by three
+      because the final norm is missing and the stream grew 3.0x.
+    - >-
+      Somebody asks how many parameters one layer has and you answer
+      "attention" — it is 33% of the block, and the MLP is 67%.
+    - >-
+      Prefill does 1,024 tokens in 0.7 ms and decode does them in 87 ms, and
+      nothing in the FLOP count explains a 121x gap.
+
+  analogy: |
+    A factory line with one conveyor belt. Every station reads the belt,
+    computes a correction, and adds it back; no station replaces what is on
+    it. The attention station moves material between positions, the MLP works
+    on each item where it sits, and the belt accumulates every correction.
+    After twelve stations the load is 3.3x what it was at the door, so there
+    is a final inspection.
+
+  concept_points:
+    - >-
+      **The block is two sublayers joined by two additions, and the additions carry no parameters.**
+      At $d_{\text{model}} = 768$, 12 heads, $d_{ff} = 3072$: attention
+      **2,359,296**, MLP **4,718,592**, two LayerNorms **3,072**, block
+      **7,080,960**. Twelve blocks are 84,971,520; with a
+      $50{,}257 \times 768$ embedding the model is **123,568,896** — GPT-2
+      small's 124M to within 0.4%. Attention is a third of it; the two adds
+      have no weights at all.
+    - >-
+      **The MLP is exactly twice the attention, and that ratio is the only real argument for the 4x expansion.**
+      $4d^2$ against $8d^2$ is exactly **2.0**, making the MLP **66.64%** of
+      block parameters. SwiGLU's gate adds a third matrix, so at $d_{ff} = 4d$
+      the MLP costs $12d^2$ — **50% over** (7,077,888 against 4,718,592).
+      LLaMA sets $d_{ff} = \tfrac{8}{3}d$: at $d = 4096$, 11,008, which is
+      **0.78% over** the $8d^2$ budget.
+    - >-
+      **Per token a block costs $12d^2 + 2nd$ multiply-adds, and the crossover is exactly $n = 6d$.**
+      Four projections at $4d^2$ plus the MLP at $8d^2$ give **7,077,888**
+      MACs; the attention matmuls add $2nd$. Equal at $n = 6d = 4{,}608$, so
+      at 8,192 the attention term is **1.78x** the weight term and at 131,072
+      it is **28.4x**.
+    - >-
+      **The residual stream is never normalised, so its norm grows — 3.30x across twelve blocks.**
+      Each sublayer writes a fraction of the stream's norm (0.20 attention,
+      0.54 MLP at $d=768$) and the writes are nearly orthogonal (cosine
+      **0.014**), so norms add in quadrature: 222.0 to 732.8. Deleting the
+      final norm multiplies the logit scale by 2.999 and moves max softmax
+      from **0.3214 to 0.7809**.
+    - >-
+      **The additive path is a Jacobian of $I + J_f$, which is why very deep stacks train at all.**
+      Measured over twelve random blocks, the smallest singular value of the
+      composed Jacobian is **3.84e-2** with the additions and **7.36e-13**
+      without; condition numbers **232** and **2.3e12**. One block's Jacobian
+      has $\sigma_{\max} = 1.89$, $\sigma_{\min} = 0.22$, while its sublayer
+      alone has $\sigma_{\min} = 4.2e-3$.
+    - >-
+      **Prefill is compute-bound and decode is bandwidth-bound, and both are the same block.**
+      Prefilling 1,024 tokens costs 212.6 GFLOP at 1,206 FLOP/byte: 0.72 ms at
+      30% MFU. Decoding one token at 1,024 context costs 0.208 GFLOP but moves
+      **284.9 MB** — **0.73 FLOP/byte**, 85 microseconds at 3.35 TB/s. The
+      same 1,024 tokens take 0.72 ms in prefill and 87 ms decoded: **121x**.
+
+  definitions:
+    - term: "Transformer block"
+      meaning: >-
+        The repeated unit of a language model: a multi-head attention sublayer
+        and a position-wise MLP, each preceded by a LayerNorm and followed by an
+        additive residual write. It preserves shape, so the same block can be
+        stacked L times; at 768 wide and 4x expansion it is 7,080,960
+        parameters.
+    - term: "Residual stream"
+      meaning: >-
+        The width-$d_{\text{model}}$ vector that flows through the whole stack
+        and is only ever added to. It is the block's communication bus: every
+        sublayer reads a normalised copy of it and writes an update back. Its
+        norm grows with depth (3.30x over twelve blocks at init).
+    - term: "Sublayer"
+      meaning: >-
+        One of the block's two functions — attention or the MLP — together with
+        the norm that precedes it and the addition that follows it. A sublayer
+        is where parameters live; the additions are where information persists.
+    - term: "Pre-norm (pre-LN)"
+      meaning: >-
+        Normalising the *input* to a sublayer and adding the unnormalised
+        output back: $x + f(\operatorname{LN}(x))$. The identity path carries no
+        normalisation, which keeps gradients well conditioned; it requires one
+        final norm before the unembedding because the stream is unnormalised.
+    - term: "Post-norm (post-LN)"
+      meaning: >-
+        The original paper's arrangement: $x \leftarrow
+        \operatorname{LN}(x + f(x))$. The norm sits on the residual path, so
+        every block rescales the identity. It trains, but it needs learning-rate
+        warmup at depth, and its output RMS is pinned to 1 by construction,
+        which measured a three times smaller logit spread than pre-LN on the
+        same weights.
+    - term: "Final norm (ln_f)"
+      meaning: >-
+        The single LayerNorm applied after the last block, before the
+        unembedding. It exists only because pre-LN never normalised the stream.
+        Delete it and the logit scale becomes the stream RMS — 2.999 in the
+        measured case — which sharpens the softmax by 2.4x, moving mean max
+        probability from 0.3214 to 0.7809.
+    - term: "Expansion factor"
+      meaning: >-
+        $d_{ff}/d_{\text{model}}$, the MLP's hidden width relative to the
+        stream. Four is a convention that makes the MLP exactly twice the
+        attention's parameter count; SwiGLU models use 8/3 to restore the same
+        budget after paying for the gate.
+    - term: "SwiGLU"
+      meaning: >-
+        A gated MLP: $\operatorname{Swish}(xW_1^\top) \odot (xW_3^\top)$
+        projected back by $W_2$. Three matrices instead of two, so the same
+        parameter budget forces $d_{ff} = \tfrac{8}{3}d$ — 11,008 at
+        $d = 4096$, which is 0.78% over the 8d^2 budget.
+    - term: "Block parameter count"
+      meaning: >-
+        $12d^2 + 4d$ for a bias-free pre-LN block at 4x expansion: $4d^2$
+        attention, $8d^2$ MLP, $4d$ for two LayerNorms. It is independent of
+        head count and of context length, which is why it is the unit scaling
+        laws are written in.
+    - term: "Prefill"
+      meaning: >-
+        Processing the prompt: all $n$ tokens at once, one pass, high arithmetic
+        intensity (~1,206 FLOP/byte at $n = 1024$), compute-bound. It fills the
+        KV cache and produces the first logits.
+    - term: "Decode"
+      meaning: >-
+        Generating one token at a time, each step re-reading every weight and
+        the whole cache. Arithmetic intensity collapses to 0.73 FLOP/byte at
+        1,024 context, so the step time is bytes divided by bandwidth, not FLOPs
+        divided by throughput.
+    - term: "Arithmetic intensity"
+      meaning: >-
+        FLOPs performed per byte moved from memory. Compared against the
+        hardware's ridge point (295 FLOP/byte for an H100 at fp16), it says
+        whether a kernel is limited by the tensor cores or by HBM. One block
+        sits on both sides of that line depending on whether it is prefilling or
+        decoding.
+
+  diagrams:
+    - type: architecture
+      title: "The block: two normalised sublayers writing into one unnormalised stream"
+      nodes:
+        - { id: x, x: 0, y: 1, label: "x  (n, 768)", kind: client, detail: "The residual stream. Never normalised in place, never replaced — only added to. Everything downstream is this vector plus a sum of updates." }
+        - { id: ln1, x: 1, y: 0, label: "LayerNorm 1", kind: worker, detail: "1,536 parameters (gamma and beta over 768 features). Reads a copy of x; the stream itself is untouched, which is what keeps the identity path clean." }
+        - { id: attn, x: 2, y: 0, label: "Multi-head attention", kind: model, detail: "2,359,296 parameters: W_Q, W_K, W_V, W_O at 768 x 768, or 589,824 each. The only operation in the block that moves information between positions." }
+        - { id: add1, x: 3, y: 0, label: "x = x + attn", kind: server, detail: "Elementwise addition, zero parameters. This one line is why the block Jacobian is I + J_f and why the smallest singular value stays at 3.8e-2 instead of 7.4e-13." }
+        - { id: ln2, x: 1, y: 2, label: "LayerNorm 2", kind: worker, detail: "The second 1,536-parameter norm, reading the post-attention stream — which is already larger than the input was." }
+        - { id: mlp, x: 2, y: 2, label: "MLP  768 -> 3072 -> 768", kind: gpu, detail: "4,718,592 parameters, two thirds of the block. Applied to each token independently: no position can influence another here." }
+        - { id: add2, x: 3, y: 2, label: "x = x + mlp", kind: server, detail: "Second residual write. After twelve blocks the stream norm is 3.30x its input norm, which is what the final norm exists to absorb." }
+        - { id: out, x: 3, y: 3, label: "next block  (n, 768)", kind: external, detail: "Same shape it started as. Shape preservation is what makes the block stackable and what makes depth a free variable." }
+      edges:
+        - { from: x, to: ln1, label: "normalised copy" }
+        - { from: ln1, to: attn, label: "read" }
+        - { from: attn, to: add1, label: "update" }
+        - { from: x, to: add1, label: "identity, 0 params" }
+        - { from: add1, to: ln2, label: "stream" }
+        - { from: ln2, to: mlp, label: "read" }
+        - { from: mlp, to: add2, label: "update" }
+        - { from: add1, to: add2, label: "identity" }
+        - { from: add2, to: out, label: "repeat x L" }
+      caption: "Read the two horizontal arrows on the right: they are the only paths that survive depth. Every parameter in the diagram is inside a box the identity path bypasses."
+
+    - type: pipeline
+      title: "One forward pass, with the shape and the cost at each step"
+      nodes:
+        - label: "x  (n, 768)"
+          note: "the stream"
+          detail: "Frobenius norm 222.0 for a 64-token batch at initialisation, growing 1.105x per block."
+        - label: "LN1: (n, 768)"
+          note: "1,536 params, per-token statistics"
+          detail: "Mean and variance over the 768 features of each row, then a learned affine. eps = 1e-5. This is the normalisation-layer topic applied to the block's input."
+        - label: "Q, K, V, attn  (n, 768)"
+          note: "2,359,296 MACs per token"
+          detail: "Four 768 x 768 matmuls: three projections and W_O. The score and value products add 2nd more, which is 1,536n — the only term that grows with context."
+        - label: "x1 = x + attn"
+          note: "0 params"
+          detail: "The update is 0.20 of the stream norm at init and nearly orthogonal to it, so the stream grows by addition in quadrature."
+        - label: "LN2: (n, 768)"
+          note: "1,536 params"
+          detail: "Reads the post-attention stream. Its input is already bigger than block input, which is why the stream cannot be left unnormalised at the end."
+        - label: "MLP: (n, 3072) -> (n, 768)"
+          note: "4,718,592 MACs per token"
+          detail: "Up-projection to 4d, GELU, down-projection. Two thirds of the block's parameters, none of its cross-token mixing."
+        - label: "y = x1 + mlp  (n, 768)"
+          note: "0 params; hand to block l+1"
+          detail: "After twelve of these, one final LayerNorm and the unembedding turn the stream into logits."
+      caption: "Two of the seven stages cost anything, and their costs differ by exactly 2:1 — which is the whole parameter story of the block."
+
+    - type: compare
+      title: "The same block in two regimes: prefill and decode (768 wide, 12 layers, 1,024-token context)"
+      left_label: "Prefill: all n tokens at once"
+      left_points:
+        - "1,024 tokens: 212.6 GFLOP in a single pass"
+        - "About 1,206 FLOP per byte moved — 4x above the 295 ridge point"
+        - "0.215 ms at 989 TFLOP/s peak; 0.72 ms at 30% MFU"
+        - "Tensor cores busy; every kernel is a matmul over the whole sequence"
+        - "Cost per prompt token falls as the prompt grows, because the weights are read once"
+      right_label: "Decode: one token at a time"
+      right_points:
+        - "1 token: 0.208 GFLOP and 284.9 MB moved"
+        - "0.73 FLOP per byte — 400x below the ridge point"
+        - "85.0 microseconds per step at 3.35 TB/s; ceiling 11,759 tokens/s at batch 1"
+        - "Tensor cores idle; the kernel is a memory copy of weights plus cache"
+        - "1,024 tokens decoded: 87 ms against 0.72 ms prefilled — 121x"
+
+    - type: plot
+      title: "Multiply-adds per token in one block: a constant, plus a term that grows with context"
+      chart: line
+      xLabel: "context length (tokens)"
+      yLabel: "MACs per token (millions)"
+      series:
+        - name: "weight matmuls  12 d^2 (constant)"
+          points:
+            - { x: 512, y: 7.078 }
+            - { x: 1024, y: 7.078 }
+            - { x: 2048, y: 7.078 }
+            - { x: 4608, y: 7.078 }
+            - { x: 8192, y: 7.078 }
+            - { x: 32768, y: 7.078 }
+            - { x: 131072, y: 7.078 }
+        - name: "attention matmuls  2 n d"
+          points:
+            - { x: 512, y: 0.786 }
+            - { x: 1024, y: 1.573 }
+            - { x: 2048, y: 3.146 }
+            - { x: 4608, y: 7.078 }
+            - { x: 8192, y: 12.583 }
+            - { x: 32768, y: 50.332 }
+            - { x: 131072, y: 201.327 }
+        - name: "total per token"
+          points:
+            - { x: 512, y: 7.864 }
+            - { x: 1024, y: 8.651 }
+            - { x: 2048, y: 10.224 }
+            - { x: 4608, y: 14.156 }
+            - { x: 8192, y: 19.661 }
+            - { x: 32768, y: 57.410 }
+            - { x: 131072, y: 208.405 }
+
+    - type: plot
+      title: "The residual stream triples across twelve blocks at initialisation"
+      chart: line
+      xLabel: "block index"
+      yLabel: "stream norm relative to block 0"
+      series:
+        - name: "measured, d = 768, 12 heads, 64 tokens"
+          points:
+            - { x: 0, y: 1.000 }
+            - { x: 1, y: 1.217 }
+            - { x: 2, y: 1.414 }
+            - { x: 3, y: 1.620 }
+            - { x: 4, y: 1.839 }
+            - { x: 5, y: 2.018 }
+            - { x: 6, y: 2.223 }
+            - { x: 7, y: 2.404 }
+            - { x: 8, y: 2.608 }
+            - { x: 9, y: 2.814 }
+            - { x: 10, y: 2.908 }
+            - { x: 11, y: 3.139 }
+            - { x: 12, y: 3.301 }
+
+  markdown: |
+    ## Two sublayers, one stream
+
+    Every component of this block has its own topic. The block is the wiring
+    that turns them into a repeated object:
+
+    $$x \leftarrow x + \operatorname{Attn}\!\left(\operatorname{LN}(x)\right),
+      \qquad
+      x \leftarrow x + \operatorname{MLP}\!\left(\operatorname{LN}(x)\right).$$
+
+    Three things are being asserted in those two lines. The norm reads a *copy*
+    of $x$ — the stream itself is never normalised. The sublayer writes an
+    *update*, not a replacement. And the addition is the only operation that
+    persists across depth, which is why the stream is the model's memory and the
+    sublayers are transient computations over it.
+
+    Attention is the only place one token can read another; the MLP is the only
+    place a token is transformed on its own. The block alternates them, and the
+    shape never changes, so the block is stackable and depth is a free variable.
+
+    ## The parameter bill
+
+    At $d_{\text{model}} = 768$ with 12 heads and a 4x MLP:
+
+    | component | matrices | parameters | share |
+    |---|---|---|---|
+    | $W_Q, W_K, W_V, W_O$ | four $768 \times 768$ | 2,359,296 | 33.32% |
+    | MLP up and down | $768\times3072$, $3072\times768$ | 4,718,592 | 66.64% |
+    | two LayerNorms | $4 \times 768$ | 3,072 | 0.04% |
+    | **block** | | **7,080,960** | |
+
+    Twelve blocks are 84,971,520 parameters; the $50{,}257 \times 768$
+    embedding adds 38,597,376, for 123,568,896 — GPT-2 small. The head count
+    does not appear anywhere in that table: splitting a projection into 12 heads
+    changes nothing about how many numbers it contains, which is the invariance
+    from *Multi-Head Attention* showing up as an accounting fact.
+
+    The 2:1 ratio is the only real content of the "4x expansion". A SwiGLU MLP
+    has three matrices where this one has two, so keeping $d_{ff} = 4d$ costs
+    $12d^2$ instead of $8d^2$ — 50% more. LLaMA's answer is
+    $d_{ff} = \tfrac{8}{3}d$: 11,008 at $d = 4096$, which lands 0.78% over the
+    eight-$d^2$ budget rather than 50% over it.
+
+    ## The compute bill
+
+    Per token, per block, in multiply-adds:
+
+    $$\text{MACs} = \underbrace{4d^2}_{Q,K,V,O} + \underbrace{8d^2}_{\text{MLP}}
+      + \underbrace{2nd}_{\text{scores} + AV} = 12d^2 + 2nd .$$
+
+    At $d = 768$ that is $7{,}077{,}888 + 1{,}536n$. The two terms are equal at
+    $n = 6d = 4{,}608$, so a block is weight-bound below 4.6k tokens and
+    attention-bound above it: at 8k the attention term is 1.78x the weight term,
+    at 128k it is 28.4x.
+
+    | context | weight MACs | attention MACs | attention share |
+    |---|---|---|---|
+    | 1,024 | 7,077,888 | 1,572,864 | 18.2% |
+    | 4,608 | 7,077,888 | 7,077,888 | 50.0% |
+    | 32,768 | 7,077,888 | 50,331,648 | 87.7% |
+
+    The training-time identity $\text{FLOPs} \approx 6ND$ is this same count
+    integrated: $2ND$ forward (two FLOPs per multiply-add) and $4ND$ backward,
+    where $N$ is the block parameters times depth and $D$ is the token count.
+
+    ## The stream grows
+
+    Pre-LN never normalises the stream, so every block adds to it. At
+    initialisation the writes are a fraction of the stream's norm (0.20 for
+    attention, 0.54 for the MLP at $d = 768$) and nearly orthogonal to each other
+    (cosine 0.014), so the norms combine in quadrature and the growth is
+    geometric: 222.0 to 732.8 over twelve blocks, 1.105x per block, 3.30x in
+    total. At a hundred blocks the same ratio is roughly 21,000x.
+
+    That is the entire reason a final LayerNorm exists. Delete it and the logit
+    scale becomes whatever the stream RMS happens to be — 2.999 in the measured
+    case — which sharpens the softmax and changes the loss by an amount that
+    looks like a bad learning rate rather than a missing layer.
+
+    The addition also fixes the gradient problem that depth would otherwise
+    create. The block's Jacobian is $I + J_f$; over twelve blocks the composed
+    Jacobian has $\sigma_{\min} = 3.84\times10^{-2}$ and condition number 232.
+    Remove the two additions and the same stack gives
+    $\sigma_{\min} = 7.36\times10^{-13}$, condition number
+    $2.3\times10^{12}$ — a model that cannot be trained without careful
+    initialisation, whatever its normalisation.
+
+    ## Where the time goes
+
+    | | prefill 1,024 tokens | decode 1 token |
+    |---|---|---|
+    | FLOPs | 212.6 GFLOP | 0.208 GFLOP |
+    | bytes moved | ~176 MB | 284.9 MB |
+    | FLOP/byte | ~1,206 | 0.73 |
+    | time | 0.72 ms at 30% MFU | 85.0 us |
+    | bound by | arithmetic | bandwidth |
+
+    Prefill reads the weights once for a thousand tokens. Decode reads them once
+    per token, plus the LM head (77.2 MB, 27.1% of the traffic) and the KV cache
+    (37.7 MB at 1,024 tokens, 13.3%). At batch 1 the ceiling is
+    11,759 tokens/s — and that is a bandwidth ceiling, not a compute one. The
+    same thousand tokens cost 0.72 ms prefilled and 87 ms decoded.
+
+    ## Why the block is the unit
+
+    $N = L \cdot (12d^2 + 4d) + Vd$. Every scaling decision is a choice about
+    $L$ and $d$, and both are counted inside one block. That is why parameter
+    tables, FLOP budgets, and KV-cache calculators all start by decomposing a
+    single block, and why "how big is the model" has a one-line answer only
+    after you can write that decomposition from memory.
+
+    ## The longer version
+
+    A transformer block is two pre-normalised sublayers writing additively into
+    one unnormalised residual stream, and every cost the model has — parameters,
+    FLOPs per token, bytes per decode step — follows from that wiring plus the
+    width.
+
+    A factory line with one conveyor belt. Every station reads the belt, computes
+    a correction, and adds the correction back onto the belt; no station ever
+    replaces what is on it. The attention station moves material between
+    positions on the belt, the MLP station works on each item where it sits, and
+    between them the belt accumulates every correction anyone has made.
+
+    Two things follow from "add, never replace". First, a station that has
+    nothing useful to say contributes approximately nothing and the line keeps
+    running — that is why a hundred stations can be stacked without the product
+    degrading at each one. Second, the belt's contents get denser as they move:
+    after twelve stations the load is 3.3x what it was at the door, which is why
+    there is a final inspection (the last LayerNorm) before the goods are
+    compared against the catalogue.
+
+    The analogy breaks in two places. A real belt has a fixed capacity and
+    stations must coordinate throughput; here every station reads the *whole*
+    belt in parallel and writes independently, so two stations can write
+    opposite corrections that cancel and nobody notices. And a real inspector
+    can reject a batch; the final norm only rescales it. It cannot remove what
+    an earlier station wrote — later layers can only outvote it.
+
+    ### What goes wrong
+
+    - You have three components that each work and no way to know whether the
+      assembly is right. Every shape fits, the loss goes down, and the logits
+      are still wrong by a factor of three because the final norm is missing
+      and the stream has grown to 3.0x the scale your unembedding expects.
+    - Somebody asks how many parameters one layer has and you answer
+      "attention". Attention is 33% of the block; the MLP is 67%. You cannot
+      price a model, plan a GPU, or read a paper's parameter table until you
+      can decompose a block on paper in under a minute.
+    - You profile the thing and prefill does 1,024 tokens in 0.7 ms while
+      decode does them in 87 ms. The arithmetic is identical per token.
+      Nothing in the FLOP count explains a 121x gap, because the gap is bytes,
+      not FLOPs, and the block is where the bytes live.
+    - You want to scale. Depth and width are the only two knobs, they are both
+      counted inside the block, and they are not interchangeable — doubling
+      depth adds serial rounds, doubling width quadruples each block's
+      parameters.
+    - You follow the original paper's diagram exactly — norm after the add —
+      and now training at twelve layers needs a warmup schedule, gradient
+      clipping, and a learning rate you cannot raise. The wiring is the
+      difference, and the paper's diagram is the one arrangement that puts a
+      normalisation on the identity path.
+
+    ### The full treatment
+
+    **The block is two sublayers joined by two additions, and the additions
+    carry no parameters.** Pre-norm wiring:
+    $x \leftarrow x + \operatorname{Attn}(\operatorname{LN}(x))$ then
+    $x \leftarrow x + \operatorname{MLP}(\operatorname{LN}(x))$. At
+    $d_{\text{model}} = 768$, 12 heads, $d_{ff} = 3072$: attention
+    **2,359,296**, MLP **4,718,592**, two LayerNorms **3,072**, block
+    **7,080,960**. Twelve blocks are 84,971,520; with a $50{,}257 \times 768$
+    embedding (38,597,376) the model is **123,568,896** — GPT-2 small's 124M
+    to within 0.4%. The trap is calling this "an attention layer": attention
+    is a third of it, and the part you can point at in a diagram (the two
+    adds) has no weights at all.
+
+    **The MLP is exactly twice the attention, and that ratio is the only real
+    argument for the 4x expansion.** $4d^2$ against $8d^2$ is a ratio of
+    exactly **2.0**, which makes the MLP **66.64%** of block parameters.
+    Nothing forces $d_{ff} = 4d$; what the 4 buys is a fixed 2:1 split between
+    per-token nonlinearity and token-mixing. SwiGLU's gate adds a third
+    matrix, so at $d_{ff} = 4d$ the MLP would cost $3 \cdot 4d^2 = 12d^2$ —
+    **50% over budget** (7,077,888 against 4,718,592 at $d = 768$). LLaMA
+    therefore sets $d_{ff} = \tfrac{8}{3}d$: at $d = 4096$ that is 11,008, and
+    $3 \cdot 4096 \cdot 11008 = 135{,}266{,}304$ against the $8d^2$ budget of
+    134,217,728 — **0.78% over**. The trap is copying "4x" into a SwiGLU model
+    and shipping 50% more parameters than the table you published.
+
+    **Per token a block costs $12d^2 + 2nd$ multiply-adds, and the crossover
+    is exactly $n = 6d$.** Four projections at $4d^2$ plus the MLP at $8d^2$
+    gives **7,077,888** MACs per token independent of context; the two
+    attention matmuls add $2nd$ = 1,536n. They are equal at
+    $n = 6d = 4{,}608$ tokens, so below 4.6k the block is weight-bound and
+    above it attention-bound: at 8,192 the attention term is **1.78x** the
+    weight term, at 131,072 it is **28.4x**. The trap is the slogan "2 FLOPs
+    per parameter per token" — that is the $n \to 0$ limit, within 11% at a
+    512-token step and wrong by 28x at 128k.
+
+    **The block is the unit of scaling because both knobs live inside it.**
+    $N = L \cdot (12d^2 + 4d) + Vd$: twelve blocks of 7.08M plus 38.6M of
+    embedding. Double the depth and $N$ doubles; double the width and every
+    block quadruples — a 4096-wide block is **201,342,976** parameters, 28.4x
+    the 768-wide one, and 32 of them are **6.44B** before embeddings. Depth
+    and width are not interchangeable: depth buys serial rounds of
+    token-mixing and per-token computation, width buys capacity per round, and
+    the block is the only object in which both are counted.
+
+    **The residual stream is never normalised, so its norm grows — 3.30x
+    across twelve blocks at initialisation.** Each sublayer writes a fraction
+    of the stream's norm (0.20 for attention and 0.54 for the MLP at
+    $d = 768$ at init) and the writes are nearly orthogonal to each other
+    (cosine **0.014**), so the norms add in quadrature, not linearly: 222.0 to
+    732.8 in Frobenius norm over twelve blocks, a factor of **3.30**, or
+    1.105x per block. That growth is geometric, not $\sqrt{L}$: carried to 100
+    blocks the same ratio is roughly 21,000x. It is why the final norm is
+    mandatory — deleting it multiplies the logit scale by the stream RMS
+    (2.999 in the measured case) and moves mean max softmax probability from
+    **0.3214 to 0.7809**.
+
+    **The additive path is a Jacobian of $I + J_f$, which is why very deep
+    stacks train at all.** Differentiating the block gives
+    $\partial x_{\text{out}} / \partial x_{\text{in}} = I + \partial f /
+    \partial x$. Measured over twelve random blocks, the smallest singular
+    value of the composed Jacobian is **3.84e-2** with the additions and
+    **7.36e-13** without; the condition numbers are **232** and **2.3e12**. A
+    single block's Jacobian has $\sigma_{\max} = 1.89$ and
+    $\sigma_{\min} = 0.22$, while its sublayer alone has
+    $\sigma_{\min} = 4.2e-3$ — the identity is what keeps the product away
+    from zero. The trap is attributing this to LayerNorm: the placement of the
+    norm and the existence of the addition are separate decisions, and this
+    number is about the addition.
+
+    **The block is permutation-equivariant, so order enters through
+    attention's internals and nowhere else.** Permute the rows of the input
+    and every output row permutes identically — measured max difference
+    **4.4e-16**, which is float64 round-off rather than a small error.
+    Attention reweights positions but sums over them; the MLP touches each
+    token alone. A sum over a set has no opinion about order. This is why
+    positional encoding has to live inside the block — RoPE rotates $Q$ and
+    $K$ after the projection, an additive encoding is added to the embedding
+    before block 1 — and why bolting a position vector onto the block's output
+    accomplishes nothing.
+
+    **The KV cache is a block-level quantity: 36 KiB per token here, 7.1x the
+    block weights at 32k.** $2 L n_{kv} d_{\text{head}} n b$ bytes for an
+    $n$-token sequence is 3,072 bytes per token per layer and **36,864 bytes
+    per token**, so 144 MiB at 4k, **1.125 GiB at 32k**, 4.5 GiB at 128k —
+    against 162 MiB of fp16 block weights. The cache is not an
+    inference-team footnote; it is the fourth term in the block's cost, and at
+    32k it is seven times the weights it accompanies.
+
+    **Prefill is compute-bound and decode is bandwidth-bound, and both are the
+    same block.** Prefilling 1,024 tokens costs 212.6 GFLOP at about 1,206
+    FLOP/byte: 0.215 ms at an H100's 989 TFLOP/s peak, 0.72 ms at 30% MFU.
+    Decoding one token at 1,024 context costs 0.208 GFLOP but moves
+    **284.9 MB** — 169.9 MB block weights, 77.2 MB LM head, 37.7 MB cache —
+    which is **0.73 FLOP/byte**, 85.0 microseconds at 3.35 TB/s, a ceiling of
+    **11,759 tokens/s** at batch 1. The ridge point is 295 FLOP/byte, so
+    decode sits 400x below it: the tensor cores are idle and the kernel is a
+    memory copy. The same 1,024 tokens take 0.72 ms in prefill and 87 ms
+    decoded one at a time — **121x**.
+
+    **The LM head is part of the per-token cost, not an afterthought.** At
+    50,257 x 768 it is 38,597,376 parameters — **31.2%** of the model — and at
+    decode it is 77.2 MB of the 284.9 MB moved per token, **27.1%**, more than
+    the entire KV cache's 13.3%. Tying it to the embedding saves those
+    parameters but not the read: the full matrix is streamed once per token
+    whether or not it is shared, which is why small models are
+    disproportionately hurt by a large vocabulary.
+
+
+  derivations:
+    - title: "Block parameters, and why the MLP is exactly twice the attention"
+      latex: |
+        A bias-free pre-LN block at expansion factor $r = d_{ff}/d$ owns
+
+        $$W_Q, W_K, W_V, W_O \in \mathbb{R}^{d \times d}, \qquad
+          W_1 \in \mathbb{R}^{rd \times d}, \qquad
+          W_2 \in \mathbb{R}^{d \times rd},$$
+
+        plus two LayerNorms of $2d$ parameters each. Counting:
+
+        $$N_{\text{block}} = 4d^2 + 2rd^2 + 4d .$$
+
+        At $r = 4$ this is $12d^2 + 4d$; at $d = 768$ it evaluates to
+        $7{,}077{,}888 + 3{,}072 = 7{,}080{,}960$. The attention-to-MLP ratio is
+
+        $$\frac{4d^2}{2rd^2} = \frac{2}{r},$$
+
+        which is exactly $1/2$ at $r = 4$: the MLP is 66.64% of the block. A
+        gated MLP replaces $W_1$ with two matrices $W_1, W_3$ of the same shape,
+
+        $$N_{\text{block}}^{\text{SwiGLU}} = 4d^2 + 3rd^2 + 4d,$$
+
+        so preserving the $8d^2$ budget requires $3r = 8$, i.e.
+        $r = 8/3$. At $d = 4096$ that is $d_{ff} = 11{,}008$ and
+        $3 \cdot 4096 \cdot 11008 = 135{,}266{,}304$ against
+        $8d^2 = 134{,}217{,}728$ — 0.78% over, rather than the 50% that
+        $r = 4$ would cost.
+      prose: >-
+        The expansion factor is not a hyperparameter with a deep justification;
+        it is a ratio between two parameter counts. Four makes the MLP twice the
+        attention, which is the setting the original paper used and which
+        aspect-ratio studies found near-optimal at fixed budget. Once a gate
+        adds a third matrix, the same ratio has to be bought back by shrinking
+        the hidden width, and 8/3 is what that arithmetic produces.
+
+    - title: "Multiply-adds per token, and the 6d crossover"
+      latex: |
+        Per token, the four projections cost $4d^2$ MACs and the MLP costs
+        $2rd^2 = 8d^2$ at $r = 4$. These are independent of how many tokens are
+        in the sequence, because each token is projected once. The attention
+        matmuls are not: every token's query meets every token's key,
+
+        $$S = QK^\top \in \mathbb{R}^{n \times n}, \qquad
+          \text{MACs}(S) + \text{MACs}(PV) = 2n^2 d \Big/ n = 2nd$$
+
+        per token. So
+
+        $$\text{MACs/token} = 12d^2 + 2nd,$$
+
+        and the two terms are equal when
+
+        $$2nd = 12d^2 \;\Longrightarrow\; n^\star = 6d .$$
+
+        At $d = 768$, $n^\star = 4{,}608$. Doubling the context doubles the
+        attention term and nothing else, which is why the ratio at 128k is
+        $2 \cdot 768 \cdot 131072 / 12 \cdot 768^2 = 28.4$.
+
+        Multiplying by the token count and by 6 for training (2 forward, 4
+        backward) gives the standard estimate
+
+        $$C \approx 6ND, \qquad N = L\,N_{\text{block}} + Vd .$$
+      prose: >-
+        The 6d crossover is the boundary between two different machines. Below
+        it a token's cost is dominated by streaming $12d^2$ weights; above it by
+        an $n \times n$ score matrix that grows quadratically. Every
+        long-context efficiency technique — flash attention, sliding windows,
+        sparse attention — is an attack on the second term, and none of them
+        changes the first by a single multiply-add.
+
+    - title: "Why decode is bandwidth-bound: bytes per step and the roofline"
+      latex: |
+        One decode step must read, at minimum, every weight once and the whole
+        cache once:
+
+        $$B_{\text{step}} = \underbrace{N_{\text{blocks}}\,b}_{\text{block weights}}
+          + \underbrace{2\,L\,n_{kv}\,d_{\text{head}}\,n\,b}_{\text{KV cache}}
+          + \underbrace{V d\, b}_{\text{LM head}} .$$
+
+        At $d = 768$, $L = 12$, $n = 1024$, $b = 2$: $169.9$ MB of block
+        weights, 37.7 MB of cache, 77.2 MB of LM head, $B_{\text{step}} = 284.9$
+        MB. The arithmetic is
+
+        $$F_{\text{step}} = 2\left(12d^2 + 2nd\right)L = 0.208\ \text{GFLOP},$$
+
+        so the arithmetic intensity is
+
+        $$I = \frac{F_{\text{step}}}{B_{\text{step}}} = 0.73\ \text{FLOP/byte},$$
+
+        against the machine's ridge point $P/\text{BW} = 989/3.35 \approx 295$
+        FLOP/byte. The step time is set by the memory system:
+
+        $$t_{\text{step}} \ge \frac{B_{\text{step}}}{\text{BW}}
+          = \frac{284.9 \times 10^6}{3.35 \times 10^{12}} = 85.0\ \mu s,
+          \qquad \text{throughput} \le 11{,}759\ \text{tokens/s}.$$
+
+        Batching amortises the weight term over $B$ sequences while the cache
+        term grows with $B$; the intensity becomes roughly
+        $2BN/(Nb + B\cdot\text{cache})$, which is why large batches recover
+        tensor-core utilisation and small ones cannot.
+      prose: >-
+        The same block that runs at 1,206 FLOP/byte during prefill runs at 0.73
+        during decode — a factor of 1,650 — without a single parameter changing.
+        That collapse is the reason serving is a memory-planning problem: the
+        only levers that matter are the ones that reduce bytes per token, which
+        are batching (amortise weights), GQA (shrink the cache), and
+        quantisation (shrink both).
+
+  implementations:
+    - language: python
+      title: "A pre-LN block, counted and measured"
+      note: >-
+        Correct: this is the block as specified, and it prints the three numbers
+        the topic turns on — the 33/67 parameter split, the 1.105x per-block
+        growth of the stream, and the near-orthogonality of the two writes. It
+        is deliberately naive in one way that matters: it materialises the full
+        $n \times n$ score matrix per head, so at 32 heads and 32k tokens a
+        single block would ask for 128 GiB. That is a scheduling problem, not an
+        arithmetic one, which is exactly what the flash-attention topic fixes.
+        The `merge` helper is the part to read twice — `(n, h, d_head)` then
+        transpose, and the inverse must use the transposed shape.
+      code: |
+        import numpy as np
+
+        def ln(x, g, b, eps=1e-5):
+            mu = x.mean(-1, keepdims=True)
+            var = x.var(-1, keepdims=True)
+            return g * (x - mu) / np.sqrt(var + eps) + b
+
+        def softmax(z):
+            z = z - z.max(-1, keepdims=True)
+            e = np.exp(z)
+            return e / e.sum(-1, keepdims=True)
+
+        def gelu(z):
+            return 0.5 * z * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (z + 0.044715 * z ** 3)))
+
+        def attention(x, P, h):
+            n, d = x.shape
+            dh = d // h
+            split = lambda A: A.reshape(n, h, dh).transpose(1, 0, 2)
+            merge = lambda A: A.transpose(1, 0, 2).reshape(n, h * dh)
+            Q, K, V = (split(x @ P[w].T) for w in ("Wq", "Wk", "Wv"))
+            A = softmax(Q @ K.transpose(0, 2, 1) / np.sqrt(dh))
+            return merge(A @ V) @ P["Wo"].T
+
+        def block(x, P, h):
+            a = attention(ln(x, P["g1"], P["b1"]), P, h)
+            x1 = x + a
+            m = gelu(ln(x1, P["g2"], P["b2"]) @ P["W1"].T)
+            return x1 + m @ P["W2"].T, a, m
+
+        def init(d, ff, seed):
+            r = np.random.default_rng(seed)
+            s = 1.0 / np.sqrt(d)
+            return {"Wq": r.standard_normal((d, d)) * s, "Wk": r.standard_normal((d, d)) * s,
+                    "Wv": r.standard_normal((d, d)) * s, "Wo": r.standard_normal((d, d)) * s,
+                    "W1": r.standard_normal((ff, d)) * s, "W2": r.standard_normal((d, ff)) / np.sqrt(ff),
+                    "g1": np.ones(d), "b1": np.zeros(d), "g2": np.ones(d), "b2": np.zeros(d)}
+
+        d, h, ff, L, n = 768, 12, 3072, 12, 64
+        attn_p, mlp_p, norm_p = 4 * d * d, 2 * d * ff, 4 * d
+        print("params  attn %d  mlp %d  norms %d  block %d"
+              % (attn_p, mlp_p, norm_p, attn_p + mlp_p + norm_p))
+        print("mlp share %.4f" % (mlp_p / (attn_p + mlp_p + norm_p)))
+
+        X = np.random.default_rng(0).standard_normal((n, d))
+        x, norms = X.copy(), [np.linalg.norm(X)]
+        for l in range(L):
+            P = init(d, ff, 100 + l)
+            x, a, m = block(x, P, h)
+            norms.append(np.linalg.norm(x))
+        print("stream x0 %.1f -> x12 %.1f  growth %.4f  per block %.4f"
+              % (norms[0], norms[-1], norms[-1] / norms[0],
+                 (norms[-1] / norms[0]) ** (1.0 / L)))
+        print("MACs/token at n=1024: %d" % (12 * d * d + 2 * 1024 * d))
+        # params  attn 2359296  mlp 4718592  norms 3072  block 7080960
+        # mlp share 0.6664
+        # stream x0 222.0 -> x12 732.8  growth 3.3008  per block 1.1046
+        # MACs/token at n=1024: 8650752
+
+    - language: python
+      title: "Post-LN, and the final norm that is not there — numerically WRONG for this block"
+      note: >-
+        Both functions are wrong as implementations of the block specified
+        above, and they are here because both are what people write when they
+        copy the original paper's figure. `post_ln` puts the LayerNorm on the
+        residual path instead of on the branch: measured against the pre-LN
+        block on identical weights, one block differs by 57.06% in relative
+        Frobenius norm and twelve blocks differ by 107.67% — the two stacks are
+        further apart than the norm of either. Its output RMS is pinned to
+        exactly 1.0000 by construction, so after twelve blocks the logits have
+        standard deviation 1.004 against 2.999 for pre-LN — three times smaller,
+        and the softmax is correspondingly flatter (mean max probability 0.3214
+        pre-LN against 0.0285 post-LN, an 11x difference).
+        `pre_ln_no_final_norm` is the subtler bug: the block is correct and the
+        stack is not, because nothing ever normalises the stream. Its logits are
+        scaled by the stream RMS of 2.999, moving mean max probability from
+        0.3214 to 0.7809 — a model that looks confidently wrong rather than
+        obviously broken.
+      code: |
+        import numpy as np
+
+        def ln(x, g, b, eps=1e-5):
+            mu = x.mean(-1, keepdims=True)
+            var = x.var(-1, keepdims=True)
+            return g * (x - mu) / np.sqrt(var + eps) + b
+
+        def softmax(z):
+            z = z - z.max(-1, keepdims=True)
+            e = np.exp(z)
+            return e / e.sum(-1, keepdims=True)
+
+        def gelu(z):
+            return 0.5 * z * (1.0 + np.tanh(np.sqrt(2 / np.pi) * (z + 0.044715 * z ** 3)))
+
+        def attn(x, P, h):
+            n, d = x.shape
+            dh = d // h
+            sp = lambda A: A.reshape(n, h, dh).transpose(1, 0, 2)
+            mg = lambda A: A.transpose(1, 0, 2).reshape(n, h * dh)
+            Q, K, V = (sp(x @ P[w].T) for w in ("Wq", "Wk", "Wv"))
+            A = softmax(Q @ K.transpose(0, 2, 1) / np.sqrt(dh))
+            return mg(A @ V) @ P["Wo"].T
+
+        def pre_ln(x, P, h):
+            x = x + attn(ln(x, P["g1"], P["b1"]), P, h)
+            return x + gelu(ln(x, P["g2"], P["b2"]) @ P["W1"].T) @ P["W2"].T
+
+        def post_ln(x, P, h):
+            # WRONG for this block: the norm sits ON the residual path.
+            x = ln(x + attn(x, P, h), P["g1"], P["b1"])
+            return ln(x + gelu(x @ P["W1"].T) @ P["W2"].T, P["g2"], P["b2"])
+
+        def init(d, ff, seed):
+            r = np.random.default_rng(seed)
+            s = 1 / np.sqrt(d)
+            return {"Wq": r.standard_normal((d, d)) * s, "Wk": r.standard_normal((d, d)) * s,
+                    "Wv": r.standard_normal((d, d)) * s, "Wo": r.standard_normal((d, d)) * s,
+                    "W1": r.standard_normal((ff, d)) * s, "W2": r.standard_normal((d, ff)) / np.sqrt(ff),
+                    "g1": np.ones(d), "b1": np.zeros(d), "g2": np.ones(d), "b2": np.zeros(d)}
+
+        d, ff, h, n, L = 8, 32, 2, 64, 12
+        X = np.random.default_rng(7).standard_normal((n, d))
+        a, b = pre_ln(X, init(d, ff, 1), h), post_ln(X, init(d, ff, 1), h)
+        print("one block  rel diff %.4f" % (np.linalg.norm(a - b) / np.linalg.norm(a)))
+
+        xa = xb = X.copy()
+        for l in range(L):
+            P = init(d, ff, 100 + l)
+            xa, xb = pre_ln(xa, P, h), post_ln(xb, P, h)
+        print("twelve      rel diff %.4f  norms %.2f vs %.2f"
+              % (np.linalg.norm(xa - xb) / np.linalg.norm(xa),
+                 np.linalg.norm(xa), np.linalg.norm(xb)))
+
+        WU = np.random.default_rng(3).standard_normal((1000, d)) / np.sqrt(d)
+        for name, z in (("pre-LN ", xa), ("post-LN", xb)):
+            print(name, "logit std %.3f  max prob %.4f"
+                  % ((z @ WU.T).std(), softmax(z @ WU.T).max(1).mean()))
+        # one block  rel diff 0.5706
+        # twelve      rel diff 1.0767  norms 67.86 vs 22.63
+        # pre-LN  logit std 2.999  max prob 0.3214
+        # post-LN logit std 1.004  max prob 0.0285
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        Write down the parameter count of one block at $d = 768$, 12 heads,
+        $d_{ff} = 3072$, and say which component is largest and by what factor.
+        Then explain why neither the head count nor the context length appears
+        anywhere in your answer.
+      answerKind: short_text
+      hint: >-
+        Count matrices, not layers. Four of them are $768 \times 768$; two are
+        $768 \times 3072$ or the transpose. The two LayerNorms are not zero, but
+        they are also not the story.
+      solution: >-
+        Attention: four $768 \times 768$ matrices, $4 \times 589{,}824 =
+        2{,}359{,}296$. MLP: $768 \times 3072$ up and $3072 \times 768$ down,
+        $2 \times 2{,}359{,}296 = 4{,}718{,}592$. LayerNorms: $4 \times 768 =
+        3{,}072$. Total 7,080,960. The MLP is exactly twice the attention
+        (2.0x) and 66.64% of the block. Head count does not appear because
+        splitting $d_{\text{model}}$ into $h$ heads of width $d/h$ leaves
+        $h \cdot d \cdot (d/h) = d^2$ unchanged — the invariance derived in
+        Multi-Head Attention. Context length does not appear because parameters
+        are per position, not per token seen; only the attention *matmuls* grow
+        with $n$, and they have no weights.
+    - id: cp-2
+      question: >-
+        At what context length do a block's two attention matmuls cost as much
+        as all of its weight matmuls, and why is the answer exactly $6d$? Give
+        the number for $d = 768$ and for a 4096-wide block with an 11008-wide
+        MLP.
+      answerKind: short_text
+      hint: >-
+        Weight matmuls are $4d^2$ for Q, K, V, O plus $2d\,d_{ff}$ for the MLP.
+        Attention matmuls are $2nd$ per token. Set them equal and solve for $n$.
+      solution: >-
+        $2nd = 4d^2 + 2d\,d_{ff}$, so $n^\star = 2d + d_{ff}$ — which is
+        $6d$ when $d_{ff} = 4d$. At $d = 768$ that is 4,608 tokens; at
+        $d = 4096$ with $d_{ff} = 11008$ it is $8192 + 11008 = 19{,}200$
+        tokens. Above the crossover the block is attention-bound: at 32,768
+        tokens and $d = 768$ the attention term is 50,331,648 MACs against
+        7,077,888, so 87.7% of the block's arithmetic is in the two matmuls
+        whose size is quadratic in context.
+    - id: cp-3
+      question: >-
+        Your 12-block model produces logits whose scale is about 3x too large,
+        the loss starts high and the softmax is far too peaked. Every block's
+        forward pass is correct. What is missing, and what exactly does it
+        change?
+      answerKind: short_text
+      hint: >-
+        Pre-LN never normalises the stream, and the stream grows by a factor of
+        1.105 per block at init. What was supposed to convert the stream into
+        something the unembedding can read?
+      solution: >-
+        The final LayerNorm is missing. Pre-LN leaves the residual stream
+        unnormalised by construction, and it grows 3.30x over twelve blocks, so
+        the unembedding receives vectors 2.999x larger than it expects. Every
+        logit is multiplied by that factor, which sharpens the softmax —
+        measured as mean max probability moving from 0.3214 with the final norm
+        to 0.7809 without it. The symptom looks like a learning-rate or
+        temperature problem, which is why it survives code review: every block is
+        individually correct and the error is in what is not there.
+    - id: cp-4
+      question: >-
+        You delete the two residual additions "to simplify the block" and keep
+        everything else — same norms, same widths, same depth. What happens to
+        the Jacobian of the twelve-block stack, and what does that predict about
+        training?
+      answerKind: short_text
+      hint: >-
+        Differentiate $x + f(\operatorname{LN}(x))$ and then
+        $f(\operatorname{LN}(x))$. One of them has a $+I$ in it.
+      solution: >-
+        With the additions the block Jacobian is $I + J_f$, and the composed
+        12-block Jacobian has smallest singular value 3.84e-2 with condition
+        number 232. Without them it is a product of twelve sublayer Jacobians,
+        whose smallest singular value is 7.36e-13 and whose condition number is
+        2.3e12. Gradients reaching the embedding are multiplied by that product,
+        so directions that the sublayers shrink are annihilated over twelve
+        factors: training either stalls or needs per-layer normalisation
+        (which is exactly what post-LN is trying to be) and careful
+        initialisation. The measured claim is about the addition, not about
+        LayerNorm — the two decisions are independent.
+    - id: cp-5
+      question: >-
+        Prefill of 1,024 tokens takes 0.72 ms; decoding the same 1,024 tokens
+        takes 87 ms. The per-token FLOPs are identical. Account for the 121x
+        difference, and say which change you would make first.
+      answerKind: short_text
+      hint: >-
+        Compute FLOPs per byte moved for both. Compare each against the
+        machine's ridge point.
+      solution: >-
+        Prefill moves ~176 MB and does 212.6 GFLOP — about 1,206 FLOP/byte,
+        four times above the 295 FLOP/byte ridge point, so it is compute-bound
+        and the weights are read once for a thousand tokens. Decode moves
+        284.9 MB per token (169.9 MB block weights, 77.2 MB LM head, 37.7 MB
+        cache) for 0.208 GFLOP — 0.73 FLOP/byte, 400x below the ridge point — so
+        each step costs bytes/bandwidth = 85 microseconds and the tensor cores
+        are idle. The first fix is batching: the weight term amortises over B
+        sequences while the cache term grows with B, so intensity rises roughly
+        linearly until the cache dominates. After that, GQA to shrink the cache
+        and weight quantisation to shrink both terms; neither changes the block's
+        arithmetic, only its bytes.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A block is not "attention plus some extra bits". It is two functions
+        that never see each other's output directly, both reading a shared
+        vector and both writing back into it by addition. The shared vector is
+        the model's memory; the functions are transient computations over it.
+
+        Two consequences follow immediately, and both are testable. Because the
+        writes are additions, the shared vector's magnitude drifts upward with
+        depth, and something at the end has to absorb that. Because attention
+        sums over positions and the MLP treats positions independently, the
+        whole block is indifferent to the order of its inputs — so order has to
+        enter from inside attention, not from the block's structure.
+      blocks:
+        - kind: checklist
+          body: |
+            - Two sublayers, two additions, one stream
+            - The norm sees a copy; the stream is never normalised in place
+            - Attention is the only cross-token operation
+            - The MLP is per-token and holds most of the parameters
+            - The stream grows with depth; a final norm absorbs it
+            - The block preserves shape, so it stacks
+      checkpoint: >-
+        Before reading on: which operation in the block can change one token
+        based on another token, and which one cannot? If you can answer that,
+        you already know why positional encoding has to live where it does.
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Every number in this topic comes from one of two counts, and they answer
+        different questions. Count *matrices and their shapes* to get parameters:
+        four $d \times d$ for attention, two $d \times d_{ff}$ for the MLP, and
+        $4d$ for the norms. Count *multiply-adds per token* to get compute: the
+        projections are per-token and therefore context-independent, while the
+        score and value products are per pair and therefore quadratic.
+
+        For anything about inference, stop counting FLOPs and count bytes. A
+        decode step must read every weight and the entire cache; divide that by
+        bandwidth and you have the step time, with no GPU model required. That
+        single change of units explains why the same block is fast in prefill and
+        slow in decode.
+      blocks:
+        - kind: checklist
+          body: |
+            - Parameters = matrices, weighted by their shapes
+            - FLOPs per token = per-token terms + per-pair terms
+            - The per-pair term is $2nd$ and it is the only one that grows
+            - Bytes per decode step = weights + cache + LM head
+            - Time per decode step = bytes / bandwidth, not FLOPs / throughput
+            - Compare intensity to the ridge point before optimising anything
+      checkpoint: >-
+        Which of those two counts would change if you doubled the head count
+        while holding the width fixed? Neither — and being able to say why in one
+        sentence is the whole invariance argument from the attention topics.
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Write the block as four lines before you write any matmul, then expand
+        each line into shapes. The order is the specification: norm, sublayer,
+        add — twice — and one final norm at the end of the stack.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # the block, per layer
+            a  = attention(norm_1(x))        # (n, d) -> (n, d)
+            x1 = x + a                       # residual write, no parameters
+            m  = mlp(norm_2(x1))             # (n, d) -> (n, d)
+            y  = x1 + m                      # residual write
+
+            # the stack
+            for l in range(L):
+                x = block_l(x)
+            x = final_norm(x)                # mandatory for pre-LN
+            logits = x @ W_unembed.T
+
+            # the cost, per token, per block
+            weight_macs = 4*d*d + 2*d*d_ff   # = 12 d^2 when d_ff = 4d
+            attn_macs   = 2*n*d              # scores + AV
+            crossover   = weight_macs / (2*d)  # = 2d + d_ff = 6d
+
+            # the decode step
+            bytes = N_model*b + 2*L*n_kv*d_head*n*b + V*d*b
+            seconds_per_token >= bytes / bandwidth
+      checkpoint: >-
+        In the pseudocode, `weight_macs` contains no `n` and `attn_macs`
+        contains no `d_ff`. At n = 65,536 and d = 768, what fraction of the
+        block's arithmetic lives in the term that grows with context — and which
+        of the two terms would you attack first once that fraction passes 90%?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three counts, each one line of algebra, and one inequality.
+      blocks:
+        - kind: math
+          body: |
+            Parameters. Four attention matrices, two MLP matrices, two norms:
+
+            $$N_{\text{block}} = 4d^2 + 2r d^2 + 4d = 12d^2 + 4d \quad (r = 4),$$
+
+            so attention : MLP $= 4d^2 : 2rd^2 = 2 : r = 1 : 2$, and the
+            MLP holds $8/12 = 66.64\%$ of the block.
+
+            FLOPs per token. Per-token terms plus per-pair terms:
+
+            $$\text{MACs} = 4d^2 + 8d^2 + 2nd = 12d^2 + 2nd,
+              \qquad n^\star = \frac{12d^2}{2d} = 6d .$$
+
+            At $d = 768$: 7,077,888 + 1,536n, crossover 4,608.
+
+            Scaling. With $N = L\,N_{\text{block}} + Vd$ and 6 FLOPs per
+            parameter per token (2 forward, 4 backward):
+
+            $$C \approx 6ND .$$
+
+            Decode bound. Bytes per step over bandwidth:
+
+            $$t \ge \frac{Nb + 2L n_{kv} d_{\text{head}} n b + Vdb}{\text{BW}}
+              = \frac{284.9 \times 10^6}{3.35 \times 10^{12}}
+              = 85.0\ \mu s,$$
+
+            at 0.73 FLOP/byte against a 295 FLOP/byte ridge point.
+      checkpoint: >-
+        The parameter count has no $n$ in it and the FLOP count has no $d_{ff}$
+        in its per-pair term. Which quantity in this topic is the only one that
+        depends on both depth and context at once?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The block, the counter, and the three diagnostics that tell you the
+        assembly is the one you meant: the parameter split should be 33/67, the
+        stream should grow about 1.1x per block, and the LM head should be about
+        a quarter of the bytes you move per decoded token.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the diagnostics before the code. A block that runs is not a
+            block that is right: post-LN runs, has the same parameter count, and
+            differs from pre-LN by 57% on one block and 108% over twelve. A
+            stack with no final norm runs and produces logits scaled by 3.0. A
+            block with the MLP expansion copied at 4x into a SwiGLU variant runs
+            and is 50% larger than advertised. None of these raise.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def ln(x, g, b, eps=1e-5):
+                mu = x.mean(-1, keepdims=True)
+                var = x.var(-1, keepdims=True)
+                return g * (x - mu) / np.sqrt(var + eps) + b
+
+            def softmax(z):
+                z = z - z.max(-1, keepdims=True)
+                e = np.exp(z)
+                return e / e.sum(-1, keepdims=True)
+
+            def gelu(z):
+                return 0.5 * z * (1.0 + np.tanh(np.sqrt(2 / np.pi) * (z + 0.044715 * z ** 3)))
+
+            def block(x, P, h):
+                n, d = x.shape
+                dh = d // h
+                sp = lambda A: A.reshape(n, h, dh).transpose(1, 0, 2)
+                mg = lambda A: A.transpose(1, 0, 2).reshape(n, h * dh)
+                a_in = ln(x, P["g1"], P["b1"])
+                Q, K, V = (sp(a_in @ P[w].T) for w in ("Wq", "Wk", "Wv"))
+                A = softmax(Q @ K.transpose(0, 2, 1) / np.sqrt(dh))
+                x1 = x + mg(A @ V) @ P["Wo"].T          # add 1
+                m = gelu(ln(x1, P["g2"], P["b2"]) @ P["W1"].T)
+                return x1 + m @ P["W2"].T               # add 2
+
+            def stack(x, Ps, h, g_f, b_f):
+                for P in Ps:
+                    x = block(x, P, h)
+                return ln(x, g_f, b_f)                  # final norm
+
+            def cost(d, d_ff, n, L, n_kv=None, d_head=None, b=2, V=0):
+                n_kv = n_kv or d // 64
+                d_head = d_head or d // (d // 64)
+                weight = 4 * d * d + 2 * d * d_ff
+                macs = weight + 2 * n * d
+                nbytes = L * (4 * d * d + 2 * d * d_ff) * b \
+                         + 2 * L * n_kv * d_head * n * b + V * d * b
+                return {"block_params": weight + 4 * d,
+                        "macs_per_token": macs,
+                        "crossover": weight / (2 * d),
+                        "bytes_per_decode_step": nbytes,
+                        "intensity": 2 * macs * L / nbytes}
+      checkpoint: >-
+        `cost` returns intensity for a decode step. What does it return if you
+        pass `n = 1` and no cache term, and why is that number the wrong one to
+        quote for serving?
+
+  problems:
+    - id: p-block-params
+      title: "Count the block"
+      difficulty: easy
+      prompt: >-
+        Implement `block_params(d_model, d_ff, n_heads, bias=False, glu=False)`
+        returning a dict with exactly the keys `attention`, `mlp`, `norms`,
+        `total` and `mlp_share`. Attention is four `d_model x d_model`
+        matrices, plus `4 * d_model` bias terms when `bias` is true. The MLP is
+        two matrices of `d_model x d_ff` (or three when `glu` is true, for
+        SwiGLU's gate), plus `d_ff + d_model` bias terms when `bias` is true.
+        `norms` counts two LayerNorms with both gamma and beta, so `4 *
+        d_model`. `total` is their sum and `mlp_share` is `mlp / total` as a
+        float. `n_heads` must not affect any value.
+      starter: |
+        def block_params(d_model, d_ff, n_heads, bias=False, glu=False):
+            # your implementation here
+            pass
+      language: python
+      entry: block_params
+      testCases:
+        - input: '[768, 3072, 12, false, false]'
+          expected: '{"attention": 2359296, "mlp": 4718592, "norms": 3072, "total": 7080960, "mlp_share": 0.6663774403470716}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[768, 3072, 1, false, false]'
+          expected: '{"attention": 2359296, "mlp": 4718592, "norms": 3072, "total": 7080960, "mlp_share": 0.6663774403470716}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[768, 3072, 12, true, false]'
+          expected: '{"attention": 2362368, "mlp": 4722432, "norms": 3072, "total": 7087872, "mlp_share": 0.66626936829559}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[4096, 11008, 32, false, true]'
+          expected: '{"attention": 67108864, "mlp": 135266304, "norms": 16384, "total": 202391552, "mlp_share": 0.6683396745729783}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[4096, 16384, 32, false, false]'
+          expected: '{"attention": 67108864, "mlp": 134217728, "norms": 16384, "total": 201342976, "mlp_share": 0.6666124176092441}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[768, 3072, 12, false, true]'
+          expected: '{"attention": 2359296, "mlp": 7077888, "norms": 3072, "total": 9440256, "mlp_share": 0.7497559388219981}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[512, 2048, 8, true, false]'
+          expected: '{"attention": 1050624, "mlp": 2099712, "norms": 2048, "total": 3152384, "mlp_share": 0.6660711385414975}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def block_params(d_model, d_ff, n_heads, bias=False, glu=False):
+            d, ff = int(d_model), int(d_ff)
+            attention = 4 * d * d + (4 * d if bias else 0)
+            mlp = (3 if glu else 2) * d * ff + ((ff + d) if bias else 0)
+            norms = 4 * d
+            total = attention + mlp + norms
+            return {"attention": attention, "mlp": mlp, "norms": norms,
+                    "total": total, "mlp_share": mlp / total}
+      solutionExplanation: >-
+        The first two cases are the same config with 12 heads and with 1 head,
+        and the answers are identical down to the last float: a projection's
+        parameter count is $d \times d$ whether you call it one head or twelve,
+        because $h \cdot d \cdot (d/h) = d^2$. If your `attention` value changes
+        when `n_heads` changes, you have written the per-head count and forgotten
+        to multiply by $h$ — or counted only one of Q, K, V. The third case adds
+        biases: $4 \times 768$ in attention and $3072 + 768$ in the MLP, which
+        moves the MLP share by 0.01 percentage points — biases are noise in the
+        accounting, which is why modern models drop them. The fourth and fifth
+        cases are the SwiGLU comparison: same width, same hidden width in one
+        sense, but the gate makes the MLP 50% more expensive at $d_{ff} = 4d$
+        (7,077,888 against 4,718,592 in the sixth case); the LLaMA setting
+        $d_{ff} = 11008 = \tfrac{8}{3} \cdot 4096$ lands at 135,266,304, which is
+        0.78% over the 134,217,728 of the ungated $4d$ MLP. The last case is a
+        512-wide block with biases, small enough to check by hand: 4 x 262,144 +
+        2,048 = 1,050,624.
+      complexity: "O(1) time and space"
+      tags: [parameter-count, mlp, swiglu, block-anatomy]
+
+    - id: p-block-cost
+      title: "The per-token cost and the crossover"
+      difficulty: medium
+      prompt: >-
+        Implement `block_cost(d_model, d_ff, n_heads, n_ctx)` returning a dict
+        with the float keys `weight_macs`, `attention_macs`, `macs_per_token`,
+        `attention_share` and `crossover_ctx`. The weight matmuls are the four
+        attention projections at `4 * d_model^2` plus the MLP at
+        `2 * d_model * d_ff`. The attention matmuls are the score and value
+        products at `2 * n_ctx * d_model` per token. `attention_share` is
+        `attention_macs / macs_per_token`, and `crossover_ctx` is the context
+        length at which the two terms are equal — solve for it rather than
+        hard-coding 4608. Head count does not enter any of these numbers.
+      starter: |
+        def block_cost(d_model, d_ff, n_heads, n_ctx):
+            # your implementation here
+            pass
+      language: python
+      entry: block_cost
+      testCases:
+        - input: '[768, 3072, 12, 1024]'
+          expected: '{"weight_macs": 7077888.0, "attention_macs": 1572864.0, "macs_per_token": 8650752.0, "attention_share": 0.18181818181818182, "crossover_ctx": 4608.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[768, 3072, 12, 4608]'
+          expected: '{"weight_macs": 7077888.0, "attention_macs": 7077888.0, "macs_per_token": 14155776.0, "attention_share": 0.5, "crossover_ctx": 4608.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[768, 3072, 12, 32768]'
+          expected: '{"weight_macs": 7077888.0, "attention_macs": 50331648.0, "macs_per_token": 57409536.0, "attention_share": 0.8767123287671232, "crossover_ctx": 4608.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[4096, 11008, 32, 8192]'
+          expected: '{"weight_macs": 157286400.0, "attention_macs": 67108864.0, "macs_per_token": 224395264.0, "attention_share": 0.29906542056074764, "crossover_ctx": 19200.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[512, 2048, 8, 1]'
+          expected: '{"weight_macs": 3145728.0, "attention_macs": 1024.0, "macs_per_token": 3146752.0, "attention_share": 0.0003254149040026033, "crossover_ctx": 3072.0}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def block_cost(d_model, d_ff, n_heads, n_ctx):
+            d, ff, n = int(d_model), int(d_ff), int(n_ctx)
+            weight = 4 * d * d + 2 * d * ff
+            attn = 2 * n * d
+            return {"weight_macs": float(weight),
+                    "attention_macs": float(attn),
+                    "macs_per_token": float(weight + attn),
+                    "attention_share": attn / (weight + attn),
+                    "crossover_ctx": float(weight / (2 * d))}
+      solutionExplanation: >-
+        Two details decide this. First, the MLP term is `2 * d * d_ff` and not
+        `d * d_ff`: there is an up-projection and a down-projection, each
+        $d \times d_{ff}$ multiply-adds per token, and dropping one makes every
+        answer a third too small (8d² instead of 12d²). Second,
+        `crossover_ctx` must be derived:
+        $2nd = 4d^2 + 2d\,d_{ff}$ gives $n = 2d + d_{ff}$, which is 4,608 at
+        $d = 768$ and 19,200 at $d = 4096$ with $d_{ff} = 11008$. The fourth case
+        is the one that catches a hard-coded 4608 — a 4096-wide SwiGLU block
+        crosses over at 19,200 tokens, four times later, because its weight
+        matmuls are 22 times larger while its per-token attention term is only
+        5.3 times larger. The second case sits exactly on the crossover and must
+        return an attention share of exactly 0.5; the fifth is the $n = 1$ limit,
+        where attention is 0.03% of the cost — the regime in which "2 FLOPs per
+        parameter per token" is true.
+      complexity: "O(1) time and space"
+      tags: [flops, crossover, arithmetic-intensity, block-anatomy]
+
+    - id: p-preln-block
+      title: "One full forward pass of a pre-LN block"
+      difficulty: hard
+      prompt: >-
+        Implement `preln_block(X, P, n_heads)`, one complete pre-LN transformer
+        block with no mask, returning the $(n, d)$ output as nested lists.
+        `X` is $(n, d)$; `P` holds the weights as nested lists with the output
+        feature first: `Wq`, `Wk`, `Wv`, `Wo` are $(d, d)$, `W1` is
+        $(d_{ff}, d)$, `W2` is $(d, d_{ff})$, `g1`, `g2` are the LayerNorm gains
+        and `b1`, `b2` the biases, each of length $d$. There are no MLP or
+        attention biases. Use LayerNorm with `eps = 1e-5` over the feature axis,
+        split heads as contiguous blocks of columns, scale scores by
+        `sqrt(d / n_heads)`, use a numerically stable softmax per head, and use
+        the tanh approximation of GELU:
+        `0.5 * z * (1 + tanh(sqrt(2/pi) * (z + 0.044715 * z**3)))`. The order is
+        norm, attention, add, norm, MLP, add — and no final norm.
+      starter: |
+        import numpy as np
+
+        def preln_block(X, P, n_heads):
+            # your implementation here
+            pass
+      language: python
+      entry: preln_block
+      testCases:
+        - input: '[[[1.0, 2.0, 3.0, 4.0]], {"Wq": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], "Wk": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], "Wv": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], "Wo": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], "W1": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [2.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [0.0, 0.0, 0.0, 2.0]], "W2": [[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], "g1": [1.0, 1.0, 1.0, 1.0], "b1": [0.0, 0.0, 0.0, 0.0], "g2": [1.0, 1.0, 1.0, 1.0], "b2": [0.0, 0.0, 0.0, 0.0]}, 2]'
+          expected: "[[-0.6284971692412464, 2.1347295024954764, 6.4219840295049515, 6.5624864696499055]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], {"Wq": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], "Wk": [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], "Wv": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [0.0, 0.0, 0.0, 2.0]], "Wo": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], "W1": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, -1.0]], "W2": [[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], "g1": [1.0, 1.0, 1.0, 1.0], "b1": [0.0, 0.0, 0.0, 0.0], "g2": [1.0, 1.0, 1.0, 1.0], "b2": [0.0, 0.0, 0.0, 0.0]}, 2]'
+          expected: "[[2.1163298028942763, 0.1676480636952422, 3.6532731654820205, -1.2439567047357984], [-0.7643015608822012, 0.7368758176361203, 3.8299909783312387, -1.2847428147004927], [0.7690623648602413, 0.8348036812594741, 1.8819267318615274, -1.230378245610533]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.5, -1.0, 2.0, 0.0], [1.0, 1.0, -1.0, 2.0]], {"Wq": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], "Wk": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], "Wv": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], "Wo": [[0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]], "W1": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0], [2.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [0.0, 0.0, 0.0, 2.0]], "W2": [[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], "g1": [2.0, 1.0, 1.0, 0.5], "b1": [0.1, -0.1, 0.0, 0.2], "g2": [1.0, 1.0, 1.0, 1.0], "b2": [0.0, 0.0, 0.0, 0.0]}, 2]'
+          expected: "[[-0.7806184519535058, 1.7247119584537713, 4.468309161838006, 1.9185241357024432], [3.463069293255238, 2.874662399675571, -0.4741750521781986, 0.3942949863848702]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def preln_block(X, P, n_heads):
+            X = np.asarray(X, dtype=np.float64)
+            g = {k: np.asarray(v, dtype=np.float64) for k, v in P.items()}
+            n, d = X.shape
+            h = int(n_heads)
+            dh = d // h
+            eps = 1e-5
+
+            def ln(x, gamma, beta):
+                mu = x.mean(axis=-1, keepdims=True)
+                var = x.var(axis=-1, keepdims=True)
+                return gamma * (x - mu) / np.sqrt(var + eps) + beta
+
+            def split(A):
+                return A.reshape(n, h, dh).transpose(1, 0, 2)
+
+            def merge(A):
+                return A.transpose(1, 0, 2).reshape(n, h * dh)
+
+            a = ln(X, g["g1"], g["b1"])
+            Q, K, V = (split(a @ g[w].T) for w in ("Wq", "Wk", "Wv"))
+            S = Q @ np.transpose(K, (0, 2, 1)) / np.sqrt(dh)
+            S = S - S.max(axis=-1, keepdims=True)
+            E = np.exp(S)
+            A = E / E.sum(axis=-1, keepdims=True)
+            x1 = X + merge(A @ V) @ g["Wo"].T
+            m = ln(x1, g["g2"], g["b2"])
+            Z = m @ g["W1"].T
+            H = 0.5 * Z * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (Z + 0.044715 * Z ** 3)))
+            return (x1 + H @ g["W2"].T).tolist()
+      solutionExplanation: >-
+        Every failure mode of this problem is a placement, not a formula. The
+        first case has a single token, so every softmax row is exactly 1 and the
+        attention sublayer reduces to $W_V^\top W_O^\top = I$ applied to the
+        *normalised* input: the block returns $x + \operatorname{LN}(x)$ plus
+        the MLP term. If your answer differs there, the bug is in the residual
+        placement — you replaced $x$ instead of adding to it, or you normalised
+        the stream rather than a copy of it. The second case is
+        where head splitting shows up: `Wk` reverses the features, so head 0
+        (features 0-1) and head 1 (features 2-3) compute different score
+        matrices, and a split by stride instead of by contiguous block gives a
+        different answer with identical shapes. The third case puts non-unit
+        `g1` and non-zero `b1` in, which is the only case that distinguishes
+        normalising before the sublayer from normalising after the add: post-LN
+        differs from pre-LN by 57% in relative Frobenius norm on the same
+        weights. The GELU must be the tanh approximation as written — the exact
+        erf form is a different function at the 1e-3 level, which is far outside
+        the tolerance.
+      complexity: "O(n^2 d + n d d_ff) time, O(n^2 h) space for the score matrices"
+      tags: [transformer-block, pre-norm, residual, gelu, forward-pass]
+
+  visualizers:
+    - id: vs-block-cost
+      kind: computation_graph
+      title: "One block: parameters, FLOPs, and bytes in the same picture"
+      description: >-
+        Move the width, the expansion factor, and the context length and watch
+        three numbers move at different rates: parameters as 12 d^2, per-token
+        multiply-adds as 12 d^2 + 2 n d, and bytes per decode step as
+        2 L (12 d^2) + 2 L n_kv d_head n. At 768 wide the attention term
+        overtakes the weight term at 4,608 tokens; at 4096 wide, at 19,200.
+      params:
+        d_model: 768
+        n_heads: 12
+        expansion: 4
+        n_layers: 12
+        contexts: [1024, 4608, 8192, 32768, 131072]
+    - id: vs-residual-stream
+      kind: tensor
+      title: "The stream grows: twelve blocks of additive writes"
+      description: >-
+        Each block writes a fraction of the stream's norm back into it, and the
+        writes are nearly orthogonal, so the norm grows by 1.105x per block at
+        initialisation — 3.30x over twelve blocks. Remove the writes and the
+        composed Jacobian's smallest singular value falls from 3.8e-2 to 7.4e-13.
+      params:
+        d_model: 768
+        n_blocks: 12
+        write_ratio: 0.55
+        show_jacobian: true
+
+
+  try_it: >-
+    Count the parameters of one 768-wide block by hand — four attention projections at $4d^2$,
+    two MLP matrices at $4d^2$ each, plus biases — and check the total against 7,080,960. Then
+    set $d = 4096$ and confirm the block is 201,342,976, 28.4x the 768-wide one.
+  interview_questions:
+    - question: 'Where do a block parameters go, and why is the MLP two thirds of them?'
+      level: mid
+      key_points:
+        - 'Attention is 4d^2 = 2,359,296 and the MLP 8d^2 = 4,718,592 at d = 768, a ratio of exactly 2.0.'
+        - 'That makes the MLP 66.64% of block parameters, and nothing forces d_ff = 4d.'
+        - 'What the 4 buys is a fixed 2:1 split between per-token nonlinear capacity and per-token mixing.'
+        - 'The split is why MoE can sparsify the FFN alone and still touch two thirds of the parameters.'
+    - question: 'Prefill is compute-bound and decode is bandwidth-bound on the same block. Give both numbers and say what each optimisation buys.'
+      level: senior
+      key_points:
+        - 'Prefilling 1,024 tokens costs 212.6 GFLOP at about 1,206 FLOP/byte, which is 0.72 ms at 30% MFU on an H100.'
+        - 'Decoding one token at 1,024 context costs 0.208 GFLOP but moves 284.9 MB, three orders of magnitude lower intensity.'
+        - 'So prefill optimises FLOPs: fusion, larger tiles, tensor-core utilisation.'
+        - 'Decode optimises bytes: quantised weights, a smaller KV cache, and batching to amortise the weight read.'
+      follow_up: 'At what batch size does decode stop being bandwidth-bound for this block, and does that number depend on context length?'
+    - question: 'Why does the residual stream grow, and what does that force you to add?'
+      level: mid
+      key_points:
+        - 'The stream is never normalised: each sublayer writes additively into it and the writes are nearly orthogonal, with a measured cosine of 0.014.'
+        - 'Each write is a fraction of the stream norm, 0.20 for attention and 0.54 for the MLP at d = 768 at initialisation.'
+        - 'The measured growth is 3.30x across twelve blocks, so the norm depends on depth.'
+        - 'That is why a final LayerNorm is mandatory before the unembedding: otherwise the logits inherit a depth-dependent scale.'
+  common_mistakes:
+    - 'Skipping the final LayerNorm because pre-norm keeps each block stable, then feeding a stream grown 3.3x to the unembedding.'
+    - 'Following the original paper post-norm diagram, which puts a normalisation on the identity path and forces warmup and clipping at twelve layers.'
+    - 'Sizing decode by parameter count, when the LM head alone is 77.2 MB of the 284.9 MB moved per token at 1,024 context.'
+  further_reading:
+    - label: "Vaswani, Shazeer, Parmar, Uszkoreit, Jones, Gomez, Kaiser & Polosukhin, Attention Is All You Need (NeurIPS 2017)"
+    - label: "Xiong, Yang, He, Zheng, Zheng, Xing, Zhang, Lan, Wang & Liu, On Layer Normalization in the Transformer Architecture (ICML 2020)"

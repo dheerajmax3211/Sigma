@@ -1,0 +1,624 @@
+id: voice-agents-streaming
+slug: voice-agents-streaming
+title: "Full-Duplex Voice Agents: Budgeting 800 Milliseconds"
+summary: >-
+  A voice agent that feels natural is a latency budget, not a model: seven serial
+  terms from microphone frame to loudspeaker sample, each with its own tail, that
+  must add up to under 800 ms — and the only term that is a policy rather than a
+  computation is endpointing, which is why the biggest wins come from turn
+  detection and streaming rather than from a faster model.
+kind: lesson
+difficulty: expert
+position: 4
+estMinutes: 24
+prerequisites: [automatic-speech-recognition]
+
+body:
+  big_idea: >-
+    Full duplex means the agent listens while it speaks, so what matters is
+    the serial chain from end of turn to first sample heard: capture,
+    endpointing, ASR, orchestration, first token, first audio chunk, playback
+    buffer.
+  problem:
+    - "Your pipeline is fast by every individual measure and still feels slow: the terms are serial and each one's tail is worse than its median."
+    - "You set a 500 ms silence timeout: fast speakers get cut off, slow speakers wait after every clause, and neither group is wrong."
+    - "Barge-in works in a demo and fails in a room: the agent's own voice leaks into the microphone and the VAD fires on it."
+  analogy: >-
+    A simultaneous interpreter in a booth. She does not wait for the
+    paragraph: she starts on the first clause, keeps half a sentence of
+    buffer, and adjusts when the sentence turns out to be a question. She
+    stops instantly at "no, wait" — that is barge-in — and needs no stopwatch
+    to tell a pause for breath from a finished thought.
+  concept_points:
+    - "**Serial latency adds, so the budget is a sum, not a maximum.** Seven terms — 20 ms capture and jitter buffer, 200 ms endpointing, 100 ms ASR finalisation, 40 ms orchestration, 250 ms to the LLM's first token, 150 ms to the TTS's first chunk, 40 ms playback buffer — sum to exactly **800 ms**. No term is dominant, so no single optimisation removes more than a quarter of it."
+    - "**Tail latency multiplies, and that is the number the product feels.** If endpointing's p95 is 3x its median, the LLM's 2.5x and the ASR's 2x, the same pipeline has a **p95 of 1,895 ms** — 2.4x the median. Users do not experience averages; they experience the slow turn and remember it. A budget stated only as a median is not a budget."
+    - "**Endpointing is the only term that is a policy rather than a computation, and it is the largest.** A fixed 500 ms silence timer adds 500 ms to every turn and still cuts off anyone who pauses. A semantic end-of-turn model reads the partial transcript and prosody and decides in about 200 ms — 300 ms saved and more accurate — and it needs no model change to ship."
+    - "**Partials turn a serial chain into an overlapped one.** Streaming ASR emits a partial every 100-300 ms. If the last two partials agree on the last few words, the LLM can start before the final transcript exists and be cancelled or corrected if it differs. That moves ASR finalisation off the critical path, at the cost of wasted tokens and a rollback path."
+    - "**Barge-in is a cancellation problem with a signal-processing precondition.** The agent must stop within roughly one playback chunk of the user starting, which means echo cancellation with an adaptive filter converged to the room, a VAD threshold above the residual echo, and a cancel that reaches the LLM and TTS in flight. Otherwise the TTS synthesises audio nobody hears."
+    - "**Speech-to-speech collapses four terms into one frame and takes away the transcript.** A duplex model consumes audio tokens at 12.5 Hz — an 80 ms frame — so the chain becomes 80 ms plus one forward pass plus one vocoder chunk, roughly **140 ms against 700 ms**. What disappears is the place where you ran tool calls, captions and moderation."
+  definitions:
+    - term: "Full duplex"
+      meaning: >-
+        The agent can listen and speak at the same time, so the user can interrupt
+        and the agent can react to backchannels ("mm-hm", "right") without ending
+        its turn. Half-duplex systems alternate and feel like a walkie-talkie.
+    - term: "Voice activity detection (VAD)"
+      meaning: >-
+        A frame-level classifier that says whether speech is present. It runs on
+        20 ms frames and is the input to endpointing; it is not the same thing as
+        end-of-turn detection, which needs to know whether the *thought* is
+        finished.
+    - term: "Endpointing"
+      meaning: >-
+        The decision that the user's turn has ended. A fixed silence timeout is the
+        naive version (500 ms of silence); a semantic model reads the partial
+        transcript and prosody and decides in around 200 ms.
+    - term: "Partial hypothesis"
+      meaning: >-
+        An interim ASR transcript emitted before the utterance ends, typically
+        every 100-300 ms. Partials let the LLM start early; they also revise, so
+        anything built on a partial needs a rollback path.
+    - term: "Barge-in"
+      meaning: >-
+        The user speaking while the agent is speaking, and the agent stopping.
+        Requires echo cancellation, a VAD threshold above residual echo, and
+        cancellation propagating to the LLM and TTS in flight.
+    - term: "Acoustic echo cancellation (AEC)"
+      meaning: >-
+        An adaptive filter that subtracts the known playback signal from the
+        microphone signal. Without it the agent's own voice triggers its VAD, and
+        every barge-in detector fires on the agent itself.
+    - term: "Time to first token (TTFT)"
+      meaning: >-
+        The delay from a complete prompt to the first generated token. For a voice
+        agent it is the LLM's contribution to the budget, and it is dominated by
+        prefill over the prompt rather than by decode speed.
+    - term: "Time to first audio (TTFA)"
+      meaning: >-
+        The delay from text handed to the TTS to the first playable audio sample.
+        It is the TTS's contribution to the budget and is independent of how fast
+        the rest of the utterance renders.
+    - term: "Jitter buffer"
+      meaning: >-
+        A small queue that absorbs variation in packet or frame arrival. Two 20 ms
+        frames is 40 ms of added latency, spent to avoid gaps; the correct size is
+        the measured tail of the arrival distribution, not a default.
+    - term: "Speech-to-speech model"
+      meaning: >-
+        A single model that consumes audio tokens and emits audio tokens, with no
+        text bottleneck. It removes the ASR-final and TTS-first-chunk terms and
+        roughly halves the floor, at the cost of the transcript and the control
+        surfaces built on it.
+    - term: "Ducking"
+      meaning: >-
+        Lowering the agent's playback volume rather than stopping it, used when
+        barge-in confidence is low. It buys the detector time without a hard cut,
+        and it is audible as a polite pause rather than an interruption.
+    - term: "p95 latency"
+      meaning: >-
+        The 95th percentile of end-to-end delay. The number to design against,
+        because a pipeline whose median is 800 ms and whose p95 is 1.9 s feels
+        broken even though the average looks fine.
+
+  diagrams:
+    - type: pipeline
+      title: "The 800 ms cascade, with the cumulative clock"
+      nodes:
+        - label: "Capture + jitter buffer"
+          note: "20 ms — one 20 ms frame at 16 kHz is 320 samples"
+          detail: "Two frames of jitter buffer absorbs scheduling noise and costs 40 ms if you use two. The floor here is the frame size, not the network."
+        - label: "Endpointing"
+          note: "200 ms — cumulative 220 ms"
+          detail: "The largest single term and the only one that is a policy. A fixed 500 ms silence timer would put the cumulative at 520 ms before ASR has done anything."
+        - label: "ASR finalisation"
+          note: "100 ms — cumulative 320 ms"
+          detail: "Only the final hypothesis costs this. Partials have been streaming since the user started, and a stable partial can let the LLM start here for free."
+        - label: "Orchestration + network"
+          note: "40 ms — cumulative 360 ms"
+          detail: "Prompt assembly, retrieval, guardrails, one network hop. The term people forget when they measure the model in isolation."
+        - label: "LLM time to first token"
+          note: "250 ms — cumulative 610 ms"
+          detail: "Prefill over the prompt dominates, so prompt length is a latency parameter. Streaming decode only has to keep ahead of the TTS, which is a much weaker requirement than being fast."
+        - label: "TTS time to first audio"
+          note: "150 ms — cumulative 760 ms"
+          detail: "Independent of total render time. The subsequent constraint is RTF below 1 so playback never starves."
+        - label: "Playback buffer"
+          note: "40 ms — cumulative 800 ms"
+          detail: "Two 20 ms frames. The end of the budget and the last place to look for savings, because cutting it produces audible gaps rather than a faster answer."
+
+    - type: compare
+      title: "Cascaded pipeline and speech-to-speech: what the text bottleneck costs and buys"
+      left_label: "Cascade (ASR -> LLM -> TTS)"
+      left_points:
+        - "Serial terms: endpointing 200 + ASR final 100 + LLM TTFT 250 + TTS TTFA 150 = 700 ms before playback buffers"
+        - "Every stage is inspectable: transcript, tool calls, guardrails, captions, per-stage metrics"
+        - "Each stage is independently replaceable and independently scalable"
+        - "Tails add: four stages with 2-3x p95 multipliers produce a p95 near 1.9 s from an 800 ms median"
+        - "Partials let you overlap ASR with the LLM, but only if you can roll back a wrong guess"
+      right_label: "Speech-to-speech (duplex)"
+      right_points:
+        - "One 80 ms audio frame in, one forward pass, one vocoder chunk out: roughly 140 ms against 700 ms"
+        - "No endpointing term, because turn-taking is learned — and therefore not directly controllable"
+        - "No transcript unless a separate head produces one, so tool calls need a text decoder or an auxiliary ASR"
+        - "Prosody and backchannels are native: the model can laugh, pause, or say mm-hm without a text token for it"
+        - "Harder to moderate and to evaluate, because there is no intermediate representation to inspect"
+
+    - type: plot
+      title: "Where 800 ms goes, per stage (median)"
+      chart: bar
+      xLabel: "stage index (capture, endpoint, ASR, orchestration, LLM, TTS, playback)"
+      yLabel: "milliseconds"
+      series:
+        - name: "median"
+          points:
+            - { x: 1, y: 20 }
+            - { x: 2, y: 200 }
+            - { x: 3, y: 100 }
+            - { x: 4, y: 40 }
+            - { x: 5, y: 250 }
+            - { x: 6, y: 150 }
+            - { x: 7, y: 40 }
+
+    - type: sequence
+      title: "One turn, including a barge-in"
+      items:
+        - "User starts speaking; VAD opens a segment on a 20 ms frame boundary"
+        - "ASR emits partials every ~150 ms; the orchestrator watches for a stable tail"
+        - "Endpointing model scores the partial plus prosody; at 200 ms of evidence it declares the turn over"
+        - "LLM prefill runs over the assembled prompt; first token at 250 ms"
+        - "TTS synthesises the first 300 ms of audio in 150 ms and streams it to the playback buffer"
+        - "Agent is speaking; AEC subtracts its own output from the microphone signal"
+        - "User interrupts; VAD fires above residual echo; TTS stops, LLM generation is cancelled, state is truncated to what was actually heard"
+
+  markdown: |
+    ## Four loops, one turn
+
+    A voice agent is not a chat model with a microphone. It runs four loops
+    concurrently: capture (20 ms frames), understanding (streaming ASR), generation
+    (an LLM that may call tools), and speech (a TTS that streams). The user can
+    speak while the agent speaks, so at any instant two of those loops are active
+    and the agent's own output is arriving at its own input.
+
+    That concurrency is what makes the latency problem different from text. In a
+    text chat, latency is time-to-first-token and nobody notices 200 ms. In a
+    voice turn, every stage is serial and audible, and the user's tolerance is set
+    by human conversation: turn gaps in natural dialogue average around 200 ms.
+
+    ## The budget, line by line
+
+    | stage | median | cumulative | p95 multiplier | p95 |
+    |---|---|---|---|---|
+    | capture + jitter buffer | 20 | 20 | 1.5 | 30 |
+    | endpointing | 200 | 220 | 3.0 | 600 |
+    | ASR finalisation | 100 | 320 | 2.0 | 200 |
+    | orchestration + network | 40 | 360 | 2.0 | 80 |
+    | LLM time to first token | 250 | 610 | 2.5 | 625 |
+    | TTS time to first audio | 150 | 760 | 2.0 | 300 |
+    | playback buffer | 40 | 800 | 1.5 | 60 |
+
+    The medians sum to exactly 800 ms. The p95 column sums to 1,895 ms, which is
+    the number users actually remember. This is the first thing to internalise
+    about voice latency: a median budget is a plan, and the tail is the product.
+
+    Two terms deserve their own paragraphs. Endpointing at 200 ms is the largest
+    policy term, and it is the only one where a better decision procedure — rather
+    than a faster model — buys the time. LLM time-to-first-token at 250 ms is
+    dominated by prefill, so prompt length is a latency parameter: every retrieved
+    document in the prompt is milliseconds on the critical path.
+
+    ## Turn detection is not a silence timer
+
+    A fixed timeout is a bet that silence means finished. It is wrong in both
+    directions. A speaker who pauses for breath at 450 ms is cut off; a speaker who
+    finishes and waits is answered 500 ms late. Raising the timeout reduces the
+    first failure and worsens the second, and there is no setting that fixes both.
+
+    A semantic end-of-turn model reads the partial transcript and the audio
+    prosody: a falling pitch contour, a completed syntactic clause, and a pause
+    longer than the speaker's own baseline. It decides in about 200 ms and is right
+    more often than a 500 ms timer. That is a 300 ms saving on every turn, which is
+    more than any single model upgrade in the stack typically delivers.
+
+    The failure mode to watch is the false cut: declaring the turn over while the
+    user is mid-clause. Its cost is not symmetric with a false wait — being
+    interrupted is worse than waiting — so the classifier should be tuned to
+    require stronger evidence than a symmetric error rate would suggest.
+
+    ## Partials and speculative starts
+
+    Streaming ASR gives a partial hypothesis every 100-300 ms. Partials revise.
+    The useful signal is *stability*: if the last two partials agree on the last
+    few words, the probability that the final will differ is low, and the LLM can
+    begin prefill on the partial.
+
+    That moves the ASR-finalisation term off the critical path: the 100 ms is paid
+    in parallel with the LLM instead of before it. The price is a rollback path. If
+    the final transcript differs, the in-flight generation must be cancelled and
+    the prompt rebuilt, and the user may have already heard a prefix of the answer.
+    Speculation is worth it when the model's partials are stable and the prompt is
+    long enough that prefill dominates; it is not worth it on noisy audio.
+
+    ## Barge-in
+
+    The user interrupts, and the agent must stop. Three things have to be true:
+
+    1. **The agent can hear the interruption.** Its own playback is in the
+       microphone signal, so an adaptive echo canceller must subtract it; the
+       residual echo sets the VAD threshold.
+    2. **The stop is fast.** The playback buffer is the granularity: 40 ms of
+       buffered audio means the agent is at most 40 ms late, plus the detector's
+       own frame.
+    3. **The stop propagates.** The TTS must stop synthesising, the LLM must
+       cancel, and the conversation state must be truncated to what the user
+       actually heard — not to what was generated.
+
+    The third is the one that is usually missing. An agent that stops playing but
+    keeps generating believes it said things the user never heard, and the next
+    turn's context is wrong in a way that is very hard to debug from logs.
+
+    ## TTS: first chunk, then keep up
+
+    Speech runs at about 15 characters per second at a normal rate, so the
+    arithmetic of chunking is easy. A 40-character first chunk is 2.67 seconds of
+    audio; at 10× real time that is 267 ms of compute, which is a third of the
+    entire budget. A first chunk of 300 ms of audio is about 4-5 characters, too
+    short to carry prosody.
+
+    The resolution is that TTFA and throughput are different requirements. TTFA
+    must be small — a few hundred milliseconds of audio, synthesised in well under
+    200 ms. Throughput only has to exceed real time: an RTF of 0.5 keeps playback
+    fed with a growing buffer. A model that renders a whole sentence in 50 ms is
+    worse for a voice agent than one that emits the first 300 ms in 100 ms and
+    then streams, because the second one starts talking sooner.
+
+    ## Why speech-to-speech changes the budget
+
+    A duplex speech model consumes audio tokens — 12.5 Hz, an 80 ms frame, eight
+    codebooks per frame — and emits its own audio tokens, with no text in between.
+    The serial chain becomes:
+
+    $$80\ \text{ms frame} + t_{\text{forward}} + t_{\text{vocoder chunk}}
+      \approx 80 + 40 + 20 = 140\ \text{ms},$$
+
+    against 700 ms for the four serial terms of the cascade. That is a 5× reduction
+    in the floor, and it removes the endpointing term entirely: turn-taking is a
+    behaviour learned from data rather than a policy you set.
+
+    What it removes with the text bottleneck is everything the text bottleneck
+    enabled. There is no transcript to run a tool call against, so tool use needs a
+    separate text head or an auxiliary ASR. There is no token stream to moderate
+    before it becomes audio. There is no per-stage latency metric, only one
+    end-to-end number. And there is no way to make the model wait longer before
+    answering, because the decision to answer is a property of the weights.
+
+    ## What breaks first
+
+    In the cascade, endpointing breaks first: it is the largest term, it is a
+    policy, and its tail is the worst (a 3× multiplier on 200 ms is 600 ms). Next
+    is LLM TTFT, because prompt growth is invisible in development and linear in
+    production. Then TTS TTFA, which is stable per provider and therefore the
+    easiest to monitor. And underneath all of them, the tail: a pipeline tuned to
+    800 ms median will fail its p95 by a factor of two, and the fix is not a
+    faster model but fewer serial terms and more overlap.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Full duplex means the agent is listening while it speaks, so the latency that matters is not the model's throughput but the serial chain from the end of the user's turn to the first sample the user hears — capture, endpointing, ASR finalisation, orchestration, the first LLM token, the first TTS audio chunk and the playback buffer — and every design decision is a trade on one of those seven terms, with a speech-to-speech model collapsing four of them into one frame and taking away the transcript with which to control the rest.
+
+    ### The analogy, in full
+
+    A simultaneous interpreter in a booth. She does not wait for the speaker to finish the paragraph; she starts on the first clause, keeps a half-sentence of buffer, and adjusts when the sentence turns out to be a question. She also stops instantly when the speaker says "no, wait" — that is barge-in — and she does not need a stopwatch to know when a pause is a full stop rather than a breath. The analogy breaks in the two places that make engineering hard. The interpreter has one clock; the pipeline has seven, and their tails add independently, so a median of 800 ms can be a p95 of 1.9 seconds. And the interpreter can hear herself in her own headphones — she has an echo-cancellation system in her ears. A software agent has no ears: the speaker output re-enters the microphone and must be cancelled by an adaptive filter before the VAD sees it, which is why barge-in is a signal-processing problem before it is a product feature.
+
+    ### Failure modes, in full
+
+    - Your pipeline is fast by every individual measure and still feels slow. The LLM streams at 40 tokens per second, the ASR is real-time, the TTS is faster-than-real-time — and the user waits 1.9 seconds because the terms are serial and each one's tail is worse than its median.
+    - You set a 500 ms silence timeout for end-of-turn. Fast speakers get cut off mid-sentence, slow speakers wait half a second after every clause, and neither group is wrong: a fixed timer cannot distinguish a pause for breath from a finished thought.
+    - Barge-in "works" in a demo and fails in a room. The agent's own voice leaks into the microphone, the voice activity detector fires on it, the agent interrupts itself, and the fix is echo cancellation plus a smarter threshold rather than a lower one.
+    - You move to a speech-to-speech model to remove ASR and TTS latency and discover you have lost the transcript, so you can no longer run a tool call on the user's words, cannot show captions, and cannot apply the guardrail that blocked a sentence in the previous stack.
+
+    ### The mechanisms, in full
+
+    - **Serial latency adds, so the budget is a sum, not a maximum.** Seven terms in the cascade — 20 ms of capture and jitter buffer, 200 ms of endpointing, 100 ms of ASR finalisation, 40 ms of orchestration, 250 ms to the LLM's first token, 150 ms to the TTS's first audio chunk, 40 ms of playback buffer — sum to exactly 800 ms. No term is dominant, and no single optimisation removes more than a quarter of the total, which is why voice latency work is a sequence of small, boring wins.
+    - **Tail latency multiplies, and that is the number the product feels.** If endpointing's p95 is 3× its median, the LLM's 2.5×, and the ASR's 2×, the same pipeline has a p95 of 1,895 ms — 2.4× the median. Users do not experience averages; they experience the slow turn and remember it. A budget stated only as a median is not a budget.
+    - **Endpointing is the only term that is a policy rather than a computation, and it is the largest.** A fixed 500 ms silence timer adds 500 ms to every turn and still cuts off anyone who pauses. A semantic end-of-turn model reads the partial transcript and the prosody and decides in about 200 ms, which saves 300 ms and is more accurate at the same time. It is also the only term you can improve without touching a model.
+    - **Partials turn a serial chain into an overlapped one.** Streaming ASR emits a partial hypothesis every 100-300 ms. If the partial is stable — the last two partials agree on the last few words — the LLM can start before the final transcript exists, and be cancelled or corrected if the final differs. That moves the ASR-finalisation term off the critical path entirely, at the cost of wasted tokens when the guess is wrong and a rollback path when it is.
+    - **Barge-in is a cancellation problem with a signal-processing precondition.** The agent must stop speaking within roughly one playback chunk of the user starting, which means echo cancellation with an adaptive filter converged to the room, a VAD threshold above the residual echo, and a cancel message that reaches the LLM and the TTS in flight. Without cancellation the TTS keeps synthesising audio nobody will hear, which burns GPU and, worse, keeps the conversation state ahead of what the user actually heard.
+    - **TTS first-chunk latency is not RTF, and chunk size is the dial.** Speech runs at about 15 characters per second at a normal rate, so a 40-character first chunk is 2.67 seconds of audio; synthesising it at 10× real time costs 267 ms of compute, which is already a third of the budget. Streaming TTS emits a first chunk of a few hundred milliseconds of audio and then keeps pace with playback: the requirement is TTFA plus an RTF below 1, not a fast whole-utterance render.
+    - **Speech-to-speech collapses four terms into one frame and takes away the transcript.** A duplex model consumes audio tokens at 12.5 Hz — an 80 ms frame — and emits audio tokens for its own stream, so the serial chain becomes 80 ms of frame plus one forward pass plus one vocoder chunk, roughly 140 ms against 700 ms for the cascade. What disappears with the text bottleneck is the place where you ran tool calls, captions, moderation and turn-taking logic; those become separate heads, separate decoders, or properties learned from data.
+    - **The budget is a product decision, and it changes with the modality of the answer.** A spoken answer to a spoken question has an 800 ms budget; a spoken answer that requires a database query does not, because the query is an unavoidable term. The honest design states the budget per turn type: conversational turns under 800 ms, tool-using turns under 2 seconds with a filler ("let me check") that is itself generated inside the budget.
+    - **Jitter buffers trade latency for continuity, and the trade is visible.** A 20 ms capture frame at 16 kHz is 320 samples; a jitter buffer of two frames absorbs scheduling noise and adds 40 ms. Playback buffers do the same on the output side. Both are pure latency added to protect against variance, so the correct size is a measurement of the network's tail, not a default.
+  derivations:
+    - title: "The budget is a sum of medians and a sum of tails"
+      latex: |
+        Let the cascade have stages $i = 1 \dots K$ with median $m_i$ and p95
+        $q_i$. End-to-end latency is the sum, because the stages are serial:
+
+        $$M = \sum_{i=1}^{K} m_i, \qquad Q \approx \sum_{i=1}^{K} q_i.$$
+
+        With the seven terms and multipliers from the table:
+
+        $$M = 20 + 200 + 100 + 40 + 250 + 150 + 40 = 800\ \text{ms},$$
+
+        $$Q = 30 + 600 + 200 + 80 + 625 + 300 + 60 = 1{,}895\ \text{ms}.$$
+
+        The ratio $Q/M = 2.37$ is the tail penalty, and it grows with $K$: if every
+        stage had the same multiplier $\kappa$, the ratio would be exactly $\kappa$,
+        but heterogeneous multipliers concentrate the tail in the stages with the
+        largest $m_i \kappa_i$ — here endpointing and the LLM.
+      prose: >-
+        Summing p95s is conservative because the stages are not perfectly
+        correlated; the true end-to-end p95 is below the sum and above the maximum.
+        The conservative version is the right planning number, because the stages
+        are often correlated in practice — a slow network slows orchestration and
+        the LLM call together. The actionable consequence is the same either way:
+        removing a serial stage removes its tail as well as its median, which is
+        why overlap and speech-to-speech beat tuning.
+
+    - title: "Why speech-to-speech removes 560 ms and not just 100"
+      latex: |
+        Cascade, from the end of the user's speech to the first agent audio:
+
+        $$T_{\text{cascade}} = t_{\text{endpoint}} + t_{\text{asr}}
+          + t_{\text{orch}} + t_{\text{ttft}} + t_{\text{ttfa}}
+          = 200 + 100 + 40 + 250 + 150 = 740\ \text{ms}.$$
+
+        Duplex, with an 80 ms frame, a forward pass and a vocoder chunk:
+
+        $$T_{\text{duplex}} = t_{\text{frame}} + t_{\text{fwd}} + t_{\text{voc}}
+          = 80 + 40 + 20 = 140\ \text{ms}.$$
+
+        The saving is $740 - 140 = 600$ ms, a factor of
+        $740/140 = 5.3$.
+      prose: >-
+        The saving is not the ASR's 100 ms or the TTS's 150 ms individually; it is
+        that the four terms stop being serial. In the cascade the LLM cannot start
+        until the ASR is final and the TTS cannot start until the LLM emits a
+        sentence; in a duplex model the same forward pass consumes the user's frame
+        and produces the agent's frame, so the only serial cost is the frame itself
+        and one forward. The 80 ms frame is the new latency floor, and it is set by
+        the codec rather than by the model.
+
+  implementations:
+    - language: python
+      title: "A budget you can argue with: medians, tails, and the character-to-audio check"
+      note: >-
+        The first function is the table above, and it prints 800 and 1895 — the two
+        numbers the topic is built on. The second is the TTS sanity check that
+        catches most chunking mistakes: at 15 characters per second, a 40-character
+        first chunk is 2.67 seconds of audio, which at 10× real time is 267 ms of
+        compute and already a third of the budget. A first chunk should be sized in
+        milliseconds of audio, not in sentences.
+      code: |
+        STAGES = [
+            ("capture+jitter", 20, 1.5),
+            ("endpointing", 200, 3.0),
+            ("asr_final", 100, 2.0),
+            ("orchestration", 40, 2.0),
+            ("llm_ttft", 250, 2.5),
+            ("tts_ttfa", 150, 2.0),
+            ("playback", 40, 1.5),
+        ]
+
+
+        def budget(stages=STAGES):
+            median = sum(m for _, m, _ in stages)
+            p95 = sum(m * f for _, m, f in stages)
+            cum = 0
+            for name, m, f in stages:
+                cum += m
+                print(f"{name:15s} {m:4d} ms  cum {cum:4d}  p95 {m * f:6.0f}")
+            print(f"{'total':15s} {median:4d} ms  p95 {p95:6.0f}")
+            return median, p95
+
+
+        def first_chunk_cost(chars, chars_per_second=15.0, realtime_factor=0.1):
+            """Audio duration for a text chunk, and the compute to render it."""
+            audio_s = chars / chars_per_second
+            compute_ms = audio_s * 1000 * realtime_factor
+            return audio_s, compute_ms
+
+
+        if __name__ == "__main__":
+            budget()                        # total 800 ms, p95 1895
+            print(first_chunk_cost(40))     # (2.67 s, 267 ms)
+            print(first_chunk_cost(6))      # (0.4 s, 40 ms)
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        Your pipeline's medians are 20, 200, 100, 40, 250, 150 and 40 ms. What is
+        the end-to-end median, and what happens if you halve the LLM's TTFT?
+      answerKind: short_text
+      hint: "Add the terms first, then change one."
+      solution: >-
+        $20+200+100+40+250+150+40 = 800$ ms. Halving the LLM's 250 ms to 125 ms
+        gives 675 ms — a 15.6% improvement for a doubling of LLM speed. The
+        endpointing term at 200 ms is a larger and cheaper target, and moving ASR
+        off the critical path with stable partials removes 100 ms without a model
+        change at all.
+
+    - id: cp-2
+      question: >-
+        Why does a fixed silence timeout fail in both directions, and what replaces
+        it?
+      answerKind: short_text
+      hint: "Think about what silence means for a fast speaker versus a slow one."
+      solution: >-
+        Silence is not evidence that a thought is finished: a speaker pausing for
+        breath at 450 ms is cut off by a 500 ms timer, and a speaker who has
+        finished waits the full 500 ms. Raising the timeout protects the first and
+        penalises the second. A semantic end-of-turn model reads the partial
+        transcript and prosody — falling pitch, completed clause, pause relative to
+        the speaker's own baseline — decides in about 200 ms, and is both faster and
+        more accurate.
+
+    - id: cp-3
+      question: >-
+        A speech-to-speech model removes 600 ms from the turn. Name two things it
+        removes that are not latency.
+      answerKind: short_text
+      hint: "What did the text bottleneck let you do?"
+      solution: >-
+        The transcript and the per-stage control surfaces. Without a text
+        intermediate you cannot run a tool call on the user's words without a
+        separate head or auxiliary ASR, cannot apply a text guardrail before the
+        answer becomes audio, cannot show captions, and cannot measure latency per
+        stage — only end to end. It also removes the ability to make the agent wait
+        longer before answering, because turn-taking is baked into the weights.
+
+  try_it: >-
+    Write your own seven-term budget with the medians you believe, add them, then
+    multiply each by a tail factor you can defend from a real measurement. If the
+    p95 exceeds 1.5 seconds, identify the two stages to overlap rather than the two
+    to optimise, and say what rollback each overlap needs.
+
+  interview_questions:
+    - question: "Walk me through the latency budget for a voice agent that must respond in under 800 ms."
+      level: senior
+      key_points:
+        - "Seven serial terms: capture and jitter 20, endpointing 200, ASR final 100, orchestration 40, LLM TTFT 250, TTS TTFA 150, playback 40 — summing to 800."
+        - "Endpointing is the largest term and the only policy term, so it is the first place to look; a semantic turn detector at 200 ms beats a 500 ms silence timer on both latency and accuracy."
+        - "Partials and speculative LLM starts overlap ASR with generation, moving the 100 ms off the critical path at the cost of a rollback path."
+        - "The tail is the product: with per-stage p95 multipliers the same pipeline is 1.9 s at p95, so the design target is overlap and fewer serial stages, not a faster model."
+      follow_up: "Which stage would you remove first if you could only remove one, and what would break?"
+    - question: "How does barge-in work, and why does it usually fail in a real room?"
+      level: senior
+      key_points:
+        - "The agent's own playback re-enters the microphone, so an adaptive echo canceller must subtract it before the VAD sees the signal."
+        - "The residual echo sets the detection threshold; lowering the threshold to catch quiet speech makes the agent interrupt itself."
+        - "Stopping playback is bounded by the playback buffer and the detector frame, so the buffer is a latency parameter, not just a smoothness one."
+        - "Cancellation must propagate to the LLM and TTS in flight, and conversation state must be truncated to what the user actually heard."
+      follow_up: "What is the difference between ducking and stopping, and when is ducking the better choice?"
+    - question: "Why would you choose a speech-to-speech model over a cascade, and what do you give up?"
+      level: senior
+      key_points:
+        - "It collapses four serial terms into one 80 ms frame plus a forward pass plus a vocoder chunk, roughly 140 ms against 740 ms."
+        - "Turn-taking and backchannels are learned behaviours, so the agent can laugh, pause, or overlap without a text token for it."
+        - "You give up the transcript, which is the surface for tool calls, guardrails, captions and per-stage metrics."
+        - "You also give up controllability of turn-taking: you cannot make the model wait longer, because the decision lives in the weights."
+      follow_up: "How would you add tool use to a speech-to-speech agent without reintroducing the full cascade?"
+
+  common_mistakes:
+    - "Reporting median end-to-end latency and calling it the budget, when the p95 is more than twice the median and is the number users remember."
+    - "Tuning the LLM because it is the biggest single median, when endpointing plus ASR finalisation is 300 ms of policy and process that can be overlapped or improved for free."
+    - "Sizing the TTS first chunk in sentences rather than milliseconds of audio, so a 40-character chunk costs 267 ms of compute before any sound plays."
+    - "Stopping playback on barge-in without cancelling the LLM and truncating state, so the agent believes it said things the user never heard."
+
+  further_reading:
+    - label: "Défossez, Mazaré, Orsini & Royer, Moshi: a Speech-Text Foundation Model for Real-Time Dialogue (2024)"
+    - label: "Stivers et al., Universals and Cultural Variation in Turn-Taking in Conversation (Science, 2009)"
+    - label: "Borsos et al., AudioLM: a Language Modeling Approach to Audio Generation (2022)"
+    - label: "Skantze, Turn-taking in Conversational Systems and Human-Robot Interaction: A Review (Computer Speech & Language, 2021)"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A voice turn is a serial chain, and the user hears the end of the chain. Add
+        the terms before optimising any of them. Then ask which terms can be
+        overlapped, because overlapping is the only move that removes a term's
+        latency rather than shrinking it.
+      blocks:
+        - kind: checklist
+          body: |
+            - capture 20, endpoint 200, ASR 100, orchestration 40, LLM 250, TTS 150, playback 40
+            - median 800 ms; with tails, 1,895 ms
+            - the largest term is a policy (endpointing), not a model
+            - overlap ASR with the LLM using stable partials
+      checkpoint: >-
+        Which two adjacent terms would you overlap first, and what does the overlap
+        require you to be able to undo?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work from the user's ear backwards. The playback buffer and TTS TTFA are
+        fixed by the vendor; the LLM TTFT is a prompt-length problem; the ASR final
+        can be overlapped; the endpointing is a classifier you control. Fix them in
+        that order, then measure p95 rather than mean.
+      blocks:
+        - kind: checklist
+          body: |
+            - playback + TTS TTFA: choose a streaming vendor and a small first chunk
+            - LLM TTFT: shorten the prompt before shrinking the model
+            - ASR final: start on a stable partial, roll back on revision
+            - endpointing: replace the timer with a model, tuned for false-cut cost
+      checkpoint: >-
+        Which of those four changes needs a rollback path, and which is safe?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The turn loop, with the two cancellations that barge-in requires.
+      blocks:
+        - kind: pseudocode
+          body: |
+            on_frame(frame):
+                if vad(frame) and agent_speaking:
+                    barge_in()                  # stop playback, cancel, truncate
+                if vad(frame):
+                    partial = asr.push(frame)
+                    if stable(partial):
+                        llm.prime(partial)      # speculative prefill
+                if endpoint_model(partial, prosody):
+                    final = asr.finalize()
+                    reply = llm.generate(final)
+                    tts.stream(reply)
+
+            barge_in():
+                tts.stop(); llm.cancel()
+                state.truncate_to_heard()       # not to generated
+      checkpoint: >-
+        Why is `state.truncate_to_heard()` different from `state.truncate_to_generated()`,
+        and which one is correct after a barge-in?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The two sums: medians and tails, and the cascade-versus-duplex floor.
+      blocks:
+        - kind: math
+          body: |
+            $$M = \sum_i m_i = 20+200+100+40+250+150+40 = 800\ \text{ms},$$
+
+            $$Q = \sum_i m_i \kappa_i = 30+600+200+80+625+300+60
+              = 1{,}895\ \text{ms}.$$
+
+            Cascade to first agent audio:
+            $200+100+40+250+150 = 740$ ms.
+            Duplex: $80+40+20 = 140$ ms.
+            Ratio $740/140 = 5.3$.
+      checkpoint: >-
+        Summing p95s overstates the true end-to-end p95. Why is it still the right
+        planning number?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The budget calculator and the chunk arithmetic, with the numbers the topic
+        quotes.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            stages = [("capture", 20, 1.5), ("endpoint", 200, 3.0),
+                      ("asr", 100, 2.0), ("orch", 40, 2.0),
+                      ("llm", 250, 2.5), ("tts", 150, 2.0), ("playback", 40, 1.5)]
+            print(sum(m for _, m, _ in stages))          # 800
+            print(sum(m * f for _, m, f in stages))      # 1895.0
+
+            chars_per_s, rtf = 15.0, 0.1
+            for chars in (6, 40):
+                audio = chars / chars_per_s
+                print(chars, round(audio, 3), round(audio * 1000 * rtf, 1))
+            # 6 0.4 40.0   |   40 2.667 266.7
+      checkpoint: >-
+        If the TTS's RTF were 0.6 instead of 0.1, which line of the budget changes
+        and which does not?

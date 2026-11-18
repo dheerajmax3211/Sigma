@@ -1,0 +1,1244 @@
+id: system-design-foundations
+slug: system-design-foundations
+title: "How to Do System Design: The Repeated Framework"
+summary: >-
+  Seven questions in a fixed order — requirements, constraints, data, model,
+  serving, failure, measurement — each answered with a number before any box is
+  drawn. You will size a 2,000,000-request-a-day service end to end: 69.44 peak
+  QPS becomes 125,000 prefill tokens per second, becomes 14 GPUs, becomes
+  $0.208 per million tokens, inside a 350 ms p99 budget that sums to 272 ms.
+kind: lesson
+difficulty: medium
+position: 1
+estMinutes: 29
+prerequisites: [model-evaluation, reading-papers]
+phase: framework
+tags:
+  - system-design
+  - capacity-planning
+  - back-of-envelope
+  - latency-budget
+  - queueing
+  - precompute
+  - ml-system-design
+  - gpu-cost
+  - utilisation
+  - interview
+
+body:
+  big_idea: >-
+    A system design is not an architecture diagram but a capacity sheet and a
+    latency budget that agree with each other, produced by asking the same
+    seven questions in the same order.
+  problem:
+    - "You have forty-five minutes, you have done this before, and you start drawing boxes at minute two and never say anything falsifiable."
+    - "Your review feedback is \"seems reasonable\" — the worst outcome, because nothing in the design was specific enough to be wrong."
+    - "The interviewer asks how many GPUs and you have a strong opinion about vector databases and no idea what a token of prefill costs."
+  analogy: >-
+    Cooking dinner for forty. You do not start by drawing the kitchen: you
+    start with the covers and sitting time, then the oven's capacity, then
+    what is in the fridge and how long it keeps, then recipes that fit that
+    oven, then the plating line, then what happens if the fish does not
+    arrive. Covers per hour is peak QPS; oven volume is HBM.
+  concept_points:
+    - "**Requirements are two numbers and a distribution.** \\\"Fast\\\" becomes a pair of SLOs — p99 time-to-first-token of 350 ms and p99 completion of 5 s — and \\\"at scale\\\" becomes an arrival rate: 2,000,000 drafts a day is 23.15 QPS mean, and at a peak factor of 3 it is **69.44 QPS**. Little's law then gives concurrency: 69.44 x 2.45 s is **170 requests in flight**."
+    - "**The capacity sheet is six lines of unit conversion.** 69.44 QPS x 1,800 prompt tokens is **125,000 prefill tokens/s**; x 220 output tokens is **15,278 decode tokens/s**. Prefill is $2NT$: $2 \\times 8\\text{e}9 \\times 125{,}000 = 2.0$ PFLOP/s, which at 35% MFU is **5.78 GPUs**. Decode is bytes: 32.94 GB per step, 9.83 ms, 6,508 tokens/s per GPU, 2.35 GPUs. **14 GPUs, $840/day, $0.208 per million tokens.**"
+    - "**Prefill is FLOP-bound, decode is byte-bound, and the fleet is the sum of two unrelated divisions.** Prefill takes 10 of the 14 cards — **71%** — because a long prompt is arithmetic and a short answer is memory traffic. The two cross at roughly **540 output tokens** at this prompt length and batch, which is why a chat product and a summarisation product with the same model need different machines."
+    - "**Utilisation is a latency decision and the most expensive number in the sheet.** An M/M/1 queue's p99 sojourn is $1 + \\ln(100\\rho)/(1-\\rho)$ service times: **11.2 at 60%, 46.0 at 90%, 92.1 at 95%**. So 14 GPUs at 60% ($25,550/month) against 10 at 85% ($18,250/month) is a 29% saving that costs a 4.1x worse tail — and at 100% the delay is undefined."
+    - "**The latency budget is a waterfall that must sum to the SLO, and percentiles do not add.** Seven p99 terms — 15 edge, 20 auth, 45 context, 60 retrieval, 25 prompt build, 95 prefill, 12 first token — sum to **272 ms of a 350 ms SLO, leaving 78 ms (22%)**. Simulating them as independent lognormals puts end-to-end p99 at **159.9 ms**, so the additive budget overstates by **1.70x**."
+    - "**Where the FLOPs go decides where the engineering goes.** One request's prefill is **28.8 TFLOP**; scoring 200 passages with a 340M-parameter ranker is $200 \\times 2 \\times 3.4\\text{e}8 = 0.136$ TFLOP — **212x less**, 0.11% of the budget. A 28x bigger ranker is affordable; a 10% prompt trim is worth 8.3 ms and **$1,054/month**."
+  definitions:
+    - term: "Back-of-envelope estimate"
+      meaning: >-
+        A capacity number computed from four or five stated assumptions in under
+        two minutes, accurate to within a factor of two, whose purpose is to
+        eliminate designs rather than to predict cost. 69.44 QPS to 14 GPUs is
+        one: five multiplications, each checkable by the person watching.
+    - term: "Peak factor"
+      meaning: >-
+        Peak arrival rate divided by mean, over the busiest hour of the busiest
+        day. Three for a business-hours product, ten or more for a consumer
+        product with a scheduled event. It multiplies the whole capacity sheet,
+        so it is the single assumption most worth arguing about in the first
+        five minutes.
+    - term: "Little's law"
+      meaning: >-
+        $L = \lambda W$: the number of items in a system equals arrival rate
+        times time in system. At 69.44 QPS and 2.45 s that is 170 requests in
+        flight. It sizes connection pools, streaming slots and memory buffers;
+        it does not size compute, because compute is set by work per request.
+    - term: "Prefill and decode"
+      meaning: >-
+        The two phases of a generation request with opposite bottlenecks.
+        Prefill processes the whole prompt in parallel and is FLOP-bound
+        ($2NT$); decode emits one token at a time and is byte-bound (weights
+        plus one cache per sequence). 125,000 prefill tokens/s and 15,278 decode
+        tokens/s are different machines on the same GPU.
+    - term: "Time to first token (TTFT)"
+      meaning: >-
+        Queueing plus every stage before the first sampled token: edge, auth,
+        context fetch, retrieval, prompt build, prefill. In the reference
+        design it is a 350 ms p99 budget whose terms sum to 272 ms, and prefill
+        is 95 ms of that.
+    - term: "Latency budget (waterfall)"
+      meaning: >-
+        A per-stage allocation of the end-to-end SLO in p99 currency that must
+        sum to less than the SLO, with the residual left unallocated on purpose.
+        272 of 350 ms leaves 78 ms for the stage nobody remembered. It is a
+        discipline for finding the largest term, not a model of the end-to-end
+        tail.
+    - term: "Utilisation target"
+      meaning: >-
+        The fraction of capacity the fleet is allowed to run at, set from the
+        tail you can tolerate rather than from the invoice. 60% buys a p99
+        sojourn of 11.2 service times; 90% costs 46.0. The fleet size is
+        $(\text{prefill GPUs} + \text{decode GPUs})/\rho$, rounded up.
+    - term: "Dollars per million tokens"
+      meaning: >-
+        Total fleet cost per day divided by tokens served per day, times
+        $10^6$. Blended, the reference design is $0.208; split, $0.167 per
+        million input tokens and $0.545 per million output tokens, because
+        prefill and decode are paid for on different ledgers. A per-token price
+        is a property of a load, not of a model.
+    - term: "Precompute versus online"
+      meaning: >-
+        Whether a derived artefact is built on a schedule or per request,
+        decided in bytes per day. 80 GB per daily rebuild against 4.61 TB/day of
+        online reads is 57.6x; hourly rebuilds narrow it to 2.4x. The deciding
+        variable is the freshness requirement, not the latency.
+    - term: "Quality-cost curve"
+      meaning: >-
+        The measured frontier of a model's quality against its serving cost:
+        0.782 AUC at 0.014 ms, 0.806 at 0.393 ms, 0.809 at 1.964 ms. A design
+        chooses a point on it; a distributed-system design has no such
+        frontier, only a contract.
+    - term: "Retry amplification"
+      meaning: >-
+        The load multiplier a retry policy creates: with per-attempt failure
+        probability $p$ and $R$ attempts, $1 + p + p^2 + \dots$, so 1.39 at
+        $p = 0.3$ and two retries. Compared against the absorbable budget
+        $(1-\rho)/p$, which at 90% utilisation is 0.33 — less than one retry.
+    - term: "Feedback loop (exposure bias)"
+      meaning: >-
+        A system that trains on the outcomes of its own decisions. At 2%
+        exploration, 98% of the training signal for a new item never exists, so
+        the item needs 50x as long to earn 1,000 impressions and the model's
+        offline metrics improve while the catalogue it can serve narrows.
+
+  diagrams:
+    - type: pipeline
+      title: "The seven questions, in order, and the number each one must produce"
+      nodes:
+        - label: "Requirements"
+          note: "Peak QPS, two SLOs, one quality floor"
+          detail: "2,000,000 drafts/day is 23.15 QPS mean and 69.44 at a peak factor of 3. If this step produces an adjective instead of a number, every later step is unfalsifiable."
+        - label: "Constraints"
+          note: "Money, headcount, hardware, deadline"
+          detail: "14 GPUs is 25,550 dollars a month; that number is a constraint on the model choice, not a consequence of it. State the budget before the design, or the design will be a wish."
+        - label: "Data"
+          note: "What exists, how fresh, how labelled"
+          detail: "Retrieval over 100M items, a 340M-parameter ranker trained on 40M labelled drafts, and a 6-week label delay. The delay is a constraint on the retrain cadence, not on the architecture."
+        - label: "Model"
+          note: "One point on the quality-cost curve"
+          detail: "8B fp16 for generation, 340M for ranking. 28.8 TFLOP per prefill against 0.136 TFLOP per rank: the choice that matters is prompt length, not ranker width."
+        - label: "Serving"
+          note: "Prefill pool, decode pool, cache, budget"
+          detail: "10 prefill GPUs and 4 decode GPUs at 60% utilisation, a prompt cache covering 60% of the prompt, and a 272 ms of 350 ms waterfall."
+        - label: "Failure"
+          note: "Drift, cascade, feedback loop"
+          detail: "0.004 AUC lost per week, retry budget 0.33 attempts at 90% utilisation, 2% exploration. Each one sizes a component: the retrain job, the retry policy, the exploration slot."
+        - label: "Measurement"
+          note: "What the SLO is measured on, and when"
+          detail: "Acceptance rate on a 2,000,000-draft sample, p99 TTFT from the edge, and the fraction of traffic that is exploration. Offline AUC is a leading indicator, never the contract."
+      caption: "The order is not stylistic. Requirements fix the units, constraints fix the scale, data and model fix the ratio, serving turns the ratio into machines, and failure and measurement are the two steps that turn a design into an operable system."
+
+    - type: architecture
+      title: "The reference design: where the 350 ms and the 14 GPUs actually live"
+      nodes:
+        - { id: c, x: 0, y: 1, label: "Agent desktop", kind: client, detail: "A human is waiting, so the SLO is a p99 and not an average: 350 ms to first token, 5 s to the finished draft. Streaming is what makes a 2.4 s completion acceptable." }
+        - { id: lb, x: 1, y: 1, label: "Edge + LB", kind: load_balancer, detail: "15 ms of the budget, including TLS. This is the term people leave out and then discover when the p99 is measured at the edge rather than inside the service." }
+        - { id: idx, x: 1, y: 0, label: "Vector index, 100M items", kind: storage, detail: "750 KiB read per query at 1,500 candidates. 4.61 TB/day of online reads, against 80 GB for a daily precomputed neighbour table." }
+        - { id: db, x: 1, y: 2, label: "CRM + feature store", kind: database, detail: "Three KV gets, 45 ms. This is the stage that makes train/serve skew possible: the feature computed here must be the feature computed at training time." }
+        - { id: ctx, x: 2, y: 2, label: "Context service", kind: server, detail: "Assembles account state and the last three tickets into the prompt prefix; 60% of the 1,800-token prompt is cacheable prefix, which is worth 6 GPUs." }
+        - { id: ret, x: 2, y: 0, label: "Retrieval service", kind: server, detail: "60 ms p99, 2,000 candidates reduced to 200. The funnel exists because cost per candidate rises faster than the count falls." }
+        - { id: rk, x: 3, y: 0, label: "Ranker, 340M", kind: model, detail: "0.136 TFLOP per request, 0.393 ms. Twenty-eight times the parameters of the small model for 0.38 ms and 0.024 AUC." }
+        - { id: pf, x: 3, y: 1, label: "Prefill pool, 10 GPUs", kind: gpu, detail: "125,000 tokens/s at 35% MFU. 83.2 ms of exclusive GPU time per 1,800-token request, 95 ms measured p99 inside the budget." }
+        - { id: dc, x: 3, y: 2, label: "Decode pool, 4 GPUs", kind: gpu, detail: "6,508 tokens/s per card at batch 64 and a 2,020-token context. 9.83 ms per token, so a 220-token answer is 2,164 ms of the 5 s completion budget." }
+      edges:
+        - { from: c, to: lb, label: "69.44 QPS peak" }
+        - { from: lb, to: ret, label: "20 ms auth + quota" }
+        - { from: ret, to: idx, label: "1,500 reads" }
+        - { from: lb, to: ctx, label: "3 KV gets" }
+        - { from: ctx, to: db, label: "45 ms" }
+        - { from: ret, to: rk, label: "200 passages" }
+        - { from: ctx, to: rk, label: "features" }
+        - { from: rk, to: pf, label: "1,800-token prompt" }
+        - { from: pf, to: dc, label: "KV cache handoff" }
+        - { from: dc, to: c, label: "SSE stream", style: async }
+      caption: "Two GPU pools rather than one because prefill is FLOP-bound and decode is byte-bound; splitting them lets each be sized by its own division. Every edge label is a term in the latency budget, which is the test of whether an architecture diagram is doing any work."
+
+    - type: plot
+      title: "What utilisation costs in the tail: p99 sojourn in units of service time"
+      chart: line
+      xLabel: "utilisation (rho)"
+      yLabel: "p99 sojourn / service time"
+      series:
+        - name: "M/M/1 p99"
+          points:
+            - { x: 0.3, y: 5.86 }
+            - { x: 0.4, y: 7.15 }
+            - { x: 0.5, y: 8.82 }
+            - { x: 0.6, y: 11.24 }
+            - { x: 0.7, y: 15.16 }
+            - { x: 0.8, y: 22.91 }
+            - { x: 0.9, y: 46.0 }
+            - { x: 0.95, y: 92.08 }
+      caption: "Flat until 60%, then vertical. This is the curve that turns a 29% hardware saving into a 4.1x worse tail, and it is why the utilisation target appears in the capacity sheet rather than in the operations runbook."
+
+    - type: compare
+      title: "Two kinds of design review, two kinds of number"
+      left_label: "Distributed system design"
+      left_points:
+        - "Contract: the read returns the value, or an error"
+        - "Capacity is a constraint: meet it or fail the review"
+        - "Failure is binary and observable — timeouts, 5xx, lag"
+        - "The trade space is replication, partitioning, consistency"
+        - "Cost scales with bytes stored and bytes moved"
+        - "A 2x capacity error costs 2x the fleet"
+      right_label: "ML system design"
+      right_points:
+        - "Contract: a distribution of quality that decays with time"
+        - "Capacity is a curve: quality bought with latency and dollars"
+        - "Failure is silent — 200 OK, slightly worse, for weeks"
+        - "The trade space adds the model, the prompt and the label"
+        - "Cost scales with tokens, and tokens are a product decision"
+        - "A 2x prompt error costs 2x the fleet and moves quality"
+
+    - type: cycle
+      title: "The loop that makes an ML system fail while its metrics improve"
+      steps:
+        - "The model scores candidates and the top ones get shown"
+        - "Shown items generate the impressions that become training data"
+        - "Training on that data reproduces the model's own preferences"
+        - "Items the model never showed have no data, so they stay unscored"
+        - "At 2% exploration a new item needs 50x as long to earn 1,000 impressions"
+        - "Offline AUC rises, the catalogue narrows, and the product metric falls"
+
+  markdown: |
+    ## The seven questions
+
+    Every system design answer that has ever been rated "strong" is the same
+    seven questions in the same order. The order is not a ritual: each step
+    fixes the units for the next one, and skipping a step does not save time, it
+    moves the error somewhere you will not look.
+
+    | # | Question | The number it must produce | What it prevents |
+    |---|---|---|---|
+    | 1 | What must it do, by when? | peak QPS, two SLOs, a quality floor | designing for the mean |
+    | 2 | What can I spend? | dollars/month, GPUs, headcount | a design that is a wish |
+    | 3 | What data exists, how fresh? | rows, tokens, label delay | an unbuildable model |
+    | 4 | What model, at what point on the curve? | FLOPs and bytes per request | optimising the wrong component |
+    | 5 | How does it serve? | GPUs, cache, ms per stage | a diagram with no machines |
+    | 6 | How does it break? | retry budget, retrain cadence, exploration rate | a system that fails silently |
+    | 7 | How will I know? | the metric, its sample, its lag | a dashboard that measures the model |
+
+    The test of a design is not whether the diagram is plausible. It is whether
+    the capacity sheet and the latency budget agree with each other — whether
+    the machines implied by step 5 can pay the milliseconds implied by step 1.
+
+    ## A worked example, end to end
+
+    A support-desk drafting feature: an agent opens a ticket, the system
+    retrieves help-centre passages, ranks them, and generates a 220-token draft.
+    Two million drafts a day.
+
+    **Step 1.** $2{,}000{,}000/86{,}400 = 23.15$ QPS mean, 69.44 at a peak
+    factor of 3. SLOs: p99 TTFT 350 ms, p99 completion 5 s. Little's law gives
+    170 requests in flight — a connection-pool number, not a fleet number.
+
+    **Step 2.** At \$2.50 per GPU-hour the envelope is about \$25,000 a month.
+    That is a constraint on the model size, and it is worth saying out loud
+    before choosing one.
+
+    **Step 3.** 100,000,000 indexed items, 40,000,000 labelled drafts, and a
+    six-week label delay — which sets the retrain cadence, not the architecture.
+
+    **Step 4.** An 8B model in fp16 (16.0 GB of weights, 128 KiB of KV cache per
+    token) and a 340M ranker over 200 passages.
+
+    **Step 5.** The two divisions:
+
+    $$G_{\text{prefill}} = \frac{2N\lambda P}{F \cdot u}
+      = \frac{2 \cdot 8\text{e}9 \cdot 69.44 \cdot 1800}{346\text{e}12 \cdot 0.6}
+      = 9.63 \;\rightarrow\; 10,$$
+
+    $$G_{\text{decode}} = \frac{\lambda O}{\text{batch} \cdot
+      \frac{\text{BW}}{W + b \cdot \text{KV} \cdot C}}
+      = \frac{15{,}278}{6{,}508 \cdot 0.6} = 3.91 \;\rightarrow\; 4.$$
+
+    Fourteen GPUs, \$840 a day, 4.04 billion tokens a day, **\$0.208 per million
+    tokens**. Split by phase, \$0.167 per million input and \$0.545 per million
+    output: output tokens cost 3.3x more because decode reads the weights once
+    per token per sequence and prefill reads them once per 1,800.
+
+    **Step 6.** Drift, retries, exploration — below.
+
+    **Step 7.** Acceptance rate on an 8,000-draft daily sample, p99 TTFT measured
+    at the edge, and the exploration fraction. Offline AUC is a leading
+    indicator and never the contract.
+
+    ## The budget is a waterfall, and percentiles do not add
+
+    | Stage | p99 (ms) | Share |
+    |---|---|---|
+    | Edge + TLS | 15 | 5.5% |
+    | Auth + quota | 20 | 7.4% |
+    | Context fetch (3 KV gets) | 45 | 16.5% |
+    | Passage retrieval | 60 | 22.1% |
+    | Prompt build + tokenise | 25 | 9.2% |
+    | Prefill, 1,800 tokens | 95 | 34.9% |
+    | First token + network | 12 | 4.4% |
+    | **Allocated** | **272** | **77.7% of 350** |
+    | **Unallocated** | **78** | **22.3%** |
+
+    The unallocated 78 ms is not slop. It is the budget for the stage nobody
+    remembered, and a budget that sums to exactly the SLO has already failed.
+
+    Now the hard part. Those seven numbers are p99s of seven different stages,
+    and the end-to-end p99 is not their sum. Simulating each stage as a
+    lognormal with p99 four times its median ($\sigma = 0.596$) and adding
+    400,000 draws gives an end-to-end p99 of **159.9 ms** — the additive budget
+    is conservative by **1.70x**. Add the medians instead (68.0 ms) and you
+    understate the tail by 2.35x. Neither is a measurement; the additive budget
+    is a way to find the largest term and to buy margin, and the measurement is
+    one histogram of the whole path.
+
+    The largest term is prefill, and it is the one that moves with the product.
+    At a 4,000-token prompt, prefill goes from 95 to 184.9 ms and the budget
+    reaches 361.9 — 11.9 ms over. The fix is not a faster GPU: at 4.62 ms per
+    100 prompt tokens, **trimming 260 tokens buys back 12.0 ms**, and that is a
+    product conversation, not an infrastructure one.
+
+    ## Precompute, or pay per request
+
+    Retrieval can be answered from a table built nightly or computed per query.
+    In bytes per day: $10^8$ items times 100 neighbours times 8 bytes is
+    **80 GB per rebuild**; 1,500 candidate reads of 512 bytes at 69.44 QPS is
+    **4.61 TB/day**. Precompute wins by 57.6x. Rebuild hourly and it is 1.92
+    TB/day, winning by 2.4x — so the question "how fresh must this be" has a
+    price, and it is the only question that actually decides the design.
+
+    The same arithmetic runs the other way for features. A per-request join
+    against the CRM costs 45 ms of the budget; a precomputed feature costs a
+    write and a skew risk. The skew risk is the interesting one, because a
+    feature computed two different ways is a correctness bug that looks like a
+    modelling problem.
+
+    ## The model is a component with a curve
+
+    | Ranker | Params | FLOPs/request | Latency | AUC |
+    |---|---|---|---|---|
+    | small | 12M | 4.8 GFLOP | 0.014 ms | 0.782 |
+    | large | 340M | 136 GFLOP | 0.393 ms | 0.806 |
+    | 5 x large | 1.7B | 680 GFLOP | 1.964 ms | 0.809 |
+
+    0.063 AUC per millisecond, then 0.0019 — the second purchase is 33x worse
+    than the first. A distributed design has no such table: a replica either
+    serves the read or does not. This is why the ML design question is "where on
+    the curve", and why the answer needs the product's exchange rate (here 0.6
+    acceptance points per 0.01 AUC) in the room. Without it the review debates
+    model sizes; with it the review picks a point.
+
+    ## What breaks
+
+    **Drift.** 0.004 AUC per week, measured on a rolling labelled sample. A
+    two-week retrain bounds the loss at 0.008; an eight-week cycle reaches
+    0.032, which is 1.9 acceptance points, which is 434,000 extra edits in the
+    final week. The cadence is a number the design produces, not an ops habit.
+
+    **Cascade.** At a 30% timeout rate, two retries offer 1.39x the load. The
+    load an M/M/1 at utilisation $\rho$ can absorb is $(1-\rho)/p$; at 90% that
+    is 0.33 retries, so the retry policy that is supposed to improve
+    availability is the mechanism that removes it. Budget the retries from the
+    utilisation, and add jitter and a circuit breaker, or the p99 improvement
+    from retrying is paid for by everyone else's p99.
+
+    **Feedback.** At 2% exploration, an item needs 50x as long to accumulate
+    1,000 impressions, so the training data is 98% the model's own taste. The
+    offline metric rises, the catalogue narrows, and the product metric falls
+    six weeks later — the classic signature of optimising a proxy that the
+    system itself generates.
+
+    ## Twenty minutes on a whiteboard
+
+    Forty-five minutes, seven steps, 6.4 minutes each. Say the peak QPS and both
+    SLOs inside the first six minutes, because everything you say afterwards is
+    a consequence of them and a reviewer cannot audit a consequence without the
+    premise. Write the capacity sheet as six lines with units on every arrow.
+    Draw the architecture last, and label every edge with the milliseconds it
+    costs — an unlabelled edge is a stage you have not budgeted.
+
+    Then spend twelve minutes on failure. It is the only section that cannot be
+    copied from a blog post, it is where the interviewer's next question
+    already lives, and it is what separates a design that sounds senior from an
+    engineer who is senior.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A system design is not an architecture diagram — it is a capacity sheet and a latency budget that agree with each other, produced by asking the same seven questions in the same order, which is why two engineers who have never met can compare designs by comparing numbers.
+
+    ### The analogy, in full
+
+    Cooking a dinner party for forty. You do not start by drawing the kitchen. You start with the covers and the sitting time (requirements), then look at what the oven can hold and how many burners you have (constraints), then at what is actually in the fridge and how long it keeps (data), then pick recipes that fit that oven (model), then work out the plating line so forty plates leave hot within ten minutes of each other (serving), then ask what happens if the fish does not arrive (failure), then read the plates coming back (measurement). The mapping is exact where it matters. Covers per hour is peak QPS. Oven volume is HBM. The fridge is your feature store and its shelf life is freshness. The recipe is the model, and its quality-versus-effort curve is real: the difference between the good stock and the great stock is two hours and is invisible on the plate. The plating line is the serving path, and it is where a menu that is fine on paper dies. It breaks in three places, and the three are the whole topic. An oven does not get slower when it is 90% full — there is no queueing term — so a kitchen sized by oven volume will meet its throughput target and miss its ten-minutes-to-table target. Guests do not change what they like halfway through the meal, so there is no drift: the recipe you validated on Tuesday is the recipe on Saturday. And you can taste as you go, whereas in production the label arrives six weeks later, which is why measurement is a design step and not a dashboard someone else owns.
+
+    ### Failure modes, in full
+
+    - You have forty-five minutes on a whiteboard, you have done this three times before, and each time you started drawing boxes at minute two and ran out of time before you said anything a senior engineer could disagree with.
+    - Your design review feedback is "seems reasonable" — which is the worst possible outcome, because it means nothing in the design was specific enough to be wrong, so nothing in it can be trusted either.
+    - The interviewer asks "how many GPUs?" and you realise you have a strong opinion about vector databases and no idea what a token of prefill costs, so the rest of the hour is adjectives.
+    - You copy an architecture from a blog post — the same services, the same queue, the same cache — into a product with a tenth of the traffic and a latency SLO, and it is both four times more expensive than it needs to be and unable to answer in 350 ms.
+    - You finish the design, ship it, and six weeks later the model's measured quality has not moved while the product's has fallen — because the thing you designed was the serving path, and the failure was in the loop that fed it.
+
+    ### The mechanisms, in full
+
+    - **Requirements are two numbers and a distribution, and the distribution is the one people forget.** "Fast" becomes a pair of SLOs — p99 time-to-first-token of 350 ms and p99 completion of 5 s — and "at scale" becomes an arrival rate: 2,000,000 drafts a day is 23.15 QPS mean, and at a peak factor of 3 it is **69.44 QPS**. Everything downstream divides into those numbers. Little's law then gives the concurrency, not the fleet: 69.44 QPS times 2.45 s of mean latency is **170 requests in flight**, which is a rounding error against 14 GPUs — useful for sizing connection pools and streaming slots, useless for sizing compute. The trap is quoting the mean, designing for it, and discovering the peak factor on launch day.
+    - **The capacity sheet is six lines and every line is a unit conversion.** 69.44 QPS times 1,800 prompt tokens is **125,000 prefill tokens/s**; times 220 output tokens it is **15,278 decode tokens/s**. Prefill is $2 N T$ FLOPs, so $2 \times 8\text{e}9 \times 125{,}000 = 2.0$ PFLOP/s, which at 989 TFLOP/s peak and 35% MFU is 346 TFLOP/s per card and **5.78 GPUs**. Decode is bytes: 16.0 GB of weights plus 64 sequences of 264.8 MB is 32.94 GB per step, 9.83 ms at 3.35 TB/s, **6,508 tokens/s per GPU**, so 2.35 GPUs. Sum, divide by the utilisation target, round up: **14 GPUs, $840/day, $0.208 per million tokens**. The trap is stopping at QPS, because every arrow in that chain is a place to be wrong by 10x and none of them is visible in a diagram.
+    - **Prefill is FLOP-bound, decode is byte-bound, and the fleet is the sum of two unrelated divisions.** That is why one GPU count for "the model" is always wrong. Here prefill takes 10 of the 14 cards — **71%** — because a long prompt is a lot of arithmetic and a short answer is a lot of memory traffic. The two terms cross at roughly **540 output tokens** at this prompt length and batch (220 times 5.778/2.348): make the answers long and the fleet flips to decode-bound, which is why a chat product and a summarisation product with the same model and the same QPS need different machines. The trap is reasoning about the model instead of about the token ratio.
+    - **Utilisation is a latency decision, and it is the most expensive number in the sheet.** An M/M/1 queue's p99 sojourn is $1 + \ln(100\rho)/(1-\rho)$ service times: **11.2 at 60% utilisation, 46.0 at 90%, 92.1 at 95%**. So 14 GPUs at 60% ($25,550/month) against 10 at 85% ($18,250/month) is a 29% saving that costs a 4.1x worse tail — and at 100% (9 GPUs, $16,425) the queueing delay is not large, it is undefined, because the queue has no stationary distribution. The trap is treating high utilisation as efficiency: it is a purchase of capex with the SLO, and it should be a stated decision with a number attached, not a default.
+    - **The latency budget is a waterfall that must sum to the SLO, and percentiles do not add.** Seven p99 terms — 15 edge, 20 auth, 45 context, 60 retrieval, 25 prompt build, 95 prefill, 12 first token — sum to **272 ms of a 350 ms SLO, leaving 78 ms (22%) for the term you have not thought of**, and prefill is 34.9% of it. But the sum is not the p99 of the sum: simulating those seven stages as independent lognormals with p50 = p99/4 ($\sigma = 0.596$, 400,000 draws) puts the end-to-end p99 at **159.9 ms**, so the additive budget overstates by **1.70x**, while adding the p50s instead (68.0 ms) understates by 2.35x. The trap is picking one of those two and calling it a measurement: the additive budget is a planning discipline that buys margin, not a prediction.
+    - **Where the FLOPs go decides where the engineering goes, and the model you can see is usually not the one that costs.** One request's prefill is **28.8 TFLOP**; scoring 200 retrieved passages with a 340M-parameter ranker is $200 \times 2 \times 3.4\text{e}8 = 0.136$ TFLOP. That is **212x less**, and it costs 0.393 ms of a 350 ms budget — 0.11%. So a 28x bigger ranker is affordable (0.38 ms) while a 10% prompt trim is worth 8.3 ms and **$1,054/month**. The trap is optimising the component with a name and a paper: the prompt is a tensor, not a model, and it is where the bill is.
+    - **Precompute versus online is a bytes-per-day comparison, and freshness has a linear price.** Precomputing 100 nearest neighbours for 100,000,000 items is $10^{8} \times 100 \times 8$ bytes = **80 GB per rebuild**; answering the same question online is 1,500 candidate reads of 512 bytes = 750 KiB per query, which at 69.44 QPS is **4.61 TB/day**. Precompute is **57.6x cheaper** — and a rebuild every hour is 1.92 TB/day, only **2.4x** cheaper. So the trade is not "precompute is fast, online is slow"; it is "how many rebuilds per day does the product's freshness requirement actually need", and that number has a price you can quote in the review.
+    - **An ML system design is not a distributed system design, because the model is a component with a quality-versus-cost curve rather than a function with a contract.** A KV store either returns the value or does not; the ranker returns an AUC, and 0.782, 0.806 and 0.809 are all "working". Measured: the 12M-parameter ranker costs 0.014 ms per request, the 340M one 0.393 ms for +0.024 AUC, and an ensemble of five 1.964 ms for +0.003 more — **0.063 AUC per ms, then 0.0019, a 33x worse exchange rate**. The design question is where on that curve the product should sit, and it is answerable only if you have the marketing-facing number (0.6 points of acceptance per 0.01 AUC) in the room. The trap is applying the distributed playbook — replicate, retry, cache — to a component whose failure mode is "returns 200, slightly worse".
+    - **Failure modes are design inputs, not a risks section.** Three of them change the architecture, and each has a number. Retry amplification: at a 30% timeout rate, allowing two retries offers $1 + 0.3 + 0.09 = 1.39$ times the load, and the load a system at utilisation $\rho$ can absorb is $(1-\rho)/p = (1-0.9)/0.3 = 0.33$ retries — so at 90% utilisation the safe retry budget is *less than one*, and the retry that "improves reliability" is the thing that takes the service down. Drift: at 0.004 AUC lost per week, a 2-week retrain cadence bounds the loss at 0.008 while an 8-week one reaches 0.032, which at 0.6 acceptance points per 0.01 AUC is 1.9 points — **434,000 extra edits in the final week** at 2,000,000 drafts a day. Feedback loop: at 2% exploration a new item collects 1,000 impressions in **50x** the time, so the model never learns about it and the metric that measures the model improves while the catalogue narrows.
+    - **Presenting is part of the method, and the clock is part of the constraint.** Forty-five minutes over seven steps is 6.4 minutes each, and the first number must be on the board by minute six — peak QPS, the binding constraint's cost, and the p99 breakdown, in that order, because every later claim hangs off them. Failure modes take the last twelve minutes, not the last two: they are the only section that cannot be produced by someone who has read the same blog posts. The trap is spending twenty minutes on requirements and clarifying questions because it feels like diligence — it is the one part of the hour that produces no falsifiable claim, and it is why "seems reasonable" is the feedback.
+  derivations:
+    - title: "From requests per second to GPUs: two divisions, not one"
+      latex: |
+        Prefill processes the whole prompt, so its work is
+        $2N$ FLOPs per token and the fleet it needs is a FLOP division:
+
+        $$G_p = \frac{2 N \lambda P}{F u},$$
+
+        with $N = 8\text{e}9$, $\lambda = 69.44$ requests/s, $P = 1800$ tokens,
+        $F = 346$ TFLOP/s effective per card and a utilisation target
+        $u = 0.6$. That is
+        $2 \cdot 8\text{e}9 \cdot 69.44 \cdot 1800 / (3.46\text{e}14 \cdot 0.6)
+        = 9.63$, so ten cards.
+
+        Decode emits one token per live sequence per step, and a step reads the
+        weights once plus one cache per sequence. Tokens per second per card is
+        therefore
+
+        $$T_{\text{gpu}} = \frac{b \cdot \text{BW}}{W + b \cdot
+          \text{KV} \cdot C}
+          = \frac{64 \cdot 3.35\text{e}12}{16.0\text{e}9 + 64 \cdot 1.31\text{e}5
+          \cdot 2020} = 6{,}508,$$
+
+        so $G_d = \lambda O / (T_{\text{gpu}} u)
+          = 15{,}278 / (6{,}508 \cdot 0.6) = 3.91$, four cards. The fleet is
+        $G_p + G_d = 14$, and the cost is
+        $14 \cdot 24 \cdot \$2.50 = \$840$ a day over
+        $4.04\text{e}9$ tokens, or **\$0.208 per million tokens**.
+
+        Differentiate the two expressions to find where the balance flips: $G_d$
+        grows linearly in $O$ and $G_p$ linearly in $P$, so with everything else
+        fixed they are equal at
+
+        $$O^{*} = O \cdot \frac{G_p}{G_d} = 220 \cdot
+          \frac{5.778}{2.348} = 541 \ \text{tokens}.$$
+      prose: >-
+        Two divisions with different units is the whole capacity method.
+        Prefill is a FLOP division and moves when the prompt moves; decode is a
+        byte division and moves when the answer moves. A fleet sized with one
+        number is always wrong, and the error is invisible until the workload
+        changes shape — which is exactly what a product team does in week two.
+
+    - title: "Why the p99 of a sum is not the sum of p99s"
+      latex: |
+        For a single M/M/1 queue with utilisation $\rho$, the sojourn time
+        exceeds $t$ with probability $\rho e^{-(\mu-\lambda)(t - S)}$ for
+        $t \ge S$. Setting that to 0.01 and writing $t = kS$:
+
+        $$\rho e^{-(1-\rho)(k-1)} = 0.01
+          \quad\Longrightarrow\quad
+          k = 1 + \frac{\ln(100\rho)}{1-\rho}.$$
+
+        At $\rho = 0.6$ that is $1 + \ln 60 / 0.4 = 11.24$ service times; at
+        $\rho = 0.9$ it is $1 + \ln 90 / 0.1 = 46.0$; at $0.95$, 92.1. A 1.5x
+        increase in load multiplies the tail by 4.1.
+
+        For a chain of stages the tempting move is to add the per-stage p99s.
+        That is the p99 of the sum only if every stage hits its tail in the same
+        request, which is the perfectly correlated case:
+
+        $$P\left(\sum_i T_i > \sum_i t_i^{(99)}\right) \le
+          \sum_i P\left(T_i > t_i^{(99)}\right) = n \cdot 0.01.$$
+
+        The union bound gives an upper limit, not an equality. With seven
+        independent lognormal stages whose p99s are 15, 20, 45, 60, 25, 95 and
+        12 ms and whose medians are a quarter of those ($\sigma = 0.596$), a
+        400,000-draw simulation puts the p99 of the sum at **159.9 ms** against
+        an additive 272 — the budget is 1.70x conservative — while the sum of
+        medians, 68.0 ms, understates the tail by 2.35x.
+      prose: >-
+        The practical consequence is that the waterfall is a tool for finding
+        the largest term and for buying margin, and it is not a model of the
+        end-to-end tail. Quote it as a budget, then measure one histogram of the
+        whole path and replace the sum with the measurement. Designs that never
+        make the second measurement end up either buying hardware they do not
+        need or missing an SLO they believed they had 78 ms of room in.
+
+    - title: "The price of a utilisation point"
+      latex: |
+        The fleet is $G = \lceil (G_p + G_d)/u \rceil$ and daily cost is
+        $24 c G$, so cost per token is
+
+        $$\frac{24 c}{ \lambda (P + O)} \cdot
+          \left\lceil \frac{G_p + G_d}{u} \right\rceil .$$
+
+        With $G_p + G_d = 8.13$, $c = \$2.50$, $\lambda = 69.44$ and
+        $P + O = 2020$:
+
+        $$u = 1.00:\ G = 9,\ \ \$0.134/\text{M};\qquad
+          u = 0.85:\ G = 10,\ \ \$0.149/\text{M};\qquad
+          u = 0.60:\ G = 14,\ \ \$0.208/\text{M}.$$
+
+        The tail moves the other way, from the same $\rho$:
+        $k(0.6) = 11.24$ and $k(0.9) = 46.0$ service times. So the exchange rate
+        between the two is
+
+        $$\frac{\Delta \text{cost}}{\Delta k}
+          = \frac{0.208 - 0.149}{46.0 - 11.24} = \$0.0017 \ \text{per million
+          tokens per service time of tail}.$$
+      prose: >-
+        That is the number to put in a design review, because it converts an
+        argument about "efficiency" into a purchase: 29% of the hardware bill
+        buys a 4.1x better tail. It also shows why 100% utilisation is not the
+        cheap end of the curve — at $u = 1$ the rounding is doing the work and
+        the queueing delay is not large, it is undefined, so the $0.134 is a
+        price for a system that cannot hold an SLO at all.
+
+  implementations:
+    - language: python
+      title: "The capacity sheet: six lines from requests per day to dollars per million tokens"
+      note: >-
+        Correct, and deliberately unit-explicit: every line prints the unit it
+        converted into, because the failure mode this guards against is a
+        plausible number in the wrong unit. `prefill` and `decode` are separate
+        divisions on purpose — summing them before dividing by the utilisation
+        target is what lets one GPU count hide two different bottlenecks. Two
+        honest limitations: the memory term uses the full context for every
+        sequence in the batch, which overstates decode bytes when the batch is
+        dominated by short prompts, and the FLOP term assumes 35% MFU, which is
+        a prefill number — a decode-heavy workload will not reach it.
+      code: |
+        import math
+
+        N, GPU_TFLOPS, MFU = 8.0e9, 989.0, 0.35
+        BW, KV, BATCH = 3.35e12, 128 * 1024, 64
+        P, O, USD_HR = 1800, 220, 2.50
+        QPS = 2_000_000 / 86400 * 3.0            # mean x peak factor
+
+        weights = N * 2                          # fp16
+        ctx = P + O
+        flops_per_gpu = GPU_TFLOPS * 1e12 * MFU
+
+        # 1. QPS -> tokens/s, separately for the two phases
+        pre_tps, dec_tps = QPS * P, QPS * O
+        print("tokens/s      prefill %.0f  decode %.0f" % (pre_tps, dec_tps))
+
+        # 2. prefill is FLOPs = 2 N T
+        pre_gpus = 2 * N * pre_tps / flops_per_gpu
+        print("prefill       %.2f PFLOP/s -> %.2f GPUs"
+              % (2 * N * pre_tps / 1e15, pre_gpus))
+
+        # 3. decode is bytes = weights + one cache per live sequence
+        step_bytes = weights + BATCH * KV * ctx
+        dec_per_gpu = BATCH * BW / step_bytes
+        dec_gpus = dec_tps / dec_per_gpu
+        print("decode        %.2f GB/step, %.0f tok/s/card -> %.2f GPUs"
+              % (step_bytes / 1e9, dec_per_gpu, dec_gpus))
+
+        # 4. utilisation, then money
+        for u in (1.0, 0.85, 0.6):
+            g = math.ceil((pre_gpus + dec_gpus) / u)
+            per_day = g * 24 * USD_HR
+            print("u=%.2f  %2d GPUs  $%.2f/M tokens  $%.0f/month"
+                  % (u, g, per_day / (2_000_000 * (P + O)) * 1e6, g * 730 * USD_HR))
+
+        # tokens/s      prefill 125000  decode 15278
+        # prefill       2.00 PFLOP/s -> 5.78 GPUs
+        # decode        32.94 GB/step, 6508 tok/s/card -> 2.35 GPUs
+        # u=1.00   9 GPUs  $0.13/M tokens  $16425/month
+        # u=0.85  10 GPUs  $0.15/M tokens  $18250/month
+        # u=0.60  14 GPUs  $0.21/M tokens  $25550/month
+
+    - language: python
+      title: "The latency budget that sums the medians and declares 5x headroom"
+      note: >-
+        **Numerically WRONG, and wrong in the direction that ships.** It adds
+        each stage's *median* rather than its p99 and compares the total to a
+        p99 SLO, reporting **68.0 ms against 350 ms — 282% headroom** — where
+        the p99 budget for the same stages is 272 ms and a simulation of the
+        whole path gives 159.9 ms. So it understates the tail by between 2.35x
+        and 4x depending on which truth you compare against, and it always errs
+        optimistic: a stage's median is close to its service time, so the sum of
+        medians is roughly the *fastest* the path can be. Nothing raises, the
+        numbers look conservative because they are small, and the design that
+        ships meets its SLO only on requests that never queue. The same mistake
+        in the other direction — adding p99s and calling the sum the end-to-end
+        p99 — is safe but 1.70x pessimistic, which is how teams buy 30% more
+        hardware than they need and then cannot say why.
+      code: |
+        # each stage: (name, median_ms, p99_ms) as measured in production
+        stages = [
+            ("edge + TLS",    9,  15),
+            ("auth + quota", 11,  20),
+            ("context fetch", 21,  45),
+            ("retrieval",     32,  60),
+            ("prompt build",  13,  25),
+            ("prefill",       48,  95),
+            ("first token",    6,  12),
+        ]
+        SLO = 350
+
+        def budget(stages, slo, which=1):
+            # WRONG when which == 1: a p99 SLO compared against summed medians
+            total = sum(s[which] for s in stages)
+            head = (slo - total) / slo
+            return total, head
+
+        med, head = budget(stages, SLO, 1)
+        p99, _ = budget(stages, SLO, 2)
+        print("median budget %5.1f ms  headroom %+5.1f%%" % (med, 100 * head))
+        print("p99 budget    %5.1f ms  headroom %+5.1f%%" % (p99, 100 * (SLO - p99) / SLO))
+        print("largest term  %s at %.1f%% of the p99 budget"
+              % (max(stages, key=lambda s: s[2])[0], 100 * max(s[2] for s in stages) / p99))
+
+        # median budget  68.0 ms  headroom +80.6%
+        # p99 budget    272.0 ms  headroom +22.3%
+        # largest term  prefill at 34.9% of the p99 budget
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        Two designs for the same service: 9 GPUs at 100% utilisation and 14 at
+        60%. They have identical throughput. Which do you ship, and what does the
+        difference cost per month?
+      answerKind: short_text
+      hint: >-
+        Throughput is the same by construction. Ask what the p99 sojourn is in
+        each, in units of service time, before you answer with a dollar figure.
+      solution: >-
+        Ship 14. The monthly difference is $25,550 - $16,425 = $9,125, and what
+        it buys is the tail: the M/M/1 p99 sojourn is 11.24 service times at
+        $\rho = 0.6$ against 46.0 at 0.9, and at $\rho = 1$ it is not large but
+        undefined, because the queue has no stationary distribution — the 9-GPU
+        design meets its throughput target and its SLO only on the days traffic
+        is below forecast. The general form is the one to remember:
+        $G = \lceil(G_p + G_d)/u\rceil$, so the utilisation target is a
+        multiplier on the entire fleet, and it is the single cheapest place to
+        buy tail latency. If $9,125 a month is unaffordable, the honest move is
+        to shrink the workload — trim the prompt — not to run at $\rho = 1$.
+    - id: cp-2
+      question: >-
+        Your p99 budget allocates 95 ms to prefill out of 350 ms, and the product
+        team wants to double the prompt to 3,600 tokens. What actually breaks,
+        and what are the three ways out?
+      answerKind: short_text
+      hint: >-
+        Prefill FLOPs are linear in prompt length. Convert the extra tokens into
+        milliseconds before converting them into hardware.
+      solution: >-
+        Prefill goes from 95 to about 190 ms, the additive budget from 272 to
+        367, and the design is 17 ms over a 350 ms SLO. The three ways out, in
+        increasing order of cost: trim or structure the prompt — at 4.62 ms per
+        100 tokens you need to cut 370 tokens, which is exactly the kind of
+        decision a retrieval change can make; cache the static prefix — 60% of
+        the prompt being cacheable is what turns 5.78 prefill GPUs into 2.31 and
+        saves 6 cards, $10,950 a month; or buy prefill capacity, which fixes
+        throughput and does nothing for the latency term, because the 190 ms is
+        the arithmetic, not the queue. What does *not* work is quoting the sum
+        of p99s as the end-to-end p99 and concluding you have 78 ms of headroom:
+        the additive budget is conservative, but the headroom is not a licence to
+        double a term that is already the largest one.
+    - id: cp-3
+      question: >-
+        Finance asks for a single "$ per million tokens" number. You report
+        $0.208. Why is that number almost useless for a decision, and what do you
+        report instead?
+      answerKind: short_text
+      hint: >-
+        The blended number is a weighted average of two prices that differ by
+        3.3x, over a mix that the product controls.
+      solution: >-
+        Because the mix is the design. The reference split is $0.167 per million
+        input tokens and $0.545 per million output, and the blend moves whenever
+        the prompt-to-answer ratio moves — a 10% prompt trim is worth $1,054 a
+        month while a 10% answer trim is worth less, in absolute terms, because
+        there are 8x fewer output tokens. Report three numbers: input price,
+        output price, and the tokens per request the product is currently
+        emitting, then let finance weight them by the forecast mix. The other
+        reason the blend misleads is that it is not a property of the model at
+        all: the same 0.5B model at 1,000 requests a day costs $300 per million
+        tokens, because one GPU is the smallest unit you can buy and it is idle.
+    - id: cp-4
+      question: >-
+        Offline AUC improves by 0.012 after a retrain and online acceptance does
+        not move. Name the three checks, in order, and what each one costs you if
+        you skip it.
+      answerKind: short_text
+      hint: >-
+        The model is a component, and the pipeline around it can absorb an
+        improvement before anyone sees it. Start with whether the model's output
+        ever reached a user.
+      solution: >-
+        First, position and exposure: if the ranker only reorders the top ten
+        and the draft generator ignores rank beyond position three, a 0.012 AUC
+        change is invisible by construction — check the rank correlation of the
+        deployed ordering against the evaluated one, which costs an hour and
+        saves a quarter. Second, feedback: if 98% of impressions come from the
+        model's own top-1 at 2% exploration, the new model is being evaluated on
+        the old model's support, so the offline gain is measured on data the new
+        model will never generate — this is the loop that makes offline metrics
+        rise while the product narrows. Third, the label: with a six-week delay,
+        the online window you are looking at is six weeks stale, so a real
+        improvement looks like nothing for a month and a half. The ordering
+        matters because the first two are free to check and the third changes
+        what you are allowed to conclude.
+    - id: cp-5
+      question: >-
+        You have twelve minutes left in a design review and have not discussed
+        failure. What do you say, in what order, and what do you drop?
+      answerKind: short_text
+      hint: >-
+        Three failure modes have numbers attached and change components. The
+        rest are a list, and a list is what "seems reasonable" means.
+      solution: >-
+        Say the three with numbers, in the order they can hurt you this quarter.
+        Cascade: at 90% utilisation the absorbable retry budget is
+        $(1-\rho)/p = 0.33$ attempts, so the retry policy must be capped at one
+        attempt with jitter and a circuit breaker, and the timeout must be set
+        from the p99 rather than from the mean. Drift: 0.004 AUC a week means a
+        two-week retrain cadence bounds the loss at 0.008, against 0.032 at eight
+        weeks, which is 434,000 extra edits in the final week. Feedback: at 2%
+        exploration a new item takes 50x as long to earn its first 1,000
+        impressions, so the exploration slot is a design component with a size,
+        not a rounding error. Drop the availability arithmetic and the
+        multi-region discussion: they are generic, they are in every review, and
+        nobody learns anything from them. The test of a failure section is that
+        each item names a component it changed.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A system design is a claim about money and milliseconds, made before the
+        system exists. The seven questions are the order in which the claim
+        becomes checkable: what must it do, what can I spend, what data exists,
+        which model, how does it serve, how does it break, how will I know.
+
+        The reason the order is fixed is that each answer sets the units for the
+        next. Requirements turn "fast" into milliseconds and "at scale" into
+        requests per second. Those two numbers, divided into the work per
+        request, produce machines. The machines, divided into the budget,
+        produce a design that either agrees with itself or does not.
+
+        Two things make this an ML design rather than a distributed one. The
+        model is a point on a curve you can move along — quality bought with
+        latency and dollars — so "which model" is a decision with a price rather
+        than a lookup. And the system's own outputs become its training data, so
+        failure arrives as a slow narrowing rather than an outage.
+      blocks:
+        - kind: checklist
+          body: |
+            - Requirements: peak QPS, two SLOs, one quality floor
+            - Constraints: dollars, GPUs, headcount, deadline — say them out loud
+            - Data: rows, tokens, and the label delay
+            - Model: FLOPs and bytes per request, not a paper
+            - Serving: two divisions and a utilisation target
+            - Failure: retry budget, retrain cadence, exploration rate
+            - Measurement: the metric, its sample, its lag
+      checkpoint: >-
+        Before going on: which of the seven produces a number that could make
+        you abandon the design entirely, and which produces a number that only
+        changes its size?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in one direction until you hit a machine, then work backwards from
+        the machine to money. Requests per second times tokens per request is
+        tokens per second; tokens per second times FLOPs per token is FLOPs per
+        second; FLOPs per second divided by effective FLOPs per card is cards.
+        For the other phase, tokens per second divided by tokens per second per
+        card is cards, and that card number comes from bandwidth divided by
+        bytes moved per step.
+
+        Then treat the latency SLO as a fixed pot and allocate it, largest term
+        first, before you decide anything about the architecture. The allocation
+        tells you which component is worth engineering; the architecture diagram
+        is a picture of the allocation, not a substitute for it.
+
+        For the ML half, stop asking "which model" and ask "what does a point on
+        the curve cost, and what is a point worth". You cannot answer the second
+        half without a product number in the room.
+      blocks:
+        - kind: checklist
+          body: |
+            - Convert to tokens/s first; QPS alone is not a capacity
+            - Prefill: FLOPs = 2 x params x tokens; divide by effective FLOPs/card
+            - Decode: bytes/step = weights + batch x KV x context; divide BW
+            - Add the two card counts, then divide by the utilisation target
+            - Allocate the SLO in p99 before choosing components
+            - Price the model as a curve, and get the product's exchange rate
+      checkpoint: >-
+        If prefill needs 5.78 cards and decode needs 2.35, why is the answer 14
+        and not 9, and which of the two numbers would you attack first if the
+        budget were cut by a third?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three functions: the sheet, the budget, and the comparison that decides
+        precompute. Every one returns numbers, and every one is short enough to
+        write on a whiteboard in two minutes.
+      blocks:
+        - kind: pseudocode
+          body: |
+            capacity(req_day, peak, P, O, N, F, mfu, BW, kv, batch, u, usd):
+                qps   = req_day / 86400 * peak
+                pre   = 2 * N * qps * P / (F * mfu)          # cards, FLOPs
+                tcard = batch * BW / (2*N + batch * kv * (P+O))
+                dec   = qps * O / tcard                       # cards, bytes
+                gpus  = ceil((pre + dec) / u)
+                return gpus, gpus*24*usd / (req_day*(P+O)) * 1e6
+
+            budget(stages, slo):                              # stages: (name, p99)
+                total = sum(p99 for name, p99 in stages)
+                return total, slo - total, argmax(stages, key=p99)
+
+            precompute(n, k, idb, rebuilds, qps, cand, bpc):
+                pre    = n * k * idb * rebuilds / 1e9          # GB/day
+                online = qps * cand * bpc * 86400 / 1e12        # TB/day
+                return pre, online, online*1e3 / pre            # ratio
+      checkpoint: >-
+        In `capacity`, the decode card count uses `P+O` as the context but the
+        prefill count uses only `P`. Why is that asymmetry correct, and what
+        happens to the decode number if the workload is dominated by very short
+        answers?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Two divisions for the fleet, one closed form for the tail, and one
+        ceiling that no design choice moves.
+      blocks:
+        - kind: math
+          body: |
+            Fleet. Prefill is FLOP-bound, so with $\lambda$ requests/s,
+            $P$ prompt tokens and $F u$ effective FLOPs per card,
+
+            $$G_p = \frac{2 N \lambda P}{F u},\qquad
+              G_d = \frac{\lambda O}{b\,\text{BW}/(W + b\,\text{KV}\,C)} .$$
+
+            At $\lambda = 69.44$, $N = 8\text{e}9$, $P = 1800$, $O = 220$,
+            $F u = 3.46\text{e}14$, $b = 64$, $W = 16.0\text{e}9$,
+            $\text{KV} = 1.31\text{e}5$, $C = 2020$ and $\text{BW} = 3.35\text{e}12$:
+            $G_p = 5.78$, $G_d = 2.35$, and at $u = 0.6$ the fleet is
+            $\lceil 8.13/0.6 \rceil = 14$.
+
+            Tail. For M/M/1, $P(T > t) = \rho e^{-(\mu-\lambda)(t-S)}$, so the
+            p99 sojourn in service times is
+
+            $$k(\rho) = 1 + \frac{\ln(100\rho)}{1-\rho},$$
+
+            giving 11.24 at 0.6 and 46.0 at 0.9. Adding per-stage p99s is the
+            union bound, $\sum_i P(T_i > t_i) = n \cdot 0.01$, not the p99 of
+            the sum: seven independent lognormal stages with those p99s sum to
+            an end-to-end p99 of 159.9 ms, against an additive 272.
+
+            Ceiling. As the batch grows the weight term vanishes from
+            $W/n + C$, so tokens per second per card tends to
+
+            $$\frac{\text{BW}}{C} = \frac{3.35\text{e}12}{1.31\text{e}5 \cdot 2020}
+              = 12{,}647,$$
+
+            which contains no batch size, no scheduler and no GPU count — only
+            bandwidth, cache bytes per token and context length.
+      checkpoint: >-
+        The decode ceiling is 12,647 tokens/s per card at a 2,020-token context.
+        Halve the context and it doubles; halve the KV bytes per token and it
+        doubles again. What does it do if you double the batch — and why is that
+        the wrong lever to reach for when the SLO is the problem?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The whole method in one page: the sheet, the budget, the two comparisons
+        that decide the architecture, and the numbers the reference design
+        produces.
+      blocks:
+        - kind: warning
+          body: >-
+            Three ways this analysis is faked, all common. Sizing at 100%
+            utilisation, which produces a 36% cheaper fleet and an SLO that
+            cannot be met, because the queueing term at $\rho = 1$ is not large
+            but undefined. Comparing a p99 SLO against a sum of medians, which
+            reports 68 ms of 350 and 282% headroom. And quoting a blended
+            dollars-per-million-token figure as if it were a property of the
+            model, when it is a property of the prompt-to-answer ratio and the
+            smallest unit of hardware you can rent.
+        - kind: code
+          language: python
+          body: |
+            def design(req_day, peak, P, O, N, gpu_tflops, mfu, bw_gbs, kv_kib, batch, u, usd_hr):
+                qps = req_day / 86400 * peak
+                f_eff = gpu_tflops * 1e12 * mfu
+                pre = 2 * N * qps * P / f_eff
+                step = N * 2 + batch * kv_kib * 1024 * (P + O)
+                per_card = batch * bw_gbs * 1e9 / step
+                dec = qps * O / per_card
+                gpus = math.ceil((pre + dec) / u)
+                per_day = gpus * 24 * usd_hr
+                tonnes = req_day * (P + O)
+                return {
+                    "qps_peak": qps,
+                    "prefill_gpus": pre, "decode_gpus": dec, "gpus": gpus,
+                    "usd_per_m": per_day / tonnes * 1e6,
+                    "ttft_prefill_ms": 2 * N * P / f_eff * 1e3,
+                    "step_ms": step / (bw_gbs * 1e9) * 1e3,
+                }
+        - kind: checklist
+          body: |
+            - 69.44 peak QPS; 125,000 prefill tokens/s; 15,278 decode tokens/s
+            - 5.78 + 2.35 raw cards, 14 at 60% utilisation, $0.208/M tokens
+            - Budget 272 of 350 ms, prefill 34.9%, 78 ms deliberately unallocated
+            - End-to-end p99 measured 159.9 ms; the additive budget is 1.70x conservative
+            - Prompt cache at 60% of 1,800 tokens: 6 fewer cards, $10,950/month
+            - Precompute 80 GB/day against 4.61 TB/day online: 57.6x, 2.4x hourly
+            - Retry budget 0.33 attempts at 90% utilisation; drift 0.004 AUC/week
+      checkpoint: >-
+        `ttft_prefill_ms` is 83.2 and the budget allocates 95. Where do the
+        other 11.8 ms come from, and why does the same divergence make the
+        end-to-end p99 smaller than the sum of the p99s rather than larger?
+
+  problems:
+    - id: p-capacity-plan
+      title: "Turn a volume and a model into a fleet and a price"
+      difficulty: medium
+      prompt: >-
+        Implement `capacity_plan(...)` returning a dict with exactly the keys
+        `qps_mean`, `qps_peak`, `prefill_tokens_per_s`, `decode_tokens_per_s`,
+        `prefill_gpus`, `decode_gpus`, `gpus` and `usd_per_million_tokens`.
+
+        Definitions, in this order:
+
+        - `qps_mean = req_per_day / 86400`
+        - `qps_peak = qps_mean * peak_factor`
+        - `prefill_tokens_per_s = qps_peak * prompt_tokens`
+        - `decode_tokens_per_s = qps_peak * output_tokens`
+        - `prefill_gpus = 2 * params_b * 1e9 * prefill_tokens_per_s /
+          (gpu_tflops * 1e12 * mfu)`
+        - weights are fp16, so `weights = params_b * 1e9 * 2` bytes;
+          `kv_bytes = kv_kib_per_token * 1024`; the context is
+          `prompt_tokens + output_tokens`
+        - `bytes_per_step = weights + batch * kv_bytes * context`
+        - `decode_tokens_per_gpu = batch * gpu_bw_gbs * 1e9 / bytes_per_step`
+        - `decode_gpus = decode_tokens_per_s / decode_tokens_per_gpu`
+        - `gpus = ceil((prefill_gpus + decode_gpus) / target_util)`
+        - `usd_per_million_tokens = gpus * 24 * gpu_hour_usd /
+          (req_per_day * (prompt_tokens + output_tokens)) * 1e6`
+
+        Return the two GPU counts as floats (unrounded) and `gpus` as an int.
+      starter: |
+        import math
+
+        def capacity_plan(req_per_day, peak_factor, prompt_tokens, output_tokens,
+                          params_b, gpu_tflops, mfu, gpu_bw_gbs, kv_kib_per_token,
+                          batch, target_util, gpu_hour_usd):
+            # your implementation here
+            pass
+      language: python
+      entry: capacity_plan
+      testCases:
+        - input: '{"req_per_day": 2000000, "peak_factor": 3.0, "prompt_tokens": 1800, "output_tokens": 220, "params_b": 8.0, "gpu_tflops": 989.0, "mfu": 0.35, "gpu_bw_gbs": 3350.0, "kv_kib_per_token": 128.0, "batch": 64, "target_util": 0.6, "gpu_hour_usd": 2.5}'
+          expected: '{"qps_mean": 23.14814814814815, "qps_peak": 69.44444444444444, "prefill_tokens_per_s": 125000.0, "decode_tokens_per_s": 15277.777777777777, "prefill_gpus": 5.777841976021956, "decode_gpus": 2.3476035820895524, "gpus": 14, "usd_per_million_tokens": 0.2079207920792079}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"req_per_day": 86400, "peak_factor": 1.0, "prompt_tokens": 1000, "output_tokens": 100, "params_b": 1.0, "gpu_tflops": 989.0, "mfu": 0.35, "gpu_bw_gbs": 3350.0, "kv_kib_per_token": 128.0, "batch": 32, "target_util": 1.0, "gpu_hour_usd": 2.0}'
+          expected: '{"qps_mean": 1.0, "qps_peak": 1.0, "prefill_tokens_per_s": 1000.0, "decode_tokens_per_s": 100.0, "prefill_gpus": 0.005777841976021956, "decode_gpus": 0.006169528358208955, "gpus": 1, "usd_per_million_tokens": 0.5050505050505051}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"req_per_day": 500000, "peak_factor": 2.0, "prompt_tokens": 8000, "output_tokens": 50, "params_b": 70.0, "gpu_tflops": 989.0, "mfu": 0.4, "gpu_bw_gbs": 3350.0, "kv_kib_per_token": 64.0, "batch": 8, "target_util": 0.6, "gpu_hour_usd": 3.0}'
+          expected: '{"qps_mean": 5.787037037037037, "qps_peak": 11.574074074074074, "prefill_tokens_per_s": 92592.5925925926, "decode_tokens_per_s": 578.7037037037037, "prefill_gpus": 32.7678537991986, "decode_gpus": 3.114214483139856, "gpus": 60, "usd_per_million_tokens": 1.0732919254658384}'
+          mode: json
+          tolerance: 1e-9
+        - input: '{"req_per_day": 1000, "peak_factor": 1.0, "prompt_tokens": 100, "output_tokens": 100, "params_b": 0.5, "gpu_tflops": 989.0, "mfu": 0.35, "gpu_bw_gbs": 3350.0, "kv_kib_per_token": 128.0, "batch": 4, "target_util": 0.5, "gpu_hour_usd": 2.5}'
+          expected: '{"qps_mean": 0.011574074074074073, "qps_peak": 0.011574074074074073, "prefill_tokens_per_s": 1.1574074074074074, "decode_tokens_per_s": 1.1574074074074074, "prefill_gpus": 3.343658550938632e-06, "decode_gpus": 9.543062465450524e-05, "gpus": 1, "usd_per_million_tokens": 300.0}'
+          mode: json
+          tolerance: 1e-6
+        - input: '{"req_per_day": 200000, "peak_factor": 1.0, "prompt_tokens": 200, "output_tokens": 4000, "params_b": 8.0, "gpu_tflops": 989.0, "mfu": 0.35, "gpu_bw_gbs": 3350.0, "kv_kib_per_token": 128.0, "batch": 128, "target_util": 0.6, "gpu_hour_usd": 2.5}'
+          expected: '{"qps_mean": 2.314814814814815, "qps_peak": 2.314814814814815, "prefill_tokens_per_s": 462.962962962963, "decode_tokens_per_s": 9259.25925925926, "prefill_gpus": 0.021399414726007246, "decode_gpus": 1.867060254284135, "gpus": 4, "usd_per_million_tokens": 0.2857142857142857}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+
+        def capacity_plan(req_per_day, peak_factor, prompt_tokens, output_tokens,
+                          params_b, gpu_tflops, mfu, gpu_bw_gbs, kv_kib_per_token,
+                          batch, target_util, gpu_hour_usd):
+            qps_mean = req_per_day / 86400.0
+            qps_peak = qps_mean * peak_factor
+            prefill_tps = qps_peak * prompt_tokens
+            decode_tps = qps_peak * output_tokens
+
+            gpu_flops = gpu_tflops * 1e12 * mfu
+            prefill_gpus = 2.0 * params_b * 1e9 * prefill_tps / gpu_flops
+
+            weights = params_b * 1e9 * 2.0
+            kv_bytes = kv_kib_per_token * 1024.0
+            context = prompt_tokens + output_tokens
+            bytes_step = weights + batch * kv_bytes * context
+            decode_per_gpu = batch * gpu_bw_gbs * 1e9 / bytes_step
+            decode_gpus = decode_tps / decode_per_gpu
+
+            gpus = int(math.ceil((prefill_gpus + decode_gpus) / target_util))
+            per_day = gpus * 24.0 * gpu_hour_usd
+            tokens_day = req_per_day * (prompt_tokens + output_tokens)
+
+            return {
+                "qps_mean": qps_mean,
+                "qps_peak": qps_peak,
+                "prefill_tokens_per_s": prefill_tps,
+                "decode_tokens_per_s": decode_tps,
+                "prefill_gpus": prefill_gpus,
+                "decode_gpus": decode_gpus,
+                "gpus": gpus,
+                "usd_per_million_tokens": per_day / tokens_day * 1e6,
+            }
+      solutionExplanation: >-
+        Case one is the reference design and the one to check by hand: 2,000,000
+        a day is 23.15 QPS, times three is 69.44, times 1,800 tokens is 125,000
+        prefill tokens/s; at 2 FLOPs per parameter per token that is 2.0
+        PFLOP/s, and 2.0e15 over 3.4615e14 is 5.78 cards. Decode: 16 GB of
+        weights plus 64 sequences of 264.8 MB is 32.94 GB per step, so
+        64 x 3.35e12 / 32.94e9 = 6,508 tokens/s per card, and 15,278 / 6,508 =
+        2.35. The sum divided by 0.6 rounds up to 14, which at $2.50 an hour over
+        4.04 billion tokens is $0.208. Case two is the sanity check that the
+        formulas degrade gracefully: one request a second on a 1B model needs
+        0.0058 cards, and the answer is one card, because one is the smallest
+        thing you can buy — which is why the per-token price comes out at $0.505
+        and why per-token prices are a property of a load, not of a model. Case
+        three is the prefill-heavy extreme: a 70B model at 8,000-token prompts
+        needs 32.77 cards of prefill against 3.11 of decode, and the ceiling
+        pushes it to 60. Case four is the same point as case two in the other
+        direction: 1,000 requests a day on a 0.5B model rounds up to one card and
+        reports **$300 per million tokens**, which is the number to quote when
+        someone asks why a per-token price cannot be compared across products.
+        Case five flips the balance: 4,000-token answers make decode 1.87 cards
+        against 0.02 of prefill, and batching 128 long answers amortises the
+        weights so well that the price falls to $0.286.
+      complexity: "O(1) time and space"
+      tags: [capacity-planning, back-of-envelope, gpu-cost, prefill-decode]
+
+    - id: p-latency-budget
+      title: "Check a latency budget against its SLO"
+      difficulty: easy
+      prompt: >-
+        Implement `budget_check(stages, slo_ms)` where `stages` is a list of
+        `[name, p99_ms]` pairs. Return a dict with exactly the keys `total_ms`,
+        `headroom_ms`, `verdict`, `largest_stage`, `largest_share` and
+        `over_by_ms`.
+
+        - `total_ms` is the sum of the stage p99s
+        - `headroom_ms` is `slo_ms - total_ms` (negative when over)
+        - `verdict` is `"fits"` when `total_ms <= slo_ms`, else `"over"`
+        - `largest_stage` is the name of the stage with the largest p99, and
+          the first such name when there is a tie; `""` for an empty list
+        - `largest_share` is that stage's p99 divided by `total_ms`, or `0.0`
+          when `total_ms` is 0
+        - `over_by_ms` is `max(0, total_ms - slo_ms)`
+      starter: |
+        def budget_check(stages, slo_ms):
+            # your implementation here
+            pass
+      language: python
+      entry: budget_check
+      testCases:
+        - input: '[[["edge + TLS", 15], ["auth + quota", 20], ["context fetch", 45], ["passage retrieval", 60], ["prompt build", 25], ["prefill 1800 tokens", 95], ["first token", 12]], 350]'
+          expected: '{"total_ms": 272.0, "headroom_ms": 78.0, "verdict": "fits", "largest_stage": "prefill 1800 tokens", "largest_share": 0.3492647058823529, "over_by_ms": 0.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[["edge", 15], ["auth", 20], ["context", 45], ["retrieval", 60], ["prompt", 25], ["prefill", 185], ["first token", 12]], 350]'
+          expected: '{"total_ms": 362.0, "headroom_ms": -12.0, "verdict": "over", "largest_stage": "prefill", "largest_share": 0.511049723756906, "over_by_ms": 12.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[["a", 40], ["b", 60]], 100]'
+          expected: '{"total_ms": 100.0, "headroom_ms": 0.0, "verdict": "fits", "largest_stage": "b", "largest_share": 0.6, "over_by_ms": 0.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[["a", 50], ["b", 50], ["c", 50]], 150]'
+          expected: '{"total_ms": 150.0, "headroom_ms": 0.0, "verdict": "fits", "largest_stage": "a", "largest_share": 0.3333333333333333, "over_by_ms": 0.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[["a", 120], ["b", 80], ["c", 220]], 300]'
+          expected: '{"total_ms": 420.0, "headroom_ms": -120.0, "verdict": "over", "largest_stage": "c", "largest_share": 0.5238095238095238, "over_by_ms": 120.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[], 250]'
+          expected: '{"total_ms": 0.0, "headroom_ms": 250.0, "verdict": "fits", "largest_stage": "", "largest_share": 0.0, "over_by_ms": 0.0}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def budget_check(stages, slo_ms):
+            total = sum(float(ms) for _, ms in stages)
+            largest_name, largest_ms = "", 0.0
+            for name, ms in stages:
+                if float(ms) > largest_ms:
+                    largest_name, largest_ms = name, float(ms)
+            return {
+                "total_ms": total,
+                "headroom_ms": slo_ms - total,
+                "verdict": "fits" if total <= slo_ms else "over",
+                "largest_stage": largest_name,
+                "largest_share": (largest_ms / total) if total else 0.0,
+                "over_by_ms": max(0.0, total - slo_ms),
+            }
+      solutionExplanation: >-
+        The first case is the reference design: 272 ms against 350, so 78 ms
+        stays unallocated on purpose, and prefill is 34.9% of the total — which
+        is why it is the term worth attacking. The second is the same design
+        with a 4,000-token prompt: prefill nearly doubles to 185, the total goes
+        to 362, and the verdict flips to "over" by 12 ms. Cases three and four
+        are the boundary: `total == slo` is "fits" with zero headroom, not
+        "over", and the tie in case four must resolve to the first name in input
+        order — an implementation that uses `max(stages, key=...)` on a list of
+        pairs, or that sorts, will return "b" or "c" and fail. Case five is the
+        over case with a clear largest term at 52.4%. Case six is the empty
+        budget: the total is zero, the verdict is "fits", the largest stage is
+        the empty string, and the share must be guarded against a division by
+        zero. That last guard is not pedantry — it is what stops a dashboard
+        from throwing the first time a service has no stages configured.
+      complexity: "O(n) time, O(1) space"
+      tags: [latency-budget, slo, review]
+
+    - id: p-precompute-vs-online
+      title: "Price a precomputed table against per-query reads"
+      difficulty: easy
+      prompt: >-
+        Implement `precompute_vs_online(n_items, neighbours, id_bytes,
+        rebuilds_per_day, qps_peak, candidates_per_query, bytes_per_candidate)`
+        returning a dict with exactly the keys `precompute_gb_per_day`,
+        `online_tb_per_day`, `ratio` and `cheaper`.
+
+        - `precompute_gb_per_day = n_items * neighbours * id_bytes *
+          rebuilds_per_day / 1e9`
+        - `online_tb_per_day = qps_peak * candidates_per_query *
+          bytes_per_candidate * 86400 / 1e12`
+        - `ratio` is the online bytes divided by the precompute bytes
+        - `cheaper` is `"precompute"` when the precompute bytes are less than or
+          equal to the online bytes, else `"online"`
+      starter: |
+        def precompute_vs_online(n_items, neighbours, id_bytes, rebuilds_per_day,
+                                 qps_peak, candidates_per_query, bytes_per_candidate):
+            # your implementation here
+            pass
+      language: python
+      entry: precompute_vs_online
+      testCases:
+        - input: '[100000000, 100, 8, 1, 69.44444444444444, 1500, 512]'
+          expected: '{"precompute_gb_per_day": 80.0, "online_tb_per_day": 4.608, "ratio": 57.6, "cheaper": "precompute"}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[100000000, 100, 8, 24, 69.44444444444444, 1500, 512]'
+          expected: '{"precompute_gb_per_day": 1920.0, "online_tb_per_day": 4.608, "ratio": 2.4, "cheaper": "precompute"}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[5000000, 50, 8, 1, 200.0, 2000, 768]'
+          expected: '{"precompute_gb_per_day": 2.0, "online_tb_per_day": 26.54208, "ratio": 13271.04, "cheaper": "precompute"}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[1000, 1, 8, 1000, 1.0, 10, 8]'
+          expected: '{"precompute_gb_per_day": 0.008, "online_tb_per_day": 6.912e-06, "ratio": 0.864, "cheaper": "online"}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[2000000, 20, 16, 3, 5000.0, 300, 1024]'
+          expected: '{"precompute_gb_per_day": 1.92, "online_tb_per_day": 132.7104, "ratio": 69120.0, "cheaper": "precompute"}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def precompute_vs_online(n_items, neighbours, id_bytes, rebuilds_per_day,
+                                 qps_peak, candidates_per_query, bytes_per_candidate):
+            pre = n_items * neighbours * id_bytes * rebuilds_per_day
+            online = qps_peak * candidates_per_query * bytes_per_candidate * 86400.0
+            return {
+                "precompute_gb_per_day": pre / 1e9,
+                "online_tb_per_day": online / 1e12,
+                "ratio": online / pre,
+                "cheaper": "precompute" if pre <= online else "online",
+            }
+      solutionExplanation: >-
+        Case one is the reference: 100M items times 100 neighbours times 8 bytes
+        is 80 GB per rebuild, and 69.44 QPS times 1,500 reads of 512 bytes over a
+        day is 4.608 TB, so precomputing is 57.6x cheaper. Case two is the same
+        table rebuilt hourly instead of daily: the precompute side grows 24x to
+        1,920 GB/day and the ratio collapses to 2.4 — the freshness requirement
+        is the whole trade, and it is a product question with a byte answer.
+        Case three shows the shape at a smaller catalogue and a heavier query:
+        5M items and 2,000 candidates per query, 13,271x. Case four is the one
+        that matters for correctness of the branch — a thousand items rebuilt a
+        thousand times a day is 8 MB, but a thousand queries a second reading 80
+        bytes each is only 6.9 MB per day, so **online wins** and `cheaper` must
+        return `"online"`; an implementation that hardcodes "precompute" passes
+        the first four cases and fails this one. Case five is a realistic
+        social-graph feature: 2M entities, 20 neighbours, 16-byte ids, rebuilt
+        three times a day, against 5,000 QPS of 300 reads — 69,120x, because the
+        query volume, not the table size, is what makes precompute win.
+      complexity: "O(1) time and space"
+      tags: [precompute, freshness, read-write-tradeoff, cost-model]
+
+  try_it: >-
+    Take 2,000,000 drafts a day: that is 23.15 QPS mean, and 69.44 QPS at a peak factor of 3.
+    Multiply by 1,800 prompt tokens and by 220 output tokens to get 125,000 prefill tokens/s and
+    15,278 decode tokens/s, then say which of those two numbers is FLOP-bound and which is
+    byte-bound before you draw a single box.
+  interview_questions:
+    - question: "Why is one GPU count for 'the model' always wrong?"
+      level: senior
+      key_points:
+        - "Prefill is FLOP-bound at 2NT FLOPs per request while decode is byte-bound by the weights read per step, so the fleet is the sum of two unrelated divisions."
+        - "Here 69.44 QPS at 1,800 prompt tokens is 125,000 prefill tokens/s, which at 35% MFU is 346 TFLOP/s and takes 10 of the 14 cards — 71% of the fleet."
+        - "The split moves with the product's prompt-to-output ratio, so a single number hides which phase dominates and by how much."
+        - "The honest answer is two counts and their sum, with the assumption that set the ratio stated out loud."
+      follow_up: "Your product doubles output length and holds prompts fixed. Which of the two divisions moves, and by how much?"
+    - question: "Utilisation is described as the most expensive number in the sheet. Show the trade rather than asserting it."
+      level: senior
+      key_points:
+        - "An M/M/1 queue's p99 sojourn is 1 + ln(100 rho)/(1 − rho) service times: 11.2 at 60% utilisation, 46.0 at 90% and 92.1 at 95%."
+        - "Fourteen GPUs at 60% cost 25,550 dollars a month against ten at 85% for 18,250 — a 29% saving that buys a 4.1× worse tail."
+        - "So the cheaper fleet is not cheaper if the SLO is written at p99, and the utilisation target belongs in the design rather than in an ops runbook."
+        - "The number is only meaningful with the arrival process attached: burstier traffic makes the same utilisation worse."
+      follow_up: "Where does that formula come from, and what does it assume about arrivals that your workload violates?"
+    - question: "Your latency waterfall sums to 272 ms of a 350 ms SLO. Is the remaining 78 ms your margin?"
+      level: staff
+      key_points:
+        - "No — percentiles do not add: the sum of seven p99 terms is not the p99 of the sum, because independent terms partially cancel while shared terms correlate."
+        - "The 78 ms, 22% of the budget, is the allowance for the term nobody thought of, and prefill's 95 ms is 34.9% of the 272 ms already spent."
+        - "The defensible claim is a measured end-to-end p99; the waterfall is a tool for finding where to look, not a proof that the SLO is met."
+        - "Quote both numbers, the arithmetic budget and the measured tail, and say which one you would defend in review."
+      follow_up: "If percentiles do not add, why build the waterfall at all?"
+  common_mistakes:
+    - "Drawing boxes at minute two and never writing peak QPS or the binding constraint's cost, which is why the review comes back as 'seems reasonable'."
+    - "Reporting mean QPS as capacity when the peak factor is 3 — 23.15 against 69.44 — and the queue is non-linear in utilisation."
+    - "Comparing designs by component list instead of by a capacity sheet and a latency budget that agree with each other."
+  further_reading:
+    - label: "Kleppmann, Designing Data-Intensive Applications, O'Reilly 2017"
+    - label: "Sculley et al., Hidden Technical Debt in Machine Learning Systems, NeurIPS 2015"

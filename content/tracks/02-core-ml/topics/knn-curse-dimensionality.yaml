@@ -1,0 +1,981 @@
+id: knn-curse-dimensionality
+slug: knn-curse-dimensionality
+title: "k-NN at 1,000 Dimensions: Your Nearest Neighbour Is a Stranger"
+summary: >-
+  Build k-NN from scratch, then compute — before you train anything — whether
+  its neighbourhood means anything, and learn the three moves that make it
+  work at 768 dimensions: reduce, reweight, or abandon it for a parametric
+  model.
+kind: lesson
+difficulty: medium
+position: 4
+estMinutes: 24
+prerequisites: [linear-algebra-foundations, vectors-and-geometry]
+phase: supervised-learning
+tags: [knn, curse-of-dimensionality, distance-concentration, nonparametric, hubness, intrinsic-dimension, embeddings]
+
+body:
+  big_idea: >-
+    k-NN has no parameters beyond the bet that a small ball holds informative labels,
+    and the curse measures when that ball grows: at 1,000 dimensions the 10th neighbour
+    is 95% as far as a stranger.
+
+  problem:
+    - "You fit k-NN on 40 features for 0.91 AUC, add a 400-dimensional TF-IDF block, and accuracy drops to 0.78."
+    - "At $d=100$ your 10th neighbour and your 10,000th are 5% apart in distance, so choosing $k$ is choosing among near-ties."
+    - "Your ANN index answers in 4 ms with recall@10 of 0.62, because it was built on distances that no longer rank anything."
+
+  analogy: |
+    You sort coins with a scale that reads to the nearest gram. In a sack of
+    identical pennies — 2.5 g each, varying by ±0.05 g — every coin reads "3 g".
+    Sorting by weight is impossible: the resolution is coarser than the spread
+    you are asking it to rank. That is k-NN at 1,000 dimensions. The ruler is
+    fine; the spread it must resolve has collapsed.
+
+  concept_points:
+    - "**k-NN is a Voronoi partition with a vote, and nothing else.** Fitting stores the training set; prediction finds the $k$ nearest points and takes a majority. No weights, no loss, no optimisation — so every failure is geometric and computable before training. Training accuracy is always 100.0% with $k=1$, since every point's nearest neighbour is itself."
+    - "**The only thing that matters is the radius of the k-ball.** For $n$ points over unit volume, the ball holding $k$ has radius $r_k = (k/(nV_d))^{1/d}$ with $V_d = \\pi^{d/2}/\\Gamma(d/2+1)$. At $n = 10{,}000$, $k=10$: $r_{10} = 0.018$ at $d=2$, $0.46$ at $d=10$, $2.32$ at $d=100$, $7.63$ at $d=1000$ — measured $0.0176$, $0.534$, $3.36$, $12.04$."
+    - "**Normalise the radius by the typical distance and the story is complete.** Measured at $n = 10{,}000$, $k=10$: $r_{10}$ is 3.0% of the mean interpoint distance at $d=2$, 41% at $d=10$, 82% at $d=100$, 94.6% at $d=1000$. By $d=1000$ the ten nearest neighbours are within 5.4% of the distance of a point chosen at random."
+    - "**The data bill is exponential, not linear.** To keep a 10-point ball of radius 0.1 in a unit cube you need $n = k/(V_d r^d)$: 318 points at $d=2$, 190,000 at $d=5$, $3.9\\times10^{10}$ at $d=10$, $3.9\\times10^{22}$ at $d=20$, $4.2\\times10^{140}$ at $d=100$. At fixed $n$, each doubling of $d$ squares the density requirement."
+    - "**The rate is $n^{-2/(d+2)}$, and that exponent is the interview answer.** k-NN regression balances bias $O(r^2)$ against variance $O(1/(nr^d))$, giving $r^* \\propto n^{-1/(d+2)}$ and risk $\\propto n^{-2/(d+2)}$. Halving the error needs $2^{(d+2)/2}$ times the data: 4× at $d=2$, 64× at $d=10$, 2,048× at $d=20$, $2.25\\times10^{15}$× at $d=100$. A correctly specified parametric model has rate $n^{-1}$ in any dimension."
+    - "**Intrinsic dimension is the only real escape, and it is measurable.** The rate depends on the dimension the data fills. The Levina–Bickel MLE — for each point, take the $k$ nearest distances $T_1 < \\dots < T_k$ and compute $[\\frac{1}{k-1}\\sum_{j<k}\\log(T_k/T_j)]^{-1}$, then take the median — returns **4.7** on 100-dimensional data from a 5-dimensional subspace. Run it on your 768-dimensional embeddings before declaring k-NN hopeless."
+
+  definitions:
+    - { term: 'k-nearest-neighbours classifier', meaning: 'A model that stores the training set and predicts the majority label among the $k$ stored points closest to the query. No fitted parameters: the entire model is the training data plus a distance function.' }
+    - { term: 'Curse of dimensionality', meaning: 'The family of ways algorithms calibrated on low-dimensional data fail as dimension grows — neighbourhoods inflate, distances concentrate, and the sample size needed for a fixed accuracy grows exponentially.' }
+    - { term: 'Neighbourhood radius', meaning: 'The distance from a query to its $k$-th nearest training point, written $r_k$. The most useful single diagnostic for a k-NN model, because it says how much of the input space the local average actually covers.' }
+    - { term: 'Distance contrast', meaning: '$(r_k - r_1)/r_1$ — how much further the $k$-th neighbour is than the first. At 0.05 the ranking among the top $k$ is mostly noise; at 4.7, which is two dimensions, it is a strong signal.' }
+    - { term: 'Voronoi cell', meaning: 'The region of input space closer to a given training point than to any other. 1-NN is piecewise constant on these cells, which is why its decision boundary can be arbitrarily complicated while its only stored state is the training set.' }
+    - { term: 'Nonparametric rate', meaning: 'The convergence rate of an estimator whose complexity grows with the data. For k-NN regression in $d$ dimensions the $L_2$ risk falls as $n^{-2/(d+2)}$, against $n^{-1}$ for a correctly specified parametric model.' }
+    - { term: 'Intrinsic dimension', meaning: 'The number of degrees of freedom the data actually uses, as opposed to the ambient dimension of its coordinates. A curve in 3-D space has ambient dimension 3 and intrinsic dimension 1.' }
+    - { term: 'Levina–Bickel MLE', meaning: 'An estimator of intrinsic dimension built from local distances to the $k$ nearest neighbours: $\hat\alpha = [\frac{1}{k-1}\sum_{j<k}\log(T_k/T_j)]^{-1}$, aggregated over points by the median.' }
+    - { term: 'Hubness', meaning: 'The high-dimensional phenomenon in which a small number of points appear in an outsized share of all $k$-NN lists, so predictions are dominated by a handful of arbitrary training examples.' }
+    - { term: 'Effective sample size per dimension', meaning: '$n/d$ — the crude budget that decides whether a local method has any chance. Below roughly 100 points per dimension, expect k-NN to be far from the Bayes rate regardless of tuning.' }
+
+  diagrams:
+    - type: plot
+      title: "The k-ball stops being local: distance contrast vs dimension (n = 10,000, k = 10)"
+      chart: "line"
+      xLabel: "log10(d)"
+      yLabel: "(r10 − r1) / r1"
+      series:
+        - name: "measured, uniform data"
+          points:
+            - { x: 0.301, y: 4.672 }
+            - { x: 0.699, y: 0.891 }
+            - { x: 1.0, y: 0.408 }
+            - { x: 1.301, y: 0.205 }
+            - { x: 1.699, y: 0.0934 }
+            - { x: 2.0, y: 0.0537 }
+            - { x: 2.699, y: 0.0215 }
+            - { x: 3.0, y: 0.0140 }
+            - { x: 3.301, y: 0.0097 }
+    - type: plot
+      title: "Same Bayes error (5%), same n: k-NN error by training-set size and dimension"
+      chart: "line"
+      xLabel: "log10(n)"
+      yLabel: "test error"
+      series:
+        - name: "d = 2"
+          points:
+            - { x: 2.301, y: 0.0553 }
+            - { x: 3.0, y: 0.0560 }
+            - { x: 3.699, y: 0.0555 }
+            - { x: 4.398, y: 0.0583 }
+        - name: "d = 10"
+          points:
+            - { x: 2.301, y: 0.0735 }
+            - { x: 3.0, y: 0.0605 }
+            - { x: 3.699, y: 0.0595 }
+            - { x: 4.398, y: 0.0545 }
+        - name: "d = 50"
+          points:
+            - { x: 2.301, y: 0.1175 }
+            - { x: 3.0, y: 0.1110 }
+            - { x: 3.699, y: 0.0918 }
+            - { x: 4.398, y: 0.0800 }
+        - name: "d = 100"
+          points:
+            - { x: 2.301, y: 0.1800 }
+            - { x: 3.0, y: 0.1350 }
+            - { x: 3.699, y: 0.1145 }
+            - { x: 4.398, y: 0.1125 }
+        - name: "Bayes floor"
+          points:
+            - { x: 2.301, y: 0.05 }
+            - { x: 4.398, y: 0.05 }
+    - type: compare
+      title: "The same model at two dimensions, same n = 25,000"
+      left_label: "d = 2 — the assumption holds"
+      left_points:
+        - "The 10-NN ball has radius 0.018; a random point is 0.58 away"
+        - "The 10th neighbour is 5.7× further than the 1st — the ranking is real"
+        - "k-NN reaches 5.8% error against a Bayes floor of 5.0%"
+        - "A k-d tree prunes away 95%+ of the data per query"
+      right_label: "d = 100 — the assumption has failed"
+      right_points:
+        - "The 10-NN ball has radius 3.36; a random point is 4.08 away"
+        - "The 10th neighbour is 5.4% further than the 1st — a near-tie"
+        - "k-NN is stuck at 11.5%, while logistic regression gets 4.9%"
+        - "The k-d tree degenerates to a scan, so you buy an ANN index instead"
+    - type: architecture
+      title: "Where the curse bites in a k-NN pipeline"
+      nodes:
+        - { id: embed, x: 0, y: 1, label: "Embeddings (768-d)", kind: client, detail: "Vectors from a model you did not train. Nothing is normalised, so a handful of high-variance coordinates dominate every distance." }
+        - { id: norm, x: 1, y: 1, label: "L2 normalise", kind: server, detail: "Projects onto the unit sphere. At d = 768 the norm varies by only 2.6%, so this costs almost no information and makes dot product equal cosine." }
+        - { id: reduce, x: 2, y: 0, label: "Reduce to intrinsic dim", kind: model, detail: "PCA or random projection to the dimension the Levina-Bickel estimator reports. This is the step that restores distance discrimination, and the step people skip." }
+        - { id: index, x: 2, y: 2, label: "Exact scan / ANN index", kind: database, detail: "At 1e6 x 768 the exact index is 3.1 GB of float32 and about 31 ms per query. HNSW buys latency by giving up exactness, on a metric that may already be uninformative." }
+        - { id: query, x: 0, y: 3, label: "Query", kind: client, detail: "Must go through exactly the same normalise-and-project path. Fitting PCA on the corpus and querying raw is the classic train/serve skew in retrieval." }
+        - { id: vote, x: 3, y: 1, label: "k-NN vote", kind: worker, detail: "Majority vote over the k retrieved labels. If the k-ball spans most of the dataset, this is a weighted prior, not a local estimate." }
+        - { id: para, x: 3, y: 3, label: "Parametric fallback", kind: external, detail: "Logistic regression or a small MLP on the same features. At n/d below 100 it usually wins outright, and it wins by sharing statistical strength across dimensions." }
+      edges:
+        - { from: embed, to: norm, label: "unit norm" }
+        - { from: norm, to: reduce, label: "project" }
+        - { from: norm, to: index, label: "index as-is" }
+        - { from: reduce, to: index, label: "index reduced" }
+        - { from: query, to: index, label: "search" }
+        - { from: index, to: vote, label: "top k" }
+        - { from: vote, to: para, label: "if contrast < 0.05" }
+    - type: pipeline
+      title: "Diagnose before you ship a distance-based model"
+      nodes:
+        - label: "Compute r1 and rk"
+          note: "on real data, real metric"
+          detail: "Not on a Gaussian toy. The radius is a property of your coordinates and your sample size, and it takes one line of NumPy to measure."
+        - label: "Normalise by the mean interpoint distance"
+          note: "r_k / E||x − y||"
+          detail: "An absolute radius means nothing. Above about 0.8 the neighbourhood covers the dataset and local stops being a description of anything."
+        - label: "Compute the contrast"
+          note: "(rk − r1) / r1"
+          detail: "Below 0.05 the ordering among the top k is dominated by floating-point noise. Below 0.02 it is noise."
+        - label: "Count hub occurrences"
+          note: "how often each point is someone's neighbour"
+          detail: "If the top 1% of points take more than about 10% of neighbour slots, predictions are dominated by a handful of examples."
+        - label: "Estimate the intrinsic dimension"
+          note: "Levina–Bickel MLE"
+          detail: "If it is far below the ambient dimension, reduce first: the rate depends on the intrinsic dimension, not the coordinate count."
+        - label: "Only now choose k and the metric"
+          note: "and re-run the diagnostic after reducing"
+          detail: "Tuning k on a metric whose contrast is 0.02 is tuning a coin flip. Fix the geometry, then tune."
+
+  markdown: |
+    ## A classifier with no parameters
+
+    k-NN does not fit anything. It stores the training set and, at query time,
+    finds the $k$ stored points closest to the query and takes a vote.
+    Everything the model knows is in that sentence, and its entire inductive
+    bias is an assumption about geometry:
+
+    > a small ball around $x$ contains points whose labels tell you something
+    > about the label of $x$.
+
+    That assumption is what the curse of dimensionality attacks, and — unlike
+    most assumptions in machine learning — it can be evaluated in closed form
+    before you train anything, on data you have not collected yet.
+
+    ## The ball you average over
+
+    If $n$ points were spread uniformly over a region of unit volume, the ball
+    that captures $k$ of them would have radius
+
+    $$V_d\, r_k^{\,d} = \frac{k}{n}
+      \quad\Longrightarrow\quad
+      r_k = \left(\frac{k}{n\,V_d}\right)^{1/d},
+      \qquad V_d = \frac{\pi^{d/2}}{\Gamma(d/2+1)}.$$
+
+    First, $r_k$ is a $d$-th root: at $d = 100$,
+    doubling the dataset multiplies the radius by $2^{-1/100} = 0.9931$ — a
+    0.7% improvement for twice the data. Second, to halve the radius at fixed
+    $k$ you need $2^d$ times the data; at $d = 100$ that is
+    $1.27 \times 10^{30}$.
+
+    Measured on 10,000 uniform points in $[0,1]^d$ with $k = 10$:
+
+    | $d$ | predicted $r_{10}$ | measured $r_{10}$ | mean interpoint distance | $r_{10}$ / mean |
+    |---|---|---|---|---|
+    | 2 | 0.018 | 0.0176 | 0.577 | **0.030** |
+    | 10 | 0.456 | 0.534 | 1.291 | **0.414** |
+    | 100 | 2.32 | 3.36 | 4.08 | **0.822** |
+    | 1,000 | 7.63 | 12.04 | 12.91 | **0.946** |
+    | 2,000 | — | 17.55 | 18.26 | **0.961** |
+
+    The closed form is a *local-density* approximation: it is accurate while
+    the ball is small compared with the support ($d \lesssim \log n$), and
+    under-predicts by 31% at $d = 100$ and 37% at $d = 1000$ because a ball
+    that large sticks out of the cube and the density is no longer uniform
+    inside it. The qualitative conclusion is unaffected and is the one that
+    matters: **the neighbourhood inflates until it is the whole dataset.**
+
+    At $d = 2$ the ten nearest neighbours sit at 3% of a typical interpoint
+    distance — they are genuinely local. At $d = 1000$ they sit at 95%, which
+    is to say the nearest ten of your 10,000 rows are, on average, within 5%
+    of the distance of a row picked at random.
+
+    ## What that costs
+
+    Inverting the radius formula gives the sample size needed to keep a
+    10-point ball of radius 0.1 inside a unit cube:
+
+    | $d$ | $n$ needed for $r = 0.1$ |
+    |---|---|
+    | 2 | 318 |
+    | 3 | 2,387 |
+    | 5 | $1.9 \times 10^{5}$ |
+    | 10 | $3.9 \times 10^{10}$ |
+    | 20 | $3.9 \times 10^{22}$ |
+    | 100 | $4.2 \times 10^{140}$ |
+
+    Three extra coordinates move the requirement from one afternoon of
+    labelling to more rows than there are atoms in a small mountain. This
+    table, not the phrase curse of dimensionality, is the thing to put in
+    front of someone proposing a 500-feature nearest-neighbour model.
+
+    ## Cover–Hart, and the fine print
+
+    The classical reassurance is that 1-NN is never much worse than optimal:
+    its asymptotic error is at most twice the Bayes error. The proof works
+    because the neighbour's label distribution converges to the query's, which
+    requires the neighbour's *position* to converge, which requires
+    $r_k \to 0$. That in turn requires $n r^d \to \infty$ — a condition that
+    is trivially satisfied when $d$ is a constant and $n$ grows, and never
+    satisfied when $d$ grows with $n$.
+
+    The bound is therefore true and useless in exactly the regime where people
+    cite it. Measured, on two isotropic Gaussians with a Bayes error of 5.0%
+    at every dimension, $k = 5$, $n = 25{,}000$:
+
+    | $d$ | k-NN error | logistic regression |
+    |---|---|---|
+    | 2 | 5.8% | 5.1% |
+    | 10 | 5.8% | 4.8% |
+    | 50 | 8.2% | 5.6% |
+    | 100 | **11.5%** | **4.9%** |
+
+    The Bayes floor is 5.0%. Logistic regression sits on it at every
+    dimension, because a linear boundary with $d+1$ parameters is estimated
+    from $n$ points at rate $n^{-1}$ regardless of $d$. k-NN does not, because
+    its effective parameter count is the number of Voronoi cells, which grows
+    with $n$ and never concentrates.
+
+    Extrapolate the 1-NN curve to its limit and it does not stop at twice the
+    Bayes error — it goes to $2p(1-p)$, which for balanced classes is 50%. The
+    neighbour becomes an independent draw, and an independent draw carries no
+    information about the query.
+
+    ## Why hubness is a separate symptom
+
+    When distances concentrate, the *ordering* becomes unstable, and the
+    instability is not symmetric: points near the centre of the cloud are
+    slightly closer to everything than points near the edge, so they win
+    near-ties repeatedly. Measured on 10,000 uniform points, 1,000 queries,
+    $k = 10$:
+
+    | $d$ | top 1% share of neighbour slots | points that are nobody's neighbour |
+    |---|---|---|
+    | 2 | 4.3% | 37% |
+    | 10 | 4.8% | 40% |
+    | 100 | 10.9% | 53% |
+    | 1,000 | **15.2%** | **59%** |
+
+    At $d = 1000$ the single most popular point appears in 4.3% of all
+    queries' neighbour lists, and 59% of the database never appears at all.
+    The classifier is not averaging over the training set; it is averaging over
+    a few dozen points that happened to sit in the middle. That is why k-NN
+    predictions in high dimensions are unstable and strangely confident.
+
+    ## The escape: intrinsic dimension
+
+    All of the above assumes the data fills its coordinates. Real data does
+    not. A 768-dimensional embedding of images or sentences typically lies near
+    a manifold of dimension 30–60, and the rate $n^{-2/(d+2)}$ depends on the
+    dimension the data actually occupies.
+
+    That dimension is estimable. For each point, sort its distances to the $k$
+    nearest neighbours, $T_1 < \dots < T_k$, and compute
+
+    $$\hat\alpha_i = \left[\frac{1}{k-1}\sum_{j=1}^{k-1}
+      \log\frac{T_k}{T_j}\right]^{-1},$$
+
+    then take the median over points. On 100-dimensional data generated inside
+    a 5-dimensional subspace this returns **4.7** with $k = 10$ and 4.6 with
+    $k = 20$; on 50-dimensional data inside a 3-dimensional subspace it returns
+    3.0. It is biased slightly downward and needs $k$ between 5 and 20,
+    but it answers the only question that decides whether k-NN is viable.
+
+    ## The decision rule
+
+    Three levers, in increasing order of effectiveness:
+
+    1. **Normalise.** L2-normalise before measuring, so magnitude — which
+       varies by 2.6% at $d = 768$ and carries no signal — stops contributing.
+    2. **Reweight.** Whiten, so that no handful of high-variance coordinates
+       owns the distance.
+    3. **Reduce.** Project to the intrinsic dimension. This is the only lever
+       that changes the exponent in the rate, and the only one that makes a
+       768-dimensional problem behave like a 40-dimensional one.
+
+    If none of them is available — no basis in which the data is
+    low-dimensional, no meaningful metric — then the honest move is to abandon
+    the local method and fit something parametric. That is not a defeat. It is
+    reading the exponent correctly.
+
+    ## The longer version
+
+    The remaining mechanisms, verbatim: the Cover–Hart guarantee and its escape
+    clause, distance contrast, hubness, and the cost side where pruning dies
+    before accuracy does.
+
+    ### Failure modes, in full
+
+    - You fit k-NN on a 40-feature tabular problem and get 0.91 AUC. You add the 400-dimensional TF-IDF block and the 300-dimensional embedding block because more signal is better. Accuracy drops to 0.78, nothing errors, and no log line tells you why.
+    - You are told to choose $k$ by cross-validation and pick an odd number for tie-breaking. Both are fine, but they are not the question: at $d = 100$ your 10th neighbour and your 10,000th neighbour are 5% apart in distance, so the choice of $k$ is choosing among near-ties.
+    - Your ANN index answers in 4 ms, feels instant, and has recall@10 of 0.62 against exact search — because it was built on distances that no longer rank anything, and approximate search faithfully reproduces a ranking that is already noise.
+    - You are told to use a nonparametric model because it makes no assumptions. It makes exactly one: that $n$ points can cover $d$ dimensions. At $n = 50{,}000$ and $d = 800$ each dimension gets 62 points, and that is the assumption failing.
+    - Interviews ask why k-NN fails in high dimensions. The answer they want is a rate and a radius, not the phrase curse of dimensionality.
+
+    ### The mechanisms, in full
+
+    - **k-NN is a Voronoi partition with a vote, and nothing else.** Fitting consists of storing the training set; prediction consists of finding the $k$ nearest stored points and taking a majority. There are no weights, no loss, and no optimisation — which is why every failure it has is a *geometric* failure and can be computed in closed form before you train. The one number you must not trust is training accuracy: with $k = 1$ and the query present in the training set, every point's nearest neighbour is itself, so training accuracy is 100.0% at any $n$ and any $d$, by construction. Leave-one-out is the only honest estimate, and it is exactly the quantity the rest of this topic is about.
+    - **The only thing that matters is the radius of the k-ball.** For $n$ points spread over a region of unit volume, the ball holding $k$ of them has radius $r_k = (k/(n V_d))^{1/d}$ with $V_d = \pi^{d/2}/\Gamma(d/2+1)$ the volume of the unit $d$-ball. At $n = 10{,}000$ and $k = 10$ the formula gives $r_{10} = 0.018$ at $d = 2$, $0.46$ at $d = 10$, $2.32$ at $d = 100$ and $7.63$ at $d = 1000$ — measured on uniform data: $0.0176$, $0.534$, $3.36$, $12.04$. The closed form is a local-density approximation: it is accurate while the ball is small compared with the support ($d \lesssim \log n$) and under-predicts by 31% at $d = 100$ and 37% at $d = 1000$, because a ball that large starts sticking out of the cube.
+    - **Normalise the radius by the typical distance and the story is complete.** Measured at $n = 10{,}000$, $k = 10$: $r_{10}$ is 3.0% of the mean interpoint distance at $d = 2$, 41% at $d = 10$, 82% at $d = 100$, 94.6% at $d = 1000$ and 96.1% at $d = 2000$. By $d = 1000$ there is no "local" left — the ten nearest neighbours of a point are, on average, within 5.4% of the distance of a point chosen at random from the database. Every claim you make about a local method after this point has to be justified against that number.
+    - **The data bill is exponential, not linear.** Inverting the radius formula: to keep a 10-point ball of radius 0.1 in a unit cube you need $n = k/(V_d r^d)$ — 318 points at $d = 2$, 190,000 at $d = 5$, $3.9 \times 10^{10}$ at $d = 10$, $3.9 \times 10^{22}$ at $d = 20$ and $4.2 \times 10^{140}$ at $d = 100$. Equivalently, at fixed $n$ each doubling of $d$ squares the density requirement. This is the number to put in a design review when someone proposes 500 hand-engineered features and a nearest-neighbour model with 20,000 rows.
+    - **Cover–Hart says 1-NN is at most twice the Bayes error — asymptotically in $n$ at fixed $d$, which is precisely the escape clause.** Measured on two isotropic Gaussians whose Bayes error is 5.0% at every dimension, with $k = 5$ and $n = 25{,}000$: 5.8% at $d = 2$, 5.8% at $d = 10$, 8.2% at $d = 50$, 11.5% at $d = 100$. Logistic regression on the same samples gets 5.1%, 4.8%, 5.6%, 4.9% — the Bayes floor at every dimension. Same data, same labels, same information; the local method simply cannot reach it once $d$ gets ahead of $n$.
+    - **The rate is $n^{-2/(d+2)}$, and that exponent is the interview answer.** k-NN regression balances bias $O(r^2)$ against variance $O(1/(n r^d))$, giving $r^{*} \propto n^{-1/(d+2)}$ and risk $\propto n^{-2/(d+2)}$. To halve the error you need $2^{(d+2)/2}$ times the data: 4× at $d = 2$, 64× at $d = 10$, 2,048× at $d = 20$, $6.7 \times 10^{7}$× at $d = 50$, $2.25 \times 10^{15}$× at $d = 100$. A parametric model with the right functional form has rate $n^{-1}$ in any dimension — that gap is the entire reason high-dimensional ML is dominated by models with parameters.
+    - **Distance concentration is the mechanism, and you already measured it.** In *Vectors and the Geometry* the relative spread of pairwise distances fell as $1/\sqrt{d}$ — 2.42 at $d = 2$, 0.43 at $d = 100$, 0.043 at $d = 10{,}000$. For k-NN the relevant form is the *contrast* $(r_k - r_1)/r_1$: measured 4.67 at $d = 2$ (the 10th neighbour is 5.7× further than the 1st), 0.891 at $d = 5$, 0.408 at $d = 10$, 0.205 at $d = 20$, 0.054 at $d = 100$, 0.0140 at $d = 1000$. Below a contrast of roughly 0.05 the neighbour ranking is decided by numerical noise as much as by geometry.
+    - **Hubness: the votes are captured by a few points long before the distances tie.** Count how often each database point appears in a 10-NN list. Measured on 10,000 uniform points with 1,000 queries: at $d = 2$ the top 1% of points take 4.3% of all neighbour slots and 37% of points are never anyone's neighbour; at $d = 100$ those become 10.9% and 53%; at $d = 1000$, **15.2% and 58.5%**, with the single most popular point appearing in 4.3% of all queries. A handful of "hubs" become the neighbours of everything, so the classifier's output is dominated by a tiny, arbitrary subset of the training set — an error mode that looks nothing like "distances are all equal" but has the same cause.
+    - **Intrinsic dimension is the only real escape, and it is measurable.** The rate depends on the dimension the data actually fills, not the number of coordinates you store. The Levina–Bickel MLE — for each point, take its $k$ nearest distances $T_1 < \dots < T_k$ and compute $\hat\alpha = \left[\frac{1}{k-1}\sum_{j<k}\log(T_k/T_j)\right]^{-1}$, then take the median — returns **4.7** on 100-dimensional data drawn from a 5-dimensional subspace ($k = 10$), and 4.6 with $k = 20$. Run it on your 768-dimensional embeddings before you decide k-NN is hopeless: if the answer is 40, the effective problem is 40-dimensional and k-NN is back in business.
+    - **The cost side confirms the geometry: pruning dies before accuracy does.** Brute force is $2nd$ flops per query, so a 1,000,000 × 768 float32 index is 3.1 GB and 1.54 GFLOP per query — about 31 ms at 50 GFLOP/s, i.e. 32 queries per second per core. A k-d tree would prune that to a few percent of the points at $d = 5$, but above roughly 15–20 dimensions its bounding boxes overlap almost everywhere and the search degenerates toward a full scan. That is why production systems use approximate indexes: not because the distances are good, but because exact search is unaffordable — and approximation on an uninformative metric is where silent recall loss comes from.
+
+
+  derivations:
+    - title: "The radius of the k-nearest-neighbour ball"
+      latex: |
+        Assume the $n$ training points are uniform over a region of unit
+        volume, so the density is $n$ points per unit volume. The ball of
+        radius $r$ around a query has volume $V_d r^d$, hence contains
+        $n V_d r^d$ points in expectation. Setting that equal to $k$:
+        $$V_d\, r_k^{\,d} = \frac{k}{n}
+          \quad\Longrightarrow\quad
+          r_k = \left(\frac{k}{n\,V_d}\right)^{1/d}.$$
+        Taking logs and differentiating with respect to $n$:
+        $$\frac{\partial \log r_k}{\partial \log n} = -\frac{1}{d},$$
+        so doubling $n$ multiplies $r_k$ by $2^{-1/d}$, and halving $r_k$
+        requires $n \mapsto 2^{d} n$.
+      prose: >-
+        Because the radius is a d-th root of a fixed quantity, it is almost
+        insensitive to sample size: at d = 100, doubling the dataset buys a
+        0.7% smaller neighbourhood. The knob that is supposed to let you make
+        a local method more local has effectively been disconnected, and the
+        d in the exponent is the whole curse in one symbol.
+    - title: "Why the risk falls only as n^(-2/(d+2))"
+      latex: |
+        Let the regression function be $L$-Lipschitz. A k-NN estimate averaged
+        over a ball of radius $r$ has bias $O(Lr)$ and variance
+        $O(\sigma^2 / (n r^d))$, because only the $n r^d V_d$ points inside the
+        ball contribute:
+        $$\mathbb{E}\left[(\hat f(x) - f(x))^2\right]
+          \;\lesssim\; L^2 r^2 + \frac{\sigma^2}{n r^d}.$$
+        Minimising over $r$ gives $r^{*} \propto n^{-1/(d+2)}$, and
+        substituting back:
+        $$\mathbb{E}\left[(\hat f(x) - f(x))^2\right]
+          \;\lesssim\; n^{-2/(d+2)}.$$
+      prose: >-
+        The exponent is a ratio of two costs: bias wants a small ball,
+        variance wants many points inside it, and the dimension sets the
+        exchange rate. At d = 2 the rate is n^-1/2 and doubling the data cuts
+        error by 29%; at d = 10 it cuts it by 11%; at d = 100 by 1.35%.
+        Halving the error needs 2^51 = 2.25e15 times the data, which is why
+        nobody ships k-NN on 100 raw features without reducing them first.
+    - title: "Cover–Hart, and the step where it breaks"
+      latex: |
+        Let $\eta(x) = P(Y = 1 \mid X = x)$ and let $x_{nn}$ be the 1-NN of
+        $x$ with label $Y_{nn}$. The 1-NN error at $x$, averaged over labels,
+        is
+        $$P(Y \neq Y_{nn} \mid x) = \eta(x)\,(1 - \eta(x_{nn}))
+          + (1 - \eta(x))\,\eta(x_{nn}).$$
+        If $x_{nn} \to x$ then $\eta(x_{nn}) \to \eta(x)$ and the expression
+        tends to $2\eta(x)(1-\eta(x))$, whose expectation is at most
+        $2R^{*}$ because $2\eta(1-\eta) \le 2\min(\eta, 1-\eta)$.
+        The convergence step needs
+        $$\|x_{nn} - x\| \to 0
+          \quad\Longleftarrow\quad
+          n\, r_k^{\,d} \to \infty .$$
+      prose: >-
+        At fixed d and growing n the condition holds and 1-NN really is within
+        a factor of two of Bayes. When d grows with n, r_k converges instead to
+        the typical interpoint distance, the neighbour becomes an independent
+        draw from the data distribution, and the error converges to 2p(1-p) —
+        0.5 for balanced classes. The theorem is not wrong; it is answering a
+        question about a limit you are not in.
+
+  implementations:
+    - language: python
+      title: "Exact k-NN, chunked, with the self-match removed"
+      note: >-
+        This is numerically wrong in three specific ways, all of which bite in
+        high dimensions. (1) Distances are computed with the expansion
+        ||a||^2 + ||b||^2 - 2a.b, which cancels catastrophically when the norms
+        are large and the points are close: at d = 768, subtracting two numbers
+        near 768 to recover a squared distance of order 1 leaves about 12
+        significant digits, and the result can go negative, so the square root
+        needs a clip. (2) Ties are broken by argpartition, which is arbitrary
+        and can differ between BLAS builds. (3) Nothing here detects that the
+        k-th radius has grown to the size of the dataset — it returns an
+        answer, not a warning.
+      code: |
+        import numpy as np
+
+        def sqdist(A, B):
+            """Squared Euclidean distances, BLAS-shaped, clipped at zero."""
+            a2 = (A * A).sum(1)[:, None]
+            b2 = (B * B).sum(1)[None, :]
+            D = a2 + b2 - 2.0 * (A @ B.T)
+            # The expansion produces -1e-12 for a point and itself; sqrt of
+            # that is nan, and one nan poisons an entire query row.
+            np.maximum(D, 0.0, out=D)
+            return D
+
+        def knn_indices(X, Q, k, chunk=2048):
+            """Indices of the k nearest rows of X for each row of Q."""
+            out = []
+            for s in range(0, Q.shape[0], chunk):
+                D = sqdist(Q[s:s + chunk], X)
+                # argpartition is O(n) per query instead of O(n log n).
+                out.append(np.argpartition(D, k - 1, axis=1)[:, :k])
+            return np.vstack(out)
+
+        def knn_predict(X, y, Q, k):
+            idx = knn_indices(X, Q, k)
+            votes = y[idx]                       # (n_query, k)
+            out = []
+            for row in votes:
+                # np.unique sorts, so argmax breaks ties on the smallest label
+                labels, counts = np.unique(row, return_counts=True)
+                out.append(labels[np.argmax(counts)])
+            return np.asarray(out)
+
+        def diagnostic(X, Q, k=10):
+            """The numbers that decide whether the prediction above means anything."""
+            X = np.asarray(X, float)
+            Q = np.asarray(Q, float)
+            rng = np.random.default_rng(0)
+            i = rng.integers(0, len(X), 2000)
+            j = rng.integers(0, len(X), 2000)
+            typical = float(np.sqrt(sqdist(X[i], X[j])).mean())
+
+            idx = knn_indices(X, Q, k)
+            D = np.sqrt(sqdist(Q, X))
+            r1 = np.take_along_axis(D, idx[:, :1], axis=1).ravel()
+            rk = np.take_along_axis(D, idx[:, -1:], axis=1).ravel()
+            return {
+                "r1_over_typical": float((r1 / typical).mean()),
+                "rk_over_typical": float((rk / typical).mean()),
+                "contrast": float(((rk - r1) / r1).mean()),
+            }
+    - language: python
+      title: "The intrinsic-dimension estimator, and where it lies to you"
+      note: >-
+        The estimator is only valid if the data really is locally
+        low-dimensional and the distances are not dominated by noise. It is
+        numerically wrong when two neighbours sit at identical distance: the
+        log of a ratio of 1 is 0, which drags the mean toward zero and the
+        estimate toward infinity. It is badly biased when k is comparable to n,
+        and it under-estimates on strongly curved manifolds because curvature
+        makes a curved patch look higher-dimensional at the scale of the
+        k-ball.
+      code: |
+        import numpy as np
+
+        def levina_bickel(X, k=10):
+            """MLE of intrinsic dimension (Levina & Bickel, 2005)."""
+            X = np.asarray(X, float)
+            n = X.shape[0]
+            if k >= n:
+                raise ValueError("k must be smaller than the number of points")
+
+            D = np.sqrt(((X[:, None, :] - X[None, :, :]) ** 2).sum(-1))
+            np.fill_diagonal(D, np.inf)          # exclude the point itself
+            T = np.sort(D, axis=1)[:, :k]        # k smallest distances
+
+            # log(T_k / T_j) for j = 1..k-1. Subtracting logs rather than
+            # taking the log of a quotient is the same number with one fewer
+            # rounding step, and it never divides by a zero distance.
+            ratios = np.log(T[:, -1:]) - np.log(T[:, :-1])
+            alpha = 1.0 / ratios.mean(axis=1)
+            return float(np.median(alpha)), float(np.std(alpha))
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            A = rng.normal(size=(5, 100))        # 5-d subspace of R^100
+            X = rng.random((2000, 5)) @ A
+            print(levina_bickel(X, k=10))        # roughly (4.7, 1.1)
+
+  checkpoints:
+    - id: cp-1
+      question: 'You have $n = 100{,}000$ points in $d = 50$ dimensions, uniformly spread in a unit cube, and use $k = 10$. What is the predicted radius of the 10-NN ball, and what does that radius mean for a point near a corner?'
+      answerKind: short_text
+      hint: '$r = (k/(nV_d))^{1/d}$ with $V_{50} = 1.73 \times 10^{-13}$.'
+      solution: >-
+        $r = (10/(10^5 \times 1.73 \times 10^{-13}))^{1/50} = 1.50$ — one and a
+        half times the cube's edge. Any point in the ball satisfies
+        $|\Delta x_i| \le 1.5$ in every coordinate, which every point in the
+        cube satisfies anyway: the ball's bounding box is the entire dataset.
+        It still holds only 1/10,000 of the volume, because in 50 dimensions a
+        ball is a thin sheet that spans everything and encloses nothing. That
+        is precisely what it means for a neighbourhood to stop being local.
+    - id: cp-2
+      question: "Your 1-NN model reports 100% training accuracy and 61% test accuracy. Explain the first number, and say what the honest in-sample estimate would have been."
+      answerKind: short_text
+      hint: "What is the nearest neighbour of a training point that is also in the training set?"
+      solution: >-
+        100% training accuracy is a tautology: with $k = 1$ and the query
+        included in the training set, every point's nearest neighbour is
+        itself at distance 0, so it always predicts its own label. The honest
+        in-sample estimate is leave-one-out — exclude the query, find the
+        nearest of the remaining $n-1$ — which for 1-NN is exactly the
+        leave-one-out cross-validation error and is an almost unbiased
+        estimate of test error. A 39-point gap between 100% and 61% is
+        measuring nothing; there was never any information in the first
+        number.
+    - id: cp-3
+      question: 'Cover–Hart guarantees 1-NN error at most twice the Bayes error. You measure 11.5% against a Bayes floor of 5% at $d = 100$ with $n = 25{,}000$. Has the theorem been violated?'
+      answerKind: short_text
+      hint: "In what order are the two limits taken?"
+      solution: >-
+        No. The theorem is a statement about $n \to \infty$ with $d$ fixed. At
+        $d = 100$ the condition $n r^d \to \infty$ requires $r$ to shrink like
+        $n^{-1/100}$, which happens at a rate that is invisible over the range
+        of $n$ anyone can collect: 25,000 points gives $r \approx 2.3$ in a
+        unit cube, a ball that covers a good fraction of the space.
+        Extrapolate the measured curve and the error goes to
+        $2p(1-p) = 0.5$, not to 0.1. The bound is true at the limit and
+        uninformative at the sample sizes people actually have.
+    - id: cp-4
+      question: "At $d = 768$ with 50,000 labelled points, k-NN gets 88% and logistic regression gets 91%. Which do you ship, and what single measurement would change your answer?"
+      answerKind: short_text
+      hint: "Compute n/d. Then ask what would make the effective dimension smaller than 768."
+      solution: >-
+        Ship logistic regression. $n/d = 50{,}000/768 = 65$ points per
+        dimension, below the roughly 100-per-dimension budget where local
+        methods start to track the Bayes rate, and the measured gap is exactly
+        the pattern the rate predicts. The measurement that would change the
+        answer is the Levina–Bickel estimate: if the embeddings have intrinsic
+        dimension 30–40 rather than 768, projecting to it changes the exponent
+        in $n^{-2/(d+2)}$ from $-0.0026$ to $-0.048$ — a factor of 18 — and
+        k-NN becomes competitive again. Measure before deciding, and do not
+        assume either way.
+    - id: cp-5
+      question: "Your retrieval system returns the same three documents in the top 10 for 40% of queries, and those documents are not more relevant than average. What is happening, and why does raising k not fix it?"
+      answerKind: short_text
+      hint: "Which points win near-ties, again and again?"
+      solution: >-
+        Hubness. When distances concentrate, near-ties are decided by tiny,
+        systematic differences — points near the centre of the cloud are
+        marginally closer to everything — so a few points win an outsized share
+        of neighbour slots (measured: at $d = 1000$ the top 1% of points take
+        15% of all slots while 59% of the database is nobody's neighbour).
+        Raising $k$ makes it worse rather than better: it creates more slots
+        for the hubs to occupy. The fix is geometric — reduce dimension,
+        whiten, or use a metric with better contrast such as cosine on
+        normalised vectors — or rerank with an explicit penalty on hub scores.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        k-NN works by assuming that close in input space implies similar
+        label. That assumption is a statement about the *volume* a
+        neighbourhood covers, and in high dimensions a neighbourhood of fixed
+        point-count covers almost the entire space. Nothing about the
+        algorithm is wrong; the geometry it relies on has quietly changed
+        underneath it.
+      blocks:
+        - kind: checklist
+          body: |
+            - The model has no parameters, so every failure is geometric
+            - A ball containing k of n points has a radius you can compute
+            - That radius grows with dimension at fixed n
+            - When it approaches the typical interpoint distance, nearest stops discriminating
+            - Training accuracy is worthless here: 1-NN scores 100% by construction
+      checkpoint: >-
+        Before reading on: if your 10-NN ball contains exactly 10 points, what
+        else could it contain that would make the average meaningful?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Do not tune $k$ first. Measure three things — the radius, the radius
+        divided by the typical interpoint distance, and the contrast between
+        the $k$-th and 1st neighbour — then decide. If the contrast is healthy
+        the problem is elsewhere (labels, metric, features). If it is not, the
+        only real fix is to change the dimension the distance operates in:
+        normalise, whiten, or project to the intrinsic dimension. If none of
+        those is defensible, a parametric model is the correct answer rather
+        than a compromise.
+      blocks:
+        - kind: checklist
+          body: |
+            - Measure r1, rk, and the mean interpoint distance on real data
+            - Contrast (rk - r1)/r1 below 0.05  ->  the ranking is noise
+            - rk / typical above 0.8           ->  the neighbourhood is the dataset
+            - Estimate intrinsic dimension before declaring defeat
+            - Reduce first, then re-measure; only then tune k
+      checkpoint: >-
+        Your contrast is 0.02 and your accuracy is 0.84. Which of those two
+        numbers do you believe, and why?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The diagnostic is three lines of distance arithmetic. The fix is a
+        projection. Neither is subtle, and both are usually skipped because
+        cross-validation rewards skipping them.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. Diagnose
+            D = pairwise_distances(Q, X)
+            idx = argpartition(D, k)[:, :k]
+            r1 = D[i, idx[:, 0]]
+            rk = D[i, idx[:, k-1]]
+            typical = mean(pairwise_distances(X[sample], X[sample]))
+            print(rk / typical, (rk - r1) / r1)
+
+            # 2. Reduce if needed
+            Xn = l2_normalise(X); Qn = l2_normalise(Q)
+            Xc = Xn - mean(Xn)
+            vals, vecs = eigh(cov(Xc))
+            d_int = levina_bickel(Xc, k=10)
+            P = vecs[:, -d_int:]                  # keep the top d_int directions
+            Zx, Zq = Xc @ P, (Qn - mean(Xn)) @ P  # same transform for the query!
+
+            # 3. Re-measure, then tune k on the reduced space
+            assert contrast(Zx, Zq) > contrast(X, Q)
+      checkpoint: >-
+        Why must the query be transformed with the *training* mean and
+        projection rather than with its own?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Every quantity in this topic comes from one balance: the number of
+        points inside a ball of radius $r$ is $n V_d r^d$, so the radius needed
+        to capture $k$ of them is a $d$-th root — and a $d$-th root is almost
+        constant in $d$ and almost constant in $n$.
+      blocks:
+        - kind: math
+          body: |
+            $$V_d r_k^d = \frac{k}{n}
+              \;\Longrightarrow\;
+              r_k = \left(\frac{k}{n V_d}\right)^{1/d},
+              \qquad \frac{\partial \log r_k}{\partial \log n} = -\frac{1}{d}$$
+
+            Bias–variance for a local average of radius $r$:
+            $$\text{risk} \;\lesssim\; L^2 r^2 + \frac{\sigma^2}{n r^d}
+              \;\Longrightarrow\;
+              r^{*} \propto n^{-1/(d+2)}
+              \;\Longrightarrow\;
+              \text{risk} \lesssim n^{-2/(d+2)}$$
+
+            Cover–Hart needs the neighbour to converge:
+            $$\|x_{nn} - x\| \to 0
+              \quad\Longleftarrow\quad n r_k^d \to \infty$$
+      checkpoint: >-
+        The bias term does not contain $d$ at all, yet the rate worsens sharply
+        with $d$. Where exactly did $d$ enter?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete diagnostic and repair path, with the numbers to compare
+        against and the places it fails.
+      blocks:
+        - kind: warning
+          body: >-
+            Run the diagnostic on your own data before reading the reference
+            implementation. Predict the contrast first; being wrong about your
+            own feature space is the useful part.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def sqdist(A, B):
+                a2 = (A * A).sum(1)[:, None]
+                b2 = (B * B).sum(1)[None, :]
+                D = a2 + b2 - 2.0 * (A @ B.T)
+                np.maximum(D, 0.0, out=D)
+                return D
+
+            def diagnose(X, Q, k=10, sample=2000):
+                """Radius, contrast, hubness, and the intrinsic-dimension guess."""
+                X = np.asarray(X, float); Q = np.asarray(Q, float)
+                rng = np.random.default_rng(0)
+                i = rng.integers(0, len(X), sample)
+                j = rng.integers(0, len(X), sample)
+                typical = float(np.sqrt(sqdist(X[i], X[j])).mean())
+
+                idx = np.vstack([
+                    np.argpartition(sqdist(Q[s:s+1024], X), k - 1, axis=1)[:, :k]
+                    for s in range(0, len(Q), 1024)
+                ])
+                D = np.sqrt(sqdist(Q, X))
+                r1 = np.take_along_axis(D, idx[:, :1], axis=1).ravel()
+                rk = np.take_along_axis(D, idx[:, -1:], axis=1).ravel()
+
+                counts = np.bincount(idx.ravel(), minlength=len(X)).astype(float)
+                top = np.sort(counts)[::-1][: max(1, len(X) // 100)]
+                Dx = np.sqrt(sqdist(X, X))
+                np.fill_diagonal(Dx, np.inf)
+                T = np.sort(Dx, axis=1)[:, :k]
+                alpha = 1.0 / (np.log(T[:, -1:]) - np.log(T[:, :-1])).mean(1)
+
+                return {
+                    "n": len(X), "d": X.shape[1], "n_per_dim": len(X) / X.shape[1],
+                    "r1_over_typical": float((r1 / typical).mean()),
+                    "rk_over_typical": float((rk / typical).mean()),
+                    "contrast": float(((rk - r1) / r1).mean()),
+                    "hub_share_top1pct": float(top.sum() / idx.size),
+                    "never_a_neighbour": float((counts == 0).mean()),
+                    "intrinsic_dim_mle": float(np.median(alpha)),
+                }
+
+            # Read the output as a verdict, not a dashboard:
+            #   contrast < 0.05      -> the top-k ranking is not information
+            #   rk/typical > 0.8     -> the neighbourhood covers the dataset
+            #   hub_share >> 0.01    -> a few points own the vote
+            #   intrinsic_dim << d   -> reduce; the exponent depends on it
+      checkpoint: >-
+        Suppose all four verdicts are bad and the intrinsic dimension is
+        genuinely 700. What is the honest engineering conclusion, and what
+        would you build instead?
+
+  problems:
+    - id: p-knn-classify
+      title: "k-NN classification by majority vote"
+      difficulty: easy
+      prompt: >-
+        Implement `knn_classify(X_train, y_train, X_test, k)`. For each row of
+        `X_test`, find the `k` rows of `X_train` with the smallest Euclidean
+        distance and return the majority label among them. Break a tied vote
+        by returning the smallest label value (labels are integers). If `k`
+        exceeds the number of training rows, use all of them. Return a list of
+        labels in the order of `X_test`.
+      starter: |
+        import numpy as np
+
+        def knn_classify(X_train, y_train, X_test, k):
+            # your implementation here
+            pass
+      language: python
+      entry: knn_classify
+      testCases:
+        - input: "[[[0.0, 0.0], [3.0, 0.0], [0.0, 3.0]], [0, 1, 2], [[0.1, 0.1]], 1]"
+          expected: "[0]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]], [0, 1, 0, 1], [[1.4, 0.0]], 3]"
+          expected: "[0]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[0.0, 0.0], [0.6, 0.0], [5.0, 0.0]], [2, 1, 0], [[0.2, 0.0]], 2]"
+          expected: "[1]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [0.5, 3.0], [3.0, 0.5]], [2, 0, 1, 2, 1, 0], [[0.1, 0.2], [2.9, 2.8], [1.3, 1.6]], 1]"
+          expected: "[2, 2, 0]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def knn_classify(X_train, y_train, X_test, k):
+            X = np.asarray(X_train, dtype=float)
+            y = np.asarray(y_train)
+            Q = np.asarray(X_test, dtype=float)
+            k = min(k, len(y))
+
+            out = []
+            for q in Q:
+                d = np.sqrt(((X - q) ** 2).sum(axis=1))
+                # stable sort -> deterministic when distances tie
+                idx = np.argsort(d, kind="stable")[:k]
+                # np.unique returns labels in ascending order, so argmax over
+                # the counts picks the SMALLEST label among the tied winners.
+                labels, counts = np.unique(y[idx], return_counts=True)
+                out.append(int(labels[np.argmax(counts)]))
+            return out
+      solutionExplanation: >-
+        The whole model is one distance computation and one vote. Two details
+        decide the tests: `np.unique` sorts, so `argmax` on the counts
+        resolves a tie toward the smallest label automatically; and a stable
+        sort makes the neighbour set deterministic when two training points are
+        equidistant, which matters because in high dimensions equidistance is
+        the normal case rather than the exception. Note what this function
+        does *not* do: it never notices that at $d = 768$ the three nearest
+        rows are as far away as three random rows. Correctness and usefulness
+        are different properties.
+      complexity: "O(n_test · n_train · d) time, O(n_train) space per query"
+      tags: [knn, classification, numpy]
+
+    - id: p-neighbourhood-radius
+      title: "The radius of the k-NN ball"
+      difficulty: easy
+      prompt: >-
+        Implement `neighbourhood_radius(n, k, d)`: the radius of the ball that
+        contains the `k` nearest neighbours of a query when `n` points are
+        spread uniformly over a region of unit volume. Use
+        $r = (k/(n V_d))^{1/d}$ with $V_d = \pi^{d/2}/\Gamma(d/2+1)$. Work in
+        log space so that $d = 1000$ neither overflows nor underflows — the
+        ball volume at $d = 100$ is about $2.4 \times 10^{-40}$.
+      starter: |
+        import math
+
+        def neighbourhood_radius(n, k, d):
+            # your implementation here
+            pass
+      language: python
+      entry: neighbourhood_radius
+      testCases:
+        - input: "[10000, 10, 2]"
+          expected: "0.01784124116152771"
+          mode: json
+          tolerance: 1e-9
+        - input: "[10000, 10, 10]"
+          expected: "0.45639742794200266"
+          mode: json
+          tolerance: 1e-9
+        - input: "[1000, 5, 3]"
+          expected: "0.10607844179470555"
+          mode: json
+          tolerance: 1e-9
+        - input: "[318309, 10, 2]"
+          expected: "0.003162282062113113"
+          mode: json
+          tolerance: 1e-9
+        - input: "[10, 10, 7]"
+          expected: "0.8010506126427523"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+
+        def neighbourhood_radius(n, k, d):
+            # log V_d = (d/2) log(pi) - log Gamma(d/2 + 1)
+            # lgamma is used because Gamma(51) overflows a float at d = 100,
+            # where V_d is already ~1e-40.
+            log_v = (d / 2.0) * math.log(math.pi) - math.lgamma(d / 2.0 + 1.0)
+            return float(math.exp((math.log(k / n) - log_v) / d))
+      solutionExplanation: >-
+        This one function is the curse of dimensionality in closed form. Two
+        consequences are worth memorising: the dependence on $n$ is $n^{-1/d}$,
+        so at $d = 100$ doubling your dataset shrinks the neighbourhood by
+        0.7%; and holding the radius fixed costs $n \propto V_d^{-1} r^{-d}$ —
+        318 points at $d = 2$, $3.9 \times 10^{10}$ at $d = 10$,
+        $4.2 \times 10^{140}$ at $d = 100$. Working in logs is not decoration:
+        `math.gamma(51)` raises OverflowError, and the direct form underflows
+        to 0.0 long before $d = 1000$.
+      complexity: "O(1) time, O(1) space"
+      tags: [geometry, knn, numerics]
+
+    - id: p-intrinsic-dimension
+      title: "Intrinsic dimension by maximum likelihood"
+      difficulty: medium
+      prompt: >-
+        Implement `intrinsic_dimension_mle(X, k)` — the Levina–Bickel
+        estimator. For each point, let $T_1 < \dots < T_k$ be the distances to
+        its $k$ nearest *other* points, and compute
+        $\hat\alpha_i = [\frac{1}{k-1}\sum_{j=1}^{k-1}\log(T_k/T_j)]^{-1}$.
+        Return the median of $\hat\alpha_1, \dots, \hat\alpha_n$ as a float.
+        A point must be excluded from its own neighbour list.
+      starter: |
+        import numpy as np
+
+        def intrinsic_dimension_mle(X, k):
+            # your implementation here
+            pass
+      language: python
+      entry: intrinsic_dimension_mle
+      testCases:
+        - input: "[[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.5, 0.0], [0.4, 0.6, 1.2], [2.0, 2.0, 0.5], [1.3, 0.2, 0.9], [-0.7, 1.1, 0.3], [0.9, 2.2, 1.8], [2.4, 0.8, 1.1], [0.2, 0.3, 2.0], [1.8, 1.4, 2.3], [-0.4, -0.6, 0.8]], 3]"
+          expected: "3.5692141893338913"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.5, 0.0], [0.4, 0.6, 1.2], [2.0, 2.0, 0.5], [1.3, 0.2, 0.9], [-0.7, 1.1, 0.3], [0.9, 2.2, 1.8], [2.4, 0.8, 1.1], [0.2, 0.3, 2.0], [1.8, 1.4, 2.3], [-0.4, -0.6, 0.8]], 5]"
+          expected: "3.7250523287727466"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.5, 0.0], [0.4, 0.6, 1.2], [2.0, 2.0, 0.5], [1.3, 0.2, 0.9], [-0.7, 1.1, 0.3], [0.9, 2.2, 1.8], [2.4, 0.8, 1.1], [0.2, 0.3, 2.0], [1.8, 1.4, 2.3], [-0.4, -0.6, 0.8]], 8]"
+          expected: "2.635430034768877"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def intrinsic_dimension_mle(X, k):
+            X = np.asarray(X, dtype=float)
+            n = X.shape[0]
+            if k >= n:
+                raise ValueError("k must be smaller than n")
+
+            # full distance matrix; the diagonal is +inf so that a point's own
+            # distance never enters its k smallest
+            D = np.sqrt(((X[:, None, :] - X[None, :, :]) ** 2).sum(-1))
+            np.fill_diagonal(D, np.inf)
+            T = np.sort(D, axis=1)[:, :k]
+
+            # log(T_k / T_j) in the numerically stable form
+            ratios = np.log(T[:, -1:]) - np.log(T[:, :-1])
+            alpha = 1.0 / ratios.mean(axis=1)
+            return float(np.median(alpha))
+      solutionExplanation: >-
+        The estimator asks how fast the point count grows as you expand a ball
+        from the 1st to the $k$-th neighbour. In a $d$-dimensional space the
+        count grows like $r^d$, so the ratios $T_k / T_j$ encode $d$ directly,
+        and averaging the logs over $j$ before inverting is what makes it an
+        MLE rather than a two-point ratio. The median rather than the mean
+        matters because points on the edge of the cloud have runaway estimates.
+        With only 12 points the number is noisy — which is why the same call on
+        2,000 points drawn from a 5-dimensional subspace of
+        $\mathbb{R}^{100}$ returns 4.7, and why the estimator is useful on real
+        embeddings and misleading on toy samples.
+      complexity: "O(n²d) time, O(n²) space"
+      tags: [intrinsic-dimension, manifold, knn]
+
+  try_it: >-
+    Compute $r_{10}$ as a fraction of the mean interpoint distance at
+    $n = 10{,}000$ for $d = 2, 10, 100, 1000$ and compare with 3.0%, 41%, 82% and
+    94.6%. Then invert the radius formula and work out how many points you would
+    need for a 10-point ball of radius 0.1 at $d = 10$.
+  interview_questions:
+    - question: "k-NN has no parameters. What is its inductive bias, and what does it cost?"
+      level: mid
+      key_points:
+        - "Its entire assumption is that a small ball around a query contains points whose labels are informative — fitting is just storing the data."
+        - "Prediction is a Voronoi lookup plus a vote, so every failure it has is geometric rather than an optimisation failure."
+        - "The cost is per query: $2nd$ flops for brute force, which is 1.54 GFLOP for a 1,000,000 × 768 float32 index."
+        - "That is why the interesting questions are about the radius of the $k$-ball, not about hyperparameters."
+      follow_up: "You have 10,000 points and 1,000 dimensions. What is $r_{10}$ relative to a typical distance, and what follows?"
+    - question: "Adding 400 TF-IDF features dropped AUC from 0.91 to 0.78. Diagnose it."
+      level: senior
+      key_points:
+        - "The radius formula explains it: at $n = 10^4$, $k = 10$, $r_{10}$ is 82% of the mean interpoint distance at $d = 100$ and 94.6% at $d = 1000$ — there is no local neighbourhood left."
+        - "Distances concentrate, so the contrast $(r_k - r_1)/r_1$ collapses and the vote is decided by noise."
+        - "Hubness makes it worse: at $d = 2$ the top 1% of points take 4.3% of neighbour slots, and a few points capture the votes long before distances tie."
+        - "The fixes are dimensional: estimate the intrinsic dimension, project to it, or switch to a metric learned around the task."
+      follow_up: "Intrinsic dimension is 20 in both cases. Why did the extra features still hurt?"
+    - question: "What does the $n^{-2/(d+2)}$ rate imply about collecting more data?"
+      level: mid
+      key_points:
+        - "Bias is $O(r^2)$ and variance $O(1/(n r^d))$, balancing at $r^* \\propto n^{-1/(d+2)}$ and risk $\\propto n^{-2/(d+2)}$."
+        - "Halving the error needs $2^{(d+2)/2}$ times the data: 4× at $d = 2$, 64× at $d = 10$."
+        - "The exponential data bill is the quantitative form of the curse: keeping a 10-point ball of radius 0.1 needs $3.9\\times10^{10}$ points at $d = 10$."
+        - "So adding rows is the wrong lever at high $d$ — reducing the effective dimension is the only one that changes the exponent."
+  common_mistakes:
+    - "Treating $k$ as the important knob when at $d = 100$ the 10th and 10,000th neighbours are only 5% apart in distance."
+    - "Assuming more features help k-NN, when adding a 400-dimensional TF-IDF block took AUC from 0.91 to 0.78."
+    - "Blaming the implementation for hubness, which is a property of the geometry rather than of the index."
+  further_reading:
+    - label: "Cover & Hart, Nearest neighbor pattern classification (IEEE Transactions on Information Theory, 1967)"
+    - label: "Beyer, Goldstein, Ramakrishnan & Shaft, When Is 'Nearest Neighbor' Meaningful? (ICDT 1999)"

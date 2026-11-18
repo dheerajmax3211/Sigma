@@ -1,0 +1,1087 @@
+id: learning-rate-schedules
+slug: learning-rate-schedules
+title: "Warmup, Decay, Batch Size: One Budget, Three Ways to Spend It"
+summary: >-
+  Choose the peak learning rate, the shape it decays along, and the batch size
+  as one decision rather than three — and predict from the schedule's area and
+  the first step's length whether a run will converge, plateau, or die in its
+  first hundred steps.
+kind: lesson
+difficulty: medium
+position: 10
+estMinutes: 26
+prerequisites: [gradient-descent-variants]
+phase: mathematical-foundations
+tags: [optimization, learning-rate, cosine-decay, warmup, batch-size, training]
+
+body:
+  big_idea: >-
+    What the optimizer integrates is $\sum_t \eta_t$, not the peak rate, so peak, decay
+    shape and batch size are one decision — and warmup exists only to stop the first
+    step being the largest.
+
+  problem:
+    - "Your run holds 1e-3 and the loss stops at 0.031 — the noise floor of a constant step, which is linear in the learning rate."
+    - "You move from one GPU to 32, scale the batch 32×, keep the learning rate, and get 32× fewer steps making 32× less progress."
+    - "You delete the 2,000-step warmup because it was wasting steps, and the loss spikes at step 30 and never recovers."
+
+  analogy: |
+    Landing an aircraft: you descend fast while you still have distance to
+    spend, then flare and slow to touchdown so the wheels meet the ground
+    gently. Speed is the learning rate; the distance covered is the budget, not
+    the speed you started at. Warmup is the configuration phase — gear and flaps
+    extended gradually, at a rate the airframe tolerates.
+
+  concept_points:
+    - "**A constant learning rate cannot converge, only orbit.** On $\\tfrac12\\lambda\\theta^2$ with gradient noise $\\sigma^2$ the excess loss settles at $\\eta\\sigma^2/(2(2-\\eta\\lambda))$, about $\\eta\\sigma^2/4$ for small $\\eta\\lambda$: with $\\lambda=1$, $\\sigma=1$, $\\eta=0.1$ the floor is **0.0263** and 400 seeds average 0.0268, flat from step 200. The floor is linear in $\\eta$."
+    - "**What the model experiences is the sum, not the peak.** Total movement is $\\sum_t \\eta_t = \\eta_{\\max}T\\cdot\\overline{\\text{shape}}$. At $\\eta_{\\max}=10^{-3}$ over 1,000 steps: constant gives **1.000**, cosine-to-zero **0.5005**, 10× step decay **0.5275** — the same peak with cosine travels half as far. An $\\eta_{\\max}$ copied between recipes is not the same hyperparameter twice."
+    - "**Cosine decay front-loads the budget.** The first half of a cosine run consumes $\\tfrac12 + \\tfrac1\\pi = \\mathbf{81.83\\%}$ of the area; half is gone by $t=0.265T$ and three quarters by $0.44T$. Discrete at $T=1000$: 19.8% in the first 10% of steps, 47.5% by 25%. The claim that cosine buys a long fine-tuning tail is backwards about where the time goes."
+    - "**Warmup exists because Adam's first step is already full length.** Bias correction makes step 1 exactly $\\eta\\operatorname{sign}(g_1)$ — length $\\eta$ in *every* coordinate, from one batch. At the linear-scaling rate for batch 8192, $\\eta = 3.2$ against $\\sigma_w = 0.02$: one step moves each weight **160** standard deviations. The condition is $\\eta/T_w \\le \\sigma_w$, so $T_w \\ge 160$; the published recipe used 780."
+    - "**Linear scaling, $\\eta \\propto B$, holds movement per epoch constant.** A pass of $N$ examples at batch $B$ is $N/B$ steps of size $\\eta\\bar g$, so fixing that means $\\eta$ grows with $B$: $256 \\to 8192$ is $0.1 \\to 3.2$. The derivation assumes the gradient is unchanged across sub-batches, which fails at large rates — hence warmup, and the rule breaks near $B = 8\\text{k}$–$32\\text{k}$."
+    - "**Bias correction fixes the first moment and says nothing about the second.** For an EMA with $\\beta_2$ the relative standard deviation of $\\hat v$ is $\\sqrt{\\kappa\\frac{1-\\beta_2}{1+\\beta_2}\\frac{1+\\beta_2^t}{1-\\beta_2^t}}$ with $\\kappa = 2$ for Gaussian gradients: **141%** at $t=1$, 14.1% at $t=100$, 3.16% asymptotically. Since the update divides by $\\sqrt{\\hat v}$, step-length error is half that."
+
+  definitions:
+    - term: "Learning-rate schedule"
+      meaning: >-
+        A function $\eta_t$ mapping optimizer step to step size. It is defined
+        by a peak $\eta_{\max}$, a floor $\eta_{\min}$, a horizon $T$, and a
+        shape. Any three of those four numbers determine the fourth's effect on
+        the run, which is why they cannot be tuned independently.
+    - term: "Schedule budget"
+      meaning: >-
+        $\mathcal{B} = \sum_{t=0}^{T-1}\eta_t$, the area under the schedule. It
+        is the total parameter movement the run has available, in the same units
+        as $\theta$. A cosine from $10^{-3}$ to zero over 1000 steps has
+        $\mathcal{B} = 0.5005$; the constant schedule with the same peak has
+        $\mathcal{B} = 1.000$.
+    - term: "Warmup"
+      meaning: >-
+        A ramp applied before the main schedule, usually linear,
+        $\eta_t = \eta_{\max}\,t/T_w$. Its job is to keep the first steps small
+        while the optimizer's state and the initialisation are both bad. The
+        design rule is $T_w \gtrsim \eta_{\max}/\sigma_w$, where $\sigma_w$ is
+        the weight scale at initialisation.
+    - term: "Cosine decay"
+      meaning: >-
+        $\eta_t = \eta_{\min} + \tfrac12(\eta_{\max}-\eta_{\min})
+        \left(1+\cos\frac{\pi t}{T}\right)$. Zero slope at both ends, area
+        $T(\eta_{\max}+\eta_{\min})/2 + (\eta_{\max}-\eta_{\min})/2$, and 81.83%
+        of that area spent in the first half of training.
+    - term: "Step decay"
+      meaning: >-
+        Multiplying the rate by a constant factor at fixed milestones, e.g. ×0.1
+        at 50% and 75% of training. Its area, relative to a constant schedule at
+        the same peak, is the weighted average of the plateaus — 0.5275 for the
+        cuts above, against cosine's 0.5005.
+    - term: "Inverse-time decay"
+      meaning: >-
+        $\eta_t = \eta_0/(1+t/\tau)$, the schedule that satisfies the
+        Robbins–Monro conditions exactly. Its problem is arithmetic: with
+        $\eta_0$ tuned for a constant run, it decays so fast that the run stops
+        moving long before the horizon. Measured at $\eta_0 = 0.1$, $T=2000$, it
+        ended at loss 0.0608 — *worse* than the constant-rate floor of 0.0268.
+    - term: "Linear scaling rule"
+      meaning: >-
+        $\eta \propto B$. Holds the total parameter movement per epoch constant
+        when the batch changes, on the assumption that the gradients of the
+        sub-batches it replaces are interchangeable. Valid only while the weights
+        barely move within the accumulation window, which is why it is paired
+        with warmup.
+    - term: "Square-root scaling rule"
+      meaning: >-
+        $\eta \propto \sqrt{B}$. Holds the per-step parameter noise
+        $\eta^2\sigma^2/B$ constant instead of the per-epoch movement. The
+        conservative choice when linear scaling diverges; it is what you fall back
+        to as you approach the critical batch size.
+    - term: "Critical batch size"
+      meaning: >-
+        $B_{\text{noise}} = \operatorname{tr}(\Sigma)/\|G\|^2$ for per-sample
+        gradient covariance $\Sigma$ and true gradient $G$: the batch at which the
+        gradient's noise equals its signal. Below it, doubling the batch and the
+        rate buys real speedup; above it, extra batch buys almost nothing.
+    - term: "One-cycle policy"
+      meaning: >-
+        A schedule that ramps linearly *up* to a peak (often 3–10× the
+        constant-rate optimum), then decays below it for the last stretch. It
+        works because the area, not the peak, is what the model integrates — and
+        because the up-ramp doubles as warmup.
+    - term: "Effective step size"
+      meaning: >-
+        $\eta_t\|u_t\|$ in parameter units, where $u_t$ is the optimizer's
+        normalised update direction. For Adam $|u_i| \le 1$, so the effective
+        step is at most $\eta_t$ per coordinate; for SGD it is $\eta_t\|g_t\|$
+        and inherits the gradient's scale.
+    - term: "Half-ulp floor"
+      meaning: >-
+        The smallest increment that survives being added to a number:
+        $\tfrac12\operatorname{ulp}(\theta)$, roughly $\epsilon|\theta|/2$, which
+        is $5.96\times10^{-8}$ for $|\theta|=1$ in fp32. Updates smaller than
+        this are rounded away, which is what happens to the tail of an aggressive
+        decay in a low-precision dtype.
+
+  diagrams:
+    - type: plot
+      title: "Five shapes, normalised to the same peak — and five different areas"
+      chart: "line"
+      xLabel: "fraction of training (t / T)"
+      yLabel: "η / η_max"
+      series:
+        - name: "constant"
+          points:
+            - { x: 0.0, y: 1.0 }
+            - { x: 0.1, y: 1.0 }
+            - { x: 0.25, y: 1.0 }
+            - { x: 0.5, y: 1.0 }
+            - { x: 0.75, y: 1.0 }
+            - { x: 0.9, y: 1.0 }
+            - { x: 1.0, y: 1.0 }
+        - name: "cosine"
+          points:
+            - { x: 0.0, y: 1.0 }
+            - { x: 0.1, y: 0.9755 }
+            - { x: 0.25, y: 0.8536 }
+            - { x: 0.5, y: 0.5 }
+            - { x: 0.75, y: 0.1464 }
+            - { x: 0.9, y: 0.0245 }
+            - { x: 1.0, y: 0.0 }
+        - name: "linear"
+          points:
+            - { x: 0.0, y: 1.0 }
+            - { x: 0.1, y: 0.9 }
+            - { x: 0.25, y: 0.75 }
+            - { x: 0.5, y: 0.5 }
+            - { x: 0.75, y: 0.25 }
+            - { x: 0.9, y: 0.1 }
+            - { x: 1.0, y: 0.0 }
+        - name: "step decay (×0.1 at 50%, 75%)"
+          points:
+            - { x: 0.0, y: 1.0 }
+            - { x: 0.1, y: 1.0 }
+            - { x: 0.25, y: 1.0 }
+            - { x: 0.49, y: 1.0 }
+            - { x: 0.51, y: 0.1 }
+            - { x: 0.75, y: 0.01 }
+            - { x: 1.0, y: 0.01 }
+        - name: "inverse time 1/(1+10x)"
+          points:
+            - { x: 0.0, y: 1.0 }
+            - { x: 0.1, y: 0.5 }
+            - { x: 0.25, y: 0.2857 }
+            - { x: 0.5, y: 0.1667 }
+            - { x: 0.75, y: 0.1176 }
+            - { x: 0.9, y: 0.1 }
+            - { x: 1.0, y: 0.0909 }
+    - type: plot
+      title: "The floor, measured: constant rate plateaus at 0.027, cosine keeps falling"
+      chart: "line"
+      xLabel: "optimizer step"
+      yLabel: "excess loss (mean of 400 seeds)"
+      series:
+        - name: "constant η = 0.1 (theory floor 0.0263)"
+          points:
+            - { x: 0, y: 0.542415 }
+            - { x: 200, y: 0.026125 }
+            - { x: 400, y: 0.028754 }
+            - { x: 600, y: 0.027167 }
+            - { x: 800, y: 0.028868 }
+            - { x: 1000, y: 0.027036 }
+            - { x: 1200, y: 0.027272 }
+            - { x: 1400, y: 0.028916 }
+            - { x: 1600, y: 0.02574 }
+            - { x: 1800, y: 0.024495 }
+            - { x: 2000, y: 0.026757 }
+        - name: "cosine 0.1 → 0 over the same 2000 steps"
+          points:
+            - { x: 0, y: 0.542415 }
+            - { x: 200, y: 0.024872 }
+            - { x: 400, y: 0.021531 }
+            - { x: 600, y: 0.021479 }
+            - { x: 800, y: 0.01847 }
+            - { x: 1000, y: 0.013408 }
+            - { x: 1200, y: 0.009679 }
+            - { x: 1400, y: 0.005287 }
+            - { x: 1600, y: 0.003038 }
+            - { x: 1800, y: 0.001327 }
+            - { x: 2000, y: 0.001064 }
+    - type: compare
+      title: "Linear vs √B scaling: two rules, two invariants"
+      left_label: "η ∝ B (linear)"
+      left_points:
+        - "Invariant: parameter movement per epoch, η·(N/B)·ḡ"
+        - "B ×32 ⇒ η ×32: 0.1 → 3.2 at batch 8192"
+        - "Aggressive: assumes the k sub-batches share one gradient"
+        - "Requires warmup, because the first step is now huge"
+        - "Validated to B = 8192 on ImageNet with 5 epochs of warmup (780 steps)"
+      right_label: "η ∝ √B (square root)"
+      right_points:
+        - "Invariant: noise injected per step, η²σ²/B"
+        - "B ×32 ⇒ η ×5.66: 0.1 → 0.566 at batch 8192"
+        - "Conservative: always stable, never as fast"
+        - "Needs much less warmup for the same batch"
+        - "The fallback once you approach B_noise and linear scaling diverges"
+    - type: pipeline
+      title: "Choosing the three numbers in the right order"
+      nodes:
+        - label: "1. Find the peak with a range test"
+          note: "1e-7 → 1 over ~200 steps, ×1.096 per step"
+          detail: "Raise the rate exponentially until the loss turns up. Take the peak as roughly one decade below the turn, then confirm with two short runs. Guessing a peak from another paper is guessing at another dataset's curvature."
+        - label: "2. Fix the shape, then the peak again"
+          note: "shape changes the area, area changes the optimum"
+          detail: "Cosine at a given peak travels half as far as constant at that peak. If you switch shape at a fixed peak you have changed the budget, so the peak must be re-checked — usually upward when moving to cosine."
+        - label: "3. Size warmup from the first step"
+          note: "T_w ≥ η_max / σ_w, then round up"
+          detail: "The first warmup step is η_max/T_w. It must be small relative to the initial weight scale, or you destroy the initialisation before the optimizer has any state. 780 steps for η=3.2, σ_w=0.02."
+        - label: "4. Set total_steps in optimizer steps"
+          note: "epochs × steps_per_epoch"
+          detail: "The single most common schedule bug. A cosine built with T_max = epochs and stepped per batch completes 156 cycles in a 90-epoch run at 156 steps/epoch."
+        - label: "5. Verify the tail actually moves"
+          note: "check |Δθ|/|θ| against the dtype"
+          detail: "If the final rate is below half an ulp of the weight, the last few percent of training is a no-op. Either raise η_min or accept that the tail is decorative — but know which one you are doing."
+    - type: stack
+      title: "Four different things people call 'the learning rate'"
+      layers:
+        - "The peak: η_max — the number you tune, and the only one you can see in a config file"
+        - "The shape: η_t/η_max — cosine, linear, step, one-cycle; fixes the area per unit peak"
+        - "The budget: Σ η_t = η_max·T·mean(shape) — the total parameter movement the run can spend"
+        - "The effective step: η_t·|u_t|, and whether it survives the dtype — what the weights actually feel"
+
+  markdown: |
+    ## Two numbers, not one
+
+    A learning-rate schedule is usually introduced as a curve. It is more
+    useful to think of it as an **area**. If the optimizer takes $T$ steps and
+    step $t$ has size $\eta_t$, the total distance the parameters can travel is
+
+    $$\mathcal{B} = \sum_{t=0}^{T-1} \eta_t = \eta_{\max}\,T\,\overline{\text{shape}},$$
+
+    and that area — not the peak — is what buys you a trained model. Every
+    practical decision follows from it.
+
+    | schedule | $\eta$ at $0.5T$ | area / $(\eta_{\max}T)$ | where the area goes |
+    |---|---|---|---|
+    | constant | $1.000$ | $1.000$ | 50% per half |
+    | cosine to zero | $0.500$ | $0.5005$ | 81.8% in the first half |
+    | linear to zero | $0.500$ | $0.5005$ | 75.0% in the first half |
+    | step decay ×0.1 at 50%, 75% | $0.100$ | $0.5275$ | 94.8% in the first half |
+    | inverse time $1/(1+10t/T)$ | $0.167$ | $0.2402$ | 74.8% in the first half |
+
+    Every decaying shape is front-loaded; the question is by how much. Cosine
+    and linear to zero have the *same* area — $(T+1)/(2T)$ when the floor is
+    zero — but cosine puts 81.8% of it in the first half against linear's 75.0%,
+    and that difference is why the two feel different in practice even though
+    the budget arithmetic says they are the same run. Meanwhile the peak can be
+    identical and the budget differ by a factor of four: constant against
+    cosine. That is the whole reason "the learning rate" is not one
+    hyperparameter.
+
+    ## Why a constant rate plateaus
+
+    Take the simplest non-trivial problem: $f(\theta) = \tfrac12\lambda\theta^2$
+    with a stochastic gradient $g_t = \lambda\theta_t + \xi_t$,
+    $\xi_t \sim \mathcal{N}(0,\sigma^2)$. The iterates obey an AR(1) recursion,
+
+    $$\theta_{t+1} = (1-\eta\lambda)\theta_t - \eta\xi_t,$$
+
+    which is stable for $\eta\lambda < 2$ and whose stationary variance is
+
+    $$\operatorname{Var}(\theta_\infty) = \frac{\eta^2\sigma^2}{1-(1-\eta\lambda)^2}
+      = \frac{\eta\sigma^2}{\lambda(2-\eta\lambda)}.$$
+
+    So the excess loss stops falling at
+
+    $$\mathbb{E}[f(\theta_\infty)] = \tfrac12\lambda\operatorname{Var}(\theta_\infty)
+      = \frac{\eta\sigma^2}{2(2-\eta\lambda)} \;\approx\; \frac{\eta\sigma^2}{4}.$$
+
+    Put numbers in: $\lambda = 1$, $\sigma = 1$, $\eta = 0.1$ gives
+    $0.1/(2\cdot 1.9) = 0.0263$. Averaged over 400 seeds, the measured excess
+    loss is **0.0268** at step 2000 and flat from step 200 onward. Halve the
+    rate and the floor halves to 0.0132 — but the contraction factor goes from
+    $(1-0.1) = 0.9$ to $0.95$, so reaching it takes twice as long
+    ($\ln 0.01/\ln 0.95 = 90$ steps instead of 44). You have traded speed for
+    precision at a fixed exchange rate, forever.
+
+    A decay schedule breaks the trade. Cosine from 0.1 to 0 over the same 2000
+    steps ends at **0.00106** — 25× below the constant-rate floor — because the
+    step size, and therefore the noise it admits, goes to zero as the iterate
+    arrives.
+
+    ## Why warmup is not optional at scale
+
+    Here is the fact that makes warmup necessary rather than decorative.
+    For Adam, Cauchy–Schwarz on the two running averages gives
+    $|\hat m_i| \le \sqrt{\hat v_i}$, hence $|u_i| \le 1$: the update is bounded
+    by $\eta$ per coordinate *regardless of gradient magnitude*. With bias
+    correction, step 1 is exactly $\eta\operatorname{sign}(g_1)$.
+
+    Now put a realistic large-batch number on it. Linear scaling from
+    $\eta = 0.1$ at batch 256 to batch 8192 gives $\eta = 3.2$. Weights are
+    initialised at $\sigma_w = 0.02$. One step moves each weight by up to
+    $3.2$, which is $160\sigma_w$. The model does not take a bad step; it ceases
+    to be the model you initialised.
+
+    Linear warmup over $T_w$ steps scales that first step to $\eta/T_w$, so the
+    design rule is
+
+    $$T_w \;\ge\; \frac{\eta_{\max}}{\sigma_w},$$
+
+    which asks for 160 steps here. The Goyal et al. recipe used 5 epochs of
+    ImageNet at batch 8192 — $5 \times 156 = 780$ steps — a comfortable 5×
+    margin. Note what the rule does *not* say: for $\eta_{\max} = 10^{-3}$ and
+    $\sigma_w = 0.02$ it asks for one step. Small-rate fine-tunes need no
+    warmup, and that is not a different philosophy, it is the same inequality.
+
+    ## Why bias correction is not enough
+
+    The tempting objection: Adam already divides by $1-\beta_1^t$ and
+    $1-\beta_2^t$, so its early steps are corrected. That correction restores
+    the *expectation* of the EMA. It does nothing to its *variance*, and at
+    $t=1$ the second moment is a single squared gradient.
+
+    Let $\kappa = \operatorname{Var}(g^2)/\mathbb{E}[g^2]^2$, which is 2 for a
+    Gaussian gradient. The relative standard deviation of $\hat v_t$ is
+
+    $$\operatorname{rel.sd}(\hat v_t) =
+      \sqrt{\kappa\,\frac{1-\beta_2}{1+\beta_2}\cdot
+      \frac{1+\beta_2^{t}}{1-\beta_2^{t}}}.$$
+
+    For $\beta_2 = 0.999$:
+
+    | $t$ | 1 | 10 | 100 | 1000 | $\infty$ |
+    |---|---|---|---|---|---|
+    | rel. sd of $\hat v$ | 141% | 44.7% | 14.1% | 4.65% | 3.16% |
+    | rel. error of the step (half of it) | 71% | 22.4% | 7.1% | 2.3% | 1.6% |
+
+    For the first ~100 steps the denominator is not a scale estimate, it is
+    noise with a scale estimate attached. Warmup is the cheapest fix: hold the
+    step small until the relative error is under 10%, which happens around step
+    50. RAdam is the same fix done properly, by multiplying the update by a
+    rectification term derived from this variance instead of by $t/T_w$.
+
+    ## Batch size is a schedule parameter
+
+    Two scaling rules, two invariants, and a decision procedure.
+
+    - **Linear, $\eta \propto B$.** Over an epoch of $N$ examples you take
+      $N/B$ steps of size $\eta\bar g$, so the epoch's movement is
+      $\eta(N/B)\bar g$. Keep it fixed and $\eta \propto B$.
+    - **Square root, $\eta \propto \sqrt{B}$.** The gradient noise injected per
+      step has variance $\eta^2\sigma^2/B$. Keep *that* fixed and
+      $\eta \propto \sqrt{B}$.
+
+    Linear scaling is the aggressive one and it is what worked up to batch 8192
+    on ImageNet with warmup. It fails when the weights move appreciably inside
+    the window over which you assumed the gradient was constant — which is
+    precisely the regime a large rate creates.
+
+    The arbiter is the gradient noise scale
+    $B_{\text{noise}} = \operatorname{tr}(\Sigma)/\|G\|^2$. Below it, noise
+    dominates and more batch is nearly free speedup. Above it, you are
+    averaging away a noise term that is already smaller than the signal: at
+    $B = 10{,}000$ with $B_{\text{noise}} = 100$, the relative gradient noise
+    is 10% and ten times more compute buys you 3.2× less of it.
+
+    ## Where the tail stops existing
+
+    A schedule that decays to zero eventually produces updates the dtype cannot
+    represent. Adding $\Delta$ to $\theta$ is lost when
+    $|\Delta| < \tfrac12\operatorname{ulp}(\theta)$: $5.96\times10^{-8}$ at
+    $|\theta|=1$ in fp32, $1.95\times10^{-3}$ in bf16. At $t = 0.99T$ of a
+    cosine peaking at $10^{-3}$, the rate is $2.47\times10^{-7}$ — four fp32
+    half-ulps, and eight-thousandths of a bf16 half-ulp.
+
+    The lesson is not "avoid cosine". It is that the last few percent of a
+    schedule is a numerics decision, not a modelling one, and it is the same
+    $\kappa\epsilon$ argument you met in *Numerical Linear Algebra*: the
+    relative error of the small addend in $\theta + \Delta$ is amplified by
+    $|\theta|/|\Delta|$, and past $1/\epsilon$ there is nothing left to compute
+    with.
+
+    ## The longer version
+
+    The remaining mechanisms and failure modes, verbatim: $\sqrt{B}$ scaling and
+    the gradient noise scale, the units bugs that break most schedules in
+    practice, and the dtype-resolution floor that silently ends a long cosine
+    tail.
+
+    ### Failure modes, in full
+
+    - Your run trains for 100 epochs at a constant 1e-3 and the loss stops at 0.031. You drop to 1e-4, it stops at 0.029, and you conclude the model has hit its capacity. It has not — it has hit the noise floor of a constant step size, which is linear in the learning rate and which no amount of extra data will move.
+    - You move from one GPU to 32, scale the batch 32×, keep the learning rate, and get a run that takes 32× fewer steps and makes 32× less progress per step. You bought hardware and shipped a slower model.
+    - You copy $\eta_{\max} = 0.1$ out of a published ResNet recipe into a cosine run at batch 8192 and it diverges within 200 steps — the first step is 3.2 in parameter units against weights initialised at 0.02, which is 160 standard deviations.
+    - Your loss spikes at step 30 and never recovers. The only difference from the run that worked is that you deleted the 2,000-step warmup because 'it was wasting steps'.
+    - Interviewers ask why Adam needs warmup when it already has bias correction. The answer is that bias correction fixes the mean of the optimizer's state and warmup fixes its variance, and they are not the same fix.
+
+    ### The mechanisms, in full
+
+    - **A constant learning rate cannot converge, only orbit.** On $\tfrac12 \lambda \theta^2$ with gradient noise $\sigma^2$, the recursion $\theta_{t+1} = (1-\eta\lambda)\theta_t - \eta\xi_t$ has stationary variance $\eta\sigma^2/(\lambda(2-\eta\lambda))$, so the excess loss settles at $\eta\sigma^2/(2(2-\eta\lambda))$ and, for small $\eta\lambda$, at $\eta\sigma^2/4$. Numbers: $\lambda = 1$, $\sigma = 1$, $\eta = 0.1$ gives a floor of **0.0263**; 400 seeds average **0.0268** at step 2000 and the curve is flat from step 200 onward. This is the same floor the previous topic found for Adam and called $\eta L$ — there it was measured in parameter units, here in loss units — and it is why "lower the LR" works once and then stops: the floor is linear in $\eta$, so 10× lower LR buys a 10× lower floor and 10× slower progress, permanently.
+    - **What the model experiences is the sum, not the peak.** The total parameter movement available over a run is $\mathcal{B} = \sum_{t=0}^{T-1} \eta_t = \eta_{\max} T \cdot \overline{\text{shape}}$ — the schedule's area. At $\eta_{\max} = 10^{-3}$ over $T = 1000$ steps: constant gives **1.000**; cosine to zero gives **0.5005**; a 10× step decay at 50% and 75% gives **0.5275**. The same peak with a cosine shape therefore travels *half* as far. That is the number behind "cosine lets you raise the peak", and it is also why an $\eta_{\max}$ copied between recipes is not the same hyperparameter twice. The same area governs regularisation in AdamW: its decay term is $\eta\lambda\theta$ rather than $\lambda\theta$, so a decaying schedule decays the weight decay with it — at $t = 0.9T$ of a cosine the decay per step is 2.45% of its initial value, and the last tenth of the run is very nearly unregularised.
+    - **Cosine decay front-loads the budget, hard.** Because the curve is flat at the top, the first half of a cosine run consumes $\tfrac12 + \tfrac1\pi = \mathbf{81.83\%}$ of the total area; half the area is gone by $t = 0.265T$ and three quarters by $t = 0.44T$. Measured discretely at $T = 1000$: 19.8% of the budget in the first 10% of steps, 47.5% by 25%, 81.8% by 50%. The folk description — "cosine decays slowly at the end, so the model enjoys a long fine-tuning phase" — is exactly backwards about where the time goes. What the flat tail buys is that the rate crosses the noise floor only at the very end: at $t = 0.9T$ it is still 2.45% of peak.
+    - **Warmup exists because Adam's first step is already full length.** Bias correction makes step 1 exactly $\eta\hat m/\sqrt{\hat v} = \eta g/(|g|+\epsilon) \approx \eta\operatorname{sign}(g_1)$ — a step of length $\eta$ in *every* coordinate, in a direction estimated from one batch. With the linear-scaling rate for batch 8192 the peak is $\eta = 3.2$ against weights initialised at $\sigma_w = 0.02$: one step moves each weight $3.2/0.02 = \mathbf{160}$ standard deviations. Linear warmup gives step $t$ a length $\eta\,t/T_w$, so the condition for the first step not to destroy the initialisation is $\eta/T_w \le \sigma_w$, i.e. $T_w \ge \eta/\sigma_w = 160$ steps for that run. The published recipe used 5 epochs = **780 steps**, a 5× margin. For $\eta = 10^{-3}$ the same rule asks for one step — which is why nobody warms up a small-rate fine-tune and everybody warms up a large-batch pre-training run.
+    - **Bias correction fixes the first moment and says nothing about the second.** Warmup compensates for the *variance* of Adam's state, which no correction factor touches. For an EMA with $\beta_2$ the relative standard deviation of $\hat v$ is $\sqrt{\kappa\frac{1-\beta_2}{1+\beta_2}\cdot\frac{1+\beta_2^t}{1-\beta_2^t}}$ with $\kappa = \operatorname{Var}(g^2)/\mathbb{E}[g^2]^2 = 2$ for a Gaussian gradient: **141%** at $t=1$, 44.7% at $t=10$, 14.1% at $t=100$, 4.65% at $t=1000$, saturating at 3.16%. Because the update divides by $\sqrt{\hat v}$, the *step-length* error is half that — 71% at the first step, 7.1% at step 100, 2.3% at step 1000. Early on the adaptive denominator is not scaling the step, it is randomising it. Warmup holds the step small until the relative error is under ~10%, which is about 50 steps. RAdam replaces warmup with a rectification term computed from precisely this variance.
+    - **Linear scaling, $\eta \propto B$, holds the movement per epoch constant.** Over one pass of $N$ examples at batch $B$ you take $N/B$ steps of size $\eta\bar g$, so the epoch's total movement is $\eta (N/B)\bar g$; holding it fixed while $B$ grows by $k$ requires $\eta$ to grow by $k$. Concretely $256 \to 8192$ is $\times 32$ and $\eta: 0.1 \to 3.2$. The derivation assumes the gradient is the same across the $k$ sub-batches it replaces, which is false exactly when the rate is large — within one epoch the weights have already moved $k$ times as far per step. That assumption is why Goyal et al. pair linear scaling with warmup instead of using it alone, and why the rule stops holding somewhere around $B = 8\text{k}$–$32\text{k}$ for ImageNet-scale ResNets.
+    - **$\sqrt{B}$ scaling holds a different invariant: the noise injected per step.** Gradient noise contributes $\eta^2\sigma^2/B$ to the per-step parameter variance, so holding $\eta^2/B$ constant — $\eta \propto \sqrt{B}$ — holds the noise amplitude fixed while you add compute. $256 \to 8192$ then gives $\eta: 0.1 \to 0.566$, not 3.2. Neither rule is a law. The quantity that decides is the gradient noise scale $B_{\text{noise}} = \operatorname{tr}(\Sigma)/\|G\|^2$, the batch at which gradient noise equals the signal: with per-sample noise $\sigma = 1$ and true gradient $0.1$, $B_{\text{noise}} = 100$. At $B=100$ the relative noise is 100%, at $B=1000$ it is 31.6%, at $B=10{,}000$ it is 10%. Going from 1,000 to 10,000 costs 10× the FLOPs per step for a 3.2× noise reduction, and past $B_{\text{noise}}$ the loss-versus-step curve flattens: you are buying fewer steps at the same quality, not a better model.
+    - **Three recipes with $\eta_{\max} = 0.1$ have three different budgets.** Constant: area 100 over 1000 steps. Cosine to zero: 50. 10× step decay at 50%/75%: 52.75. Moving a ResNet recipe from step decay to cosine without touching the peak cuts the budget 5.5% — harmless. Moving a one-cycle recipe (which ramps to ~3× the peak and back) to cosine cuts it by well over half, which is why one-cycle runs happily at a peak that looks reckless next to a cosine run. The rule that follows: **when you change the shape, re-tune the peak; when you change the horizon, keep the peak and let the area scale.**
+    - **The schedule is a function of the optimizer step, and nearly every schedule bug is a units bug.** `total_steps` is `epochs × steps_per_epoch`, not `epochs`. With 90 epochs at 156 steps/epoch the run is 14,040 steps; building a cosine with `T_max = 90` and stepping it per batch makes the rate complete a full decay-and-restart cycle every 90 steps — **156× too fast** — so the model trains on a sawtooth that touches $\eta_{\min}$ 156 times per epoch. The reverse error is rarer and worse: `T_max = 14040` stepped per epoch means the schedule never leaves its first 1% and the run is effectively constant-rate. The off-by-one everyone worries about (starting at $t=1$ instead of $t=0$) changes the first rate by $2.5\times10^{-6}$ relative. Worry about units, not indices.
+    - **The tail of a schedule can fall below the dtype's resolution, at which point it is not a small step, it is no step.** Adding $\Delta$ to $\theta$ is lost when $|\Delta| < \tfrac12\operatorname{ulp}(\theta)$: $5.96\times 10^{-8}$ for $|\theta| = 1$ in fp32, and $1.95\times10^{-3}$ in bf16, whose 8-bit mantissa has machine epsilon $2^{-8} = 3.9\times10^{-3}$. At $t = 0.99T$ of a cosine with $\eta_{\max} = 10^{-3}$ the rate is $2.47\times10^{-7}$; on a weight of magnitude 1 that is **4 fp32 half-ulps** — the update is quantised to about 25% relative precision — and $1/8000$ of a bf16 half-ulp, i.e. it does not happen. This is a conditioning statement in the sense of *Numerical Linear Algebra*: the relative error of the small addend in $\theta + \Delta$ is amplified by the ratio $|\theta|/|\Delta|$, and once that ratio passes $1/\epsilon$ the digit is gone. It is why mixed-precision training keeps fp32 master weights and fp32 optimizer state, and why a bf16 run with a long cosine tail appears to stop learning in its last few percent.
+
+
+  derivations:
+    - title: "The noise floor of a constant step size"
+      latex: |
+        With $g_t = \lambda\theta_t + \xi_t$ and $\xi_t$ i.i.d. with variance
+        $\sigma^2$,
+        $$\theta_{t+1} = (1-\eta\lambda)\theta_t - \eta\xi_t.$$
+        Squaring and taking expectations in the stationary regime, where
+        $\mathbb{E}[\theta_{t+1}^2] = \mathbb{E}[\theta_t^2] = V$ and
+        $\mathbb{E}[\theta_t\xi_t] = 0$:
+        $$V = (1-\eta\lambda)^2 V + \eta^2\sigma^2
+          \;\Longrightarrow\;
+          V = \frac{\eta^2\sigma^2}{1-(1-\eta\lambda)^2}
+            = \frac{\eta\sigma^2}{\lambda(2-\eta\lambda)}.$$
+        The excess loss is $\tfrac12\lambda V$:
+        $$\mathbb{E}[f(\theta_\infty)] - f^\star
+          = \frac{\eta\sigma^2}{2(2-\eta\lambda)}
+          \;\xrightarrow[\eta\lambda \to 0]{}\; \frac{\eta\sigma^2}{4}.$$
+      prose: >-
+        The stationary variance is the noise power times the squared gain of the
+        recursion, divided by the decay it loses per step. Numerator $\eta^2$,
+        denominator $\approx 2\eta\lambda$, so the whole thing is proportional
+        to $\eta$: the floor is a straight line in the learning rate. That is
+        why halving the rate halves the floor and doubles the time to reach it,
+        with no net gain — and why only a schedule that drives $\eta \to 0$ can
+        remove the floor rather than relocate it.
+    - title: "Why a schedule must be summable in square, not in sum"
+      latex: |
+        Robbins–Monro for stochastic approximation requires
+        $$\sum_{t=1}^{\infty}\eta_t = \infty
+          \qquad\text{and}\qquad
+          \sum_{t=1}^{\infty}\eta_t^2 < \infty.$$
+        The first guarantees the iterate can still travel any distance; the
+        second guarantees the accumulated noise,
+        $\sum_t \eta_t^2\sigma^2$, stays finite. A constant rate satisfies the
+        first and violates the second — which is the floor of the previous
+        derivation, restated. Inverse time, $\eta_t = \eta_0/t$, satisfies both,
+        because $\sum 1/t$ diverges logarithmically while
+        $\sum 1/t^2 = \pi^2/6 = 1.6449$. A cosine over a finite horizon $T$
+        satisfies the second trivially, since
+        $\sum_{t<T}\eta_t^2 = O(T)$, and the first only in the weak sense that
+        $\sum_{t<T}\eta_t = \Theta(T)$ is large — enough for a finite run, but
+        not a convergence guarantee.
+      prose: >-
+        The two conditions are a budget and a noise bound, and they pull in
+        opposite directions: you want to keep moving (sum diverges) while
+        injecting less and less noise (squares converge). Inverse time is the
+        canonical solution and also a cautionary tale — at $\eta_0 = 0.1$ over
+        2000 steps it summed to 0.818 of movement, less than the distance it
+        needed to travel, and finished at loss 0.0608, worse than doing nothing
+        clever at all. Satisfying an asymptotic condition says nothing about
+        whether your constants survive your actual horizon.
+    - title: "Why warmup is a variance fix, not a mean fix"
+      latex: |
+        For $\hat v_t = (1-\beta)\sum_{k=0}^{t-1}\beta^k g_{t-k}^2$ with
+        $g^2$ i.i.d., mean $\mu$ and variance $\tau^2$:
+        $$\mathbb{E}[\hat v_t] = \mu\,(1-\beta^t), \qquad
+          \operatorname{Var}(\hat v_t)
+            = \tau^2(1-\beta)^2\frac{1-\beta^{2t}}{1-\beta^2}.$$
+        Dividing,
+        $$\frac{\operatorname{Var}(\hat v_t)}{\mathbb{E}[\hat v_t]^2}
+          = \frac{\tau^2}{\mu^2}\cdot\frac{1-\beta}{1+\beta}\cdot
+            \frac{1+\beta^{t}}{1-\beta^{t}}.$$
+        With $\kappa = \tau^2/\mu^2 = 2$ and $\beta = 0.999$ this is
+        $\sqrt{2}\approx 141\%$ at $t=1$, falls as $\sqrt{2/t}$ while
+        $t \ll 1/(1-\beta)$ (44.7% at $t=10$, 14.1% at $t=100$), and saturates
+        at $\sqrt{2(1-\beta)/(1+\beta)} = 3.16\%$. The update divides by
+        $\sqrt{\hat v_t}$, so its relative error is half these numbers.
+      prose: >-
+        Bias correction multiplies by $1/(1-\beta^t)$, which is exactly the
+        factor that makes the first line's expectation equal to $\mu$. It cannot
+        touch the second line, because the second line is about spread, not
+        location. At $t=1$ the "adaptive" denominator is one sample squared and
+        the step length is wrong by up to a factor of two in either direction.
+        Warmup's $t/T_w$ multiplier is a crude proxy for the missing variance
+        term; RAdam computes the term directly, which is why it can drop the
+        warmup and keep the stability.
+
+  implementations:
+    - language: python
+      title: "A schedule you can actually reason about"
+      note: >-
+        Correct, but numerically fragile in the tail: computing
+        $1+\cos(\pi p)$ for $p \to 1$ subtracts two numbers that agree to within
+        $(\pi\epsilon)^2/2$, so the schedule's last 1% is destroyed by
+        cancellation. Measured in float32, the exact value $4.93\times10^{-8}$ at
+        $p = 1-10^{-4}$ comes back as $5.96\times10^{-8}$, and at
+        $p = 1-10^{-5}$ it comes back as exactly $0.0$. In float64 the same code
+        is fine down to $p = 1-10^{-8}$; the failure is a dtype property, not an
+        algorithm property.
+      code: |
+        import math
+
+        def lr_at(kind, step, total_steps, base_lr, min_lr=0.0,
+                  warmup_steps=0, decay_every=0, decay_factor=0.1):
+            """Learning rate at `step` (0-indexed) of a `total_steps` run.
+
+            kind: "constant" | "cosine" | "linear" | "step" | "inverse_time"
+            """
+            if total_steps <= 0:
+                return float(min_lr)
+
+            # Warmup always wins: it is defined on the first warmup_steps steps.
+            if warmup_steps > 0 and step < warmup_steps:
+                return base_lr * (step + 1) / warmup_steps
+
+            span = total_steps - warmup_steps
+            p = 0.0 if span <= 0 else (step - warmup_steps) / span
+            p = min(max(p, 0.0), 1.0)          # clamp past the horizon
+
+            if kind == "constant":
+                return float(base_lr)
+            if kind == "cosine":
+                return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * p))
+            if kind == "linear":
+                return min_lr + (base_lr - min_lr) * (1.0 - p)
+            if kind == "step":
+                # Off-by-one trap: "decay every k steps" must fire at step k,
+                # k + decay_every, ... not at step 0.
+                n = (step - warmup_steps) // decay_every if decay_every > 0 else 0
+                return base_lr * (decay_factor ** n)
+            if kind == "inverse_time":
+                return base_lr / (1.0 + 10.0 * p)
+            raise ValueError("unknown schedule " + repr(kind))
+
+        def schedule_area(kind, total_steps, base_lr, **kw):
+            """The budget: sum of the rates the run will actually use."""
+            return sum(lr_at(kind, t, total_steps, base_lr, **kw)
+                       for t in range(total_steps))
+
+        if __name__ == "__main__":
+            # `decay_every` is uniform, so this is a ×0.1 drop at 50% only.
+            # The lesson's 0.5275 row uses drops at both 50% and 75%, which a
+            # single interval cannot express.
+            for k in ("constant", "cosine", "linear", "step", "inverse_time"):
+                a = schedule_area(k, 1000, 1e-3, decay_every=500)
+                print(f"{k:13s} area={a:.4f}  area/(base*T)={a / 1e-3 / 1000:.4f}")
+    - language: python
+      title: "Measuring the floor instead of trusting the theory"
+      note: >-
+        The theory is exact for the variance and the *estimator* is not.
+        Individual tail iterates have standard deviation 0.033 around a mean of
+        0.027, so one seed's "final loss" lands anywhere in 0 to 0.1; even the
+        500-step tail mean varies by 0.0053 between seeds — 20% of the value. A
+        single-seed number therefore cannot tell you whether the floor is 0.0263
+        or 0.032, which is the numerically wrong answer this code exists to
+        avoid. Note also that the cosine figure printed below (0.00200) is a
+        500-step tail mean while the final iterate is 0.00106; both are honest
+        and they measure different things.
+      code: |
+        import numpy as np
+
+        def excess_loss(lam, sigma, eta_schedule, steps, seed):
+            rng = np.random.default_rng(seed)
+            theta = 1.0
+            tail = []
+            for t in range(steps):
+                eta = eta_schedule(t)
+                theta = theta - eta * (lam * theta + rng.normal(0.0, sigma))
+                if t >= steps - 500:
+                    tail.append(0.5 * lam * theta * theta)
+            return float(np.mean(tail))
+
+        def report(lam=1.0, sigma=1.0, eta=0.1, steps=2000, seeds=400):
+            const = lambda t: eta
+            cosine = lambda t: 0.5 * eta * (1 + np.cos(np.pi * t / steps))
+            out = {}
+            for name, sched in (("constant", const), ("cosine", cosine)):
+                vals = [excess_loss(lam, sigma, sched, steps, s) for s in range(seeds)]
+                out[name] = {"mean": float(np.mean(vals)), "sd": float(np.std(vals))}
+            out["predicted_floor"] = eta * sigma ** 2 / (2 * (2 - eta * lam))
+            return out
+
+        if __name__ == "__main__":
+            r = report()
+            print(f"constant: {r['constant']['mean']:.5f} "
+                  f"(theory {r['predicted_floor']:.5f})")
+            print(f"cosine:   {r['cosine']['mean']:.5f}")
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A run at $\eta = 0.1$ on a quadratic with $\lambda = 1$, $\sigma = 1$
+        plateaus at an excess loss of 0.028. What is the predicted floor, and
+        what exactly do you get and lose by dropping to $\eta = 0.01$?
+      answerKind: short_text
+      hint: "The floor is $\\eta\\sigma^2/(2(2-\\eta\\lambda))$, and the approach rate is $1-\\eta\\lambda$."
+      solution: >-
+        The floor is $0.1/(2\cdot 1.9) = 0.0263$, which matches the measured
+        0.028. At $\eta = 0.01$ it becomes $0.01/(2 \cdot 1.99) = 0.00251$ — a
+        10.5× lower floor. But the contraction factor goes from 0.9 to 0.99, so
+        reaching within 1% of the floor takes
+        $\ln(0.01)/\ln(0.99) = 458$ steps instead of 44. You bought precision at
+        a fixed exchange rate. The only way to get both is to decay $\eta$.
+    - id: cp-2
+      question: >-
+        Your run is 90 epochs at 156 steps per epoch. You construct
+        `CosineAnnealingLR(optimizer, T_max=90)` and step it after every batch.
+        Describe what the learning rate does, and how far off it is.
+      answerKind: short_text
+      hint: "T_max is in the same units as the thing you call `.step()` on."
+      solution: >-
+        The scheduler's unit is the optimizer step, and you gave it 90 of them
+        while the run has $90 \times 156 = 14{,}040$. The rate completes a full
+        cosine cycle — down to $\eta_{\min}$ and back to $\eta_{\max}$ — every
+        90 steps, i.e. 156 times per epoch and 156× faster than intended. The
+        model trains on a sawtooth. The fix is `T_max = epochs *
+        steps_per_epoch = 14040`.
+    - id: cp-3
+      question: >-
+        Adam already divides its moments by $1-\beta_1^t$ and $1-\beta_2^t$.
+        Why does a large-batch run still need warmup?
+      answerKind: short_text
+      hint: "Bias correction is about the mean of the estimator. What is left?"
+      solution: >-
+        Bias correction makes $\mathbb{E}[\hat v_t]$ equal to the true second
+        moment. It says nothing about $\operatorname{Var}(\hat v_t)$, which at
+        $t=1$ is the variance of a single squared gradient — a 141% relative
+        standard deviation, so the step length is wrong by up to 2× in either
+        direction. Meanwhile the *direction* is also estimated from one batch
+        and the step length is $\eta$ per coordinate regardless. With
+        $\eta = 3.2$ and $\sigma_w = 0.02$, that first step is 160 weight
+        standard deviations. Warmup reduces the step to $\eta/T_w$ while the
+        estimates converge, which is a variance fix, not a mean fix.
+    - id: cp-4
+      question: >-
+        You move from 8 GPUs at batch 256 to 64 GPUs at batch 2048, keeping the
+        per-GPU batch. Give the linear-scaling rate for a base of 0.1, the
+        warmup length by the first-step rule with $\sigma_w = 0.02$, and say
+        which of the two numbers you would actually use.
+      answerKind: short_text
+      hint: "Batch ×8. Two rules: $\\eta \\propto B$ and $T_w \\ge \\eta/\\sigma_w$."
+      solution: >-
+        Linear scaling: $\eta = 0.1 \times 8 = 0.8$. The first-step rule asks
+        for $T_w \ge 0.8/0.02 = 40$ steps, rounded up generously — a few hundred
+        is typical, and the published large-batch recipes used thousands. Use
+        the 40 as a *floor*, not a plan: it only prevents immediate destruction,
+        and the direction quality needs longer. If 0.8 diverges even with
+        warmup, fall back to $\sqrt{B}$ scaling, which gives
+        $0.1\sqrt{8} = 0.283$.
+    - id: cp-5
+      question: >-
+        Why can a bf16 run with a cosine that decays to $10^{-5}$ look
+        identical to one that decays to exactly zero, when the same two runs
+        differ measurably in fp32?
+      answerKind: short_text
+      hint: "Compute half an ulp of a weight of magnitude 1 in both dtypes."
+      solution: >-
+        bf16 has an 8-bit significand, so $\epsilon = 2^{-8} = 3.9\times10^{-3}$
+        and half an ulp at $|\theta|=1$ is $1.95\times10^{-3}$. Any update below
+        that is rounded away entirely. A rate of $10^{-5}$ produces updates of
+        that order, so both schedules are doing the same thing — nothing — for
+        their last stretch. In fp32 the half-ulp is $5.96\times10^{-8}$, so a
+        $10^{-5}$ update is ~170 representable levels and still moves the
+        weights. The difference between the two runs is a dtype property, not a
+        schedule property.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A schedule has a peak, a shape, and a horizon, and the model integrates
+        the *area* under it. Two schedules with the same peak can differ by a
+        factor of four in total movement. Separately, the very first step of an
+        adaptive optimizer is already full length, which is why a run that is
+        fine at small batch destroys itself at large batch unless the rate is
+        ramped up from near zero.
+      blocks:
+        - kind: checklist
+          body: |
+            - The budget is the sum of the rates, not the peak
+            - Cosine to zero spends half the area of a constant run at the same peak
+            - Cosine puts 81.8% of its area in the first half of training
+            - The first Adam step is eta per coordinate, in a direction from one batch
+            - Warmup length is set by the first step being small next to the weight scale
+      checkpoint: >-
+        If you double the number of training steps and keep the peak rate, what
+        happens to the budget? What if you also switch from constant to cosine?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Two separate quantities, two separate tools. To reason about *how much
+        training* a schedule delivers, compute its area — by closed form where
+        one exists, by summation otherwise — and compare shapes at equal peak.
+        To reason about *whether a run survives its first hundred steps*,
+        compute the size of the first step in parameter units and compare it to
+        the initialisation scale.
+      blocks:
+        - kind: checklist
+          body: |
+            - Budget question -> integrate the schedule; do not sample it
+            - Peak question -> range test, then re-check after changing shape
+            - Stability question -> first step vs weight scale, not average step
+            - Batch question -> which invariant do you need: per-epoch movement or per-step noise
+      checkpoint: >-
+        Which of those four questions does "my loss spiked at step 30" belong
+        to, and which number would you compute first?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The area of a cosine is a closed form, not a loop; the warmup length is
+        an inequality, not a guess.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. Budget of a schedule over T steps
+            area = sum over t in [0, T) of lr(t)
+            # cosine: use the closed form
+            area_cosine = T*(peak + floor)/2 + (peak - floor)/2
+
+            # 2. Compare two shapes at the same peak
+            ratio = area_cosine / area_constant   # = 0.5005 when floor = 0
+
+            # 3. Warmup length
+            first_step = peak / warmup_steps
+            require first_step <= weight_scale
+            warmup_steps = ceil(peak / weight_scale)
+
+            # 4. Batch change
+            if keeping per-epoch movement: new_peak = peak * (new_batch / old_batch)
+            else:                          new_peak = peak * sqrt(new_batch / old_batch)
+      checkpoint: >-
+        Why is the closed form for the cosine area not exactly
+        $T(\eta_{\max} + \eta_{\min})/2$?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The cosine sum has an exact value because the cosines over a full period
+        cancel almost completely: the sum of $\cos(\pi t/T)$ over $t = 0..T-1$
+        is 1 for every $T \ge 2$, which leaves a single half-step of leftover
+        area.
+      blocks:
+        - kind: math
+          body: |
+            $$\eta_t = \eta_{\min} + \tfrac12(\eta_{\max}-\eta_{\min})
+              \left(1+\cos\frac{\pi t}{T}\right)$$
+            $$\sum_{t=0}^{T-1}\eta_t
+              = T\eta_{\min} + \tfrac12(\eta_{\max}-\eta_{\min})
+                \left(T + \sum_{t=0}^{T-1}\cos\frac{\pi t}{T}\right)$$
+            and, summing the geometric series
+            $\sum_{t=0}^{T-1}e^{i\pi t/T} = \frac{1-e^{i\pi}}{1-e^{i\pi/T}}$,
+            whose real part is exactly 1,
+            $$\sum_{t=0}^{T-1}\eta_t
+              = \frac{T(\eta_{\max}+\eta_{\min})}{2}
+                + \frac{\eta_{\max}-\eta_{\min}}{2}.$$
+
+            For warmup, the first step is $\eta_{\max}/T_w$ and the requirement
+            is $\eta_{\max}/T_w \le \sigma_w$, hence
+            $T_w \ge \eta_{\max}/\sigma_w$.
+
+            For the floor, the stationary variance of
+            $\theta_{t+1}=(1-\eta\lambda)\theta_t-\eta\xi_t$ is
+            $\eta\sigma^2/(\lambda(2-\eta\lambda))$, so the excess loss is
+            $\eta\sigma^2/(2(2-\eta\lambda))$.
+      checkpoint: >-
+        The extra $(\eta_{\max}-\eta_{\min})/2$ term does not shrink with $T$.
+        What does that mean for very short runs?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete, executable schedule module plus the budget and warmup
+        calculations, with the two places it is numerically wrong called out.
+      blocks:
+        - kind: warning
+          body: >-
+            Two traps that survive a unit test. First, `1 + cos(pi*p)` is a
+            subtraction of nearly equal numbers as $p \to 1$: in float32 the
+            schedule's last 1% is quantised to zero. Second, the floor
+            experiment's "final loss" is a single sample from a distribution
+            with standard deviation larger than its mean — average the tail over
+            seeds or you will report noise as a result.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+            def cosine_lr(step, total_steps, base_lr, min_lr=0.0, warmup_steps=0):
+                if total_steps <= 0:
+                    return float(min_lr)
+                if warmup_steps > 0 and step < warmup_steps:
+                    return base_lr * (step + 1) / warmup_steps
+                span = total_steps - warmup_steps
+                if span <= 0:
+                    return float(base_lr)
+                p = min(max((step - warmup_steps) / span, 0.0), 1.0)
+                return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * p))
+
+            def cosine_budget(base_lr, min_lr, total_steps):
+                T = int(total_steps)
+                if T <= 0:
+                    return 0.0
+                return T * (base_lr + min_lr) / 2.0 + (base_lr - min_lr) / 2.0
+
+            def warmup_for(peak_lr, weight_scale, safety=5.0):
+                return int(math.ceil(safety * peak_lr / weight_scale))
+
+            # Verify the closed form against the loop before trusting it:
+            #   sum(cosine_lr(t, 1000, 1e-3) for t in range(1000)) -> 0.5005000000000001
+            #   cosine_budget(1e-3, 0.0, 1000)                     -> 0.5005
+      checkpoint: >-
+        The two differ by 1.1e-16 — floating-point summation error, not a
+        modelling difference. Which one would you put in a test's expected
+        field, and why does it matter that you can answer that?
+
+  problems:
+    - id: p-cosine-lr
+      title: "Cosine schedule with linear warmup"
+      difficulty: medium
+      prompt: >-
+        Implement `cosine_lr(step, total_steps, base_lr, min_lr=0.0,
+        warmup_steps=0)`, the learning rate at 0-indexed optimizer step `step`
+        of a run of `total_steps` steps.
+
+        Rules, in this order:
+
+        1. If `warmup_steps > 0` and `step < warmup_steps`, return
+           `base_lr * (step + 1) / warmup_steps` — so the first step is non-zero
+           and the last warmup step lands exactly on `base_lr`.
+
+        2. Otherwise compute `p = (step - warmup_steps) / (total_steps -
+           warmup_steps)`, clamp it to `[0, 1]`, and return
+           `min_lr + 0.5 * (base_lr - min_lr) * (1 + cos(pi * p))`.
+
+        Steps past the horizon must return `min_lr` rather than extrapolating.
+      starter: |
+        import math
+
+        def cosine_lr(step, total_steps, base_lr, min_lr=0.0, warmup_steps=0):
+            # your implementation here
+            pass
+      language: python
+      entry: cosine_lr
+      testCases:
+        - input: "[0, 1000, 0.001]"
+          expected: "0.001"
+          mode: json
+          tolerance: 1e-9
+        - input: "[250, 1000, 0.001]"
+          expected: "0.0008535533905932737"
+          mode: json
+          tolerance: 1e-9
+        - input: "[500, 1000, 0.001]"
+          expected: "0.0005"
+          mode: json
+          tolerance: 1e-9
+        - input: "[900, 1000, 0.001]"
+          expected: "2.4471741852423235e-05"
+          mode: json
+          tolerance: 1e-9
+        - input: "[0, 1000, 0.001, 0.0, 100]"
+          expected: "1e-05"
+          mode: json
+          tolerance: 1e-9
+        - input: "[99, 1000, 0.001, 0.0, 100]"
+          expected: "0.001"
+          mode: json
+          tolerance: 1e-9
+        - input: "[100, 1000, 0.001, 0.0, 100]"
+          expected: "0.001"
+          mode: json
+          tolerance: 1e-9
+        - input: "[550, 1000, 0.001, 0.0001, 100]"
+          expected: "0.00055"
+          mode: json
+          tolerance: 1e-9
+        - input: "[1400, 1000, 0.001]"
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+
+        def cosine_lr(step, total_steps, base_lr, min_lr=0.0, warmup_steps=0):
+            if total_steps <= 0:
+                return float(min_lr)
+            if warmup_steps > 0 and step < warmup_steps:
+                return float(base_lr) * float(step + 1) / float(warmup_steps)
+            span = total_steps - warmup_steps
+            if span <= 0:
+                return float(base_lr)
+            p = (step - warmup_steps) / span
+            if p < 0.0:
+                p = 0.0
+            elif p > 1.0:
+                p = 1.0
+            return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * p))
+      solutionExplanation: >-
+        The warmup branch uses `step + 1` so the first optimizer step is not a
+        no-op and the ramp is continuous with the cosine at
+        `step == warmup_steps`. Clamping `p` is what makes steps past the
+        horizon return `min_lr` instead of a value that climbs back up — `cos`
+        is periodic, so an unclamped `p > 1` would restart the schedule. That is
+        exactly the bug behind `CosineAnnealingLR(T_max=90)` in a 14,040-step
+        run: 156 cycles instead of one.
+      complexity: "O(1) time, O(1) space"
+      tags: [learning-rate, cosine, warmup]
+
+    - id: p-cosine-budget
+      title: "The budget of a cosine schedule, in closed form"
+      difficulty: medium
+      prompt: >-
+        Implement `cosine_budget(base_lr, min_lr, total_steps)`: the exact sum
+        of the cosine schedule that starts at `base_lr` at step 0 and ends at
+        `min_lr` at step `total_steps`, over the `total_steps` steps of the run.
+        Return 0.0 when `total_steps <= 0`.
+
+        Use the closed form rather than looping — the point is that you know it.
+        Note the extra half-step of area: the sum of `cos(pi * t / T)` over a
+        full period is exactly 1, not 0, so the budget is
+        `T*(base+min)/2 + (base-min)/2`.
+      starter: |
+        def cosine_budget(base_lr, min_lr, total_steps):
+            # your implementation here
+            pass
+      language: python
+      entry: cosine_budget
+      testCases:
+        - input: "[0.001, 0.0, 1000]"
+          expected: "0.5005"
+          mode: json
+          tolerance: 1e-9
+        - input: "[0.001, 0.0, 4]"
+          expected: "0.0025"
+          mode: json
+          tolerance: 1e-9
+        - input: "[0.001, 0.0001, 100]"
+          expected: "0.05545"
+          mode: json
+          tolerance: 1e-9
+        - input: "[0.01, 0.01, 500]"
+          expected: "5.0"
+          mode: json
+          tolerance: 1e-9
+        - input: "[0.001, 0.0, 1]"
+          expected: "0.001"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def cosine_budget(base_lr, min_lr, total_steps):
+            T = int(total_steps)
+            if T <= 0:
+                return 0.0
+            return T * (base_lr + min_lr) / 2.0 + (base_lr - min_lr) / 2.0
+      solutionExplanation: >-
+        Summing `min_lr + 0.5*(base-min)*(1+cos(pi*t/T))` over `t = 0..T-1`
+        splits into `T*min_lr` plus `0.5*(base-min)*(T + sum(cos))`, and
+        `sum(cos(pi*t/T)) = 1` for every `T >= 2`. That leftover 1 is a genuine
+        half-step of area: at `T=1000`, peak 1e-3, floor 0, the budget is
+        0.5005, not 0.5000. The closed form matters practically — the mean
+        height of a cosine is `(base+min)/2`, so a cosine run travels exactly
+        half as far as a constant run at the same peak, which is the number that
+        licenses raising the peak when you switch shapes. When `min_lr ==
+        base_lr` the formula collapses to `T*base_lr`, which is the constant
+        schedule, as it must.
+      complexity: "O(1) time, O(1) space"
+      tags: [learning-rate, cosine, integration]
+
+    - id: p-batch-plan
+      title: "Scaling the rate and re-counting the steps"
+      difficulty: easy
+      prompt: >-
+        Implement `plan_learning_rate(base_lr, base_batch, target_batch,
+        dataset_size, epochs, mode="linear")`, returning a dict with keys
+        `lr`, `steps_per_epoch`, and `total_steps`.
+
+        `steps_per_epoch` is `dataset_size // target_batch` (integer floor),
+        `total_steps` is `steps_per_epoch * epochs`, and `lr` is
+        `base_lr * (target_batch / base_batch)` when `mode == "linear"` or
+        `base_lr * sqrt(target_batch / base_batch)` when `mode == "sqrt"`.
+      starter: |
+        import math
+
+        def plan_learning_rate(base_lr, base_batch, target_batch,
+                               dataset_size, epochs, mode="linear"):
+            # your implementation here
+            pass
+      language: python
+      entry: plan_learning_rate
+      testCases:
+        - input: "[0.1, 256, 8192, 1281167, 90]"
+          expected: '{"lr": 3.2, "steps_per_epoch": 156, "total_steps": 14040}'
+          mode: json
+          tolerance: 1e-9
+        - input: "[0.1, 256, 8192, 1281167, 90, \"sqrt\"]"
+          expected: '{"lr": 0.5656854249492381, "steps_per_epoch": 156, "total_steps": 14040}'
+          mode: json
+          tolerance: 1e-9
+        - input: "[0.1, 256, 1024, 1281167, 90]"
+          expected: '{"lr": 0.4, "steps_per_epoch": 1251, "total_steps": 112590}'
+          mode: json
+          tolerance: 1e-9
+        - input: "[0.001, 32, 32, 50000, 10]"
+          expected: '{"lr": 0.001, "steps_per_epoch": 1562, "total_steps": 15620}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import math
+
+        def plan_learning_rate(base_lr, base_batch, target_batch,
+                               dataset_size, epochs, mode="linear"):
+            ratio = float(target_batch) / float(base_batch)
+            lr = base_lr * ratio if mode == "linear" else base_lr * math.sqrt(ratio)
+            steps_per_epoch = int(dataset_size) // int(target_batch)
+            return {
+                "lr": float(lr),
+                "steps_per_epoch": steps_per_epoch,
+                "total_steps": steps_per_epoch * int(epochs),
+            }
+      solutionExplanation: >-
+        The step count is the part people forget: going from batch 256 to 8192
+        divides the steps per epoch by 32, so a 90-epoch run is 14,040 steps
+        rather than 112,590. Every schedule's horizon must be expressed in that
+        unit, and the warmup must be too. The two modes encode different
+        invariants — linear holds the movement per epoch constant, sqrt holds
+        the noise per step constant — and they differ by 5.66× here, which is
+        the difference between a run that converges and one that diverges.
+      complexity: "O(1) time, O(1) space"
+      tags: [batch-size, learning-rate, linear-scaling]
+
+  try_it: >-
+    At $\eta_{\max} = 0.1$ over $T = 1000$ steps, compute the schedule budget
+    $\sum_t \eta_t$ for a constant rate, a cosine decay to zero, and 10× step
+    decay at 50% and 75%, and check your three numbers against 100, 50 and 52.75.
+    Then work out what fraction of the cosine budget is already spent by
+    $t = 0.265T$, and why that matters if you restart the run at that point.
+  interview_questions:
+    - question: "Why can a constant learning rate never converge?"
+      level: mid
+      key_points:
+        - "The recursion $\\theta_{t+1} = (1-\\eta\\lambda)\\theta_t - \\eta\\xi_t$ has stationary variance $\\eta\\sigma^2/(\\lambda(2-\\eta\\lambda))$, so the excess loss settles at a floor proportional to $\\eta$."
+        - "The iterate orbits the optimum in a ball whose radius scales with $\\sqrt{\\eta}$; smaller steps shrink the ball but never collapse it."
+        - "Decaying $\\eta \\to 0$ is what removes the floor, which is why the shape of the tail matters more than the peak for final loss."
+        - "The practical symptom is that extra data and extra epochs stop helping: you have hit noise, not capacity."
+      follow_up: "Your loss floor is 0.031 at $\\eta = 10^{-3}$ and 0.029 at $10^{-4}$. What does that ratio tell you about the noise scale?"
+    - question: "You move from 1 GPU to 32 and scale the batch 32×. Linear or square-root learning-rate scaling, and what breaks first?"
+      level: senior
+      key_points:
+        - "Linear $\\eta \\propto B$ holds the movement per epoch constant: $N/B$ steps of size $\\eta\\bar g$, so growing $B$ by $k$ needs $\\eta$ to grow by $k$."
+        - "Square-root scaling holds the noise injected per step constant instead, since gradient noise contributes $\\eta^2\\sigma^2/B$ to per-step variance."
+        - "Linear scaling fails past the critical batch size, where added batch buys gradient averaging and no wall-clock — the run is larger, not faster."
+        - "Adam needs warmup on top of either rule, because its first step is already full length in every coordinate."
+      follow_up: "How would you measure the critical batch size on your own workload without a grid search?"
+    - question: "Why does warmup exist if Adam already applies bias correction?"
+      level: mid
+      key_points:
+        - "Bias correction fixes the first moment's scale, $1-\\beta_1^t$; it says nothing about the variance of $\\hat v$, which is large in the first few hundred steps."
+        - "The relative standard deviation of $\\hat v$ scales with $\\sqrt{(1-\\beta_2)/(1+\\beta_2)}$, so the step direction is estimated from very little evidence early on."
+        - "A linear warmup from 0 over $N$ steps bounds the early step length at $\\eta t/N$, so one unlucky batch cannot move the weights far."
+        - "Warmup is cheap insurance at the start and irrelevant later — which is why a schedule that never leaves warmup is a bug, not a policy."
+  common_mistakes:
+    - "Building a cosine schedule with `T_max = epochs` and stepping it per batch — 90 epochs at 156 steps/epoch is 14,040 steps, so the rate collapses 156× too early."
+    - "Porting a step-decay recipe to cosine without checking the budget, which changes the total parameter movement even when the peak rate is identical."
+    - "Scaling the rate linearly with batch size past the critical batch size, then reporting the extra hardware as a speedup it did not buy."
+  further_reading:
+    - label: "Goyal, Dollár, Girshick, Noordhuis, Wesolowski, Kyrola, Tulloch, Jia & He, Accurate, Large Minibatch SGD (2017)"
+    - label: "Loshchilov & Hutter, SGDR: Stochastic Gradient Descent with Warm Restarts (ICLR 2017)"

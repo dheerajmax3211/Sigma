@@ -1,0 +1,665 @@
+id: cs-llm-serving
+slug: cs-llm-serving
+title: "Case Study: Serving a 100B-Parameter Model"
+summary: >-
+  Serve a 100B model against two SLAs — 800 ms to first token and 50 ms between
+  tokens — and discover the design is a memory-bandwidth budget split between a
+  compute-bound prefill pool and a bandwidth-bound decode pool.
+kind: case_study
+difficulty: expert
+position: 10
+estMinutes: 23
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [llm-serving, kv-cache, prefill-decode, continuous-batching, paged-attention, speculative-decoding, capacity]
+
+body:
+  big_idea: >-
+    A 100B model is served by splitting one bandwidth budget across two
+    workloads with opposite bottlenecks: prefill is compute-bound at 129 ms
+    per 2K prompt, decode is bandwidth-bound at 3.7 ms of weights per token.
+  problem:
+    - "You put the model on one 8×H100 node and it does not fit: 100 GB of FP8 weights against 80 GB per GPU."
+    - "p99 time-to-first-token is 4 s while GPU utilisation reads 95%: a 2,048-token prefill is 129 ms of compute that every decode step pays for."
+    - "You add replicas and cost per token rises, because each re-reads 100 GB of weights per step: 3.7 ms of traffic for one token."
+  analogy: >-
+    A print shop with one press that either burns a new plate or runs copies.
+    Burning a plate is compute: 129 ms of press attention that produces
+    nothing a customer can hold. Running copies is bandwidth: the press
+    re-reads the plate for every page. Stop the press to burn a plate and
+    every job printing stalls — that is head-of-line blocking.
+  concept_points:
+    - "**Weight memory sets the floor on parallelism before any SLA is discussed.** 100e9 parameters at 1 byte in FP8 is 100 GB; an H100 holds 80 GB, so one GPU cannot hold the model. TP=8 puts 12.5 GB on each GPU and leaves 67.5 GB, of which roughly **60 GB** is usable for KV cache after activations, CUDA graphs and workspace. That subtraction is the capacity plan."
+    - "**Decode is bandwidth-bound by a factor of 147.** Per token at batch 1 the model reads 100 GB and does $2 \\times 10^{11}$ FLOPs, an intensity of 2 FLOP/byte. The ridge point is $989/3.35 = 295$ FLOP/byte. Batching raises intensity linearly: at 350 sequences it is 700 FLOP/byte, above the ridge, and decode becomes compute-bound again."
+    - "**The KV cache is $2 \\times L \\times H_{kv} \\times d$ bytes per token.** For 80 layers, 8 KV heads and head_dim 128 in FP8 that is **160 KiB per token**. An 8K-context sequence is $163{,}840 \\times 8{,}192 = 1.342$ GB; the 350 sequences a node can hold are the entire concurrency budget, and every feature that lengthens context spends it."
+    - "**TTFT is prefill FLOPs over achievable FLOPS, not peak.** A 2,048-token prompt costs $2 \\times 100\\times10^{9} \\times 2{,}048 = 4.096\\times10^{14}$ FLOPs. Eight H100s at 989 TFLOPS are 7.91 PFLOPS peak; at 40% MFU that is 3.16 PFLOPS, so prefill is **129 ms**. The 800 ms SLA is therefore a queueing problem, and queueing is what disaggregation fixes."
+    - "**Inter-token latency is one decode step, bounded below by bytes over bandwidth.** Weights alone are $100\\text{ GB}/26.8\\text{ TB/s} = 3.73$ ms for the node; the KV read at 350 sequences x 8K is 470 GB, so the step is $470/26.8 = 17.5$ ms — **21.3 ms**, 47 steps/s, 16,400 tokens/s. At 55% of peak it is 38.7 ms, inside a 50 ms SLA."
+    - "**Chunked prefill buys the SLA back only if the chunk is small enough.** Prefill runs at 15,875 tokens/s per node, so one token costs 0.063 ms. With a 21 ms decode floor, prefill may add 29 ms — a chunk of $29/0.063 = 460$ tokens. Chunk at 512 and you miss the SLA by 3 ms; at 256 you have margin. Chunk size is derived, never chosen by feel."
+  definitions:
+    - { term: "Prefill", meaning: "The pass that consumes the prompt and builds the KV cache. Compute-bound: FLOPs scale with prompt tokens times parameters, and it produces no output token." }
+    - { term: "Decode", meaning: "The autoregressive pass that emits one token per sequence per step. Bandwidth-bound: every step re-reads all weights and the whole KV cache." }
+    - { term: "TTFT", meaning: "Time to first token, measured from request arrival to the first streamed token. Dominated by queueing plus prefill." }
+    - { term: "ITL (inter-token latency)", meaning: "Wall-clock gap between consecutive streamed tokens. Equal to one decode step for a sequence, and the SLA that caps batch size." }
+    - { term: "KV cache", meaning: "Per-layer keys and values retained for every past token. 2 x layers x KV heads x head_dim x bytes per token, and the dominant memory cost at long context." }
+    - { term: "PagedAttention", meaning: "KV cache stored in fixed-size blocks with a per-sequence block table, so memory is allocated on demand and prefixes can be shared by reference." }
+    - { term: "Continuous batching", meaning: "Iteration-level scheduling: sequences join and leave the running batch between decode steps instead of at request boundaries." }
+    - { term: "Chunked prefill", meaning: "Splitting a long prompt into pieces scheduled alongside decode steps, trading TTFT for a bounded ITL." }
+    - { term: "Disaggregation", meaning: "Running prefill and decode in separate pools with KV cache transferred between them, so neither workload's burst damages the other's SLA." }
+    - { term: "MFU", meaning: "Model FLOPs utilisation: achieved model FLOPs divided by peak dense FLOPs. 35-45% is a good prefill number on H100; decode is far lower because it is bandwidth-bound." }
+    - { term: "Speculative decoding", meaning: "A small draft model proposes k tokens, the target model verifies them in one pass, and accepted tokens are kept. Speedup is accepted tokens divided by the relative cost of verification." }
+    - { term: "Prefix caching", meaning: "Reusing the KV blocks of a shared prompt prefix across requests, turning repeated system prompts into a refcount instead of a re-prefill." }
+
+  diagrams:
+    - type: architecture
+      title: "Two pools, one KV handoff, four columns"
+      nodes:
+        - { id: client, x: 0, y: 1, label: "Clients", kind: client, detail: "20 req/s at peak, 2,048-token prompts, 512 output tokens. Streaming over SSE, so TTFT is user-visible before any completion exists." }
+        - { id: lb, x: 1, y: 1, label: "Router", kind: load_balancer, detail: "Routes by prompt length and cache affinity, not round-robin. A prefix-cache hit is worth 129 ms of prefill and is only findable if the router remembers where the prefix lives." }
+        - { id: pre, x: 2, y: 0, label: "Prefill pool (3 nodes)", kind: gpu, detail: "Compute-bound: 40% MFU on 8xH100 gives 15,875 tokens/s per node, so 40,960 prompt tokens/s needs 2.6 nodes. Sized for FLOPS, not memory." }
+        - { id: kv, x: 3, y: 0, label: "KV transfer", kind: cache, detail: "1.342 GB per 8K sequence moved over RDMA. At 100 GB/s that is 13 ms, which is why disaggregation is only viable on nodes with fast interconnect." }
+        - { id: dec, x: 2, y: 2, label: "Decode pool (2 nodes)", kind: gpu, detail: "Bandwidth-bound: 21 ms per step at the roofline, 38.7 ms at 55% efficiency, 350 sequences resident. Sized for bytes and for KV capacity." }
+        - { id: detok, x: 3, y: 2, label: "Detokenise + stream", kind: server, detail: "Incremental detokenisation matters: buffering a whole response to detokenise at the end adds seconds and wastes the TTFT win entirely." }
+      edges:
+        - { from: client, to: lb, label: "prompt" }
+        - { from: lb, to: pre, label: "cache miss" }
+        - { from: lb, to: dec, label: "cache hit" }
+        - { from: pre, to: kv, label: "blocks" }
+        - { from: kv, to: dec, label: "handoff", style: "async" }
+        - { from: dec, to: detok, label: "tokens" }
+
+    - type: compare
+      title: "Colocated with chunked prefill vs disaggregated pools"
+      left_label: "One pool, chunked prefill"
+      left_points:
+        - "Simplest to operate: one deployment, one autoscaler, no KV transfer"
+        - "Chunk size is capped at 460 tokens by the 50 ms ITL SLA, so a 32K prompt takes 71 chunks"
+        - "Prefill and decode compete for the same HBM, so the KV budget shrinks by the activation workspace"
+        - "A traffic burst of long prompts still raises p99 ITL, because chunking bounds the damage rather than removing it"
+      right_label: "Two pools, KV handoff"
+      right_points:
+        - "Each pool is sized for its own bottleneck: 3 prefill nodes for FLOPS, 2 decode nodes for bytes"
+        - "TTFT is independent of decode load; a 2K prompt is 129 ms plus queue, not 129 ms plus every resident sequence"
+        - "Costs an RDMA hop of 13 ms per 8K sequence and a KV store that must be garbage-collected on failure"
+        - "Only worth it above roughly 20 req/s; below that the idle pool costs more than the tail latency saves"
+
+    - type: pipeline
+      title: "The 800 ms TTFT budget and the 50 ms ITL budget, itemised"
+      nodes:
+        - label: "Admission"
+          note: "2 ms"
+          detail: "Tokenise, check max context, reserve KV blocks. A request that cannot get blocks is rejected here rather than preempted later, because preemption is a 1.34 GB copy."
+        - label: "Queue"
+          note: "0-400 ms, the real variable"
+          detail: "The only term you control with capacity rather than code. At 60% utilisation a queue is short; at 90% it is not, and p99 grows without bound as utilisation approaches 1."
+        - label: "Prefill"
+          note: "129 ms at 40% MFU"
+          detail: "4.096e14 FLOPs over 3.16 PFLOPS. Halve MFU and you double this term, which is why kernel quality shows up directly in TTFT."
+        - label: "First decode"
+          note: "21-39 ms"
+          detail: "One step to produce the first token. Sampling, grammar constraints and logit processors all live here and are usually the difference between 21 ms and 60 ms."
+        - label: "Steady state"
+          note: "38.7 ms per token"
+          detail: "At 55% of peak bandwidth the decode step is 38.7 ms, so 512 output tokens take 19.8 s. Little's law then says 20 req/s needs 396 concurrent sequences — more than one node holds."
+
+  markdown: |
+    ## Two workloads wearing one model
+
+    Prefill and decode run the same weights and have nothing else in common.
+
+    Prefill reads a prompt of $S$ tokens and does
+
+    $$F_{\text{prefill}} = 2\,N\,S$$
+
+    FLOPs, where $N$ is the parameter count and the factor 2 is one multiply and
+    one add per parameter. It is a big dense matmul: 2,048 tokens against 100e9
+    parameters is $4.096\times10^{14}$ FLOPs, and at 40% MFU on eight H100s
+    (3.16 PFLOPS) that is **129 ms**.
+
+    Decode reads every weight to produce one token per sequence:
+
+    $$t_{\text{step}} \ge \frac{N \cdot b_w + \text{KV bytes}}{B_{\text{agg}}}.$$
+
+    With FP8 weights, $N b_w = 100$ GB, and $B_{\text{agg}} = 8 \times 3.35 =
+    26.8$ TB/s, the weight term alone is **3.73 ms**. That is the floor on
+    inter-token latency for the whole batch, and it does not care how many users
+    are waiting — which is exactly why batching is free until bandwidth runs out.
+
+    | quantity | prefill | decode |
+    |---|---|---|
+    | bound by | FLOPs | bytes |
+    | arithmetic intensity | ~2,048 FLOP/byte | 2 FLOP/byte at batch 1 |
+    | time for the unit of work | 129 ms per 2K prompt | 3.73 ms minimum per step |
+    | what improves it | higher MFU, better kernels | bigger batch, fewer bytes per token |
+    | what breaks it | queueing, long prompts | KV growth, all-reduce, sampling |
+
+    ## The KV cache is the capacity plan
+
+    $$M_{\text{KV}} = 2 \cdot L \cdot H_{kv} \cdot d \cdot n_{\text{tokens}} \cdot b.$$
+
+    For $L = 80$, $H_{kv} = 8$ (grouped-query attention), $d = 128$ and one byte
+    per element, that is 163,840 bytes — **160 KiB per token**. An 8K sequence is
+    1.342 GB. A node with $8 \times 60 = 480$ GB of usable KV therefore holds
+    **357 sequences at 8K**, and that number, not the FLOP count, is what limits
+    concurrency.
+
+    Push context to 32K and the same node holds 89 sequences: $4\times$ the
+    context is $4\times$ less concurrency for the same hardware. Every product
+    decision about context length is a capacity decision, and it is usually made
+    by someone who has never seen this equation.
+
+    ## Why the two pools have to separate
+
+    Colocate them and a 2,048-token prefill inserts 129 ms of compute into a
+    batch whose decode step was 21 ms. Every resident sequence sees its
+    inter-token gap go from 21 ms to 150 ms — a 7× p99 violation caused by a
+    request that has not produced a single token yet.
+
+    Chunked prefill bounds the damage instead of removing it. Prefill runs at
+    15,875 tokens/s per node, so 0.063 ms per token. With a 50 ms ITL budget and a
+    21 ms decode floor, prefill gets 29 ms, which is
+
+    $$\frac{29\text{ ms}}{0.063\text{ ms/token}} = 460 \text{ tokens per chunk}.$$
+
+    A 512-token chunk lands at 53 ms and misses; 256 lands at 37 ms and passes.
+    That is the entire tuning story of a chunked-prefill server, and it is
+    arithmetic rather than taste.
+
+    Disaggregation removes the coupling. Prefill nodes are sized on FLOPS
+    (2.6 nodes for 40,960 prompt tokens/s), decode nodes on bytes and KV
+    (396 concurrent sequences at peak, 357 per node, so two nodes). The price is a
+    KV handoff: 1.342 GB per 8K sequence at 100 GB/s RDMA is 13 ms, which is
+    negligible against a 129 ms prefill but fatal on a 10 GB/s network.
+
+    ## Batching, and where it stops paying
+
+    Decode at batch $B$ has arithmetic intensity
+
+    $$I(B) = \frac{2N}{N b_w + B \cdot M_{\text{KV/token}} \cdot \bar{S}}$$
+
+    which grows with $B$ until the KV term dominates the weight term. At
+    $B = 350$ and $\bar{S} = 8{,}192$ the KV read is 470 GB against 100 GB of
+    weights, so intensity is 700 FLOP/byte — above the 295 FLOP/byte ridge point.
+    Past that, adding sequences costs more time than it buys throughput, and the
+    step time grows linearly with batch: the classic throughput/latency knee.
+
+    Static batching wastes the other end of the curve. With mean output 512
+    tokens and p95 1,200, a static batch of 32 runs 1,200 steps to deliver 16,384
+    useful tokens out of 38,400 slot-steps — 43%. Continuous batching refills
+    slots at iteration boundaries and recovers most of the gap, which is why
+    every production server is an iteration-level scheduler with preemption
+    rather than a request-level one.
+
+    ## Speculative decoding, with the acceptance arithmetic
+
+    Draft $k$ tokens with a small model, verify all $k+1$ in one target pass, keep
+    the longest accepted prefix. With per-token acceptance $\alpha$,
+
+    $$\mathbb{E}[\text{accepted}] = \frac{1-\alpha^{k+1}}{1-\alpha}.$$
+
+    At $\alpha = 0.7$, $k = 4$: $(1-0.168)/0.3 = 2.77$ tokens per step. The
+    verification pass costs about 1.25 decode steps because it is still
+    bandwidth-bound, and a 1B draft adds 4 weight reads of 1 GB = 4 GB per step,
+    about 11% of a 35 ms budget. Net $2.77/1.36 = 2.0\times$.
+
+    At $\alpha = 0.4$ the same formula gives $(1-0.010)/0.6 = 1.65$, and
+    $1.65/1.36 = 1.21\times$ — real but not worth the operational complexity.
+    Below $\alpha = 0.5$ with a large draft model the ratio goes under 1 and you
+    have shipped a latency regression with a research paper attached.
+
+    ## What it costs
+
+    Five nodes (40 H100s) at 2.50 USD per GPU-hour is 100 USD per hour, or
+    2,400 USD per day. At 7 req/s average and 512 output tokens, that is
+    310 million output tokens per day, or **7.7 USD per million output tokens** —
+    provisioned for a peak that is 3× the average, which is where two thirds of
+    the bill comes from.
+
+    The lever that moves it is not a cheaper GPU. It is utilisation: a
+    disaggregated pool that runs at 70% instead of 45% serves the same traffic on
+    two thirds of the hardware, which is a bigger win than any kernel.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A 100B model is not served by buying a bigger GPU, it is served by splitting one memory-bandwidth budget across **two workloads with opposite bottlenecks**: prefill is compute-bound and finishes a 2,048-token prompt in 129 ms, decode is bandwidth-bound and pays 3.7 ms of weight traffic for every token it emits, and the only way to hold both SLAs at once is to stop running them in the same process.
+
+    ### The analogy, in full
+
+    A print shop with one press that can either burn a new plate or run copies. Burning a plate is compute: it takes a fixed 129 ms of press attention and produces nothing a customer can hold. Running copies is bandwidth: the press re-reads the plate for every page, so one page costs one plate-read whether you print one copy or four hundred. If you stop the press to burn a plate, every job currently printing stalls — that is head-of-line blocking, and it is why p99 inter-token latency is three times p50 in a colocated server. Split the shop into a plate room and a press room and each can be sized for its own bottleneck; the plate room needs FLOPS, the press room needs bandwidth, and neither one waits for the other. Two places the analogy breaks. The plate room keeps finished plates on a shelf (prefix caching), so the same system prompt is never burned twice. And the press can print four hundred different pages at once, which means the marginal cost of the four-hundredth page is nearly zero until bandwidth saturates — the exact opposite of a printing press, and the reason batching is the whole economics of serving.
+
+    ### Failure modes, in full
+
+    - You put the model on one 8×H100 node and it does not fit: 100 GB of FP8 weights against 80 GB per GPU, so tensor parallelism is mandatory — and once the weights take 12.5 GB per GPU, the 60 GB left over is the number that decides concurrency, not the model's quality.
+    - p99 time-to-first-token is 4 s under load while GPU utilisation reads 95%. Both numbers are true: a 2,048-token prefill is 129 ms of pure compute, and every decode step it interrupts pays that latency, so the cluster looks busy and the product feels broken.
+    - You add replicas to fix latency and cost per token goes up, because each replica re-reads 100 GB of weights per decode step. At batch 1 that is 3.7 ms of memory traffic to produce a single token — 1.4% of the GPU's peak FLOPs, which is the definition of a bandwidth-bound workload.
+    - You cap max_tokens to control spend and the KV cache still OOMs, because an 8K-context sequence costs 1.34 GB and the allocator loses another 40% to fragmentation between sequences.
+    - An interviewer asks how many GPUs for 20 requests per second at 2K prompt and 512 output tokens. The answer is five 8-GPU nodes, and the derivation is three multiplications you have to be able to do out loud.
+
+    ### The mechanisms, in full
+
+    - **Weight memory sets the floor on parallelism before any SLA is discussed.** 100e9 parameters at 1 byte in FP8 is 100 GB; an H100 holds 80 GB, so one GPU cannot hold the model at all. TP=8 puts 12.5 GB of weights on each GPU and leaves 67.5 GB, of which roughly 60 GB is usable for KV cache after activations, CUDA graphs and workspace. That single subtraction — 80 minus 12.5 minus 7.5 — is the capacity plan; everything else is a consequence.
+    - **Decode is bandwidth-bound by a factor of 147.** Per token at batch 1 the model reads 100 GB and does $2 \times 10^{11}$ FLOPs, an arithmetic intensity of 2 FLOP/byte. The H100's ridge point is $989\times10^{12} / 3.35\times10^{12} = 295$ FLOP/byte, so decode sits 147× below the point where compute matters. Batching raises intensity linearly: at 350 sequences it is 700 FLOP/byte, above the ridge, and decode becomes compute-bound again — which is why throughput scales with batch until it suddenly does not.
+    - **The KV cache is $2 \times L \times H_{kv} \times d \times$ bytes per token.** For 80 layers, 8 KV heads and head_dim 128 in FP8 that is $2 \times 80 \times 8 \times 128 \times 1 = 163{,}840$ bytes = **160 KiB per token**. An 8K-context sequence is $163{,}840 \times 8{,}192 = 1.342$ GB; the 350 sequences a node can hold are the entire concurrency budget, and every feature that lengthens context spends it.
+    - **TTFT is prefill FLOPs divided by achievable FLOPS, not by peak.** A 2,048-token prompt costs $2 \times 100\times10^{9} \times 2{,}048 = 4.096\times10^{14}$ FLOPs. Eight H100s at 989 TFLOPS dense are 7.91 PFLOPS peak; at a realistic 40% MFU that is 3.16 PFLOPS, so prefill is **129 ms**. The 800 ms SLA is therefore not a compute problem — it is a queueing problem, and queueing is what disaggregation fixes.
+    - **Inter-token latency is one decode step, and the step is bounded below by bytes over bandwidth.** Weights alone are $100\text{ GB} / 26.8\text{ TB/s} = 3.73$ ms for the whole node. Add the KV read at 350 sequences × 8K context = 470 GB, and the step is $470/26.8 = 17.5$ ms; total **21.3 ms**, or 47 steps/s, which at 350 sequences is 16,400 tokens/s. At 55% of peak bandwidth the step becomes 38.7 ms — inside a 50 ms SLA, with 11 ms of headroom.
+    - **Chunked prefill buys the SLA back only if the chunk is small enough.** Prefill runs at 15,875 tokens/s per node (2,048 tokens in 129 ms), so one token of prefill costs 0.063 ms. To keep a step under 50 ms with a 21 ms decode floor, prefill may add at most 29 ms — a chunk of $29/0.063 = 460$ tokens. Chunk at 512 and you sit at 53 ms and miss the SLA by 3 ms; chunk at 256 and you are at 37 ms with margin. Chunk size is derived from the SLA, never chosen by feel.
+    - **PagedAttention turns fragmentation into a rounding error.** Contiguous pre-allocation reserves max_model_len per sequence: at 8K that is 1.342 GB reserved for a sequence that may use 300 tokens, and measured waste runs 60–80%. Fixed 16-token blocks waste at most 15 tokens per sequence — $15 \times 160\text{ KiB} = 2.4$ MB, or 0.18% of the 1.342 GB — and the block table makes prefix sharing a refcount instead of a copy.
+    - **Continuous batching is worth more than any model optimisation.** Static batching of 32 waits for the longest sequence: with a mean of 512 output tokens and a p95 of 1,200, the batch runs 1,200 steps to deliver $32 \times 512 = 16{,}384$ useful tokens out of 38,400 slot-steps — **43% utilisation**. Iteration-level scheduling refills a slot the moment a sequence finishes and recovers most of the other 57%, at the cost of a scheduler that must be correct under preemption.
+    - **Speculative decoding is arithmetic, not magic.** With a draft acceptance rate $\alpha = 0.7$ and $k = 4$ drafted tokens, expected accepted tokens per verification step is $(1-\alpha^{k+1})/(1-\alpha) = (1-0.168)/0.3 = 2.77$. Verifying five tokens costs about 1.25 decode steps (bandwidth-bound, so extra tokens are cheap) and the 1B draft model adds 11% for its own weight reads, giving $2.77/1.36 = 2.0\times$. Below $\alpha \approx 0.5$ the same arithmetic returns less than 1× and the technique is a latency regression.
+    - **Tensor parallelism spends a measurable slice of every step in all-reduce.** At batch 350 the per-layer activation is $350 \times 8{,}192 \times 2 = 5.73$ MB; two all-reduces per layer over 80 layers with ring cost $2(P-1)/P$ per GPU is 1.6 GB per step, which at 450 GB/s of NVLink is **3.6 ms — 17% of a 21 ms step**. TP=4 halves that (1.8 ms) at the cost of 25 GB of weights per GPU; that is the real content of the "TP8 or 2×TP4" argument.
+  problem_statement: >-
+    Design a serving stack for a 100B-parameter dense model (80 layers, 8 KV
+    heads, head_dim 128, FP8 weights) that holds TTFT p99 under 800 ms and ITL
+    p99 under 50 ms at 20 requests per second peak, with 2,048-token prompts and
+    512-token outputs, on H100-class hardware. State the parallelism, the
+    prefill/decode split, the batching policy and the KV cache budget, and show
+    the arithmetic that produced each.
+
+  requirements:
+    functional:
+      - "Stream tokens with SSE, emitting the first token within the TTFT SLA and continuing at the ITL SLA"
+      - "Honour per-request max_tokens and max_context, rejecting over-budget requests at admission rather than preempting them later"
+      - "Reuse a shared 4,000-token system prompt across requests via prefix caching"
+      - "Support cancellation mid-stream and release the sequence's KV blocks within one scheduler iteration"
+      - "Expose per-request TTFT, ITL and token counts for billing and for SLA reporting"
+    non_functional:
+      - "TTFT p99 <= 800 ms and ITL p99 <= 50 ms at 20 req/s peak, measured at the client rather than at the GPU"
+      - "Zero request failures during a single-node drain; in-flight sequences finish or are re-routed"
+      - "KV cache waste from fragmentation <= 1% of allocated bytes"
+      - "Cost per million output tokens under 10 USD at the stated traffic mix"
+
+  clarifying_questions:
+    - question: "Is the 800 ms TTFT measured at the client or at the model server?"
+      why_it_matters: "Network, TLS, tokenisation and queueing can be 200 ms of the budget. A design that hits 600 ms server-side can still miss a client-side SLA, and the fix is a different one — edge termination and streaming, not more GPUs."
+    - question: "What is the prompt-length distribution, not just the mean?"
+      why_it_matters: "Prefill cost is linear in prompt tokens, so a p99 of 32K against a mean of 2K means 16x the compute for 1% of traffic — enough to require a separate long-context pool or a hard admission cap."
+    - question: "Is the workload multi-turn, and do turns share a prefix?"
+      why_it_matters: "A shared 4,000-token system prompt is 40% of a 10,000-token conversation. Prefix caching turns that into a 13 ms block-table lookup instead of a 250 ms prefill, which changes both the node count and the router design."
+    - question: "What is the acceptable quality loss from FP8 weights and KV cache?"
+      why_it_matters: "FP8 halves both weight traffic and KV footprint, roughly doubling decode throughput per node. If the eval shows a regression the whole capacity plan changes, so this is a first-meeting question, not a later optimisation."
+    - question: "Is traffic spiky, and what is the peak-to-average ratio?"
+      why_it_matters: "Provisioning for peak at 3x average triples the bill. A queue with a stated admission policy is often cheaper than capacity: dropping the 0.1% of requests that would blow the tail is a product decision worth putting on the table."
+
+  capacity_estimation:
+    assumptions:
+      - "Model: 100e9 parameters, 80 layers, 64 attention heads, 8 KV heads (GQA), head_dim 128, FP8 weights at 1 byte per parameter, FP8 KV cache at 1 byte per element"
+      - "Hardware: H100 SXM5 with 80 GB HBM3 at 3.35 TB/s and 989 TFLOPS BF16 dense; eight GPUs per node connected by NVLink at 450 GB/s per direction"
+      - "Traffic: 20 req/s peak, 7 req/s average, 2,048-token prompts, 512-token outputs, shared 4,000-token system prompt on every request"
+      - "Efficiency: 40% MFU on prefill, 55% of peak HBM bandwidth on decode, 60 GB of each 80 GB GPU usable for KV after weights, activations and workspace"
+      - "Cost: 2.50 USD per GPU-hour, 8 GPUs per node"
+
+    arithmetic:
+      - label: "Weight memory and the tensor-parallel floor"
+        calculation: "100e9 params x 1 byte = 100 GB; one H100 holds 80 GB, so 100/80 = 1.25 -> TP >= 2. At TP=8: 100 GB / 8 = 12.5 GB per GPU; 80 - 12.5 = 67.5 GB, minus ~7.5 GB activations and workspace = 60 GB usable for KV."
+        conclusion: "One node cannot hold the model on a single GPU, and TP=8 leaves 60 GB of every 80 GB GPU for KV cache. That subtraction is the capacity plan."
+
+      - label: "KV cache per token and per sequence"
+        calculation: "2 x 80 layers x 8 KV heads x 128 head_dim x 1 byte = 163,840 bytes = 160 KiB per token. At 8,192 tokens: 163,840 x 8,192 = 1.342e9 bytes = 1.342 GB per sequence."
+        conclusion: "Every 8K sequence costs 1.342 GB of KV, so the node's KV budget converts directly into a sequence count."
+
+      - label: "Concurrency per node"
+        calculation: "8 GPUs x 60 GB = 480 GB of KV; 480 GB / 1.342 GB per 8K sequence = 357 sequences. At a 2,560-token average context (2K prompt + 512 output): 163,840 x 2,560 = 419 MB per sequence, so 480/0.419 = 1,145 sequences."
+        conclusion: "357 resident sequences at full 8K context, or about 1,145 at the average context. Concurrency is a function of context length, not of GPU count alone."
+
+      - label: "Decode step time and aggregate throughput"
+        calculation: "Weights: 100 GB / 26.8 TB/s aggregate = 3.73 ms. KV read at 350 sequences x 8,192 tokens x 160 KiB = 470 GB; 470/26.8 = 17.5 ms. Step = 3.73 + 17.5 = 21.3 ms -> 47 steps/s -> 350 x 47 = 16,400 tokens/s at the roofline. At 55% of peak bandwidth: 21.3/0.55 = 38.7 ms, 25.8 steps/s, 350 x 25.8 = 9,030 tokens/s."
+        conclusion: "One decode node produces about 9,000 tokens/s at 38.7 ms ITL, which is 25.8 tokens/s per user and just inside the 50 ms SLA."
+
+      - label: "Prefill FLOPs and TTFT"
+        calculation: "2 x 100e9 params x 2,048 tokens = 4.096e14 FLOPs. Eight H100s at 989 TFLOPS = 7.91 PFLOPS peak; at 40% MFU = 3.16 PFLOPS. 4.096e14 / 3.16e15 = 0.1296 s = 130 ms. Per-node prefill rate = 2,048 / 0.130 = 15,750 tokens/s."
+        conclusion: "A 2K prompt prefills in 130 ms, so the 800 ms TTFT SLA leaves 670 ms for queueing and network — it is a scheduling problem, not a compute problem."
+
+      - label: "Cluster sizing at 20 req/s"
+        calculation: "Prefill: 20 req/s x 2,048 tokens = 40,960 prompt tokens/s; 40,960 / 15,750 = 2.6 -> 3 nodes. Decode: Little's law with 512 output tokens at 25.8 tokens/s = 19.8 s per request; 20 x 19.8 = 396 concurrent sequences; 396 / 357 capacity = 1.11 -> 2 nodes. Total 5 nodes = 40 GPUs."
+        conclusion: "Three prefill nodes and two decode nodes, a 3:2 split driven by the fact that a 2K prompt costs 130 ms of compute while 512 output tokens cost 19.8 s of bandwidth."
+
+      - label: "Cost per million output tokens"
+        calculation: "5 nodes x 8 GPUs x 2.50 USD/GPU-hour = 100 USD/hour = 2,400 USD/day. Output tokens at average traffic: 7 req/s x 86,400 s x 512 tokens = 3.10e8 tokens/day. 2,400 / 310 = 7.74 USD per million output tokens."
+        conclusion: "7.74 USD per million output tokens when provisioned for a 3x peak — and two thirds of that bill is idle capacity held for the peak, which is why utilisation is the real cost lever."
+
+      - label: "Chunked-prefill chunk size from the ITL SLA"
+        calculation: "ITL budget 50 ms - decode floor 21.3 ms = 28.7 ms available for prefill. Prefill rate 15,750 tokens/s = 15.75 tokens per ms. 28.7 ms x 15.75 tokens/ms = 452 tokens per chunk."
+        conclusion: "Chunks must be 450 tokens or smaller to hold a 50 ms ITL; a 512-token chunk lands at 53.8 ms and misses the SLA."
+
+  architecture_summary: >-
+    A router splits traffic into a compute-bound prefill pool and a
+    bandwidth-bound decode pool, handing KV blocks between them over RDMA. Each
+    pool scales on its own bottleneck — prefill nodes on FLOPs, decode nodes on
+    KV bytes — and within the decode pool a paged KV allocator with 16-token
+    blocks plus an iteration-level scheduler keeps 350 sequences resident on a
+    node that a request-level batcher would fill with 40.
+
+  deep_dives:
+    - topic: "Prefill/decode disaggregation versus colocated chunked prefill"
+      explanation: >-
+        Colocating is simpler and is right below roughly 20 req/s. Above that the
+        two workloads fight: prefill steals FLOPs from decode and decode steals
+        bandwidth and KV from prefill, and the chunk size that protects ITL also
+        caps TTFT for long prompts. Disaggregation makes each pool's scaling rule
+        independent, at the cost of a KV transfer, a second autoscaler and a
+        failure mode where a prefill node dies holding blocks nobody can free.
+      tradeoffs:
+        - option: "Colocated, one deployment, chunked prefill"
+          pros: "No KV transfer, one autoscaler, one failure domain, and the simplest possible capacity story: nodes = total work / per-node work."
+          cons: "Chunk size is pinned to the ITL SLA (450 tokens here), so a 32K prompt takes 71 chunks and its TTFT is coupled to whatever the decode batch is doing."
+        - option: "Disaggregated prefill and decode pools"
+          pros: "Each pool sized for its own bottleneck; TTFT becomes independent of decode load; prefill can use cheaper, higher-FLOPS-per-dollar hardware without KV capacity."
+          cons: "A 1.342 GB KV handoff per 8K sequence (13 ms at 100 GB/s), a KV store to garbage-collect, and an idle pool whenever traffic is skewed."
+        - option: "Disaggregate only above a threshold, colocate below"
+          pros: "Pays the operational complexity only where it buys latency; small deployments stay single-pool."
+          cons: "Two serving paths to test, and the threshold moves as traffic grows, so the migration is a permanent piece of roadmap rather than a one-off."
+
+    - topic: "KV cache layout: paged blocks versus contiguous reservation"
+      explanation: >-
+        Contiguous reservation is what a naive server does: allocate
+        max_model_len worth of KV per sequence at admission. At 8K that is
+        1.342 GB reserved per sequence whether it uses 300 tokens or 8,192, and
+        because sequences finish at different times the freed memory is
+        fragmented into holes too small for the next request. Paged allocation
+        fixes both: blocks of 16 tokens allocated on demand, a block table per
+        sequence, and waste bounded at 15 tokens rather than 7,000.
+      tradeoffs:
+        - option: "Contiguous pre-allocation at max_model_len"
+          pros: "Trivially simple, no indirection in the attention kernel, and predictable per-request memory."
+          cons: "60-80% waste in practice and external fragmentation that gets worse as sequences churn; the OOM arrives at 40% of the concurrency the memory could support."
+        - option: "Paged blocks with a block table"
+          pros: "Waste bounded at 15 tokens per sequence (2.4 MB); prefix sharing becomes a refcount; concurrency nearly triples at the same memory."
+          cons: "Every attention kernel pays an indirection per block, and the scheduler must implement preemption and copy-on-write for shared prefixes."
+        - option: "Compress the cache instead: GQA/MQA plus FP8"
+          pros: "Attacks the 160 KiB per token directly — 8 KV heads instead of 64 is an 8x cut, and FP8 halves it again to the number used here."
+          cons: "A model-architecture decision, not a serving one; you cannot retrofit GQA onto a trained checkpoint without retraining or a quality drop."
+
+    - topic: "Parallelism: one TP=8 replica versus two TP=4 replicas"
+      explanation: >-
+        TP=8 maximises KV per node (60 GB per GPU with 12.5 GB of weights) but
+        every decode step pays two all-reduces per layer across eight GPUs: 1.6 GB
+        per step, 3.6 ms at 450 GB/s, 17% of a 21 ms step. TP=4 puts 25 GB of
+        weights on each GPU, leaving 47.5 GB for KV, and halves all-reduce traffic
+        to 1.8 ms — but each replica holds 4 x 47.5 = 190 GB of KV instead of 480.
+        Total KV for two TP=4 replicas is 380 GB against 480 for one TP=8, so you
+        trade 21% of concurrency for half the communication and two failure
+        domains.
+      tradeoffs:
+        - option: "TP=8, one replica per node"
+          pros: "Maximum KV per node and the fewest replicas to route between; all-reduce stays inside NVLink, never crossing the network."
+          cons: "17% of every decode step is communication, and one GPU failure takes the whole node's 350 sequences down."
+        - option: "TP=4, two replicas per node"
+          pros: "Half the all-reduce, two independent failure domains, finer-grained routing, and 47.5 GB per GPU still holds 140 sequences at 8K."
+          cons: "21% less total KV per node, twice the scheduler complexity, and each replica needs its own prefix cache, so hit rate falls."
+        - option: "Pipeline parallelism across nodes"
+          pros: "Scales past one NVLink domain and cuts weight memory per GPU further, which is the only way to serve a 400B model."
+          cons: "Bubbles: with 8 stages and a batch that must be split into microbatches, decode latency grows by the pipeline fill time and ITL suffers badly."
+
+    - topic: "Speculative decoding as a latency tool, not a throughput tool"
+      explanation: >-
+        Speculation trades spare FLOPs for fewer sequential steps. It only pays
+        when the target model has compute headroom at the batch size you run —
+        which is true at low batch and false at high batch, where decode is already
+        compute-bound. That single fact determines the deployment shape: turn it on
+        for latency-sensitive low-concurrency traffic, turn it off for bulk
+        offline generation.
+      tradeoffs:
+        - option: "Draft model (1B) plus target verification, k=4"
+          pros: "2.0x at alpha=0.7 by the acceptance formula; the draft can be distilled from the target, so acceptance is tunable."
+          cons: "An extra model to host and version, 11% step overhead, and speedup collapses below alpha=0.5."
+        - option: "Medusa/EAGLE-style trained heads on the target"
+          pros: "No second model, lower per-token overhead, and the heads share the target's KV cache."
+          cons: "Requires training and re-training per checkpoint, so it is unusable on a model you do not own."
+        - option: "No speculation; spend the same effort on batching"
+          pros: "Throughput per dollar is better at high concurrency because decode is compute-bound there, and there is nothing extra to operate."
+          cons: "Does nothing for single-stream latency, which is exactly the number a chat product's users feel."
+
+  bottlenecks:
+    - failure: "KV cache fragmentation under churn"
+      symptom: "OOM at 40-45% of the sequence count the arithmetic says fits; preemption rate spikes; p99 TTFT grows while average GPU utilisation looks normal."
+      mitigation: "Paged allocation in 16-token blocks with a free-block pool, plus admission control that reserves the worst-case blocks for the request's max_tokens. Measure allocator waste as a first-class metric, not as a postmortem finding."
+    - failure: "Head-of-line blocking from one long prompt"
+      symptom: "p99 ITL jumps 5-7x for every resident sequence whenever a 32K prompt arrives, then recovers; the spike correlates with prompt length, not with request rate."
+      mitigation: "Chunk prefill to 450 tokens (derived from the ITL SLA), or route prompts above a length threshold to a dedicated long-context pool so their prefill never shares a step with latency-sensitive decode."
+    - failure: "Tensor-parallel straggler"
+      symptom: "ITL p99 is 2-3x p50 with no traffic change; one GPU in the TP group shows lower clocks or higher memory temperature; all-reduce wait time rises on every other rank."
+      mitigation: "Keep TP inside one NVLink domain, monitor per-rank all-reduce wait, and drain the node on a sustained skew. At the replica level, route around a slow node rather than retrying into it."
+    - failure: "Prefix cache thrash"
+      symptom: "Cache hit rate collapses from 40% to near zero after a deploy; TTFT rises by exactly the system-prompt prefill cost (about 250 ms at 4,000 tokens) across the board."
+      mitigation: "Hash the prefix by content, not by request id; keep the system prompt byte-identical across deploys; and give the cache an LRU with a size floor so a burst of long unique prompts cannot evict the shared prefix."
+
+  what_to_steal:
+    - "Size the pools separately: prefill on FLOPs (2 x N x S per request), decode on bytes (N x bytes + KV read per step). They are never the same number, and averaging them produces a cluster that misses both SLAs."
+    - "Derive chunk size from the ITL SLA rather than picking 512: (ITL_budget - decode_step) x prefill_rate gives 450 tokens here, and that derivation transfers to any model."
+    - "Quote KV cache as bytes per token (2 x L x H_kv x d x bytes) before quoting concurrency. Concurrency is a derived quantity and it moves 4x when context moves 4x."
+    - "State the peak-to-average ratio in the capacity section. Provisioning for 3x peak is where two thirds of the bill comes from, and it is a product decision that deserves to be visible."
+    - "Treat speculative decoding as a latency feature gated on batch size: quote the acceptance formula and the break-even alpha, or you will ship a regression at high concurrency."
+
+  try_it: >-
+    Take the 160 KiB-per-token KV figure and recompute concurrency for a 32K
+    context window on the same node: 480 GB / (163,840 x 32,768 bytes) = 89
+    sequences. Then recompute the decode step at that context and batch, and work
+    out whether the 50 ms ITL SLA survives. Finally, derive the chunk size that
+    would keep ITL at 50 ms if you halved MFU to 20% — and notice that the chunk
+    shrinks even though the SLA did not change.
+
+  interview_questions:
+    - question: "Walk me through sizing a deployment for a 100B model at 20 requests per second with a 50 ms inter-token SLA."
+      level: staff
+      key_points:
+        - "Weights first: 100e9 x 1 byte = 100 GB, so TP >= 2 and TP=8 leaves 12.5 GB per GPU and 60 GB for KV after workspace."
+        - "KV per token is 2 x 80 x 8 x 128 x 1 = 160 KiB, so 8K context is 1.342 GB per sequence and a node holds 357 of them."
+        - "Decode step is 100 GB / 26.8 TB/s = 3.73 ms of weights plus 17.5 ms of KV read at 350 sequences, so 21.3 ms roofline and 38.7 ms at 55% bandwidth — inside 50 ms."
+        - "Prefill is 2 x 100e9 x 2,048 = 4.1e14 FLOPs, 130 ms at 40% MFU, which is 15,750 tokens/s per node and 3 nodes for 40,960 prompt tokens/s; decode needs 2 nodes for 396 concurrent sequences."
+      follow_up: "The product wants 32K context. What breaks first, and what do you change rather than adding nodes?"
+
+    - question: "Why is p99 inter-token latency three times p50 in a colocated server, and what does disaggregation actually fix?"
+      level: senior
+      key_points:
+        - "A 2,048-token prefill is 130 ms of compute; inserted into a 21 ms decode step it makes every resident sequence wait 150 ms, a 7x spike caused by a request that has emitted nothing."
+        - "Chunked prefill bounds this: with a 50 ms budget and a 21 ms decode floor, prefill gets 28.7 ms, which at 0.0635 ms per token is a 450-token chunk."
+        - "Disaggregation removes the coupling entirely, so TTFT stops depending on decode batch size and decode ITL stops depending on prompt arrivals."
+        - "It costs a KV handoff of 1.342 GB per 8K sequence — 13 ms at 100 GB/s RDMA — which is why it needs fast interconnect and is not worth it below about 20 req/s."
+      follow_up: "Where does the KV handoff itself become the bottleneck, and how would you hide it?"
+
+    - question: "Your speculative decoder gives 2x on the benchmark and 1.1x in production. What happened?"
+      level: senior
+      key_points:
+        - "Acceptance rate fell: expected accepted tokens is (1 - alpha^(k+1))/(1 - alpha), which is 2.77 at alpha=0.7 but 1.65 at alpha=0.4 and near 1 below alpha=0.35."
+        - "Production traffic differs from the benchmark prompt distribution — code, tables and non-English text all reduce acceptance for a draft trained on chat."
+        - "Decode at high batch is compute-bound, so verification no longer costs ~1.25 steps; the extra tokens are real FLOPs and the speedup denominator grows."
+        - "The 11% draft-model overhead is fixed, so as the numerator shrinks the ratio crosses 1 and the feature becomes a regression."
+      follow_up: "How would you decide, per request, whether to speculate at all?"
+
+    - question: "Why does batching stop helping, and what is the knee made of?"
+      level: senior
+      key_points:
+        - "Decode intensity is 2N / (N x bytes + B x KV bytes per sequence), so it grows linearly with batch until the KV term dominates the weight term."
+        - "At 350 sequences and 8K context the KV read is 470 GB against 100 GB of weights, so intensity is 700 FLOP/byte — past the 295 FLOP/byte ridge point, decode becomes compute-bound."
+        - "Past the knee, each added sequence lengthens the step roughly linearly, so aggregate throughput flattens while ITL degrades."
+        - "The knee is a property of context length, not of the model: at 2K context the same node absorbs 4x the batch before the KV term bites."
+      follow_up: "Given a 50 ms ITL SLA, where would you put the operating point, and what do you do with the requests that do not fit?"
+
+  common_mistakes:
+    - "Sizing on parameter count alone and concluding one 8-GPU node is generous: 100 GB of weights is only the start, and the 60 GB per GPU left for KV is what actually limits concurrency to 357 sequences."
+    - "Reporting GPU utilisation as evidence the serving stack is healthy. A colocated server at 95% utilisation with a 150 ms p99 ITL is busy and broken at the same time."
+    - "Choosing a 512-token prefill chunk because it is a round number, then missing a 50 ms ITL SLA by 4 ms. The chunk size is (ITL budget - decode step) x prefill rate, which is 450 tokens here."
+    - "Turning on speculative decoding for a high-concurrency endpoint without checking the acceptance rate; below alpha of about 0.5 the arithmetic returns less than 1x and the feature is a latency regression."
+    - "Ignoring prefix caching on a multi-turn product. A shared 4,000-token system prompt is 40% of a 10,000-token conversation and 250 ms of prefill per turn that a block-table lookup would have avoided."
+
+  further_reading:
+    - label: "Kwon, Li, Zhuang, Sheng, Zheng, Yu, Gonzalez, Zhang, Stoica, Efficient Memory Management for Large Language Model Serving with PagedAttention (SOSP 2023)"
+    - label: "Yu, Jeong, Kim, Kim, Chun, Orca: A Distributed Serving System for Transformer-Based Generative Models (OSDI 2022)"
+    - label: "Zhong, Liu, Chen, Hu, Zhang, Liu, Distserve: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving (OSDI 2024)"
+    - label: "Leviathan, Kalman, Matias, Fast Inference from Transformers via Speculative Decoding (ICML 2023)"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        There are two workloads here, not one. One turns a prompt into a cache and
+        is limited by arithmetic; the other turns a cache into tokens and is
+        limited by how fast memory can be read. Find the bytes, find the FLOPs,
+        and the design is the division.
+      blocks:
+        - kind: checklist
+          body: |
+            - Weights: parameters x bytes per parameter, divided by GPUs
+            - KV: 2 x layers x KV heads x head_dim x bytes, per token
+            - Prefill: 2 x parameters x prompt tokens, divided by achievable FLOPS
+            - Decode: (weights + KV read) divided by aggregate bandwidth
+      checkpoint: >-
+        Which of those four numbers changes when you double the batch size, and
+        which one does not?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Start from the SLA that constrains you and work backwards. A TTFT SLA
+        limits prefill queueing; an ITL SLA limits batch size and prefill chunk
+        size. Then check whether one node's KV can hold the concurrency Little's
+        law demands, and only then pick a parallelism degree.
+      blocks:
+        - kind: warning
+          body: >-
+            Do not start from "which GPU". Start from bytes per token and FLOPs
+            per prompt; the GPU choice falls out, and starting from hardware is
+            how designs end up with 8-way tensor parallelism on a model that fits
+            twice over.
+      checkpoint: >-
+        Little's law says concurrency equals arrival rate times latency. If the
+        KV budget says 357 sequences and Little's law says 396, what are your two
+        honest options?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Size the two pools, then check the SLA against the step time.
+      blocks:
+        - kind: pseudocode
+          body: |
+            w_bytes   = N * bytes_per_param
+            tp        = ceil(w_bytes / gpu_mem)          # then round up to NVLink width
+            kv_tok    = 2 * L * H_kv * d * kv_bytes
+            seqs      = (gpu_mem - w_bytes/tp - workspace) * tp / (kv_tok * ctx)
+            t_step    = (w_bytes + seqs*kv_tok*ctx) / (tp * bw_per_gpu)
+            t_prefill = 2*N*prompt_tokens / (tp * peak_flops * mfu)
+            nodes_pre = ceil(qps*prompt_tokens / (prompt_tokens/t_prefill))
+            nodes_dec = ceil(qps * out_tokens * t_step / seqs)
+      checkpoint: >-
+        Which line would you defend hardest in a design review, and which one is
+        most sensitive to an assumption you have not stated?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Roofline, KV arithmetic, and the speculation formula.
+      blocks:
+        - kind: math
+          body: |
+            **Decode step.**
+            $$t_{\text{step}} \ge \frac{N b_w + B\,M_{\text{KV}}\bar{S}}{B_{\text{agg}}}$$
+
+            **KV per token.**
+            $$M_{\text{KV}} = 2 L H_{kv} d\, b_{\text{kv}}$$
+
+            **Accepted tokens under speculation.**
+            $$\mathbb{E}[\text{accepted}] = \frac{1-\alpha^{k+1}}{1-\alpha}$$
+      checkpoint: >-
+        Plug in alpha = 0.7 and k = 4. Do you get 2.77? What does alpha = 0.5 give?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The five-node design, with the arithmetic that produced it.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            N, L, H_kv, d = 100e9, 80, 8, 128
+            gpu_gb, bw, peak = 80, 3.35e12, 989e12
+            w = N * 1                    # FP8
+            tp = 8
+            kv_tok = 2 * L * H_kv * d * 1
+            ctx, seqs_max = 8192, None
+            usable = (gpu_gb - w/8/1e9 - 7.5) * 1e9 * 8
+            seqs = usable / (kv_tok * ctx)
+            t_step = (w + seqs*kv_tok*ctx) / (8*bw)
+            t_pre = 2*N*2048 / (8*peak*0.40)
+            print(round(seqs), round(t_step*1e3,1), round(t_pre*1e3))
+      checkpoint: >-
+        Which of the three printed numbers would move most if the model used MQA
+        (one KV head) instead of 8-head GQA?
+  implementations:
+    - language: python
+      title: "Prefill TTFT, decode bandwidth, and the chunked-prefill budget"
+      note: >-
+        Prefill is 2ND over 8 H100s at 40% MFU, giving 129 ms; decode reads the FP8 weights plus 350 sequences of 8K KV cache and lands at 18 ms. The remaining 32 ms of the 50 ms ITL budget buys a 506-token prefill chunk. Treating HBM bandwidth as one 26.8 TB/s number is the simplification; contention between the two pools is the hard part in production.
+      code: |
+        PARAMS, TP, H100_TFLOPS, MFU = 100e9, 8, 989e12, 0.40
+        BW_TBPS = 26.8            # node HBM bandwidth
+        PROMPT, SEQ, CTX = 2_048, 350, 8_192
+        KV_BYTES_PER_TOKEN = 160 * 1024
+        ITL_SLA_MS = 50.0
+
+
+        def ttft_ms(prompt=PROMPT):
+            """Prefill is compute-bound: 2 x params x prompt tokens."""
+            flops = 2 * PARAMS * prompt
+            return flops / (TP * H100_TFLOPS * MFU) * 1e3
+
+
+        def decode_ms(seq=SEQ, ctx=CTX, kv=KV_BYTES_PER_TOKEN):
+            """Decode is bandwidth-bound: weights plus every sequence's KV cache."""
+            weights = PARAMS / TP                      # FP8: one byte per parameter
+            return (weights + seq * ctx * kv) / (BW_TBPS * 1e12) * 1e3
+
+
+        def prefill_tokens_per_s():
+            return TP * H100_TFLOPS * MFU / (2 * PARAMS)
+
+
+        def main():
+            print(f"TTFT for a {PROMPT}-token prompt: {ttft_ms():.1f} ms")
+            d = decode_ms()
+            weights_ms = (PARAMS / TP) / (BW_TBPS * 1e12) * 1e3
+            print(f"decode step at {SEQ} x {CTX}: {d:.1f} ms "
+                  f"(weights alone {weights_ms:.2f} ms)")
+
+            rate = prefill_tokens_per_s()
+            print(f"prefill rate: {rate:,.0f} tokens/s")
+            chunk = int(rate * (ITL_SLA_MS - d) / 1e3)
+            print(f"largest prefill chunk inside the {ITL_SLA_MS:.0f} ms ITL: {chunk} tokens")
+
+            assert 125 < ttft_ms() < 135
+            assert 17 < d < 19
+            assert 480 <= chunk <= 520
+            assert d + chunk / rate * 1e3 <= ITL_SLA_MS
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-llm-decode-step
+      title: "Decode step from bytes and bandwidth"
+      difficulty: easy
+      prompt: >-
+        A decode step reads the FP8 weights (12.5 GB per GPU after TP=8) plus `seq * ctx *
+        kv_bytes` of KV cache. Return milliseconds at `bw_tbps` TB/s.
+      language: python
+      entry: decode_ms
+      testCases:
+        - input: '{}'
+          expected: "17.994853"
+          tolerance: 1e-6
+        - input: '{"seq": 1, "ctx": 1, "weights_gb": 26.8, "bw_tbps": 26.8}'
+          expected: "1.000006"
+          tolerance: 1e-6
+      solution: |
+        def decode_ms(seq=350, ctx=8192, kv_bytes=160 * 1024, weights_gb=12.5, bw_tbps=26.8):
+            return (weights_gb * 1e9 + seq * ctx * kv_bytes) / (bw_tbps * 1e12) * 1e3
+      solutionExplanation: >-
+        The 470 GB KV read dominates the 12.5 GB of weights, so decode is a bandwidth budget.
+        Batching amortises the weights but not the KV.
+      tags: [serving, latency]

@@ -1,0 +1,1380 @@
+id: fsdp-zero
+slug: fsdp-zero
+title: "FSDP and ZeRO Stages 1–3"
+summary: >-
+  Shard the training state instead of the batch: a parameter is 16 bytes in an
+  Adam mixed-precision run, not 2, and the optimizer owns 12 of them — 107.2 GB
+  per device for a 6.7e9-parameter model. Stages 1, 2 and 3 cut that to 36.85,
+  25.13 and 13.40 GB on eight devices for 1.0x, 1.0x and 1.5x the all-reduce
+  traffic, with a floor of 4, 2 and 0 bytes per parameter that decides which
+  models can fit at all.
+kind: lesson
+difficulty: expert
+position: 2
+estMinutes: 25
+prerequisites: [data-parallelism]
+phase: distributed-training
+tags: [zero, fsdp, sharding, optimizer-state, mixed-precision, all-gather, reduce-scatter, memory, distributed-training]
+
+body:
+  big_idea: >-
+    ZeRO does not shard the model: it shards the sixteen bytes of training
+    state every device keeps a private copy of, twelve of them optimizer
+    state, buying that with at most 1.5x the communication.
+  problem:
+    - "A 7B job needs 107.2 GB per device before storing one activation, on 80 GB cards, and adding GPUs changes nothing."
+    - "FSDP runs but is 40% slower than the data-parallel job, and nobody knows whether the cost is the all-gather, its exposed tail, or accumulation."
+    - "A 70B model will not start on 8 GPUs at any device count: stage 1 keeps 4 bytes per parameter replicated, which is 280 GB."
+  analogy: >-
+    Every machinist keeps a private cabinet: the part (fp16 weights), the
+    offcuts (gradients), the master drawing (fp32 weights) and the maintenance
+    log with two service readings (Adam's m and v). Sixteen units, and only
+    two of them are the part. ZeRO stops duplicating the cabinet — one eighth
+    of the logs, then the offcuts, then the part itself.
+  concept_points:
+    - "**Sixteen bytes per parameter runs this topic.** Adam mixed precision keeps fp16 weights (2), fp16 gradients (2), an fp32 master (4) and two moments (4 each). For 6.7e9 parameters that is **107.2 GB per device**, of which **80.4 GB — 75% — is optimizer state**; the moments alone are 53.6 GB, **4.0x the weights**. Data parallelism replicates every one of those bytes on every rank."
+    - "**Stage 1 shards the twelve optimizer bytes and touches nothing else.** $4 + 12/N$ bytes per parameter — **5.5 at N = 8, 36.85 GB**, a **2.9x** cut for the 2S bytes data parallelism already spends. It is numerically free: after 20 Adam steps the sharded update differs from the single-process reference by **0.000000e+00**, because Adam is elementwise."
+    - "**Stage 2 shards the gradients, which changes the shape of the backward pass.** $2 + 14/N$ gives **3.75 bytes per parameter at N = 8 (25.13 GB)**, **4.3x** less. The full gradient can no longer exist on any device, so reduction is reduce-scattered as it is produced — and gradient accumulation must defer it, or eight micro-batches cost **321.6 GB per rank against 40.2 GB**."
+    - "**Stage 3 shards the parameters, and it is the only stage with a zero floor.** $16/N$ bytes per parameter: **2.0 at N = 8, 13.40 GB**, an **8x** reduction. Stages 1 and 2 cannot go below **4 and 2 bytes**, so a 70B model needs **280 GB** and **140 GB** respectively and cannot fit 80 GB cards at any device count; stage 3 fits at **N >= 16**."
+    - "**Stage 3 pays 3S, not 2S, and the third S is the backward all-gather.** Measured **35.175 GB against 23.45 GB per rank at N = 8**, **1.5x**. It is per layer, so the bill is small: 478.571 MB per layer is **1.396 ms against 29.730 ms of compute**, and prefetching one layer exposes only **0.17% of an 832.45 ms step**."
+    - "**FSDP is ZeRO-3 with the shard boundary drawn at the module.** It packs a block's 12 parameter tensors into one flat buffer, so 28 blocks become **56 collectives instead of 672** and **0.448 ms of launch instead of 5.376 ms**. `reshard_after_forward` is the stage switch per module: true frees the parameters (ZeRO-3, 3S), false keeps them (ZeRO-2, 2S)."
+  definitions:
+    - term: "Sharded data parallelism"
+      meaning: >-
+        Keeping data parallelism's batch split and additionally splitting the
+        per-device training state across the same ranks. The gradient is still
+        averaged across workers; what changes is who is holding the optimizer
+        state that consumes it, and therefore how much memory each rank needs.
+    - term: "ZeRO stage 1"
+      meaning: >-
+        Shard the optimizer state (fp32 master weights, Adam m, Adam v) across
+        ranks, keeping fp16 weights and fp16 gradients replicated. Memory goes
+        from 16 to 4 + 12/N bytes per parameter for 2S bytes of traffic, the
+        same as plain data parallelism.
+    - term: "ZeRO stage 2"
+      meaning: >-
+        Stage 1 plus sharded gradients: 2 + 14/N bytes per parameter. The
+        gradient is reduce-scattered as it is produced, so no rank ever holds a
+        full gradient vector. Traffic is still 2S; the cost is that accumulation
+        must be deferred to the last micro-batch.
+    - term: "ZeRO stage 3"
+      meaning: >-
+        Stage 2 plus sharded parameters: 16/N bytes per parameter, and the only
+        stage with no floor. Every use of a layer's weights needs an all-gather
+        of that layer first, so the step makes three passes over the model
+        instead of two: 3S bytes per rank, 1.5x data parallelism.
+    - term: "Optimizer state"
+      meaning: >-
+        Everything the update rule must remember between steps: the fp32 master
+        weights, Adam's first moment m and second moment v. Twelve bytes per
+        parameter for Adam, 75% of the sixteen, 80.4 GB for a 6.7e9-parameter
+        model. It is the largest thing in the training state and the least
+        frequently touched, which is exactly why it is the first thing sharded.
+    - term: "Master weights"
+      meaning: >-
+        The fp32 copy of the parameters that the optimizer actually updates.
+        The fp16 weights are a projection of these, kept because that is the
+        dtype the matrix multiplies want. Updating the fp16 copy directly loses
+        the low bits of every small update, which is why the fp32 master exists
+        and costs 4 bytes per parameter.
+    - term: "Flat parameter"
+      meaning: >-
+        FSDP's per-module buffer: every tensor in a module is concatenated into
+        one contiguous allocation so that a single all-gather materialises the
+        whole module. It exists to collapse a dozen small collectives into one
+        and to give the prefetch a unit it can reason about. `reshard_after_forward`
+        decides whether that buffer is freed after use.
+    - term: "All-gather"
+      meaning: >-
+        The collective that gives every rank a copy of every chunk: $N-1$ steps
+        of $S/N$ bytes, $(N-1)S/N$ per rank. It is the second half of a ring
+        all-reduce and the whole cost of ZeRO-3, whose parameter access pattern
+        is gather, use, free, gather again.
+    - term: "Reduce-scatter"
+      meaning: >-
+        The collective that sums a buffer across ranks and leaves each rank
+        owning one fully reduced chunk: the first half of a ring all-reduce,
+        $(N-1)S/N$ bytes per rank. ZeRO-1, 2 and 3 all use it for the gradient,
+        which is why their gradient traffic is the same as data parallelism's
+        and their state is not.
+    - term: "Reshard after forward"
+      meaning: >-
+        FSDP's per-module switch between ZeRO-2 behaviour (keep the gathered
+        parameters, 2S traffic, 2 + 14/N bytes) and ZeRO-3 behaviour (free them,
+        re-gather for the backward, 3S traffic, 16/N bytes). Setting it False
+        on the modules that dominate traffic and True on the ones that dominate
+        memory is the standard tuning knob.
+    - term: "Communication amplification"
+      meaning: >-
+        Traffic divided by data parallelism's 2S: 1.0 for stages 0, 1 and 2,
+        1.5 for stage 3, and worse than that in practice when gradient
+        accumulation re-gathers per micro-batch — eight micro-batches at stage 3
+        with no deferral is 8.0x, and 5.7x even with the reduce-scatter
+        deferred.
+
+  diagrams:
+    - type: architecture
+      title: "One ZeRO-3 step: gather, compute, gather, scatter, update"
+      nodes:
+        - { id: store, x: 0, y: 1, label: "per-rank shard: 1/N of every tensor", kind: storage, detail: "2 bytes per parameter at N=8, so 13.40 GB for 6.7e9 parameters. Between steps this is the only copy of the weights that exists anywhere, so no rank can start a forward pass until the pieces for a layer have been collected." }
+        - { id: ag1, x: 1, y: 0, label: "all-gather layer L: 418.75 MB/rank", kind: server, detail: "478.571 MB of parameters for one layer, of which (N-1)/N crosses each link: 418.750 MB per rank, 1.396 ms at 300 GB/s. Launched one layer early, so it runs inside layer L-1's 29.73 ms of compute." }
+        - { id: fwd, x: 2, y: 0, label: "forward layer L", kind: gpu, detail: "29.73 ms at 8,192 tokens per GPU and 40% MFU. The gather is 4.7% of that, which is why a single layer of prefetch hides it completely and why an unprefetched stage 3 is a fifth slower rather than half again." }
+        - { id: ag2, x: 1, y: 2, label: "all-gather again before backward", kind: server, detail: "The same 418.75 MB, a second time. The derivative with respect to W needs W, and the forward's copy was freed so the buffer could be reused by the next layer. This is the third pass over the model and the only place stage 3 costs more than stages 1 or 2." }
+        - { id: bwd, x: 2, y: 2, label: "backward layer L", kind: gpu, detail: "Produces one layer's gradient. Because the parameters are already partitioned, the local shard's slice of the gradient can be kept and the rest discarded — no gather of the gradient is ever needed." }
+        - { id: rs, x: 3, y: 2, label: "reduce-scatter: 418.75 MB/rank", kind: server, detail: "Averaged across ranks like any data-parallel gradient, but scattered: rank r ends up owning the reduced gradient for chunk r only. Fused into the backward pass, so it hides the way the all-reduce does." }
+        - { id: upd, x: 3, y: 1, label: "Adam on the local shard", kind: model, detail: "Each rank updates 1/8 of the master weights with 1/8 of m and v. Elementwise, so it is bit-identical to a full-vector update: measured 0.000000e+00 difference against a single-process reference after 20 steps." }
+      edges:
+        - { from: store, to: ag1, label: "1/N chunks" }
+        - { from: ag1, to: fwd, label: "full layer 478.57 MB" }
+        - { from: store, to: ag2, label: "1/N chunks" }
+        - { from: ag2, to: bwd, label: "full layer, again" }
+        - { from: fwd, to: bwd, label: "activations" }
+        - { from: bwd, to: rs, label: "dL/dW" }
+        - { from: rs, to: upd, label: "1/N of the gradient" }
+        - { from: upd, to: store, label: "1/N updated", style: async }
+      caption: "Three passes over the model per step against data parallelism's two: gather before the forward, gather before the backward, scatter the gradient. 1.5x the bytes, and 0.17% of the step once one layer of prefetch is in place."
+
+    - type: stack
+      title: "The sixteen bytes per parameter, and which stage removes each slice"
+      reversed: true
+      layers:
+        - "Adam second moment v — fp32, 4 bytes per parameter — sharded by stage 1"
+        - "Adam first moment m — fp32, 4 bytes per parameter — sharded by stage 1"
+        - "fp32 master weights — 4 bytes per parameter — sharded by stage 1"
+        - "fp16 gradients — 2 bytes per parameter — sharded by stage 2"
+        - "fp16 weights — 2 bytes per parameter — sharded by stage 3"
+
+    - type: plot
+      title: "Bytes per parameter against device count, by stage"
+      chart: line
+      xLabel: "devices (N)"
+      yLabel: "bytes per parameter"
+      series:
+        - name: "stage 0 — plain data parallelism (floor 16)"
+          points:
+            - { x: 1, y: 16.0 }
+            - { x: 2, y: 16.0 }
+            - { x: 4, y: 16.0 }
+            - { x: 8, y: 16.0 }
+            - { x: 16, y: 16.0 }
+            - { x: 32, y: 16.0 }
+            - { x: 64, y: 16.0 }
+            - { x: 128, y: 16.0 }
+            - { x: 512, y: 16.0 }
+        - name: "stage 1 — optimizer state (floor 4)"
+          points:
+            - { x: 1, y: 16.0 }
+            - { x: 2, y: 10.0 }
+            - { x: 4, y: 7.0 }
+            - { x: 8, y: 5.5 }
+            - { x: 16, y: 4.75 }
+            - { x: 32, y: 4.375 }
+            - { x: 64, y: 4.1875 }
+            - { x: 128, y: 4.09375 }
+            - { x: 512, y: 4.023438 }
+        - name: "stage 2 — gradients (floor 2)"
+          points:
+            - { x: 1, y: 16.0 }
+            - { x: 2, y: 9.0 }
+            - { x: 4, y: 5.5 }
+            - { x: 8, y: 3.75 }
+            - { x: 16, y: 2.875 }
+            - { x: 32, y: 2.4375 }
+            - { x: 64, y: 2.21875 }
+            - { x: 128, y: 2.109375 }
+            - { x: 512, y: 2.027344 }
+        - name: "stage 3 — parameters (floor 0)"
+          points:
+            - { x: 1, y: 16.0 }
+            - { x: 2, y: 8.0 }
+            - { x: 4, y: 4.0 }
+            - { x: 8, y: 2.0 }
+            - { x: 16, y: 1.0 }
+            - { x: 32, y: 0.5 }
+            - { x: 64, y: 0.25 }
+            - { x: 128, y: 0.125 }
+            - { x: 512, y: 0.03125 }
+
+    - type: compare
+      title: "Plain data parallelism vs ZeRO-3, 6.7e9 parameters on 8 x 80 GB"
+      left_label: "Plain data parallelism"
+      left_points:
+        - "16 bytes per parameter on every rank: 107.2 GB"
+        - "Plus 10 GB of activations: 117.2 GB against an 80 GB card, at any device count"
+        - "2S of traffic per rank: 23.45 GB, 78.17 ms at 300 GB/s"
+        - "One all-reduce per bucket, entirely hidden inside the backward pass"
+        - "Largest model that fits at N=8: 4.38e9 parameters"
+      right_label: "ZeRO-3 (FSDP)"
+      right_points:
+        - "2 bytes per parameter per rank at N=8: 13.40 GB"
+        - "Plus 10 GB of activations: 23.40 GB, fitting with 56 GB to spare"
+        - "3S of traffic per rank: 35.175 GB, 117.25 ms if nothing is hidden"
+        - "Gather before the forward and again before the backward; 0.17% exposed with one layer of prefetch"
+        - "Largest model that fits at N=8: 3.5e10 parameters"
+
+    - type: sequence
+      title: "One step at stage 3 with a one-layer prefetch: where the time goes"
+      items:
+        - "Step t ends. Each rank holds 1/8 of every layer's weights — 13.40 GB at N=8 — and no layer is usable yet."
+        - "Gather layer 0: 418.75 MB per rank, 1.396 ms at 300 GB/s. This one is exposed, because no compute is running behind it."
+        - "Layer 0 computes for 29.73 ms. During that window, layer 1's gather is launched and finishes with 28.3 ms to spare."
+        - "Layer 1 computes as layer 0's buffer is freed and layer 2's gather lands. Steady state: all communication inside compute."
+        - "The same through layer 27. The last gather finishes during layer 26, so the forward adds nothing after the initial 1.396 ms."
+        - "Backward replays the schedule in reverse, gathering each layer again before differentiating it: 28 more windows, all covered by compute."
+        - "Total exposed: 1.396 ms of an 832.45 ms step, 0.17%. Total moved: 35.175 GB per rank, 1.5x the 23.45 GB of plain data parallelism."
+
+  markdown: |
+    ## Sixteen bytes, not two
+
+    A parameter in an Adam mixed-precision run is not two bytes. It is sixteen.
+
+    | what | dtype | bytes | who needs it |
+    |---|---|---|---|
+    | weight | fp16 | 2 | the forward pass |
+    | gradient | fp16 | 2 | the backward pass |
+    | master weight | fp32 | 4 | the optimizer |
+    | Adam first moment $m$ | fp32 | 4 | the optimizer |
+    | Adam second moment $v$ | fp32 | 4 | the optimizer |
+
+    $$16 = 2 + 2 + 4 + 4 + 4$$
+
+    For the 6.7e9-parameter model this track uses, that is **107.2 GB per
+    device**, and **80.4 GB of it is optimizer state**. Adam's two moments are
+    53.6 GB, four times the fp16 weights they belong to. Data parallelism
+    replicates all sixteen bytes on every rank — that is the whole reason
+    *Data Parallelism* priced a 2S bill for a model whose weights are only S.
+
+    ## The ladder
+
+    Each stage shards one more field and leaves one fewer replicated.
+
+    $$b_0 = 16, \qquad b_1 = 4 + \frac{12}{N}, \qquad
+      b_2 = 2 + \frac{14}{N}, \qquad b_3 = \frac{16}{N}$$
+
+    | stage | shards | bytes/param | floor | 6.7e9 params at $N=8$ | traffic |
+    |---|---|---|---|---|---|
+    | 0 | nothing | 16 | 16 | 107.20 GB | $2S$ |
+    | 1 | optimizer state | $4 + 12/N$ | 4 | 36.85 GB | $2S$ |
+    | 2 | + gradients | $2 + 14/N$ | 2 | 25.13 GB | $2S$ |
+    | 3 | + parameters | $16/N$ | 0 | 13.40 GB | $3S$ |
+
+    The floors are the column that decides feasibility, and they are easy to
+    skip past. Stage 1 can never go below four bytes per parameter because the
+    fp16 weight and the fp16 gradient are still whole on every rank. For a 70B
+    model that is 280 GB; for 13B it is 52 GB. A 70B model therefore cannot run
+    at stage 1 on an 80 GB card at *any* device count, and stage 2's 140 GB
+    floor rules that out too. Only stage 3, whose limit is activations and
+    nothing else, fits it — at 16 devices.
+
+    ## Why the third pass exists
+
+    Stages 1 and 2 keep the parameters whole, so they move exactly what data
+    parallelism moves: reduce-scatter the gradient, all-gather the updated
+    parameters, $(N-1)S/N$ bytes each way.
+
+    $$B_1 = B_2 = 2\frac{N-1}{N}S \;\longrightarrow\; 2S$$
+
+    Stage 3 gave the parameters away. It needs them for the forward, and it
+    needs them again for the backward, because
+
+    $$\frac{\partial L}{\partial W_{ij}} = \delta_i \, a_j$$
+
+    is written in terms of the weight's own input and output — differentiate
+    the layer and you are differentiating *through* the matrix, so the matrix
+    must be resident. A gather, then a free, then a gather again:
+
+    $$B_3 = 3\frac{N-1}{N}S \;\longrightarrow\; 3S$$
+
+    Measured at $N = 8$ for 6.7e9 parameters in fp16: 23.45 GB per rank against
+    35.175 GB, 78.17 ms against 117.25 ms at 300 GB/s. Nothing is duplicated,
+    nothing is approximated, no rank holds more than its share at any instant —
+    the bill is simply one more pass over the model.
+
+    ## What the extra pass actually costs
+
+    A gather of the whole model would be 13.4 GB per rank and would dominate
+    everything. That is not what happens, because the gather is per layer and
+    the compute for that layer is 21x longer than the gather.
+
+    $$t_{\text{gather}} = \frac{N-1}{N}\cdot\frac{S}{L}\cdot\frac{1}{\text{BW}}
+      = \frac{7}{8}\cdot 478.571\ \text{MB} \cdot \frac{1}{300\ \text{GB/s}}
+      = 1.396\ \text{ms}$$
+
+    $$t_{\text{compute}} = \frac{832.45\ \text{ms}}{28} = 29.73\ \text{ms}$$
+
+    So an implementation that gathers and immediately uses the buffer pays
+    4.7% of its step, and one that launches layer $L+1$'s gather during layer
+    $L$ pays 1.396 ms once — the pipeline fill — which is **0.17%**. This is
+    the single most important engineering fact in the topic: stage 3's 1.5x
+    traffic is nearly free *because it is granular*, and a stage 3
+    implementation that is 50% slower than data parallelism has a scheduling
+    bug, not a bandwidth problem.
+
+    Stages 1 and 2 have the opposite profile. Their bytes equal data
+    parallelism's, but data parallelism's all-reduce is entirely inside the
+    backward pass while their parameter all-gather sits between the optimizer
+    step and the next forward, with nothing to hide behind: 11.725 GB per rank
+    is 39.08 ms, **4.7%** of the step at $N = 8$ on NVLink, and **31.7%** at
+    $N = 64$ on 50 GB/s links. That exposed tail is the honest price of stage 1
+    and 2, and streaming the gather into the next forward's first layers is how
+    real implementations remove it.
+
+    ## FSDP is the same algorithm with a different shard boundary
+
+    FSDP draws the boundary at the module instead of the tensor. A transformer
+    block's twelve parameter tensors are concatenated into one *flat parameter*,
+    so the all-gather is one collective rather than twelve and the prefetch has
+    a unit it can schedule. At 28 blocks that is 56 collectives per step instead
+    of 672, and 0.448 ms of launch overhead instead of 5.376 ms — 0.05% against
+    0.65% of an 832 ms step.
+
+    That difference is small at 7B and enormous at the other end. A
+    1M-parameter block split into twelve tensors gives twelve 166 KB messages,
+    each costing 8 us of latency plus 0.56 us of transfer: 8.56 us apiece, 102.7
+    us in total, against 14.67 us for one flat gather of the same bytes. **7.0x
+    the time for identical traffic** — latency, not bandwidth.
+
+    The second thing FSDP exposes is the stage switch itself.
+    `reshard_after_forward = True` frees the flat parameter after use and
+    re-gathers for the backward: stage 3, $16/N$ bytes, 3S traffic.
+    `False` keeps it: stage 2 for that module, $2 + 14/N$ bytes, 2S traffic.
+    Setting it per module is how a large model keeps its memory-cheap layers at
+    stage 2 and pays stage 3 only where it must.
+
+    ## The crossover
+
+    For a 7B model on 80 GB cards with 10 GB of activations, data parallelism
+    needs 117.2 GB per device and no device count changes that. ZeRO-1 needs
+    $N \ge 1.86$ and stage 3 needs $N \ge 1.53$ — both round to two devices. At
+    eight devices the ceiling is 4.38e9 parameters under data parallelism,
+    12.73e9 at stage 1, 18.67e9 at stage 2 and 3.5e10 at stage 3.
+
+    Below that line, plain data parallelism remains the right answer: 2S bytes,
+    no gather on the critical path, no reshard policy, no sharded checkpoint.
+    Above it, the choice is not whether to shard but which stage, and the
+    deciding question is not "how much memory can I save" — it is "which of my
+    layers are worth an extra pass over the model".
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    ZeRO and FSDP do not shard the model — they shard the sixteen bytes of training state every device is keeping a private copy of, twelve of which are optimizer state, and they buy that with at most 1.5x the communication because what has to be replicated is the arithmetic, not the bytes.
+
+    ### The analogy, in full
+
+    A workshop where every machinist has a private tool cabinet. The cabinet holds the part being worked on (the fp16 weights), the offcuts (the gradients), the master drawing (the fp32 master weights), and the maintenance log with the last two service readings (Adam's m and v). The cabinet is sixteen units of space, and only two of them are the part. ZeRO is the decision to stop duplicating the cabinet. Stage 1 gives each machinist one eighth of the maintenance logs to keep — twelve units become one and a half, and nobody has to fetch anything, because a machinist only ever services their own eighth. Stage 2 also divides the offcuts, which works only if the offcuts are sorted as they come off the lathe rather than all at the end. Stage 3 divides the part itself: now the bench has to assemble the eight pieces of the part before anyone can touch it, twice per operation — once to cut, once to measure — because the pieces were put away in between. The analogy breaks in two places, and both matter. First, the fetch is a collective: all eight machinists must fetch their piece at the same instant or the fastest one waits, so the cost is not "one trip" but "one trip that everyone takes together". Second, a machinist works on one tool at a time while a GPU works on a whole layer at once — so the fetch is a bulk transfer that can run underneath the previous layer's work. That is the difference between paying 1.5x the traffic as 50% more time and paying it as 0.17% of a step. And the analogy has no room for the one thing that never shrinks: the bench itself, which is the activations, and is what actually runs out at long sequence length.
+
+    ### Failure modes, in full
+
+    - Your 7B job needs 107.2 GB per device before it stores a single activation, on 80 GB cards, so it dies in the first forward. You add GPUs and nothing changes, because plain data parallelism replicates all sixteen bytes on every rank and the rank count is not in that number.
+    - You turn on FSDP, the job runs, and the step is 40% slower than the data-parallel run it replaced. Nobody can tell you whether that is the parameter all-gather, the exposed tail of it, or the gradient accumulation you also turned on — and those three have completely different fixes.
+    - A 70B model that "FSDP handles" will not start on 8 GPUs, and the reason is a floor nobody mentions: stage 1 keeps 4 bytes per parameter replicated, which is 280 GB for 70B, so no device count makes it fit. Only stage 3, at 16 devices or more, can run it.
+    - Your checkpoint is 8x the size of the model and takes 40 minutes, because every rank wrote its own full copy of the 16 bytes per parameter. The sharded checkpoint that fixes it is also the only format you can resume from at a different world size — and that compatibility is not free.
+    - Someone changes the all-gather to bf16 "to halve the traffic". The loss curve still goes down, so it ships — with a measured 2.8e-3 relative error injected into every forward pass and 9.3e-3 of drift after twenty Adam steps.
+
+    ### The mechanisms, in full
+
+    - **Sixteen bytes per parameter is the integer that runs this topic.** Adam mixed precision keeps five things: fp16 weights (2), fp16 gradients (2), an fp32 master copy (4), Adam's first moment (4) and its second moment (4). For the 6.7e9-parameter model this track uses, that is **107.2 GB per device**, of which **80.4 GB — 75% — is optimizer state**. Adam's two moments alone are 53.6 GB, **4.0x the fp16 weights they belong to**. Plain data parallelism replicates every one of those bytes on every rank, which is why a 13.4 GB model needs 107.2 GB per GPU before the first activation is stored.
+    - **Stage 1 shards the twelve optimizer bytes and touches nothing else.** $4 + 12/N$ bytes per parameter: **5.5 at N = 8, so 36.85 GB** — a **2.9x** reduction for the 2S bytes data parallelism already spends. It is also numerically free: measured against a single-process reference after 20 Adam steps the sharded step differs by **0.000000e+00**, because Adam is elementwise, so updating one eighth of the vector with one eighth of the state is the same function. When the reduce-scatter accumulates in a different order from the reference mean the difference is **9.02e-16** in float64 and **4.92e-07** in float32 — round-off, not sharding.
+    - **Stage 2 shards the gradients, and that is the stage that changes the shape of the backward pass.** $2 + 14/N$, which is **3.75 bytes per parameter at N = 8 (25.13 GB)** and **4.3x** less than plain data parallelism, at the same 2S bytes. But the full gradient can no longer exist on any device: it has to be reduce-scattered as it is produced, so the reduction is fused into the backward pass and any gradient accumulation has to defer it — otherwise every micro-batch pays a full reduce-scatter, and eight of them cost **321.6 GB per rank against 40.2 GB, 8.0x**.
+    - **Stage 3 shards the parameters, and it is the only stage whose floor is zero.** $16/N$ bytes per parameter: **2.0 at N = 8, 13.40 GB**, an **8x** reduction, and **0.25 bytes per parameter at N = 64 (1.675 GB)**. The floors are what make this the important stage: stages 1 and 2 cannot go below **4 and 2 bytes per parameter**, so a 70B model needs **280 GB** at stage 1 and **140 GB** at stage 2 and therefore *cannot* fit on 80 GB cards at any device count. Stage 3 fits it at **N >= 16**.
+    - **Stage 3 pays 3S instead of 2S, and the third S is the backward all-gather.** Measured 2S at 23.45 GB per rank against 3S at **35.175 GB** at N = 8: **1.5x**, or **78.17 ms against 117.25 ms** at 300 GB/s. Nothing is duplicated and nothing is approximated. The extra pass exists because you gave the parameters away after the forward and $\partial L/\partial W$ needs $W$ back.
+    - **The all-gather is per layer, so 1.5x the bytes is 0.17% of the step.** 6.7e9 parameters over 28 layers is **478.571 MB per layer**, of which $(N-1)/N$ is **418.750 MB per rank** — **1.396 ms at 300 GB/s** against **29.730 ms of compute** for that layer, **4.7%** if nothing is prefetched. Prefetch one layer ahead and only the pipeline fill is exposed: **1.396 ms of an 832.45 ms step = 0.17%**, because the compute window is **21x** the transfer.
+    - **Stages 1 and 2 have data parallelism's bytes but not its exposure.** The reduce-scatter hides inside the backward pass exactly as the all-reduce does, but the parameter all-gather after the optimizer step has nothing behind it: **11.725 GB per rank at N = 8 is 39.08 ms, 4.7%** of an 832 ms step, rising to **263.81 ms, 31.7%**, at N = 64 on 50 GB/s links. That is the real price of stage 1 and 2, and the reason a 7B job at 64 GPUs streams the gather into the next forward layer by layer.
+    - **FSDP is ZeRO-3 with the shard boundary drawn at the module.** It packs a block's 12 parameter tensors into one flat buffer so the all-gather is one collective instead of twelve: at 28 blocks that is **672 collectives per step becoming 56**, and **5.376 ms of launch becoming 0.448 ms** — 0.65% of the step against 0.05%. That is small at 7B and decisive for a 1M-parameter block, where splitting into 12 tensors turns **14.67 us** of transfer into twelve collectives of **8.56 us**, **7.0x** the time for identical bytes.
+    - **`reshard_after_forward` is the stage switch, and it is per module.** True: the parameters are freed after the forward and re-gathered for the backward, which is ZeRO-3 at $16/N$ bytes and 3S traffic. False: they stay resident, which is ZeRO-2 for that module at $2 + 14/N$ bytes and 2S. This is how a 70B run keeps its cheap layers at stage 2 and its expensive ones at stage 3, and why "we use FSDP" does not tell you the memory or the traffic.
+    - **The crossover is memory, and for a 7B model it is a single device.** Plain data parallelism needs **117.2 GB** (107.2 of state plus 10 of activations) and no device count reduces it. ZeRO-1 needs $N \ge 1.86$, so **2 devices**; stage 3 needs $N \ge 1.53$, so also 2. At 8x80 GB with 10 GB of activations the largest model is **4.38e9** parameters under data parallelism, **12.73e9** at stage 1, **18.67e9** at stage 2 and **3.5e10** at stage 3 — **8x** the model for at most **1.5x** the bytes. Below that boundary plain data parallelism is still right: 2S bytes, no gather, nothing to tune.
+  derivations:
+    - title: "Bytes per parameter, stage by stage"
+      latex: |
+        Five fields, in bytes per parameter: fp16 weights $w_{16}=2$, fp16
+        gradients $g_{16}=2$, fp32 master weights $w_{32}=4$, Adam's first
+        moment $m=4$, Adam's second moment $v=4$.
+
+        Stage 0 replicates all five:
+
+        $$b_0 = w_{16} + g_{16} + w_{32} + m + v = 2+2+4+4+4 = 16 .$$
+
+        Stage 1 shards exactly the optimizer's three fields, $w_{32}+m+v=12$:
+
+        $$b_1 = w_{16} + g_{16} + \frac{12}{N} = 4 + \frac{12}{N},
+          \qquad b_1(\infty) = 4 .$$
+
+        Stage 2 also shards the gradient:
+
+        $$b_2 = w_{16} + \frac{2 + 12}{N} = 2 + \frac{14}{N},
+          \qquad b_2(\infty) = 2 .$$
+
+        Stage 3 also shards the weight, and now every field is divided by $N$:
+
+        $$b_3 = \frac{2+2+4+4+4}{N} = \frac{16}{N}, \qquad b_3(\infty) = 0 .$$
+
+        At $N=8$ that is 16, 5.5, 3.75 and 2.0 bytes per parameter — 107.20,
+        36.85, 25.13 and 13.40 GB for 6.7e9 parameters.
+      prose: >-
+        Each stage crosses one more field off the replicated list, and the floor
+        is precisely the set of fields that stage cannot shard. That is why the
+        four numbers 16 / 4 / 2 / 0 are more useful than the four at N = 8: the
+        first set tells you whether a model can ever fit, the second only
+        whether it fits on the machine you happen to have.
+
+    - title: "Why stage 3 moves 3S and stages 1 and 2 move 2S"
+      latex: |
+        Each pass over the model moves $(N-1)S/N$ bytes per rank, so the
+        question is how many passes a step makes.
+
+        Stages 1 and 2 keep whole parameters on every rank. Their step is a
+        reduce-scatter of the gradient followed by an all-gather of the updated
+        parameters:
+
+        $$B_1 = B_2 = \frac{(N-1)S}{N} + \frac{(N-1)S}{N}
+          = 2\frac{N-1}{N}S \;\longrightarrow\; 2S .$$
+
+        That is the same total as data parallelism's ring all-reduce, because a
+        ring all-reduce *is* a reduce-scatter followed by an all-gather.
+
+        Stage 3 keeps only $1/N$ of each parameter, so it must materialise the
+        layer before using it — once for the forward, once for the backward,
+        because the backward differentiates through the weight matrix:
+
+        $$B_3 = \underbrace{\frac{(N-1)S}{N}}_{\text{gather, forward}}
+          + \underbrace{\frac{(N-1)S}{N}}_{\text{gather, backward}}
+          + \underbrace{\frac{(N-1)S}{N}}_{\text{scatter, gradient}}
+          = 3\frac{N-1}{N}S \;\longrightarrow\; 3S .$$
+
+        At $N=8$, $S=13.4$ GB: 23.45 GB against 35.175 GB, so
+        $B_3/B_1 = 1.5$ exactly, independent of $N$.
+      prose: >-
+        The amplification is a ratio of pass counts, not of bytes per pass, and
+        that is why it is exactly 1.5 at every scale. It also explains why the
+        number is a property of the algorithm rather than of the hardware:
+        buying a faster interconnect moves both sides of the ratio equally,
+        while removing the second gather would change the ratio itself — which
+        is what `reshard_after_forward=False` does, at the cost of the memory
+        stage 3 was for.
+
+    - title: "The floor, and the device count a model needs"
+      latex: |
+        A stage fits when its per-device state plus activations fits in the
+        card:
+
+        $$b_s(N)\,P + A \le M .$$
+
+        For stage 1, $b_1 = 4 + 12/N$, so
+
+        $$4P + \frac{12P}{N} + A \le M
+          \quad\Longrightarrow\quad
+          N \ge \frac{12P}{M - A - 4P} .$$
+
+        The denominator is the whole story. When $M - A < 4P$ the right-hand
+        side is negative and **there is no solution at any $N$**: the four
+        replicated bytes alone exceed the card. For a 70B model on 80 GB with
+        10 GB of activations, $4P = 280$ GB against $M - A = 70$ GB, so stage 1
+        is impossible; stage 2's floor of $2P = 140$ GB is also impossible.
+
+        Stage 3 has no floor, because $b_3 = 16/N$ can be made as small as you
+        like:
+
+        $$N \ge \frac{16P}{M - A}
+          = \frac{16 \times 70\times10^{9}}{70\times10^{9}} = 16 .$$
+
+        For the 7B model, stage 1 gives $N \ge 80.4/43.2 = 1.86$, so two
+        devices; stage 3 gives $N \ge 107.2/70 = 1.53$, also two.
+      prose: >-
+        Dividing by a denominator that can go negative is the mistake this
+        derivation exists to prevent: a solver that returns $N = -1.9$ for the
+        70B stage-1 case is telling you the configuration is impossible, not
+        that it needs a smaller cluster. The floor is also why "just add GPUs"
+        is the wrong reflex — it works for stage 3 and does nothing at all for
+        stages 1 and 2 past a handful of devices.
+
+  implementations:
+    - language: python
+      title: "A sharded step that is bit-identical to the unsharded one, and the ring that counts its own bytes"
+      note: >-
+        Correct, and the output is the argument. Stages 1, 2 and 3 reproduce a
+        single-process Adam run to **0.000000e+00** after 20 steps, because
+        sharding is a memory decision and the arithmetic is unchanged — the
+        gradient reduction is the same reduction, and Adam is elementwise. The
+        honest caveat: when the reduce-scatter accumulates in a different order
+        from the reference mean, the same comparison gives **9.02e-16** in
+        float64 and **4.92e-07** in float32, which is round-off and is the size
+        of the difference you should expect from a real all-reduce, not zero.
+        The byte counter is a genuine ring (reduce-scatter then all-gather, with
+        rotating chunk indices), not a formula typed twice: 23,450,000 bytes for
+        6.7e6 fp16 values across 8 ranks, matching $2(N-1)S/N$ to the byte and
+        scaling to 23.450 GB for the 6.7e9-parameter model. Single-process:
+        each "rank" is an array, so this measures the algorithm and its bytes,
+        never the interconnect's latency.
+      code: |
+        import numpy as np
+
+        P, DT = 6.7e9, 2
+
+
+        def bpp(N, stage):
+            return (16.0, 4.0 + 12.0 / N, 2.0 + 14.0 / N, 16.0 / N)[stage]
+
+
+        print("stage  bytes/param @ N=8   GB/device   floor")
+        for st in range(4):
+            print("  %d        %6.4f          %8.4f    %6.4f"
+                  % (st, bpp(8, st), bpp(8, st) * P / 1e9, bpp(10**9, st)))
+
+
+        def build(rng, d=48, h=32):
+            W1 = rng.standard_normal((d, h)) / np.sqrt(d)
+            return np.concatenate([W1.ravel(), np.zeros(h),
+                                   rng.standard_normal(h) / np.sqrt(h), np.zeros(1)])
+
+
+        def unpack(f, d=48, h=32):
+            i = 0
+            W1 = f[i:i + d * h].reshape(d, h); i += d * h
+            b1 = f[i:i + h]; i += h
+            W2 = f[i:i + h]; i += h
+            return W1, b1, W2, f[i:i + 1]
+
+
+        def grad(f, X, y, d=48, h=32):
+            W1, b1, W2, b2 = unpack(f, d, h)
+            a = np.tanh(X @ W1 + b1)
+            r = a @ W2 + b2[0] - y
+            dp = 2 * r / len(y)
+            g = np.empty_like(f); i = 0
+            da = np.outer(dp, W2) * (1 - a ** 2)
+            g[i:i + d * h] = (X.T @ da).ravel(); i += d * h
+            g[i:i + h] = da.sum(0); i += h
+            g[i:i + h] = a.T @ dp; i += h
+            g[i:i + 1] = dp.sum()
+            return g
+
+
+        def adam(f, g_shard, m, v, idx, lr=1e-2, b1=0.9, b2=0.999, eps=1e-8, t=1):
+            """One Adam step on the coordinates `idx`, with state for exactly those."""
+            m = b1 * m + (1 - b1) * g_shard
+            v = b2 * v + (1 - b2) * g_shard ** 2
+            f = f.copy()
+            f[idx] -= lr * (m / (1 - b1 ** t)) / (np.sqrt(v / (1 - b2 ** t)) + eps)
+            return f, m, v
+
+
+        def run(dtype=np.float64, N=8, steps=20):
+            rng = np.random.default_rng(7)
+            d, h, n = 48, 32, 512
+            X = rng.standard_normal((n, d)).astype(dtype)
+            y = (X @ (rng.standard_normal(d) / np.sqrt(d)) > 0).astype(dtype)
+            f0 = build(rng).astype(dtype)
+            sz, chunks, bs = f0.size, np.array_split(np.arange(f0.size), N), n // N
+
+            def reduce_grads(f):
+                acc = np.zeros(sz, dtype)
+                for q in range(N):
+                    acc = acc + grad(f, X[q * bs:(q + 1) * bs], y[q * bs:(q + 1) * bs])
+                return acc / N
+
+            f, m, v = f0.copy(), np.zeros(sz, dtype), np.zeros(sz, dtype)
+            for t in range(1, steps + 1):
+                f, m, v = adam(f, reduce_grads(f), m, v, np.arange(sz), t=t)
+            ref = f.copy()
+
+            out = {}
+            for stage in (1, 2):
+                # whole parameters, whole gradients, sharded optimizer state;
+                # stage 2 differs only in what it keeps after the scatter, which
+                # costs no flops
+                f = f0.copy()
+                ms = [np.zeros(len(c), dtype) for c in chunks]
+                vs = [np.zeros(len(c), dtype) for c in chunks]
+                for t in range(1, steps + 1):
+                    g = reduce_grads(f)
+                    for r in range(N):
+                        f, ms[r], vs[r] = adam(f, g[chunks[r]], ms[r], vs[r],
+                                               chunks[r], t=t)
+                out[stage] = f.copy()
+
+            # stage 3: the parameters themselves are partitioned, so they must be
+            # gathered before the forward and again before the backward
+            sh = [f0[c].copy() for c in chunks]
+            ms = [np.zeros(len(c), dtype) for c in chunks]
+            vs = [np.zeros(len(c), dtype) for c in chunks]
+            for t in range(1, steps + 1):
+                f = np.concatenate(sh)                 # gather: forward
+                g = reduce_grads(f)
+                f = np.concatenate(sh)                 # gather: backward
+                new = []
+                for r in range(N):
+                    fp, ms[r], vs[r] = adam(f, g[chunks[r]], ms[r], vs[r],
+                                            chunks[r], t=t)
+                    new.append(fp[chunks[r]])          # keep 1/N, free the rest
+                sh = new
+            out[3] = np.concatenate(sh)
+            return ref, out
+
+
+        ref, out = run()
+        for st in (1, 2, 3):
+            print("stage %d: max|d| vs reference %.6e   rel %.6e"
+                  % (st, np.max(np.abs(out[st] - ref)),
+                     np.linalg.norm(out[st] - ref) / np.linalg.norm(ref)))
+
+
+        def ring(parts, N):
+            bufs = [p.copy() for p in parts]
+            m = bufs[0].size // N
+            sl = lambda i: slice(i * m, (i + 1) * m)
+            sent = 0
+            for phase in (0, 1):
+                for k in range(N - 1):
+                    if phase == 0:
+                        snap = [bufs[r][sl((r - k) % N)].copy() for r in range(N)]
+                        for r in range(N):
+                            bufs[r][sl((r - k - 1) % N)] += snap[(r - 1) % N]
+                    else:
+                        snap = [bufs[r][sl((r - k + 1) % N)].copy() for r in range(N)]
+                        for r in range(N):
+                            bufs[r][sl((r - k) % N)] = snap[(r - 1) % N]
+                    sent += m * bufs[0].itemsize
+            return bufs, sent
+
+
+        rng = np.random.default_rng(0)
+        n = 6_700_000
+        parts = [rng.standard_normal(n).astype(np.float16) for _ in range(8)]
+        _, sent = ring(parts, 8)
+        print("ring bytes/rank %d  formula %.0f  scaled to 6.7e9: %.3f GB"
+              % (sent, 2 * 7 / 8 * n * 2, sent * (P / n) / 1e9))
+
+        # stage  bytes/param @ N=8   GB/device   floor
+        #   0        16.0000          107.2000    16.0000
+        #   1         5.5000           36.8500    4.0000
+        #   2         3.7500           25.1250    2.0000
+        #   3         2.0000           13.4000    0.0000
+        # stage 1: max|d| vs reference 0.000000e+00   rel 0.000000e+00
+        # stage 2: max|d| vs reference 0.000000e+00   rel 0.000000e+00
+        # stage 3: max|d| vs reference 0.000000e+00   rel 0.000000e+00
+        # ring bytes/rank 23450000  formula 23450000  scaled to 6.7e9: 23.450 GB
+
+    - language: python
+      title: "Two ways to lose the memory you paid for — numerically WRONG"
+      note: >-
+        Both bugs are real, both are here on purpose, and neither raises. The
+        first is a bf16 all-gather "to halve the traffic": bf16 keeps 8 mantissa
+        bits, so the parameters the forward sees differ from the ones the
+        optimizer holds. Measured on the numbers themselves, one gather in bf16
+        is **2.775825e-03 max relative** against fp16's **3.471837e-04**; over a
+        20-step Adam run on the 1,601-parameter model from the previous block
+        that truncation leaves the parameters **2.52e-02 max absolute, 9.26e-03
+        relative** away from the same run with an fp16 gather. The loss still
+        goes down, which is why it ships. The second is subtler and worse: a
+        stage-3 implementation that gathers into the module's persistent buffer
+        and never frees it has **18 bytes per parameter at N = 8 against plain
+        data parallelism's 16** — 120.60 GB against 107.20 GB, 1.125x *worse*
+        than not sharding at all, while every numerical check passes perfectly.
+        At N = 2 the leak is 24 bytes per parameter, 1.5x worse than DP. The
+        memory graph is the only test that catches it.
+      code: |
+        import numpy as np
+
+
+        def to_bf16(x):
+            """Truncate to bfloat16: same exponent range, 8 mantissa bits."""
+            u = x.astype(np.float32).view(np.uint32)
+            return ((u + 0x8000) & 0xFFFF0000).view(np.float32).astype(np.float64)
+
+
+        P = 6.7e9
+
+        # BUG 1: the gather is in bf16, so every forward sees truncated weights.
+        rng = np.random.default_rng(3)
+        w = rng.standard_normal(1_000_000)
+        for dt, name in ((np.float16, "fp16"), (None, "bf16")):
+            q = w.astype(dt).astype(np.float64) if dt is not None else to_bf16(w)
+            print("all-gather in %s: max rel %.6e  rms rel %.6e"
+                  % (name, np.max(np.abs(q - w)) / np.max(np.abs(w)),
+                     np.sqrt(np.mean((q - w) ** 2)) / np.sqrt(np.mean(w ** 2))))
+
+        # BUG 2: gather into the module buffer, never free it.
+        for N in (2, 8, 64):
+            print("N=%3d  leaky %.4f bytes/param vs %.4f steady vs 16 plain DP (%.4fx)"
+                  % (N, 16.0 / N + 16.0, 16.0 / N, (16.0 / N + 16.0) / 16.0))
+        print("leaky 7B at N=8: %.2f GB vs %.2f GB steady vs %.2f GB plain DP"
+              % ((16.0 / 8 + 16.0) * P / 1e9, 2.0 * P / 1e9, 16.0 * P / 1e9))
+
+        # all-gather in fp16: max rel 3.471837e-04  rms rel 2.077257e-04
+        # all-gather in bf16: max rel 2.775825e-03  rms rel 1.664869e-03
+        # N=  2  leaky 24.0000 bytes/param vs 8.0000 steady vs 16 plain DP (1.5000x)
+        # N=  8  leaky 18.0000 bytes/param vs 2.0000 steady vs 16 plain DP (1.1250x)
+        # N= 64  leaky 16.2500 bytes/param vs 0.2500 steady vs 16 plain DP (1.0156x)
+        # leaky 7B at N=8: 120.60 GB vs 13.40 GB steady vs 107.20 GB plain DP
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        Stage 1 needs no extra communication at all — 2S bytes, exactly what
+        data parallelism pays — while stage 3 needs 3S. Explain what the missing
+        pass is in stage 1, and why stage 3 cannot avoid it.
+      answerKind: short_text
+      hint: >-
+        Stage 1 keeps the whole fp16 parameter on every rank. What does stage 3
+        not have, at any instant, that the backward pass needs?
+      solution: >-
+        Stage 1 never gives up the parameters, so after the reduce-scatter each
+        rank owns the reduced gradient for its chunk, updates that chunk of the
+        master weights, and then has to make the new fp16 values visible to the
+        other ranks — that all-gather of $(N-1)S/N$ is the second half of its
+        2S, and it is identical to what data parallelism's all-reduce already
+        does. Stage 3 has no whole parameter: the forward must gather it
+        (one pass) and the backward must gather it again (the second pass),
+        because $\partial L/\partial W = \delta a^\top$ is written in terms of
+        the matrix itself — you cannot differentiate through a matrix you do not
+        have. Add the reduce-scatter and that is $3(N-1)S/N$, 1.5x, at every
+        $N$. The measured numbers at $N = 8$ for 6.7e9 parameters are 23.45 GB
+        and 35.175 GB per rank.
+    - id: cp-2
+      question: >-
+        A colleague wants to run a 70B model at ZeRO stage 1 on 8x80 GB cards
+        with 10 GB of activations, and shows you that 16 bytes per parameter
+        divided by 8 devices plus 10 GB is under 80 GB. Where is the error, and
+        what is the smallest configuration that actually works?
+      answerKind: short_text
+      hint: >-
+        Divide 16 by 8 only if all sixteen bytes are sharded. Which bytes does
+        stage 1 still replicate?
+      solution: >-
+        The error is dividing all sixteen bytes by $N$. Stage 1 shards only the
+        optimizer state: $b_1 = 4 + 12/N$, so at $N = 8$ it is 5.5 bytes per
+        parameter, not 2. For 70e9 parameters that is 385 GB, and the floor as
+        $N \to \infty$ is 4 bytes per parameter — 280 GB, against a 70 GB
+        budget. Stage 1 cannot run this model at any device count, and stage 2's
+        floor of 2 bytes (140 GB) cannot either. Stage 3 has no floor:
+        $16P/N + A \le M$ gives $N \ge 1120/70 = 16$, so 16 devices is the
+        smallest stage-3 configuration, at 70 GB of parameters plus 10 GB of
+        activations per device.
+    - id: cp-3
+      question: >-
+        A team moves a 7B run from DDP to FSDP and reports the step got 1.5x
+        slower, which they attribute to "stage 3's 1.5x communication". Is that
+        consistent with the model? What would you look at first?
+      answerKind: short_text
+      hint: >-
+        The traffic ratio is 1.5. What is the *time* ratio if the gathers are
+        prefetched one layer ahead, and what has to be true for that prefetch to
+        work?
+      solution: >-
+        No. The 1.5 is bytes, not time: a per-layer gather is 418.75 MB per rank
+        at $N = 8$, 1.396 ms at 300 GB/s, against 29.73 ms of compute for that
+        layer. Prefetched one layer ahead, only the pipeline fill is exposed —
+        1.396 ms of an 832 ms step, 0.17%. A 1.5x step time means the gathers
+        are not being overlapped, and the usual causes are, in order: no
+        prefetch (the gather is issued and immediately waited on, so it is 4.7%
+        per layer and can be much worse on a slow link), gradient accumulation
+        without deferring the reduce-scatter (eight micro-batches make it 8.0x
+        the traffic, 321.6 GB against 40.2 GB), a `limit_all_gathers`-style cap
+        that serialises the prefetch, or a module wrapped so small that every
+        gather is latency-bound. Measure the exposed tail — the time between the
+        last backward kernel and the optimizer step — before touching bandwidth.
+    - id: cp-4
+      question: >-
+        Why is the largest model that fits on 8x80 GB with 10 GB of activations
+        4.38e9 parameters under data parallelism but 3.5e10 under stage 3, and
+        what is the catch in that 8x?
+      answerKind: short_text
+      hint: >-
+        16 bytes against 2 bytes is 8x for the state. What did not get 8x
+        smaller, and what did the job pay in bytes on the wire?
+      solution: >-
+        Under data parallelism every device needs all 16 bytes per parameter, so
+        $P \le (80-10)/16 = 4.375e9$. Under stage 3 it needs $16/N = 2$ bytes,
+        so $P \le 70/2 = 3.5e10$ — 8x, exactly the ratio of 16 to 2. The catch
+        is threefold. Activations did not shrink at all, so the 8x applies only
+        to the state term and the real ceiling depends on sequence length; the
+        traffic went from 2S to 3S per rank, so the same step moves 1.5x the
+        bytes; and every parameter access now costs a gather, which is only
+        affordable because it is per layer and prefetched. At 8k tokens without
+        activation checkpointing the activations are around 30 GB, and stage 3's
+        ceiling collapses to roughly 2.5e10 — the memory you saved on state
+        becomes the memory you spend on activations.
+    - id: cp-5
+      question: >-
+        You are asked to pick a stage for a 13B model on 32x80 GB cards. Work
+        out the minimum device count for each stage, then argue for one.
+      answerKind: short_text
+      hint: >-
+        $b_s P + A \le M$ with $M = 80$ GB and $A = 10$ GB. Compute the
+        minimum $N$ for each stage before comparing anything else.
+      solution: >-
+        Stage 1: $N \ge 12P/(M - A - 4P) = 156/18 = 8.67$, so 9 devices.
+        Stage 2: $N \ge 14P/(M - A - 2P) = 182/44 = 4.14$, so 5. Stage 3:
+        $N \ge 16P/(M-A) = 208/70 = 2.97$, so 3. All three fit on 32 cards, so
+        the decision is not memory — it is the exposed tail and the traffic.
+        Stage 1 has the smallest traffic (2S) but the largest exposed
+        parameter all-gather, and at 32 devices on 50 GB/s links that tail is a
+        large fraction of the step; stage 3 has 1.5x the bytes but they are
+        granular and prefetchable, so its exposed cost is 0.17%. The answer at
+        32 cards is usually stage 1 or 2 with the parameter gather streamed into
+        the next forward, or stage 3 with `reshard_after_forward=False` on the
+        layers that dominate traffic. Choose by measuring the exposed tail, not
+        by ranking the memory columns.
+    - id: cp-6
+      question: >-
+        A stage-3 run checkpoints 107.2 GB per rank — eight identical copies of
+        the full state — and takes 40 minutes. What is the sharded alternative,
+        and what does it cost you?
+      answerKind: short_text
+      hint: >-
+        Each rank already owns exactly one eighth of every tensor. What is the
+        smallest thing it could write, and what breaks when you resume with a
+        different number of GPUs?
+      solution: >-
+        Each rank writes only its own shard — $16/N$ bytes per parameter, so
+        13.40 GB per rank rather than 107.2 GB, an 8x reduction in bytes and in
+        wall time, and no cross-rank communication at all if the shard layout
+        matches the sharding layout. What it costs: the checkpoint is no longer
+        a model, it is a function of the world size. Resuming on a different
+        device count requires a reshuffle pass — read the shards, re-partition
+        the flat parameter index space, write again — which is why frameworks
+        keep an unsharded format for export and a sharded one for resume.
+        Saving the full state on every rank instead is the version that looks
+        simple, works at any world size, and turns a 40-second write into
+        40 minutes.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Data parallelism duplicates everything except the batch. The thing being
+        duplicated is not the model — the fp16 weights are one eighth of it —
+        it is the training state: the master weights, the two Adam moments, the
+        gradients. Sixteen bytes per parameter, twelve of them owned by the
+        optimizer, three quarters of the footprint spent on numbers that are
+        touched once per step and never read by a matrix multiply.
+
+        ZeRO is the observation that those bytes do not need to be on every
+        device. Each rank can own one $N$-th of the optimizer state and update
+        one $N$-th of the parameters, because the optimizer is elementwise:
+        coordinate $i$ of the update never looks at coordinate $j$. The ladder
+        is then a question of what else can be divided before the arithmetic
+        stops working — gradients next, parameters last — and each rung costs
+        something different in traffic, because a divided parameter has to be
+        re-assembled before it can be used.
+      blocks:
+        - kind: checklist
+          body: |
+            - A parameter is 16 bytes, not 2 — count the optimizer
+            - The optimizer owns 12 of the 16, and 8 of those are Adam's moments
+            - Stage 1 divides the optimizer, stage 2 the gradients, stage 3 the weights
+            - Each stage has a floor: 16, 4, 2, 0 bytes per parameter
+            - A divided parameter must be gathered before every use
+            - The gather is per layer, which is why 1.5x bytes is not 1.5x time
+      checkpoint: >-
+        Before reading on: if the optimizer update is elementwise, why can the
+        optimizer state be divided with no communication at all, while dividing
+        the weights forces two extra passes over the model?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Answer three questions in order, and never skip to the third.
+
+        *Does it fit?* Compute $b_s(N)P + A$ against the card, using the floor
+        for the stage, not the value at your $N$. A stage whose floor exceeds
+        the card cannot be rescued by adding devices, and that is the most
+        common wasted afternoon in this topic.
+
+        *What does it cost?* Traffic per rank is $2S$ for stages 0 to 2 and
+        $3S$ for stage 3, before any multiplication by the world size. Multiply
+        by $(N-1)/N$ if you want the exact figure rather than the limit, and
+        remember that gradient accumulation multiplies it by the micro-batch
+        count unless the reduce-scatter is deferred.
+
+        *Where is it exposed?* Split the traffic into what hides inside a
+        backward pass and what does not. Stage 1 and 2 hide the reduce-scatter
+        and expose the parameter all-gather at the end of the step. Stage 3
+        exposes almost nothing if the per-layer gather is prefetched. That
+        distinction, not the byte total, decides which stage is faster.
+      blocks:
+        - kind: checklist
+          body: |
+            - Floor first: 16 / 4 / 2 / 0 bytes per parameter
+            - Then b_s(N) * P + activations against the card
+            - Traffic: 2S for stages 0-2, 3S for stage 3, times (N-1)/N
+            - Hidden vs exposed: the post-step parameter gather is exposed
+            - Per-layer gather is ~4.7% of a layer's compute at N=8 — prefetchable
+            - Gradient accumulation re-gathers per micro-batch unless deferred
+      checkpoint: >-
+        You have 32 cards, a 13B model, and a choice between stage 1 and stage
+        3. Both fit comfortably. Which question decides it, and what would you
+        measure to answer it?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Four numbers for the memory, two for the traffic, and one loop for the
+        scheduler. Write the memory first — if the configuration is infeasible,
+        the rest of the analysis is decoration.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # memory, in bytes per parameter
+            b0 = 2 + 2 + 4 + 4 + 4                  # 16
+            b1 = 2 + 2 + (4 + 4 + 4) / N            # 4 + 12/N, floor 4
+            b2 = 2 + (2 + 4 + 4 + 4) / N            # 2 + 14/N, floor 2
+            b3 = 16 / N                             # floor 0
+
+            # feasibility
+            assert b_s * P + activations <= card_bytes
+            # if it fails at N -> infinity, no cluster size helps
+
+            # traffic per rank per step
+            traffic = (2 if stage < 3 else 3) * (N - 1) / N * S
+
+            # stage-3 schedule, one layer L
+            gather(L)                     # (N-1)/N * S/L bytes, 1.4 ms at N=8
+            y[L] = fwd(x[L], W[L])        # 29.7 ms of compute
+            free(W[L])                    # or you are back at 16 bytes/param
+            prefetch(L + 1)               # launched during the compute above
+
+            # the exposed cost of a stage-3 step
+            exposed = 1 * t_gather + L * max(0, t_gather - t_compute_per_layer)
+      checkpoint: >-
+        The scheduler line frees the weights after the forward and re-gathers
+        before the backward. Which of the two gathers dominates a step, and what
+        would `reshard_after_forward = False` change about the answer?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The memory algebra, the pass count, and the floor.
+      blocks:
+        - kind: math
+          body: |
+            Five fields, sixteen bytes:
+
+            $$w_{16}=2,\quad g_{16}=2,\quad w_{32}=4,\quad m=4,\quad v=4,
+              \qquad \sum = 16 .$$
+
+            Sharding the optimizer's three fields gives stage 1, sharding the
+            gradient as well gives stage 2, sharding everything gives stage 3:
+
+            $$b_1 = 4 + \frac{12}{N}, \qquad
+              b_2 = 2 + \frac{14}{N}, \qquad
+              b_3 = \frac{16}{N} .$$
+
+            Traffic is a pass count times $(N-1)S/N$. Stages 1 and 2 keep whole
+            parameters, so their step is one reduce-scatter and one all-gather;
+            stage 3 must materialise the layer for the forward *and* for the
+            backward, because the weight gradient needs the weight:
+
+            $$B_1 = B_2 = 2\frac{N-1}{N}S, \qquad
+              B_3 = 3\frac{N-1}{N}S .$$
+
+            Feasibility, with activations $A$ on a card of $M$ bytes:
+
+            $$b_s(N)\,P + A \le M
+              \quad\Longrightarrow\quad
+              N \ge \frac{12P}{M - A - 4P} \ \ (\text{stage 1}) .$$
+
+            A negative right-hand side means no $N$ exists. For 70B on 80 GB
+            with $A = 10$ GB: $4P = 280 > 70$, so stage 1 is impossible and
+            stage 2 ($2P = 140$) is impossible; stage 3 needs
+            $N \ge 16P/(M-A) = 16$.
+      checkpoint: >-
+        Which of those three formulas would you quote to somebody deciding
+        whether to buy more GPUs, and which one tells them not to bother?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete picture: the memory model, the traffic model, the scheduler
+        that makes stage 3 cheap, and the two bugs that pass every numerical
+        check.
+      blocks:
+        - kind: warning
+          body: >-
+            Read the diagnostics first. Three of these failure modes are silent.
+            A stage that cannot fit at any $N$ looks like a hardware problem. A
+            gather that is never freed has correct numbers and worse memory than
+            not sharding. A bf16 all-gather has a loss curve that still goes
+            down. The one that does raise — a tensor whose gathered form is
+            missing when the backward runs — raises as a shape error a long way
+            from its cause.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def bpp(N, stage):
+                """Bytes of training state per parameter, per device."""
+                return (16.0, 4.0 + 12.0 / N, 2.0 + 14.0 / N, 16.0 / N)[stage]
+
+
+            def fits(params, N, stage, card_bytes, activations_bytes):
+                return bpp(N, stage) * params + activations_bytes <= card_bytes
+
+
+            def min_devices(params, stage, card_bytes, activations_bytes, cap=100_000):
+                """Smallest N that fits, or None when the stage's floor cannot."""
+                for N in range(1, cap + 1):
+                    if fits(params, N, stage, card_bytes, activations_bytes):
+                        return N
+                return None
+
+
+            def traffic_per_rank(params, N, stage, dtype_bytes=2):
+                S = params * dtype_bytes
+                passes = 3 if stage == 3 else 2
+                return passes * (N - 1) / N * S
+
+
+            def step_time(params, N, stage, layers, tokens_per_gpu,
+                          bandwidth_gbs, dtype_bytes=2, mfu=0.40, peak_tflops=989.0,
+                          prefetch=1, latency=8e-6):
+                """Compute plus the exposed part of the gathers."""
+                S = params * dtype_bytes
+                bw = bandwidth_gbs * 1e9
+                compute = 6 * params * tokens_per_gpu / (peak_tflops * 1e12 * mfu)
+                if stage < 3:
+                    exposed = (N - 1) / N * S / bw          # post-step param gather
+                    return {"compute_s": compute, "exposed_s": exposed,
+                            "step_s": compute + exposed,
+                            "overhead_pct": 100 * exposed / compute}
+                t_g = (N - 1) / N * (S / layers) / bw + latency
+                t_c = compute / layers
+                exposed = prefetch * t_g + layers * max(0.0, t_g - prefetch * t_c)
+                return {"compute_s": compute, "exposed_s": exposed,
+                        "step_s": compute + exposed,
+                        "overhead_pct": 100 * exposed / compute}
+
+
+            if __name__ == "__main__":
+                for st in range(4):
+                    print("stage", st, "bpp@8", round(bpp(8, st), 4),
+                          "floor", bpp(10**9, st),
+                          "minN 7B/80GB", min_devices(6.7e9, st, 80e9, 10e9))
+                for st in (1, 3):
+                    print(st, step_time(6.7e9, 8, st, 28, 8192, 300.0))
+                    print(st, step_time(6.7e9, 64, st, 28, 1024, 50.0))
+      checkpoint: >-
+        `step_time(6.7e9, 8, 3, 28, 8192, 300.0)` reports 0.17% overhead, and
+        `step_time(6.7e9, 64, 1, 28, 1024, 50.0)` reports something far worse.
+        Which of the two numbers is a property of the algorithm and which is a
+        property of the batch you chose?
+
+  problems:
+    - id: p-zero-memory
+      title: "The per-device memory of each ZeRO stage"
+      difficulty: medium
+      prompt: >-
+        Implement `zero_memory(params, world_size, stage, activation_bytes=0.0)`
+        returning a dict with exactly four keys: `param_bytes`, `grad_bytes`,
+        `optimizer_bytes` and `total_bytes`. The model is trained in Adam mixed
+        precision, so the per-parameter state is fp16 weights (2 bytes), fp16
+        gradients (2), fp32 master weights (4), Adam's first moment (4) and
+        second moment (4).
+
+        Stage 0 replicates everything. Stage 1 shards the optimizer state — the
+        master weights and both moments — across `world_size` ranks and keeps
+        weights and gradients whole. Stage 2 also shards the gradients. Stage 3
+        also shards the parameters. `optimizer_bytes` is the sum of the master
+        weights and both moments, per device. `total_bytes` also includes
+        `activation_bytes`, which is never sharded by any stage. All values are
+        bytes, as floats, and `world_size` is at least 1.
+      starter: |
+        def zero_memory(params, world_size, stage, activation_bytes=0.0):
+            # your implementation here
+            pass
+      language: python
+      entry: zero_memory
+      testCases:
+        - input: '[6700000000, 8, 0]'
+          expected: '{"param_bytes": 13400000000.0, "grad_bytes": 13400000000.0, "optimizer_bytes": 80400000000.0, "total_bytes": 107200000000.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6700000000, 8, 1]'
+          expected: '{"param_bytes": 13400000000.0, "grad_bytes": 13400000000.0, "optimizer_bytes": 10050000000.0, "total_bytes": 36850000000.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6700000000, 8, 2]'
+          expected: '{"param_bytes": 13400000000.0, "grad_bytes": 1675000000.0, "optimizer_bytes": 10050000000.0, "total_bytes": 25125000000.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6700000000, 8, 3]'
+          expected: '{"param_bytes": 1675000000.0, "grad_bytes": 1675000000.0, "optimizer_bytes": 10050000000.0, "total_bytes": 13400000000.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6700000000, 64, 3, 10000000000]'
+          expected: '{"param_bytes": 209375000.0, "grad_bytes": 209375000.0, "optimizer_bytes": 1256250000.0, "total_bytes": 11675000000.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[13000000000, 1, 3]'
+          expected: '{"param_bytes": 26000000000.0, "grad_bytes": 26000000000.0, "optimizer_bytes": 156000000000.0, "total_bytes": 208000000000.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[70000000000, 16, 3, 20000000000]'
+          expected: '{"param_bytes": 8750000000.0, "grad_bytes": 8750000000.0, "optimizer_bytes": 52500000000.0, "total_bytes": 90000000000.0}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        def zero_memory(params, world_size, stage, activation_bytes=0.0):
+            P, N = float(params), int(world_size)
+            if stage == 0:
+                p, g, o = 2.0 * P, 2.0 * P, 12.0 * P
+            elif stage == 1:
+                p, g, o = 2.0 * P, 2.0 * P, 12.0 * P / N
+            elif stage == 2:
+                p, g, o = 2.0 * P, 2.0 * P / N, 12.0 * P / N
+            elif stage == 3:
+                p, g, o = 2.0 * P / N, 2.0 * P / N, 12.0 * P / N
+            else:
+                raise ValueError("stage must be 0, 1, 2 or 3")
+            return {"param_bytes": p, "grad_bytes": g, "optimizer_bytes": o,
+                    "total_bytes": p + g + o + float(activation_bytes)}
+      solutionExplanation: >-
+        The whole problem is one distinction: which of the five fields has been
+        divided by $N$ and which is still whole. Stage 0 is the baseline — 16
+        bytes per parameter, 107.2 GB for 6.7e9 of them, and 80.4 GB of it
+        optimizer. Stage 1 divides exactly the three optimizer fields, so 12
+        becomes $12/N$ and 4 stays 4: 5.5 bytes at $N = 8$. Stage 2 also divides
+        the gradient, moving 2 into the divided group: $2 + 14/N$, 3.75 at
+        $N = 8$. Stage 3 divides the weight too, and now all sixteen move:
+        $16/N$, 2.0 at $N = 8$. The sixth case is the invariant worth checking —
+        at $N = 1$ every stage must equal stage 0, and it does, 208 GB for 13e9
+        parameters. The fifth case is the only one with activations, and it
+        catches the implementation that shards them: 10 GB added once, not
+        divided, giving 11.675 GB. Activations are the reason stage 3's ceiling
+        is not 8x in practice: nothing in this model shrinks them.
+      complexity: "O(1) time and space"
+      tags: [zero, memory, sharding, mixed-precision, optimizer-state]
+
+    - id: p-zero-comm
+      title: "Traffic per stage, and the amplification"
+      difficulty: medium
+      prompt: >-
+        Implement `zero_comm(params, world_size, stage, dtype_bytes=2)` returning
+        a dict with exactly four keys, all per rank per step:
+        `grad_bytes_per_rank` — the gradient reduce-scatter,
+        $(N-1)S/N$ where $S = \text{params} \times \text{dtype\_bytes}$;
+        `param_bytes_per_rank` — the parameter all-gather, which is one pass for
+        stages 0, 1 and 2 and **two** passes for stage 3, because the parameters
+        are gathered again before the backward;
+        `total_bytes_per_rank` — their sum; and `amplification` — the total
+        divided by plain data parallelism's $2(N-1)S/N$, which must be 1.0 at
+        stages 0 to 2 and 1.5 at stage 3. With a single rank there is nothing to
+        communicate, so all byte counts are 0.0 and `amplification` is 1.0.
+      starter: |
+        def zero_comm(params, world_size, stage, dtype_bytes=2):
+            # your implementation here
+            pass
+      language: python
+      entry: zero_comm
+      testCases:
+        - input: '[6700000000, 8, 0]'
+          expected: '{"grad_bytes_per_rank": 11725000000.0, "param_bytes_per_rank": 11725000000.0, "total_bytes_per_rank": 23450000000.0, "amplification": 1.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6700000000, 8, 1]'
+          expected: '{"grad_bytes_per_rank": 11725000000.0, "param_bytes_per_rank": 11725000000.0, "total_bytes_per_rank": 23450000000.0, "amplification": 1.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6700000000, 8, 3]'
+          expected: '{"grad_bytes_per_rank": 11725000000.0, "param_bytes_per_rank": 23450000000.0, "total_bytes_per_rank": 35175000000.0, "amplification": 1.5}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6700000000, 64, 2]'
+          expected: '{"grad_bytes_per_rank": 13190625000.0, "param_bytes_per_rank": 13190625000.0, "total_bytes_per_rank": 26381250000.0, "amplification": 1.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[13000000000, 4, 3, 4]'
+          expected: '{"grad_bytes_per_rank": 39000000000.0, "param_bytes_per_rank": 78000000000.0, "total_bytes_per_rank": 117000000000.0, "amplification": 1.5}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[1000000000, 1, 3, 2]'
+          expected: '{"grad_bytes_per_rank": 0.0, "param_bytes_per_rank": 0.0, "total_bytes_per_rank": 0.0, "amplification": 1.0}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        def zero_comm(params, world_size, stage, dtype_bytes=2):
+            P, N = float(params), int(world_size)
+            S = P * float(dtype_bytes)
+            frac = (N - 1) / N
+            grad = frac * S
+            param = frac * S * (2.0 if stage == 3 else 1.0)
+            total = grad + param
+            base = 2.0 * frac * S
+            return {"grad_bytes_per_rank": grad,
+                    "param_bytes_per_rank": param,
+                    "total_bytes_per_rank": total,
+                    "amplification": (total / base) if base > 0 else 1.0}
+      solutionExplanation: >-
+        Two facts decide every case. First, the gradient is always a
+        reduce-scatter of $(N-1)S/N$ — all four stages do the same thing with it,
+        because the gradient must be averaged across ranks no matter who ends up
+        owning what. Second, the parameter all-gather is where the stages
+        diverge: stages 1 and 2 still hold whole parameters and need exactly one
+        gather to make the updated values visible, which is the same
+        $(N-1)S/N$ as data parallelism's second half; stage 3 freed them after
+        the forward and needs two, once for the forward and once for the
+        backward. That is why `amplification` is exactly 1.0, 1.0, 1.0, 1.5 and
+        not a function of $N$ — it is a ratio of pass counts. The $N = 1$ case
+        is the guard for the division: with one rank `frac` is 0, the baseline
+        is 0, and `amplification` must be defined as 1.0 rather than raised as a
+        division by zero. Note the 13B case at 4 ranks with 4-byte parameters:
+        the dtype changes $S$ before anything else, so 52 GB per pass and 117 GB
+        total, which is the kind of number that decides whether a job runs at
+        400 Gb/s.
+      complexity: "O(1) time and space"
+      tags: [zero, communication, all-gather, reduce-scatter, bytes]
+
+    - id: p-zero3-schedule
+      title: "What the parameter gather costs once it is prefetched"
+      difficulty: hard
+      prompt: >-
+        Implement `zero3_schedule(params, world_size, layers, compute_seconds,
+        bandwidth_gbs, dtype_bytes=2, latency=8e-6, prefetch=1)` returning a
+        dict with exactly five keys.
+
+        One layer of parameters is `params * dtype_bytes / layers` bytes; a rank
+        gathers the fraction `(world_size - 1) / world_size` of them, at
+        `bandwidth_gbs` **gigabytes per second** ($10^9$ bytes/s), plus a fixed
+        `latency` per collective.
+
+        `gather_ms_per_layer` is that time in milliseconds.
+        `layer_compute_ms` is `compute_seconds / layers` in milliseconds.
+        A prefetch depth $d$ means layer $L$'s gather can start $d$ layers'
+        worth of compute early, so it is exposed only by
+        `max(0, gather - d * layer_compute)` — except for the first $d$ layers,
+        whose gathers have nothing in front of them and are fully exposed:
+        total exposure is `d * gather + layers * max(0, gather - d *
+        layer_compute)`. `step_seconds` is `compute_seconds + exposed_seconds`,
+        and `overhead_pct` is the exposed seconds as a percentage of
+        `compute_seconds`.
+      starter: |
+        def zero3_schedule(params, world_size, layers, compute_seconds, bandwidth_gbs,
+                           dtype_bytes=2, latency=8e-6, prefetch=1):
+            # your implementation here
+            pass
+      language: python
+      entry: zero3_schedule
+      testCases:
+        - input: '[6700000000, 8, 28, 0.832453, 300.0]'
+          expected: '{"gather_ms_per_layer": 1.4038333333333333, "layer_compute_ms": 29.730464285714287, "exposed_seconds": 0.0014038333333333333, "step_seconds": 0.8338568333333334, "overhead_pct": 0.1686381493409638}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6700000000, 8, 28, 0.832453, 300.0, 2, 8e-06, 0]'
+          expected: '{"gather_ms_per_layer": 1.4038333333333333, "layer_compute_ms": 29.730464285714287, "exposed_seconds": 0.03930733333333333, "step_seconds": 0.8717603333333334, "overhead_pct": 4.721868181546986}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6700000000, 64, 28, 0.832453, 50.0, 2, 8e-06, 1]'
+          expected: '{"gather_ms_per_layer": 9.429875, "layer_compute_ms": 29.730464285714287, "exposed_seconds": 0.009429874999999999, "step_seconds": 0.841882875, "overhead_pct": 1.132781670556776}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6700000000, 512, 28, 0.104056, 25.0, 2, 8e-06, 2]'
+          expected: '{"gather_ms_per_layer": 19.113468750000003, "layer_compute_ms": 3.716285714285714, "exposed_seconds": 0.36529206250000007, "step_seconds": 0.46934806250000005, "overhead_pct": 351.0533390674253}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[1000000000, 4, 12, 0.05, 100.0, 2, 8e-06, 1]'
+          expected: '{"gather_ms_per_layer": 1.258, "layer_compute_ms": 4.166666666666667, "exposed_seconds": 0.001258, "step_seconds": 0.051258000000000005, "overhead_pct": 2.5159999999999996}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        def zero3_schedule(params, world_size, layers, compute_seconds, bandwidth_gbs,
+                           dtype_bytes=2, latency=8e-6, prefetch=1):
+            P, N, L = float(params), int(world_size), int(layers)
+            per_layer = P * float(dtype_bytes) / L
+            gather = (N - 1) / N * per_layer
+            t_g = gather / (float(bandwidth_gbs) * 1e9) + float(latency)
+            t_c = float(compute_seconds) / L
+            d = int(prefetch)
+            exposed = d * t_g + L * max(0.0, t_g - d * t_c)
+            return {"gather_ms_per_layer": t_g * 1e3,
+                    "layer_compute_ms": t_c * 1e3,
+                    "exposed_seconds": exposed,
+                    "step_seconds": float(compute_seconds) + exposed,
+                    "overhead_pct": 100.0 * exposed / float(compute_seconds)}
+      solutionExplanation: >-
+        The first case is the headline: a 1.396 ms gather inside a 29.73 ms
+        compute window is 4.7% of that layer, but with one layer of prefetch the
+        only exposed part is the fill — 1.4038 ms including latency, which is
+        0.17% of the step. The second case is the same configuration with
+        `prefetch=0`, and it is exactly 28 gathers of 1.4038 ms, 39.31 ms,
+        4.72%: that is what "no prefetch" costs, and it is the number people
+        quote when they say stage 3 is 1.5x slower. The third case moves to 64
+        ranks on 50 GB/s: the gather becomes 9.43 ms against the same 29.73 ms
+        of compute, so even one layer of prefetch covers it (3.2x headroom) and
+        the exposed cost is 1.13%. The fourth case is the one that matters —
+        512 ranks at 25 GB/s with a short step, where the gather is 19.11 ms
+        against 3.72 ms of compute: two layers of prefetch cover 7.43 ms, so
+        11.68 ms of every layer stays exposed, 0.365 s on a 0.104 s step, 351%.
+        That is the configuration where the machine is communication-bound and
+        no amount of prefetch helps: the fix is a smaller world size, a bigger
+        batch, or a faster link, and the model says so before you submit the
+        job. The last case is a small model at small scale where the fixed 8 us
+        latency is 0.6% of a 1.258 ms gather and the whole thing is negligible.
+      complexity: "O(1) time and space"
+      tags: [zero, fsdp, all-gather, prefetch, scheduling, communication]
+
+  visualizers:
+    - id: vs-zero-memory
+      kind: computation_graph
+      title: "Four stages, one memory budget"
+      description: >-
+        Move the device count and the model size and watch the four stages
+        separate. Stages 0, 1 and 2 flatten out at 16, 4 and 2 bytes per
+        parameter while stage 3 keeps falling, so a 70B model is 1120 GB per
+        device at stage 1's floor against 0 at stage 3's — and the traffic
+        column moves the other way. At 8 devices a 6.7e9-parameter model costs
+        107.20, 36.85, 25.13 and 13.40 GB per device for 23.45, 23.45, 23.45
+        and 35.175 GB per rank of traffic.
+      params:
+        params: 6700000000
+        dtype_bytes: 2
+        world_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+        card_bytes: 80000000000
+        activation_bytes: 10000000000
+        stages: [0, 1, 2, 3]
+
+  try_it: >-
+    For a 6.7e9-parameter model, compute the five pieces of Adam mixed-precision state at 16
+    bytes per parameter: 107.2 GB per device, of which 12 bytes — 80.4 GB — is optimizer state.
+    Then compute stage 3 at N = 8 (16/8 = 2 bytes per parameter, 13.40 GB) and at N = 64
+    (0.25 bytes, 1.675 GB), and note which of those floors is zero.
+  interview_questions:
+    - question: "A 7B job needs 107.2 GB per device before it stores a single activation. Where do the sixteen bytes go, and which of them shard?"
+      level: mid
+      key_points:
+        - "fp16 weights 2 bytes, fp16 gradients 2, an fp32 master copy 4, and Adam's first and second moments 4 each — sixteen bytes per parameter."
+        - "At 6.7e9 parameters that is 107.2 GB, and 80.4 GB of it, 75%, is optimizer state rather than weights."
+        - "Stage 1 shards only the twelve optimizer bytes: 4 + 12/N is 5.5 bytes at N = 8, or 36.85 GB, a 2.9× reduction for the 2S bytes data parallelism already spends."
+        - "Stage 2 adds the gradients at 3.75 bytes per parameter, and stage 3 adds the parameters at 16/N, which is the only floor that reaches zero."
+      follow_up: "Why can stage 1 not fit a 70B model on any number of 80 GB devices?"
+    - question: "Stage 3 costs 3S of communication instead of 2S. Where does the third S come from, and why is the step only 4.7% slower?"
+      level: senior
+      key_points:
+        - "Stage 3 frees the parameters after the forward pass and has to gather them again for the backward, and that backward all-gather is the third S."
+        - "Measured 2S at 23.45 GB per rank against 3S at 35.175 GB: 1.5× the bytes, or 78.17 ms against 117.25 ms at 300 GB/s."
+        - "The all-gather is per layer — 478.571 MB per layer, 418.750 MB per rank at N = 8 — and overlaps 29.730 ms of compute, so the exposed part is 1.396 ms, 4.7%."
+        - "Prefetching one layer ahead hides nearly all of that, which is why the amplification is not the reason a stage-3 run is slow."
+      follow_up: "What happens to that 4.7% if you all-gather the whole flat parameter in one call?"
+    - question: "A 70B model that 'FSDP handles' will not start on 8 GPUs. What does that tell you about the stages?"
+      level: senior
+      key_points:
+        - "Stage 1 keeps 4 bytes per parameter replicated as the fp32 master copy, so 70B needs 280 GB before anything else — no device count fixes a replicated floor."
+        - "Stage 2's floor is 2 bytes per parameter, or 140 GB, and only stage 3's floor is zero at 16/N bytes."
+        - "So a 70B model requires stage 3 at 16 devices or more, and the memory arithmetic, not the launcher, decides the stage."
+        - "The same accounting is why the sharded checkpoint is the only format that can resume at a different world size."
+      follow_up: "Your config sets reshard_after_forward=False on some modules. Which stage is that, and what does it buy?"
+  common_mistakes:
+    - "Adding GPUs to a job that dies on 107.2 GB of replicated state — plain data parallelism's per-rank bytes do not contain the rank count at all."
+    - "Casting the all-gather to bf16 to halve traffic, which injects 2.8e-3 relative error into every forward pass and 9.3e-3 of drift after twenty Adam steps."
+    - "Turning on FSDP and gradient accumulation together, then attributing the 40% slowdown to the wrong one of three causes: the all-gather, its exposed tail, or the accumulation."
+  further_reading:
+    - label: "Rajbhandari, Rasley, Ruwase, He, ZeRO: Memory Optimizations Toward Training Trillion Parameter Models, SC 2020"
+    - label: "Zhao et al., PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel, VLDB 2023"

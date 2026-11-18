@@ -1,0 +1,673 @@
+id: cs-vector-database
+slug: cs-vector-database
+title: "Case Study: Building an ANN Index for a Billion Vectors"
+summary: >-
+  Choose between HNSW, IVF-PQ and DiskANN at a billion 768-dimensional vectors,
+  and discover that the decision is 3.07 TB of float32 against 104 GB of product
+  codes — a 29x compression that costs recall and buys two nodes instead of nine.
+kind: case_study
+difficulty: expert
+position: 13
+estMinutes: 21
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [vector-database, ann, hnsw, ivf-pq, diskann, recall, sharding, capacity]
+
+body:
+  big_idea: >-
+    A vector index is a memory-for-recall trade priced in bytes per vector:
+    3.07 TB of float32 fits no cluster, so compress to 104 GB of product codes
+    and buy the recall back with a rerank.
+  problem:
+    - "You size a billion 768-dimensional embeddings and get 3.07 TB: nine nodes hold it in int8, thirty-two in float32."
+    - "You compress to product codes, the index drops to 104 GB and recall@10 falls to 0.6, so the rerank's disk reads become the new bottleneck."
+    - "You shard nine ways and cluster p99 beats no shard: scatter-gather takes the maximum of nine draws, and 0.99 to the ninth is 0.914."
+  analogy: >-
+    Finding a house in a country of a billion addresses. One option is a road
+    network where every house links to sixteen neighbours: start anywhere,
+    walk greedily, arrive quickly — HNSW, and every house must store its
+    neighbours' addresses. Another is a postal system of 262,144 districts
+    where you search only the nearest few — IVF, where a boundary can hide the
+    right house.
+  concept_points:
+    - "**Bytes per vector is the only number that matters first.** $10^{9} \\times 768 \\times 4 = 3.072$ TB in float32, 1.536 TB in fp16, and **768 GB in int8**. Every index family is a different way of spending those bytes, and the first decision is which precision you store, because it sets whether the cluster is two nodes or thirty-two."
+    - "**HNSW stores a graph, and the graph is not free.** At $M = 16$ neighbours and 4-byte ids the links are $10^{9} \\times 16 \\times 4 = 64$ GB on top of 768 GB of int8 vectors — **832 GB**, nine 96 GB nodes for one copy. HNSW is capacity-bound, not throughput-bound: you shard it for RAM, not QPS."
+    - "**IVF-PQ converts memory into compute and is the only option that fits two nodes.** With $m = 96$ subquantizers at 8 bits, a vector is 96 bytes plus an 8-byte id: **104 GB for a billion vectors**, a **29.5x** compression. The price is approximate distances, so recall@10 lands near **0.6** without a rerank and about **0.9** with one."
+    - "**The scan cost is nprobe times list size, and it is bandwidth you can compute.** With $n_{\\text{list}} = 262{,}144$ the average list is 3,815 vectors; at $n_{\\text{probe}} = 32$ a query reads $32 \\times 3{,}815 \\times 96 = 11.7$ MB. At 5,000 QPS that is **58 GB/s** of memory traffic — which is why nprobe, not CPU, is the throughput knob."
+    - "**Compression always costs recall, and reranking is how you buy it back.** Product codes rank by approximate distance; fetching the top 100 full vectors and rescoring them exactly costs $100 \\times 768 \\times 1 = 76.8$ KB of reads per query and lifts recall from about 0.6 to about 0.9. That 76.8 KB is the hidden cost of the 104 GB index."
+    - "**Sharding is scatter-gather, and the tail is the maximum of the shards.** With nine shards each at p99 = 8 ms, the cluster's p99 is roughly a per-shard p99.5 because $0.99^{9} = 0.914$: one query in eleven sees at least one shard above its own p99. Hedged requests or fewer shards are the only fixes that do not move the queue."
+  definitions:
+    - { term: "ANN", meaning: "Approximate nearest neighbour search: trading exactness for sublinear query time, usually with a recall target rather than an exact answer." }
+    - { term: "Recall@k", meaning: "The fraction of the true top-k neighbours that appear in the returned top-k, measured against exhaustive search on a sample of queries." }
+    - { term: "HNSW", meaning: "A multi-layer proximity graph searched greedily. Memory is vectors plus M neighbour ids per node, and latency is a small number of dependent random reads." }
+    - { term: "ef", meaning: "HNSW's search breadth: the size of the dynamic candidate list. Raising ef raises recall and the number of distance computations linearly." }
+    - { term: "IVF", meaning: "Inverted file: k-means partitions the space into nlist cells, and a query scans only the nprobe nearest cells." }
+    - { term: "PQ (product quantization)", meaning: "Splitting a vector into m subspaces and storing one 8-bit centroid id per subspace, so a 768-dim float32 vector becomes 96 bytes." }
+    - { term: "nprobe", meaning: "The number of IVF cells scanned per query. Directly sets both recall and bytes read, and therefore the throughput ceiling." }
+    - { term: "DiskANN", meaning: "A graph index whose full vectors live on SSD and whose compressed vectors plus graph live in RAM, so a billion vectors fit in hundreds of GB of memory." }
+    - { term: "Rerank", meaning: "Rescoring a candidate list with exact distances using full-precision vectors, to recover recall lost to compression." }
+    - { term: "Tombstone", meaning: "A deleted vector still present in the index, filtered at query time. Accumulation inflates memory and degrades recall." }
+    - { term: "Scatter-gather", meaning: "Sending a query to every shard and merging the top-k results. Latency is the maximum across shards, not the average." }
+    - { term: "Segment", meaning: "An immutable index unit that is merged in the background. Inserts create new segments, and merges cost temporary double memory." }
+
+  diagrams:
+    - type: architecture
+      title: "One logical index, three physical tiers"
+      nodes:
+        - { id: q, x: 0, y: 1, label: "Query", kind: client, detail: "5,000 QPS peak, top-10 results, recall@10 target 0.9, p99 20 ms. The recall target is what makes this an ANN problem rather than a search problem." }
+        - { id: router, x: 1, y: 1, label: "Scatter-gather", kind: load_balancer, detail: "Fans one query to every shard and merges top-k. Tail latency is the max over shards, so shard count is a latency decision as well as a memory one." }
+        - { id: shard, x: 2, y: 0, label: "Shard: graph in RAM", kind: cache, detail: "111M vectors per shard at int8 plus 64 GB of links over nine shards. HNSW is capacity-bound: shards exist because 832 GB does not fit one node." }
+        - { id: ssd, x: 2, y: 2, label: "Full vectors on SSD", kind: storage, detail: "768 GB of int8 vectors, one 4 KB read per rerank candidate. 100 candidates per query is 400 KB of random reads and the p99 lives here." }
+        - { id: merge, x: 3, y: 1, label: "Merge + rerank", kind: server, detail: "Deduplicate across shards, rescore the top 100 exactly, return 10. Reranking is what turns 104 GB of codes into 0.9 recall." }
+      edges:
+        - { from: q, to: router, label: "vector" }
+        - { from: router, to: shard, label: "fan-out" }
+        - { from: shard, to: merge, label: "top 100" }
+        - { from: ssd, to: merge, label: "exact vectors", style: "async" }
+        - { from: merge, to: router, label: "top 10" }
+
+    - type: compare
+      title: "Three families, three bills"
+      left_label: "HNSW, int8 vectors"
+      left_points:
+        - "832 GB per copy: 768 GB of vectors plus 64 GB of links at M=16"
+        - "Nine 96 GB nodes, eighteen with replication"
+        - "Recall@10 about 0.95 at ef=64 with no rerank and no SSD traffic"
+        - "Build is 4.6 hours of random reads, and incremental inserts decay recall"
+      right_label: "IVF-PQ, 96-byte codes"
+      right_points:
+        - "104 GB per copy: a 29.5x compression that fits two nodes"
+        - "11.7 MB scanned per query at nprobe=32, so 58 GB/s at 5,000 QPS"
+        - "Recall@10 about 0.6 alone, about 0.9 after reranking 100 candidates from SSD"
+        - "Cheap in RAM, expensive in bytes read, and the rerank is mandatory rather than optional"
+
+    - type: pipeline
+      title: "Where a query's 12 ms goes in the IVF-PQ design"
+      nodes:
+        - label: "Route"
+          note: "0.3 ms"
+          detail: "Hash the query id to a shard set and fan out. Two shards at 104 GB each means every query touches both, so there is no shard pruning to exploit."
+        - label: "Cell probe"
+          note: "1.2 ms"
+          detail: "Compute distances to 262,144 centroids is too expensive; the centroid index itself is a small HNSW or a flat scan over 201 MB, and this is where nprobe is chosen."
+        - label: "Scan PQ codes"
+          note: "6.0 ms"
+          detail: "32 lists x 3,815 codes x 96 bytes = 11.7 MB of lookups. This is bandwidth, not arithmetic: a 96-entry lookup table per subspace, 96 subspaces."
+        - label: "Fetch + rerank"
+          note: "3.5 ms"
+          detail: "100 candidates x 768 bytes of int8 full vectors from SSD, batched to hide latency. Unbatched, this term is 100 dependent reads and becomes 20 ms."
+        - label: "Merge"
+          note: "1.0 ms"
+          detail: "Top-k heap merge across shards, dedupe by id, apply filters. Filters applied after the scan silently reduce recall; they must be pushed into the scan."
+
+  markdown: |
+    ## Start with bytes, not with algorithms
+
+    $$M_{\text{raw}} = N \cdot d \cdot b = 10^{9} \times 768 \times 4 = 3.072\ \text{TB}.$$
+
+    Float32 does not fit anything you would provision for a search feature. The
+    ladder down is:
+
+    | precision | bytes/vector | total | what it costs |
+    |---|---|---|---|
+    | float32 | 3,072 | 3.07 TB | nothing, and it does not fit |
+    | float16 | 1,536 | 1.54 TB | negligible recall loss |
+    | int8 | 768 | 768 GB | about 0.5-1 point of recall |
+    | PQ, m=96 | 96 | 96 GB | 4-5 points without a rerank |
+
+    Add ids at 8 bytes and the PQ index is 104 GB. That is the number the whole
+    design hangs on: **104 GB fits two nodes; 832 GB needs nine.**
+
+    ## Three ways to spend the budget
+
+    **HNSW** builds a navigable graph. Query cost is a greedy walk of about
+    $ef \times$ a small constant distance computations, each a random read of the
+    neighbour's vector. It is the best latency-per-query of the three and the
+    worst bytes-per-vector, because it stores full-precision vectors *and* a
+    graph.
+
+    $$M_{\text{HNSW}} = N(d\,b_v + M \cdot 4) = 10^{9}(768 + 64) = 832\ \text{GB}.$$
+
+    **IVF-PQ** partitions the space and compresses the vectors. Memory collapses
+    to $N(m + 8) = 104$ GB, and the cost moves to scanning: a query reads every
+    code in its probed cells.
+
+    $$B_{\text{scan}} = n_{\text{probe}} \cdot \frac{N}{n_{\text{list}}} \cdot m
+    = 32 \times 3{,}815 \times 96 = 11.7\ \text{MB}.$$
+
+    At 5,000 QPS that is 58.6 GB/s of memory traffic, which is a bandwidth budget
+    you can check against a DIMM spec rather than a benchmark you have to run.
+
+    **DiskANN** keeps the graph and the compressed vectors in RAM and the full
+    vectors on SSD:
+
+    $$M_{\text{DiskANN}} = N(m + M_{\text{graph}} \cdot 4) = 10^{9}(96 + 256) = 352\ \text{GB},$$
+
+    four nodes, with 768 GB of vectors on NVMe and a p99 dominated by storage
+    latency. Its advantage is that recall stays near HNSW's without nine nodes of
+    RAM; its disadvantage is that every query touches the disk.
+
+    ## The recall/latency frontier is a curve, not a point
+
+    Each family has a knob that trades recall for time:
+
+    | family | knob | raising it buys | and costs |
+    |---|---|---|---|
+    | HNSW | ef | recall, roughly logarithmically | linear distance computations and random reads |
+    | IVF-PQ | nprobe | recall, linearly at first | linear bytes scanned, so linear QPS cost |
+    | DiskANN | beam width | recall | more SSD reads per query, worse p99 |
+
+    The right operating point is where the marginal recall is worth less than the
+    marginal query cost — which is a product question, and it is why "which index
+    is fastest" has no answer. For a search box where the top result is clicked,
+    recall@10 of 0.9 may be plenty. For deduplication or compliance matching,
+    0.99 is the floor and HNSW is the only family that gets there cheaply.
+
+    ## Sharding turns p99 into a maximum
+
+    With nine shards and a scatter-gather, a query waits for the slowest shard.
+    If each shard's latency exceeds its p99 with probability 0.01, a query that
+    touches nine shards exceeds *some* shard's p99 with probability
+
+    $$1 - 0.99^{9} = 0.086,$$
+
+    so the cluster's p99 is approximately a single shard's p99.5. The tail
+    amplifies with the shard count, which means **shard count is a latency
+    decision disguised as a memory decision** — and the fix is either fewer,
+    fatter shards or hedged requests that re-issue to a replica after a
+    timeout.
+
+    Replication makes this worse before it makes it better: two copies double the
+    node count and let you hedge, but a hedge is a second full query, so the
+    system's effective QPS capacity is unchanged and its tail is improved at the
+    cost of 2× the hardware. That trade is worth making at p99 and not at p50.
+
+    ## Build is a random-read problem
+
+    An HNSW insert searches the existing graph for the new point's neighbours,
+    which is roughly 2,000 distance computations. Each reads a 768-byte int8
+    vector, so one insert is 1.5 MB of *random* reads and a billion inserts is
+    1.5 PB. Random-read bandwidth on a well-tuned node is a fraction of its
+    sequential bandwidth — assume 10 GB/s of the 100 GB/s the DIMMs can do:
+
+    $$t_{\text{build}} = \frac{1.5\times10^{15}}{9 \times 10^{10}} = 16{,}700\ \text{s} = 4.6\ \text{h}.$$
+
+    The FLOP count over the same work is about $3\times10^{15}$, which at a
+    teraflop per node is minutes. **The build is 300× memory-bound**, and that
+    single ratio explains why index builds are measured in hours and why buying
+    GPUs does not make them faster.
+
+    ## What it costs to operate
+
+    The index is not a static artefact. Daily churn of 1% is 10 million vectors,
+    which at 2,000 distance computations per insert is 15 TB of random reads a
+    day — the same 4.6-hour build, every day, unless inserts go into small
+    segments that merge on a schedule. Segments trade query cost for write cost:
+    each segment is a separate graph to search, so ten segments means ten
+    traversals per query, and a merge is what buys the latency back.
+
+    Merges are where the memory goes. A merge allocates the new segment before
+    freeing the old ones, so peak memory is 1.5-2x steady state, and a shard
+    sitting at 49% utilisation is at 98% during a merge. That headroom is not
+    waste; it is the compaction budget. A cluster sized to 90% utilisation cannot
+    compact without evicting the working set it needs to answer queries.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A vector index is a **memory-for-recall trade priced in bytes per vector**: 3.07 TB of float32 does not fit any cluster you can afford, so you compress to 104 GB of product codes or 768 GB of int8 and buy the recall back with a rerank — and the entire design is which of those two trades you make and how many shards it forces.
+
+    ### The analogy, in full
+
+    Finding a house in a country of a billion addresses. One option is a road network where every house is connected to sixteen neighbours: you start somewhere and walk greedily, and you always arrive quickly because the network is built for exactly that. That is HNSW, and its cost is that every house must store its neighbours' addresses in memory. The second option is a postal system: every address is assigned to one of 262,144 districts, and you only search the districts nearest your query. That is IVF, and its cost is that a district boundary can hide the right house, so you must search more districts to be sure. The third option is a library with a small card index in memory and the books on shelves: you consult the cards to decide which shelves to walk to. That is DiskANN, and its cost is a trip to the shelf for every few cards you read. Where the analogy breaks: districts and shelves are built from the data's own distribution, so a query in a sparse region of the space may find that its nearest district is far away and the answer lies in a district you did not search. And the road network is not static — new houses arrive every day and the roads are only rebuilt in bulk, which is why recall decays between rebuilds.
+
+    ### Failure modes, in full
+
+    - You size an index for a billion 768-dimensional embeddings at float32 and it is 3.07 TB. Nine nodes hold it in int8; thirty-two would hold it in float32 — and nobody budgeted for either, because the estimate was 'a billion vectors, a few hundred GB'.
+    - You compress to product codes and the index drops to 104 GB, which fits two nodes. Recall@10 falls to about 0.6, so you add a rerank that fetches 100 full vectors per query and the disk becomes the new bottleneck.
+    - You shard nine ways and the cluster p99 is worse than any single shard's p99: a scatter-gather over nine shards takes the maximum of nine draws, and 0.99 to the ninth power is 0.914.
+    - You build the graph offline in 4.6 hours and then discover that incremental inserts fragment it, so recall decays by a point a week and nothing in the latency dashboards notices.
+    - An interviewer asks 'HNSW or IVF-PQ' and the honest answer is 'what is your recall target, your RAM budget and your QPS' — because the three index families are not ranked, they are priced differently.
+
+    ### The mechanisms, in full
+
+    - **Bytes per vector is the only number that matters first.** $10^{9} \times 768 \times 4 = 3.072$ TB in float32, 1.536 TB in fp16, and **768 GB in int8**. Every index family is a different way of spending those bytes, and the first design decision is which precision you are willing to store, because it sets whether the cluster is two nodes or thirty-two.
+    - **HNSW stores a graph, and the graph is not free.** At $M = 16$ neighbours and 4-byte ids, the links are $10^{9} \times 16 \times 4 = 64$ GB on top of the 768 GB of int8 vectors — **832 GB**, or nine 96 GB nodes for one copy. HNSW is capacity-bound rather than throughput-bound: you shard it for RAM, not for QPS, which is the opposite of most distributed systems.
+    - **IVF-PQ converts memory into compute and is the only option that fits two nodes.** With $m = 96$ subquantizers at 8 bits each, a vector is 96 bytes plus an 8-byte id: **104 GB for a billion vectors**, a 29.5× compression from float32. The price is that distances are approximate, so recall@10 lands near 0.6 without a rerank and about 0.9 with one.
+    - **The scan cost is nprobe times list size, and it is bandwidth you can compute.** With $n_{\text{list}} = 262{,}144$ the average list is 3,815 vectors; at $n_{\text{probe}} = 32$ a query reads $32 \times 3{,}815 \times 96 = 11.7$ MB. At 5,000 QPS that is 58 GB/s of memory traffic — which is why nprobe, not CPU, is the throughput knob.
+    - **DiskANN trades RAM for IOPS and keeps the graph small.** Product codes at 96 bytes plus 64 neighbours at 4 bytes is **352 bytes per vector**, so the in-memory structure is 352 GB — four nodes — while the 768 GB of full vectors live on SSD. Every query then does hundreds of dependent 4 KB reads, and the p99 is a storage-latency number rather than a memory one.
+    - **Compression always costs recall, and reranking is how you buy it back.** Product codes rank by approximate distance; fetching the top 100 full vectors and rescoring them exactly costs $100 \times 768 \times 1 = 76.8$ KB of reads per query and lifts recall from about 0.6 to about 0.9. That 76.8 KB is the hidden cost of the 104 GB index.
+    - **Sharding is scatter-gather, and the tail is the maximum of the shards.** With nine shards each at p99 = 8 ms, the cluster's p99 is roughly a per-shard p99.5 because $0.99^{9} = 0.914$: one query in eleven sees at least one shard above its own p99. Hedged requests or a smaller shard count are the only fixes that do not just move the queue.
+    - **Build time is memory-latency bound, not FLOP bound.** An HNSW insert does about 2,000 distance computations, each reading a 768-byte int8 vector: 1.5 MB of random reads per insert, 1.5 PB for a billion. At an effective 10 GB/s of random-read bandwidth per node across nine nodes that is **4.6 hours** — while the FLOP count alone would suggest minutes.
+    - **Recall decays between rebuilds, and nothing alerts on it.** Incremental inserts attach to a graph that was built for a different distribution; deletes leave tombstones that searches still traverse. A one-point-per-week decay is invisible in latency and p99 dashboards and only shows up when someone measures against exhaustive search.
+  problem_statement: >-
+    Design a vector database holding one billion 768-dimensional embeddings,
+    serving 5,000 queries per second at p99 under 20 ms with recall@10 of at
+    least 0.9, supporting per-tenant filters, daily inserts and deletes, and
+    surviving the loss of a node. Choose the index family, the compression, the
+    shard and replica counts, and show the memory and bandwidth arithmetic.
+
+  requirements:
+    functional:
+      - "Top-10 nearest-neighbour search with per-tenant metadata filters applied inside the index scan, not after it"
+      - "Upsert and delete up to 1% of the corpus per day with no query-visible downtime"
+      - "Return exact distances for the top 100 candidates by reranking against full-precision vectors"
+      - "Support a recall audit endpoint that compares sampled queries against exhaustive search"
+      - "Expose per-shard latency, bytes scanned and tombstone ratio"
+    non_functional:
+      - "p99 query latency <= 20 ms at 5,000 QPS peak, measured across the scatter-gather"
+      - "recall@10 >= 0.90 on a fixed 10,000-query labelled set, re-measured weekly"
+      - "Survive one node loss with no query errors and no more than a 20% throughput dip"
+      - "Index build or rebuild completes within one maintenance window of 6 hours"
+
+  clarifying_questions:
+    - question: "Is recall@10 of 0.9 acceptable, or does the use case need 0.99?"
+      why_it_matters: "A 0.99 target rules out PQ-only serving and forces either HNSW or DiskANN, which changes memory from 104 GB to 832 GB and the node count from two to nine. This is the single highest-leverage question."
+    - question: "Are filters selective, and how many tenants are there?"
+      why_it_matters: "A filter that matches 0.1% of the corpus destroys recall if applied after the ANN scan, because the top 100 may contain none of them. Selective filters need partition-by-tenant or a filtered-graph index, which is a different data layout."
+    - question: "What is the write rate, and does freshness mean seconds or hours?"
+      why_it_matters: "A billion-vector graph cannot be updated in place at high rate without fragmenting. Seconds-level freshness forces a segment architecture with background merges; hours allows a nightly rebuild and a much simpler design."
+    - question: "Is the query load uniform, or are there hot tenants and hot queries?"
+      why_it_matters: "A single tenant issuing 40% of traffic turns a hash-sharded cluster into one hot shard, and no amount of rebalancing fixes a single key. It needs a replicated hot partition, which is a different routing design."
+    - question: "What is the acceptable cost per query, and is RAM or SSD the cheaper resource here?"
+      why_it_matters: "HNSW is nine nodes of RAM; DiskANN is four nodes of RAM plus NVMe. The price ratio between those two changes the answer, and it changes every eighteen months."
+
+  capacity_estimation:
+    assumptions:
+      - "Corpus: 1e9 vectors, 768 dimensions, float32 source embeddings, 8-byte ids"
+      - "Targets: 5,000 QPS peak, recall@10 >= 0.90, p99 <= 20 ms, daily churn 1%"
+      - "HNSW: M=16 neighbours, ef=64 at query time, int8 vectors, about 2,000 distance computations per insert"
+      - "IVF-PQ: nlist=262,144, nprobe=32, m=96 subquantizers at 8 bits, rerank top 100 against full int8 vectors"
+      - "DiskANN: 64 graph neighbours in RAM, 96-byte PQ codes in RAM, full int8 vectors on NVMe at 500,000 IOPS per node"
+      - "Hardware: 96 GB usable RAM per node, 100 GB/s sequential memory bandwidth, 10 GB/s effective random-read bandwidth, 2.50 USD per node-hour"
+
+    arithmetic:
+      - label: "Raw vector storage at three precisions"
+        calculation: "1e9 vectors x 768 dims x 4 bytes = 3.072e12 bytes = 3.07 TB float32. fp16: 3.072/2 = 1.536 TB. int8: 3.072/4 = 768 GB. Adding 8-byte ids at 1e9 adds 8 GB to each."
+        conclusion: "Float32 is 3.07 TB and unaffordable; int8 at 768 GB is the first precision that fits a realistic cluster, and PQ at 96 bytes is the first that fits two nodes."
+
+      - label: "HNSW memory and node count"
+        calculation: "Vectors: 1e9 x 768 x 1 byte = 768 GB. Links: 1e9 x 16 neighbours x 4 bytes = 64 GB. Ids: 8 GB. Total = 832 GB per copy. At 96 GB usable per node: 832/96 = 8.7 -> 9 nodes. With one replica per shard: 18 nodes."
+        conclusion: "Nine nodes for one copy, eighteen for availability. HNSW is capacity-bound: the cluster exists because 832 GB does not fit one machine, not because 5,000 QPS needs nine machines."
+
+      - label: "IVF-PQ memory and compression ratio"
+        calculation: "Codes: 1e9 x 96 bytes = 96 GB. Ids: 1e9 x 8 bytes = 8 GB. Centroids: 262,144 x 768 x 4 bytes = 805 MB. Total = 104.8 GB per copy. Compression ratio = 3,072 / 104.8 = 29.3x. At 96 GB usable: 104.8/96 = 1.09 -> 2 nodes."
+        conclusion: "Two nodes for one copy against nine for HNSW — a 4.5x reduction in hardware for a recall cost that a rerank mostly repays."
+
+      - label: "IVF-PQ scan bandwidth per query"
+        calculation: "Average list size = 1e9 / 262,144 = 3,815 vectors. nprobe=32 scans 32 x 3,815 = 122,080 codes x 96 bytes = 11.7 MB per query. At 5,000 QPS: 5,000 x 11.7 MB = 58.6 GB/s aggregate; across 2 shards that is 29.3 GB/s per node, about 29% of a 100 GB/s memory system."
+        conclusion: "11.7 MB per query is the throughput tax of the 104 GB index. Halving nprobe to 16 halves it to 5.9 MB and costs recall; doubling to 64 saturates memory bandwidth at peak."
+
+      - label: "Rerank bytes and recall recovery"
+        calculation: "Rerank 100 candidates against full int8 vectors: 100 x 768 bytes = 76.8 KB per query; at 5,000 QPS = 384 MB/s of random reads, trivial for NVMe but 100 dependent reads if unbatched. Recall moves from about 0.60 (PQ only) to about 0.90 (PQ + exact rerank)."
+        conclusion: "78 KB per query and 0.3 points of recall is the cheapest trade in the design; the failure mode is issuing 100 serial reads instead of one batched read, which turns 3.5 ms into 20 ms."
+
+      - label: "DiskANN memory and SSD sizing"
+        calculation: "PQ codes 96 bytes + graph 64 neighbours x 4 bytes = 352 bytes per vector. 1e9 x 352 = 352 GB in RAM -> 352/96 = 3.7 -> 4 nodes. Full int8 vectors on NVMe: 768 GB per copy, 1.5 TB with replication."
+        conclusion: "Four nodes of RAM instead of nine, plus 768 GB of NVMe. The saving is 5 nodes; the cost is that every query now has a storage-latency term in its p99."
+
+      - label: "Scatter-gather tail amplification"
+        calculation: "Per-shard probability of exceeding its own p99 is 0.01. Across 9 shards the probability that at least one exceeds it is 1 - 0.99^9 = 1 - 0.914 = 0.086. Across 2 shards: 1 - 0.99^2 = 0.020."
+        conclusion: "Nine shards turn a per-shard p99 into a cluster p99.5; two shards barely amplify at all. Shard count is a latency decision, not only a memory one."
+
+      - label: "HNSW build time from random-read bandwidth"
+        calculation: "Per insert: 2,000 distance computations x 768 bytes = 1.5 MB of random reads. 1e9 inserts x 1.5 MB = 1.5e15 bytes. At 9 nodes x 10 GB/s effective random-read bandwidth = 9e10 B/s: 1.5e15 / 9e10 = 16,700 s = 4.6 hours."
+        conclusion: "4.6 hours of build for one copy, against a FLOP count of 3e15 that would take minutes — the build is 300x memory-bound, so GPUs and better SIMD do almost nothing for it."
+
+      - label: "IVF centroid assignment cost"
+        calculation: "Assigning 1e9 vectors to 262,144 centroids: 1e9 x 262,144 x 768 = 2.01e17 FLOPs. At 1 PFLOPS of GPU throughput: 2.01e17 / 1e15 = 201 s. PQ encoding at 96 subspaces x 256 centroids x 8 dims = 196,608 ops per vector -> 1.97e14 ops -> 197 s."
+        conclusion: "About 400 s of GPU time to assign and encode a billion vectors, against 4.6 hours of graph build for HNSW — which is why IVF rebuilds are cheap and HNSW rebuilds are a maintenance window."
+
+      - label: "Node count and cost at peak"
+        calculation: "IVF-PQ: 2 shards x 2 replicas = 4 nodes. HNSW: 9 shards x 2 replicas = 18 nodes. At 2.50 USD per node-hour: IVF = 4 x 2.50 x 24 = 240 USD/day; HNSW = 18 x 2.50 x 24 = 1,080 USD/day. Difference = 840 USD/day = 306,600 USD/year."
+        conclusion: "The index family is an 840 USD/day decision. That is the frame in which 'HNSW is faster' has to justify itself — and for a 0.95 recall target it usually does."
+
+  architecture_summary: >-
+    A scatter-gather router over sharded index nodes. Each shard holds either
+    832 GB of int8 vectors and graph (HNSW) or 104 GB of product codes (IVF-PQ),
+    with full-precision vectors on NVMe for reranking. Queries fan out to every
+    shard, each returns a top-100 list, and the router merges, reranks and
+    filters. Inserts land in small segments that merge in the background, and a
+    nightly recall audit compares sampled queries against exhaustive search.
+
+  deep_dives:
+    - topic: "Index family selection"
+      explanation: >-
+        The three families are priced differently, not ranked. HNSW buys latency
+        and recall with RAM; IVF-PQ buys RAM with scan bandwidth and a mandatory
+        rerank; DiskANN buys RAM with SSD IOPS and accepts a storage term in the
+        tail. The selection follows from the recall target and the memory budget,
+        in that order.
+      tradeoffs:
+        - option: "HNSW with int8 vectors"
+          pros: "Recall about 0.95 at ef=64 with no rerank and no SSD dependency; p99 is a memory-latency number and is the easiest of the three to keep under 20 ms."
+          cons: "832 GB per copy means nine nodes and eighteen with replication; build is 4.6 hours; incremental inserts fragment the graph and recall decays silently."
+        - option: "IVF-PQ with exact rerank"
+          pros: "104 GB per copy, two nodes, and a rebuild in minutes of GPU time; the compression ratio is 29x and nprobe is a clean throughput knob."
+          cons: "Recall is about 0.6 without rerank, so the 78 KB rerank is mandatory; scan traffic is 11.7 MB per query, so memory bandwidth caps QPS before CPU does."
+        - option: "DiskANN"
+          pros: "352 GB of RAM for a billion vectors with near-HNSW recall, and the index scales past RAM by putting full vectors on NVMe."
+          cons: "Every query pays storage latency; p99 is sensitive to IOPS contention from unrelated workloads, and a cold cache after restart is a latency cliff."
+
+    - topic: "Quantization and the rerank contract"
+      explanation: >-
+        Quantization is a promise that approximate distances preserve the true
+        ordering well enough to keep the right candidates in a shortlist. That
+        promise degrades gracefully with more bits and badly with fewer, and the
+        rerank is what makes the degradation recoverable. The contract is: the
+        compressed index must place the true neighbour in the top R, and the
+        rerank must be able to afford R.
+      tradeoffs:
+        - option: "int8 scalar quantization"
+          pros: "4x compression with sub-point recall loss, one multiply-add per dimension per comparison, and no training step."
+          cons: "768 GB still needs nine nodes; the gain is precision, not capacity, so it does not solve the memory problem on its own."
+        - option: "PQ with 96 subquantizers"
+          pros: "29x compression and a 104 GB index; distance computation becomes table lookups, which vectorise well."
+          cons: "Recall falls to about 0.6, the codebook must be trained on a representative sample, and a distribution shift quietly invalidates it."
+        - option: "Binary quantization plus rescore"
+          pros: "32x compression at 1 bit per dimension and extremely fast Hamming distances; the smallest possible scan."
+          cons: "Recall without a very deep rescore (top 1,000+) is poor, and 1,000 full-vector fetches per query is 768 KB of random reads — the rerank becomes the system."
+
+    - topic: "Sharding and replication strategy"
+      explanation: >-
+        Sharding exists to fit memory, but it changes the latency distribution
+        because scatter-gather takes a maximum. Replication exists for
+        availability, but a hedge is a second query, so it costs capacity to buy
+        tail. The design has to state which of those two it is optimising, because
+        they pull in opposite directions on node count.
+      tradeoffs:
+        - option: "Hash shards with full replication per shard"
+          pros: "Even distribution, simple routing, and a node loss takes out one shard's replica rather than a key range; recall is unaffected by sharding."
+          cons: "Every query touches every shard, so tail amplification grows with shard count and there is no pruning to exploit."
+        - option: "Partition by tenant"
+          pros: "Queries touch one partition, so tail amplification is zero and filters are free; a large tenant can be given its own hardware."
+          cons: "Skew is structural — one tenant with 40% of the corpus is one shard — and cross-tenant search becomes a scatter-gather anyway."
+        - option: "Fewer, fatter shards with hedged requests"
+          pros: "Tail amplification is small at two to four shards, and hedging against a replica hides a slow node without rebalancing."
+          cons: "Each shard must fit a very large machine, which caps the corpus at the largest single node you can rent, and a hedge costs a full second query."
+
+    - topic: "Build, merge and recall decay"
+      explanation: >-
+        Graph indexes are built in bulk and updated incrementally, and those two
+        operations produce different structures. Incremental inserts attach to a
+        graph built for an older distribution, and deletes leave tombstones that
+        the search still traverses. Recall therefore decays between rebuilds, and
+        the merge policy is what bounds the decay.
+      tradeoffs:
+        - option: "Immutable segments with background merge"
+          pros: "Inserts are cheap appends, merges are sequential and predictable, and a query sees a consistent union of segments."
+          cons: "Merge needs temporary double memory for the merged segment, and a large merge at peak is exactly when you cannot afford it; query cost grows with segment count."
+        - option: "In-place graph insertion"
+          pros: "No segments, no merge, one graph, and the best query cost because there is no union to merge."
+          cons: "Fragmentation and recall decay are unbounded, deletion requires tombstones that are never reclaimed, and concurrent insertion into a graph needs locking that hurts p99."
+        - option: "Periodic full rebuild with alias cutover"
+          pros: "Recall is restored to a known value at a known time, which makes the SLO auditable rather than hoped for."
+          cons: "4.6 hours of build per copy and double memory during the cutover; at a billion vectors that is a real maintenance window, not a background job."
+
+  bottlenecks:
+    - failure: "Scatter-gather tail amplification"
+      symptom: "Cluster p99 is 2-3x the per-shard p99 and moves with shard count; per-shard dashboards all look healthy; the slow query rotates across shards."
+      mitigation: "Reduce shard count by using fatter nodes, issue hedged requests to replicas after a p95 timeout, and set per-shard deadlines so one slow shard cannot hold the merge open."
+    - failure: "Tombstone accumulation after deletes"
+      symptom: "Memory grows after a deletion wave, bytes scanned per query rises, recall measured against the live corpus diverges from recall against the index, and no error is logged."
+      mitigation: "Track live-to-tombstone ratio per segment, force a merge at 20% tombstones, and run the weekly recall audit against a corpus snapshot that excludes tombstoned ids."
+    - failure: "Filter applied after the ANN scan"
+      symptom: "Queries with selective filters return fewer than k results or obviously wrong ones, while unfiltered queries look fine; recall for filtered traffic is far below the aggregate metric."
+      mitigation: "Push filters into the scan (filtered HNSW traversal, or partition by the filter key), and alert on the fraction of queries returning fewer than k results rather than on average recall."
+    - failure: "Merge-induced memory spike"
+      symptom: "A node OOMs or swaps during a background merge, latency spikes for every query on that shard, and the spike correlates with insert volume rather than query volume."
+      mitigation: "Bound merge concurrency, throttle merges to a memory budget, and keep 20% RAM headroom per shard so a merge can allocate a new segment without evicting the hot working set."
+
+  what_to_steal:
+    - "Quote bytes per vector at four precisions before naming an algorithm: 3,072, 1,536, 768, 96. The algorithm choice follows from which of those you can afford."
+    - "Compute scan bytes per query as nprobe x list size x code size. That number, not a QPS benchmark, tells you whether the design is bandwidth-bound at your target load."
+    - "Treat shard count as a latency parameter: cluster p99 is roughly a per-shard p99.5 at nine shards because 1 - 0.99^9 = 0.086."
+    - "Separate build cost from query cost. HNSW build is 1.5 PB of random reads for a billion vectors — 4.6 hours — and no amount of FLOPs fixes a memory-latency problem."
+    - "Make recall an audited SLO with a fixed labelled query set, measured weekly against exhaustive search. Every index family decays, and only an audit notices."
+
+  try_it: >-
+    Recompute the IVF-PQ design at nprobe=16: the scan drops to 5.9 MB per query
+    and 29 GB/s at 5,000 QPS, but recall falls. Work out how deep the rerank has
+    to go to recover 0.9, then compute the extra random-read bytes per query and
+    decide whether the bandwidth you saved on the scan was given back on the
+    rerank. Then do the same for a 512-dimensional corpus and say which term
+    scaled with dimension and which did not.
+
+  interview_questions:
+    - question: "One billion 768-dimensional vectors. Which index, and what does it cost?"
+      level: staff
+      key_points:
+        - "Raw float32 is 3.07 TB, so the first decision is precision: int8 is 768 GB, PQ at 96 bytes is 104 GB."
+        - "HNSW adds 64 GB of links at M=16 for 832 GB and nine nodes; IVF-PQ is 104 GB and two nodes; DiskANN is 352 GB of RAM plus 768 GB of SSD and four nodes."
+        - "The choice follows the recall target: HNSW reaches about 0.95 without a rerank, IVF-PQ needs a 100-candidate rerank to reach 0.9."
+        - "The bills differ by 840 USD per day, which is the frame in which 'faster' has to justify itself."
+      follow_up: "At what corpus size does the answer flip from IVF-PQ to HNSW, and why?"
+
+    - question: "Your cluster p99 is three times the per-shard p99. What is happening?"
+      level: senior
+      key_points:
+        - "Scatter-gather takes the maximum: with nine shards and a per-shard p99 exceedance of 1%, a query exceeds some shard's p99 with probability 1 - 0.99^9 = 8.6%."
+        - "So the cluster p99 is roughly a per-shard p99.5, and the amplification grows with shard count."
+        - "Fixes are fewer and fatter shards, hedged requests to replicas after a p95 timeout, and per-shard deadlines so one slow shard cannot hold the merge."
+        - "Averaging per-shard latency hides this completely, which is why the metric has to be the max across shards for every query."
+      follow_up: "Hedging costs a second query. How do you decide the hedge timeout, and what does it do to capacity?"
+
+    - question: "You compressed 3.07 TB to 104 GB. Where did the recall go, and how do you get it back?"
+      level: senior
+      key_points:
+        - "PQ replaces each 8-dimension subspace with an 8-bit centroid id, so distances are approximate and the true neighbour can fall outside the scanned cells."
+        - "Recall@10 lands near 0.6; the compressed index only has to place the true neighbour in a shortlist of 100 for the rerank to recover it."
+        - "Reranking fetches 100 full int8 vectors — 76.8 KB per query — and rescoring exactly lifts recall to about 0.9."
+        - "The rerank must be batched, or 100 dependent reads turn 3.5 ms into 20 ms and the cheap index becomes the slow one."
+      follow_up: "What happens to the rerank budget if the recall target is 0.99 instead of 0.9?"
+
+    - question: "Building the HNSW index takes 4.6 hours. Why so long, and would GPUs help?"
+      level: senior
+      key_points:
+        - "Each insert does about 2,000 distance computations, each a random read of a 768-byte vector: 1.5 MB per insert and 1.5 PB for a billion."
+        - "At 10 GB/s of effective random-read bandwidth per node across nine nodes, that is 16,700 s — 4.6 hours."
+        - "The FLOP count is only about 3e15, which would take minutes, so the build is roughly 300x memory-bound."
+        - "GPUs do not help a dependent random-read problem; faster DIMMs, fewer dimensions, or a cheaper graph (lower M) do."
+      follow_up: "How would you build the same index in one hour without changing the hardware?"
+
+  common_mistakes:
+    - "Sizing from 'a billion vectors at 768 dimensions' without multiplying: 3.07 TB in float32, not the few hundred GB the estimate assumed."
+    - "Choosing IVF-PQ for its 104 GB footprint and forgetting that recall@10 of 0.6 requires a 100-candidate rerank with its own 78 KB of random reads per query."
+    - "Sharding nine ways for memory and then being surprised that cluster p99 is worse than any shard's p99, because scatter-gather takes a maximum."
+    - "Applying a tenant filter after the ANN scan, which silently returns fewer than k results for selective tenants while aggregate recall looks healthy."
+    - "Trusting recall measured at build time. Incremental inserts and tombstones decay it continuously, and only a scheduled audit against exhaustive search catches it."
+
+  further_reading:
+    - label: "Malkov, Yashunin, Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs (TPAMI 2018)"
+    - label: "Jegou, Douze, Schmid, Product Quantization for Nearest Neighbor Search (TPAMI 2011)"
+    - label: "Subramanya, Devvrit, Simhadri, Krishnaswamy, Kadekodi, DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node (NeurIPS 2019)"
+    - label: "Johnson, Douze, Jegou, Billion-scale Similarity Search with GPUs (IEEE Transactions on Big Data 2019)"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        An index is a bet about which bytes you can afford to keep. Full vectors
+        plus a graph is the most accurate and the most expensive; compressed codes
+        are the cheapest and the least accurate; keeping the graph in RAM and the
+        vectors on disk is the middle. Pick the bet, then pay for the recall you
+        gave up.
+      blocks:
+        - kind: checklist
+          body: |
+            - Raw bytes = vectors x dims x bytes
+            - Graph bytes = vectors x M x 4
+            - Code bytes = vectors x m
+            - Scan bytes = nprobe x (N / nlist) x code size
+            - Cluster p99 grows with shard count
+      checkpoint: >-
+        Which of those five numbers would you quote first to someone who asked
+        "will this fit", and why?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Fix the recall target, then the memory budget, then the latency budget.
+        A recall target of 0.9 permits compression plus rerank; 0.99 does not.
+        Once the family is chosen, shard for memory and check the tail, because
+        the scatter-gather will cost you more p99 than the index does.
+      blocks:
+        - kind: warning
+          body: >-
+            Do not benchmark index libraries on a million vectors and extrapolate.
+            Build cost, recall and memory all change with N in ways that a
+            million-vector test cannot show, and the build is memory-latency bound
+            in a way that only appears at scale.
+      checkpoint: >-
+        Your recall target is 0.99 and your RAM budget is two nodes. What are your
+        three honest options?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Size, then scan, then shard.
+      blocks:
+        - kind: pseudocode
+          body: |
+            raw   = N * d * 4
+            hnsw  = N * (d*1 + M*4)
+            ivfpq = N * (m + 8)
+            scan  = nprobe * (N/nlist) * (m+8)
+            nodes = ceil(index_bytes / usable_ram)
+            p99_cluster ~ per_shard_p99 at (1 - 0.99**shards)
+            build = N * hops * d * b / random_bw
+      checkpoint: >-
+        Which line would change most if the vectors were 256-dimensional instead
+        of 768, and which would not change at all?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Memory per family, scan bandwidth, and tail amplification.
+      blocks:
+        - kind: math
+          body: |
+            **Memory.**
+            $$M_{\text{HNSW}} = N(d b_v + 4M), \quad M_{\text{PQ}} = N(m + 8)$$
+
+            **Scan bytes.**
+            $$B = n_{\text{probe}}\frac{N}{n_{\text{list}}}(m+8)$$
+
+            **Tail.**
+            $$P(\text{any shard} > \text{p99}) = 1 - 0.99^{S}$$
+      checkpoint: >-
+        Compute the scan bytes at nprobe=32, nlist=262,144, m=96. Do you get about
+        11.7 MB?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The two-node IVF-PQ design with a rerank, and the nine-node HNSW it
+        competes with.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            N, d, m, nlist, nprobe, M = 1e9, 768, 96, 262144, 32, 16
+            raw   = N*d*4
+            hnsw  = N*(d*1 + M*4) + N*8
+            ivf   = N*(m + 8) + nlist*d*4
+            scan  = nprobe * (N/nlist) * (m+8)
+            print(round(raw/1e12,2), round(hnsw/1e9,0), round(ivf/1e9,0),
+                  round(scan/1e6,1), round(1-0.99**9,3))
+      checkpoint: >-
+        The printed tail probability is for nine shards. What is it for two, and
+        does that change your sharding decision?
+  implementations:
+    - language: python
+      title: "A product quantizer with measured recall and a rerank"
+      note: >-
+        Trains eight 16-centroid codebooks on 2,000 synthetic vectors, encodes each to 8 bytes, and ranks with asymmetric distance tables. PQ recall@10 is 0.25 at this deliberately coarse setting; rescoring the top 100 with exact vectors restores 1.00. The 16x ratio is smaller than the case study's 29.5x because m=8 and K=16 here, chosen so the snippet trains in under a second.
+      code: |
+        import numpy as np
+
+        N, D, M, K, NQ, TOPK, RERANK = 2_000, 32, 8, 16, 50, 10, 100
+
+
+        def kmeans(x, k, iters=8, seed=0):
+            rng = np.random.default_rng(seed)
+            c = x[rng.choice(len(x), k, replace=False)].copy()
+            for _ in range(iters):
+                lab = np.argmin(((x[:, None, :] - c[None]) ** 2).sum(-1), axis=1)
+                c = np.stack([x[lab == j].mean(0) if np.any(lab == j) else c[j]
+                              for j in range(k)])
+            return c
+
+
+        def encode(x, books):
+            sub = x.reshape(len(x), len(books), -1)
+            return np.stack([np.argmin(((sub[:, i, None] - cb) ** 2).sum(-1), axis=1)
+                             for i, cb in enumerate(books)], axis=1)
+
+
+        def adc(queries, codes, books):
+            """Asymmetric distance: one lookup table per query, then m lookups."""
+            m = len(books)
+            sub = np.asarray(queries).reshape(len(queries), m, -1)
+            out = []
+            for qi in range(len(queries)):
+                tables = np.stack([((cb - sub[qi, i]) ** 2).sum(1)
+                                   for i, cb in enumerate(books)])
+                out.append(tables[np.arange(m)[None, :], codes].sum(1))
+            return np.stack(out)
+
+
+        def main():
+            rng = np.random.default_rng(1)
+            centers = rng.normal(size=(20, D))
+            x = centers[rng.integers(0, 20, N)] + rng.normal(scale=0.5, size=(N, D))
+            q = centers[rng.integers(0, 20, NQ)] + rng.normal(scale=0.5, size=(NQ, D))
+            books = [kmeans(x.reshape(N, M, -1)[:, i], K, seed=i) for i in range(M)]
+            codes = encode(x, books)
+            print(f"bytes/vector: {M} vs {D*4} raw ({D*4/M:.0f}x compression)")
+
+            exact = np.argsort(((q[:, None] - x[None]) ** 2).sum(-1), axis=1)[:, :TOPK]
+            approx = np.argsort(adc(q, codes, books), axis=1)
+            short = approx[:, :RERANK]
+            d = ((q[:, None, :] - x[short]) ** 2).sum(-1)
+            reranked = np.take_along_axis(short, np.argsort(d, axis=1)[:, :TOPK], axis=1)
+
+            def recall(ids):
+                return float(np.mean([len(set(a) & set(b)) / TOPK for a, b in zip(ids, exact)]))
+
+            print(f"recall@10 PQ-ADC: {recall(approx[:, :TOPK]):.2f}; "
+                  f"after rerank {RERANK}: {recall(reranked):.2f}")
+            assert recall(reranked) > recall(approx[:, :TOPK]) and recall(reranked) > 0.95
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-vector-pq-ratio
+      title: "Compression ratio of a product quantizer"
+      difficulty: easy
+      prompt: >-
+        A vector of `dim` float32 values is encoded as `m` bytes, one per subquantiser. Return
+        the compression ratio against raw float32.
+      language: python
+      entry: compression_ratio
+      testCases:
+        - input: '{}'
+          expected: "16"
+          tolerance: 1e-6
+        - input: '{"dim": 768, "m": 96}'
+          expected: "32"
+          tolerance: 1e-6
+      solution: |
+        def compression_ratio(dim=32, m=8, bytes_per=4):
+            return dim * bytes_per / m
+      solutionExplanation: >-
+        32 dims * 4 bytes / 8 codes = 16x. The case study's 768 dims and 96 codes give 32x, the
+        difference between 2 TB and 96 GB.
+      tags: [vector-search, quantization]

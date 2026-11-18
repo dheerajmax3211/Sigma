@@ -1,0 +1,720 @@
+id: cs-ctr-prediction
+slug: cs-ctr-prediction
+title: "Case Study: Billion-Feature CTR Prediction"
+summary: >-
+  Size a click-through-rate model where the embedding table is 768 GB and the
+  dense network is 800 KFLOP — then discover the model is not the hard part,
+  the gather bandwidth and the 30 ms p99 are.
+kind: lesson
+difficulty: expert
+position: 6
+estMinutes: 21
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [ctr, embeddings, recommendation, online-learning, capacity, latency]
+
+body:
+  big_idea: >-
+    A billion-feature CTR model is a memory system with a small network
+    attached: 256 GB of embedding against 800 KFLOP of dense arithmetic, so
+    every design decision is about where those bytes live.
+  problem:
+    - "You size by parameter count and conclude it fits on one GPU: 1e9 features at 64 dimensions is 256 GB, 3.2x an 80 GB device."
+    - "You shard by hash and one shard melts: a few high-frequency IDs send a fifth of lookups there, so p99 follows the hottest shard."
+    - "You report AUC 0.81 and the auction loses money, because a model predicting 1.2% where truth is 1.0% pays 20% more per click."
+  analogy: >-
+    A library with a billion books and one reader per second. You do not read
+    the library: you keep a card catalogue, pull the twelve cards the question
+    names, and reason over those. The catalogue is the model and the reasoning
+    is a rounding error, so libraries are judged by how fast a card can be
+    fetched, not by how clever the librarian is.
+  concept_points:
+    - "**Bytes, not parameters, decide the deployment.** 1e9 features x 64 dimensions x 4 bytes = **256 GB** of embedding, and Adam's two moments triple it to **768 GB**. At 80 GB per device that is 9.6 devices before replication, so the honest minimum is **12 shards of 64 GB** — the model that \\\"fits in a GPU\\\" does not exist."
+    - "**The dense network is noise.** Bottom MLP 13 to 512, three DCN-v2 cross layers at d = 512, top MLP 512-512-256-1: **800,256 FLOP per example**, which at peak traffic is **55.6 GFLOP/s** against 400 TFLOP/s per GPU. The dense part is **0.014%** of the device; optimising it is a hobby, not engineering."
+    - "**Gather bandwidth is the real budget.** 1,000 lookups x 64 dims x 4 bytes is **256 KB per request**, which at 69,444 peak rps is **17.8 GB/s** of embedding traffic, 5.9 GB/s at the mean. That is small for a cluster and enormous for one shard — which is why sharding is a bandwidth decision."
+    - "**Shard by feature namespace, not by hash.** Hashing spreads count but not heat: hour-of-day has 24 values and an unbounded lookup rate. Put low-cardinality, high-frequency namespaces on replicated read-only shards and hash only the long tail; a hot shard carrying 20% of peak lookups absorbs **1.39e7 lookups/s** alone."
+    - "**The 30 ms budget decomposes unevenly.** Feature fetch 8 ms, embedding gather plus DCN-v2 plus MLP 12 ms, network 4 ms, auction and calibration 3 ms, slack 3 ms — **30 ms**. Twelve of those milliseconds are model, eight are storage, and the remaining ten are the parts nobody budgets for."
+    - "**Calibration is where the money is.** The auction bids pCTR x value, so a 20% overprediction is a 20% overpayment per click for the same value. Fit isotonic or Platt calibration on a held-out window and monitor predicted against observed CTR per traffic segment; a model with better AUC and worse calibration loses money."
+  definitions:
+    - { term: "Embedding table", meaning: "One row per sparse feature ID. The dominant memory term: rows x dim x bytes, tripled by optimizer state." }
+    - { term: "Sparse feature", meaning: "A categorical ID, e.g. campaign or device. Learned by table lookup rather than by a dense weight." }
+    - { term: "DLRM", meaning: "Deep Learning Recommendation Model: dense MLP over numeric features, embedding tables for categoricals, dot-product interaction, then a top MLP." }
+    - { term: "DCN-v2", meaning: "Deep and Cross Network v2. Explicit bounded-degree feature crosses; the full matrix costs d-squared per layer, the low-rank form costs d times rank." }
+    - { term: "Parameter server", meaning: "Sharded store holding embedding rows, serving gathers to workers and applying gradient updates asynchronously." }
+    - { term: "Hot shard", meaning: "The shard owning a high-frequency feature namespace. It sets p99 because every request touches it." }
+    - { term: "Calibration", meaning: "Mapping scores to observed frequencies. Required because the auction multiplies the score by money." }
+    - { term: "pCTR", meaning: "Predicted click-through rate. Multiplied by advertiser value to produce the bid, so its scale, not just its ranking, matters." }
+    - { term: "Frequency floor", meaning: "Minimum impression count for a feature to earn its own embedding row; below it, IDs are hashed or dropped." }
+    - { term: "Negative downsampling", meaning: "Training on a fraction of negatives to speed learning, which shifts the prior and must be corrected before calibration." }
+
+  diagrams:
+    - type: architecture
+      title: "Where the bytes live"
+      nodes:
+        - { id: feats, x: 0, y: 1, label: "Feature service", kind: cache, detail: "1,000 IDs per request at 256 KB total. 8 ms of the 30 ms budget and the component most likely to page." }
+        - { id: ps, x: 1, y: 0, label: "Embedding shards", kind: "database", detail: "12 shards x 64 GB = 768 GB. Low-cardinality namespaces replicated, long tail hashed. Hot shard sets p99." }
+        - { id: dense, x: 1, y: 2, label: "Numeric features", kind: "storage", detail: "13 dense inputs. 800 KFLOP of network total — the part everyone tunes and nobody needs to." }
+        - { id: net, x: 2, y: 1, label: "DCN-v2 + MLP", kind: "model", detail: "Three cross layers at d=512 then a 512-256-1 top MLP. 55.6 GFLOP/s at peak: a rounding error against the gather." }
+        - { id: cal, x: 3, y: 1, label: "Calibrator", kind: "worker", detail: "Isotonic on a held-out window, per traffic segment. pCTR feeds the auction, so a 20% overprediction is a 20% overpay." }
+      edges:
+        - { from: feats, to: ps, label: "1,000 ids" }
+        - { from: ps, to: net, label: "gathers" }
+        - { from: dense, to: net, label: "13 dims" }
+        - { from: net, to: cal, label: "logit" }
+        - { from: cal, to: feats, label: "gradients", style: "async" }
+    - type: plot
+      title: "Embedding storage is linear in dimension — and the 80 GB line is unforgiving"
+      chart: "bar"
+      xLabel: "embedding dimension"
+      yLabel: "table size, GB (1e9 features, fp32, Adam)"
+      series:
+        - name: "GB"
+          points:
+            - { x: 16, y: 192 }
+            - { x: 32, y: 384 }
+            - { x: 64, y: 768 }
+            - { x: 128, y: 1536 }
+            - { x: 256, y: 3072 }
+    - type: compare
+      title: "Two ways to spend the 30 ms"
+      left_label: "Dense-model instinct"
+      left_points:
+        - "Shrink the MLP: 800 KFLOP to 400 KFLOP"
+        - "Saves 0.007% of device time at peak"
+        - "Table still 768 GB, still 12 shards"
+        - "p99 unchanged"
+      right_label: "Memory-system view"
+      right_points:
+        - "Replicate hot namespaces: removes the 1.39e7 lookup/s shard"
+        - "Cut dims 64 to 32: table 768 to 384 GB, half the shards"
+        - "Batch gathers: 256 KB per request, one round trip"
+        - "p99 set by the slowest shard, which is now an average one"
+
+  problem_statement: >-
+    Design a CTR prediction service for an advertising auction: 2e9 impressions
+    per day, 1e9 distinct sparse feature IDs, a 30 ms p99 scoring budget, and a
+    model that must be no more than 15 minutes stale. The service returns a
+    calibrated click probability that the auction multiplies by advertiser value;
+    it must survive a hot feature namespace, a shard loss, and a campaign launch
+    that changes the feature distribution within an hour.
+
+  requirements:
+    functional:
+      - "Return a calibrated pCTR for each (user, ad, context) request within the scoring budget."
+      - "Accept streaming gradient updates and publish a new model version without a serving restart."
+      - "Support per-segment calibration so auction bidding stays unbiased across traffic sources."
+      - "Serve 1,000 sparse lookups plus 13 dense features per request, with a documented fallback when a shard is unavailable."
+    non_functional:
+      - "p99 latency 30 ms end to end at 69,444 peak rps; p50 under 12 ms."
+      - "99.95% availability, degrading to a rules-only score rather than an error."
+      - "Model freshness under 15 minutes; feature freshness under 60 seconds for behavioural counters."
+      - "Embedding state recoverable to within 5 minutes of a shard failure."
+
+  clarifying_questions:
+    - question: "Is the 30 ms budget for the model server alone, or does it include feature retrieval and the auction?"
+      why_it_matters: "It changes the design completely: 30 ms for scoring leaves 12 ms for the network; 30 ms end to end leaves 8 ms for features and 3 ms for the auction, which forbids any synchronous call to a cold store."
+    - question: "How many distinct feature IDs, and what fraction are rare?"
+      why_it_matters: "The table is bytes = IDs x dim x 4, tripled by the optimizer. 1e9 IDs at 64 dims is 768 GB; 1e8 is 77 GB and fits on one device, which removes the entire sharding problem."
+    - question: "Is the output consumed by a ranking stack or by a priced auction?"
+      why_it_matters: "Ranking only needs order; an auction needs the probability's scale, because bid equals pCTR times value. That is the difference between AUC being sufficient and calibration being mandatory."
+    - question: "What is the acceptable staleness when a campaign launches?"
+      why_it_matters: "It decides batch versus streaming training. A 24-hour retrain means a new campaign is scored by a model that has never seen its features, which shows up as a cold-start hole in the first hours of every launch."
+    - question: "May we drop rare features from the table?"
+      why_it_matters: "A frequency floor is the cheapest capacity lever available: dropping IDs seen under 100 times can remove most of the long tail, shrinking the table and the shard count without touching the model architecture."
+
+  capacity_estimation:
+    assumptions:
+      - "2e9 ad impressions per day, with a 3x peak-to-mean factor."
+      - "1e9 distinct sparse feature IDs, 64-dimensional fp32 embeddings, Adam with two fp32 moments."
+      - "1,000 sparse lookups and 13 dense features per request."
+      - "80 GB per accelerator, 12 shards for headroom over the 9.6-device floor."
+      - "30 ms p99 budget split as features 8, model 12, network 4, auction 3, slack 3."
+    arithmetic:
+      - label: "Request rate"
+        calculation: "2e9 impressions/day / 86,400 s = 23,148 rps mean; x 3 peak = 69,444 rps"
+        conclusion: "23,148 rps mean, 69,444 rps peak. Every bandwidth and shard number below is multiplied by the peak, not the mean."
+      - label: "Embedding table size"
+        calculation: "1e9 rows x 64 dims x 4 bytes = 2.56e11 bytes = 256 GB; x 3 for Adam moments = 768 GB; 768 / 80 GB = 9.6 devices"
+        conclusion: "768 GB of state, so at least 10 devices before replication; 12 shards of 64 GB gives 20% headroom and room to lose one."
+      - label: "Gather bandwidth at peak"
+        calculation: "1,000 lookups x 64 dims x 4 bytes = 256,000 B per request; x 69,444 rps = 1.78e10 B/s"
+        conclusion: "17.8 GB/s of embedding reads at peak (5.9 GB/s mean). Fine cluster-wide, impossible for a single shard, which is why heat must be replicated."
+      - label: "Dense compute at peak"
+        calculation: "(13x512 + 512x512 + 512x256 + 256) x 2 = 800,256 FLOP/example; x 69,444 rps = 5.56e10 FLOP/s"
+        conclusion: "55.6 GFLOP/s, or 0.014% of one 400 TFLOP/s device. The network is free; the table is the system."
+      - label: "Lookup volume per day"
+        calculation: "2e9 impressions x 1,000 lookups = 2e12 lookups/day = 2.31e7 lookups/s"
+        conclusion: "23 million embedding reads per second on average — a memory system serving a model, not the reverse."
+      - label: "Hot-shard load if a namespace is not replicated"
+        calculation: "20% of 69,444 rps x 1,000 lookups = 1.39e7 lookups/s on one shard"
+        conclusion: "One shard must serve 1.39e7 lookups/s while its peers idle. Replication of low-cardinality namespaces is not an optimisation; it is the difference between a 30 ms p99 and a timeout."
+
+  architecture_summary: >-
+    A request arrives at an edge service that resolves 1,000 sparse IDs and 13
+    dense features in parallel, then sends the ID list to a parameter-server
+    client. The client fans out to 12 embedding shards, with low-cardinality
+    namespaces (hour, device class, top campaigns) served from replicated
+    read-only replicas. Gathered vectors are summed, concatenated with the dense
+    tower, pushed through three DCN-v2 cross layers and a 512-256-1 top MLP, then
+    through a per-segment isotonic calibrator. Training runs asynchronously:
+    workers pull batches from a stream, compute gradients, and push sparse
+    updates for touched rows only — which is why the write path scales with
+    distinct IDs per batch, not with table size.
+
+  deep_dives:
+    - topic: "Sharding the embedding table"
+      explanation: >-
+        768 GB cannot live on one device, so the table is partitioned by feature
+        namespace where cardinality is low and by hash where it is high. The
+        partition function decides the tail latency: a hash over all 1e9 IDs
+        spreads row count evenly but concentrates traffic on whichever shard owns
+        hour-of-day. Because every request touches that namespace, the slowest
+        shard is the system's p99 no matter how balanced the bytes are. The
+        second-order problem is the write path: streaming updates touch only the
+        rows in a batch, so shard write load tracks distinct IDs, not table size,
+        which is why online learning is affordable at all.
+      tradeoffs:
+        - option: "Hash-partition all 1e9 IDs"
+          pros: "Perfectly even row counts and trivial rebalancing; no namespace bookkeeping."
+          cons: "Heat follows the hash, so a 24-value namespace still lands on one shard and sets p99; a hot shard cannot be split without rehashing."
+        - option: "Namespace partition with replicated hot tables"
+          pros: "Hot namespaces become read-only replicas that scale with QPS; the hashed long tail stays balanced and small."
+          cons: "Needs a per-namespace placement policy and a consistency story for replicated rows; a stale replica changes scores silently."
+        - option: "Shard by embedding dimension (tensor parallelism)"
+          pros: "Every shard sees every request, so no request is unlucky; latency is uniform."
+          cons: "Turns each request into a fan-out to all shards, multiplying network bytes by the shard count and making one slow shard everyone's problem."
+
+    - topic: "Online learning and the parameter server"
+      explanation: >-
+        Freshness is a product requirement: a campaign that launches at 09:00 has
+        no history, and a model trained at 02:00 scores it as a cold ID for seven
+        hours. Streaming updates every 5-15 minutes close that window, but they
+        invert the traffic pattern — the training path now writes to the same
+        shards that serve reads. Sparse updates help: a batch of 65,536 examples
+        x 1,000 lookups touches at most 6.6e7 rows, and deduplicated far fewer,
+        against 1e9 total, so the write amplification is bounded by distinct IDs
+        rather than by table size.
+      tradeoffs:
+        - option: "Asynchronous SGD against the live table"
+          pros: "No serving pause, no version switch, freshness measured in minutes; the simplest possible pipeline."
+          cons: "Readers see half-applied updates; a slow worker's gradient lands minutes late and silently degrades a segment; reproducibility is gone."
+        - option: "Versioned snapshots, dual-served"
+          pros: "Atomic rollout with a clean rollback; evaluation is reproducible against a fixed table."
+          cons: "Doubles memory during the switch (768 GB becomes 1.5 TB) and reintroduces staleness equal to the snapshot interval."
+        - option: "Batch retrain every 15 minutes on a warm-started table"
+          pros: "Bounded staleness with reproducible checkpoints and no read-write contention on the serving shards."
+          cons: "Costs a full pass over the recent window each cycle, and the 15-minute boundary is visible in metrics as a sawtooth."
+
+    - topic: "Calibration for a priced auction"
+      explanation: >-
+        The auction ranks by pCTR x value and charges the second price, so the
+        absolute level of pCTR sets the price paid. A model that ranks perfectly
+        and predicts 1.2% where the truth is 1.0% wins the same auctions and pays
+        20% more for each click than the click is worth — a loss that AUC cannot
+        see. Calibration is fit on a held-out time window, per traffic segment,
+        because a global isotonic fit is dominated by the largest segment and
+        leaves small ones biased.
+      tradeoffs:
+        - option: "Global isotonic regression"
+          pros: "Monotone by construction, non-parametric, one model to maintain and monitor."
+          cons: "Averaged across segments, so a 5% traffic source with a different prior stays miscalibrated; the largest segment decides the curve."
+        - option: "Per-segment Platt scaling"
+          pros: "Two parameters per segment, stable under low volume, cheap to refit hourly."
+          cons: "Assumes a sigmoid relationship; when the miscalibration is asymmetric the fit is wrong in the tail, which is where the expensive bids are."
+        - option: "Prior correction from negative downsampling plus isotonic"
+          pros: "Recovers the true prior after training on a sampled negative set, then fixes residual shape."
+          cons: "Two corrections stacked; an error in the sampling rate becomes a systematic bid bias that looks like a modelling failure."
+
+    - topic: "The 30 ms budget and queueing"
+      explanation: >-
+        The waterfall sums to exactly 30 ms with 3 ms of slack, which means the
+        design has no room for a retry and no room for a queue. At 70% utilisation
+        a single-server queue inflates p99 by roughly 3x its service time, so the
+        fleet must be provisioned near 50% utilisation — the shard count that
+        holds the bytes is not the shard count that holds the traffic. This is why
+        capacity planning for CTR is two independent calculations: memory for the
+        table, and queueing-adjusted replicas for the rate.
+      tradeoffs:
+        - option: "Provision for 50% utilisation"
+          pros: "Queueing stays bounded and p99 tracks service time; a shard loss is absorbed by the survivors."
+          cons: "Twice the hardware for the same mean throughput, and the bill is visible to finance every month."
+        - option: "Provision for 90% utilisation and autoscale on latency"
+          pros: "Half the cost at steady state; autoscaling reacts to real congestion rather than forecasts."
+          cons: "p99 explodes before the autoscaler reacts — a 90%-utilised queue has no headroom, and scaling takes longer than the SLO."
+
+  bottlenecks:
+    - failure: "A single hot embedding shard saturates its network link"
+      symptom: "p99 climbs to 80-200 ms while mean latency and cluster CPU look normal; one shard shows 10x its peers' egress and a full NIC queue."
+      mitigation: "Replicate low-cardinality namespaces onto read-only replicas, split the hashed long tail more finely, and add a per-shard request budget so one namespace cannot consume the link. Verify by plotting p99 per shard, not in aggregate."
+    - failure: "The feature service becomes a synchronous dependency in the scoring path"
+      symptom: "Model-server p99 tracks the feature store's p99, and a cache miss on a behavioural counter shows up as a 300 ms tail on 0.1% of requests."
+      mitigation: "Prefetch features in parallel with ID resolution, set a hard 8 ms deadline with a documented default per feature, and serve a rules-only score rather than waiting. A missing feature must degrade the score, not the latency."
+    - failure: "Calibration drifts after a traffic-mix change"
+      symptom: "Observed CTR falls 15% against prediction while AUC is flat; bids win more auctions than expected and margin per click declines for weeks before anyone notices."
+      mitigation: "Monitor the predicted-to-observed ratio per segment hourly with an alert on a 5% deviation, refit isotonic nightly on a held-out window, and gate any model rollout on calibration error as well as AUC."
+
+  what_to_steal:
+    - "Size the model in bytes with optimizer state, not in parameters: 1e9 x 64 x 4 x 3 = 768 GB is the number that decides the topology."
+    - "Partition embeddings by heat, not by count: replicate low-cardinality namespaces and hash the long tail, because p99 is set by the hottest shard."
+    - "Compute the dense FLOPs before optimising them: 800 KFLOP per example is 0.014% of a device, so effort belongs on the gather path."
+    - "Treat calibration as a revenue component: bid equals pCTR times value, so a 20% overprediction is a 20% overpayment."
+
+  markdown: |
+    ## The table is the model
+
+    Take the architecture seriously for one paragraph and then stop. Numeric
+    features go through a small MLP; each categorical feature is a row lookup;
+    the vectors are summed and concatenated; three cross layers model explicit
+    interactions; a top MLP produces a logit.
+
+    Now count the arithmetic. With 13 dense inputs, 512-wide hidden layers and
+    three DCN-v2 cross layers at $d = 512$:
+
+    $$(13 \times 512 + 512 \times 512 + 512 \times 256 + 256) \times 2
+    = 800{,}256\ \text{FLOP per example}.$$
+
+    At peak traffic of 69,444 requests per second that is **55.6 GFLOP/s** — one
+    part in seven thousand of a single 400 TFLOP/s device. The dense network is
+    not the system.
+
+    The table is:
+
+    $$10^{9}\ \text{rows} \times 64\ \text{dims} \times 4\ \text{bytes}
+    = 2.56\times10^{11}\ \text{bytes} = 256\ \text{GB}.$$
+
+    Adam keeps two moments per parameter, so the state is **768 GB**. At 80 GB
+    per device that is 9.6 devices before any replication, which is why the
+    honest design starts at **12 shards of 64 GB** rather than at "one GPU".
+
+    | Dimension | Table (fp32) | With Adam | 80 GB devices |
+    |---|---|---|---|
+    | 16 | 64 GB | 192 GB | 2.4 |
+    | 32 | 128 GB | 384 GB | 4.8 |
+    | **64** | **256 GB** | **768 GB** | **9.6** |
+    | 128 | 512 GB | 1,536 GB | 19.2 |
+
+    The dimension column is the only architecture decision with a capacity
+    consequence. Everything else is a rounding error against it.
+
+    ## Gather bandwidth, and why heat beats balance
+
+    Each request reads 1,000 rows of 64 floats: 256 KB. At peak that is
+
+    $$1{,}000 \times 64 \times 4\ \text{B} \times 69{,}444\ \text{rps}
+    = 1.78\times10^{10}\ \text{B/s} = 17.8\ \text{GB/s}.$$
+
+    Cluster-wide, 17.8 GB/s is nothing. Per shard it is everything, because a
+    hash spreads *rows* evenly and *traffic* not at all. A namespace with 24
+    values — hour of day, device class, top-100 campaigns — sends a fifth of peak
+    traffic to whichever shard owns it:
+
+    $$0.2 \times 69{,}444 \times 1{,}000 = 1.39\times10^{7}\ \text{lookups/s}$$
+
+    on one machine while eleven peers idle. That is the p99. The fix is
+    structural, not a bigger shard: replicate low-cardinality namespaces
+    read-only, so their capacity scales with QPS, and hash only the long tail
+    where counts and heat are both flat.
+
+    ## The 30 ms budget
+
+    | Stage | p99 |
+    |---|---|
+    | Feature fetch | 8 ms |
+    | Gather + DCN-v2 + MLP | 12 ms |
+    | Network in/out | 4 ms |
+    | Auction + calibration | 3 ms |
+    | Slack | 3 ms |
+    | **Total** | **30 ms** |
+
+    Three milliseconds of slack is not a budget, it is a hope. A queue at 90%
+    utilisation adds roughly nine times its service time at p99, so the serving
+    fleet is provisioned near **50% utilisation** — which means the replica count
+    is roughly double the throughput calculation, and that number is set by
+    traffic, not by the 768 GB of state.
+
+    ## Online learning is a freshness decision
+
+    A nightly retrain scores a 09:00 campaign launch with a model that has never
+    seen its ID. Streaming updates every 5-15 minutes close that window, and the
+    write cost is smaller than it looks: a batch of 65,536 examples with 1,000
+    lookups touches at most $6.6\times10^{7}$ rows before deduplication, against
+    $10^{9}$ total.
+
+    What it costs is consistency. Asynchronous SGD lets a reader see half-applied
+    updates, and a straggler's gradient lands minutes late on a segment that has
+    already moved on. Versioned snapshots fix reproducibility and double memory
+    during the switch — 768 GB becomes 1.5 TB for the duration. Both are
+    defensible; picking neither is not.
+
+    ## Calibration is the revenue line
+
+    The auction bids $p \times v$ and charges the second price, so the level of
+    $p$ sets the price. Predicting 1.2% where the truth is 1.0% means winning the
+    same auctions and paying **20% more per click** than the click is worth. AUC
+    is blind to this: it only sees order.
+
+    Fit isotonic on a held-out *time* window, per segment, and monitor the ratio
+    of predicted to observed CTR hourly. A global fit is dominated by the largest
+    traffic source and leaves a 5% segment systematically biased — and the biased
+    segment is usually the one with the highest-value advertisers.
+
+    ## Operating it
+
+    Three numbers govern the on-call rotation.
+
+    **One epoch over a day of impressions is 30,518 steps** at batch 65,536
+    ($2\times10^{9}/65{,}536$). That is the unit of training cost, and it is why
+    retraining cadence is a budget conversation rather than a modelling one: a
+    15-minute cycle sees 1/96th of a day's traffic per run, which is enough to
+    move a campaign's estimate and not enough to move a well-established
+    feature's.
+
+    **A new campaign needs about 2,500 impressions before its estimate is worth
+    anything.** At a 2% CTR, 50 clicks is roughly where the confidence interval
+    narrows past the effect you are trying to detect. Across the whole system
+    2,500 impressions is 36 ms of traffic, but for a small campaign in a narrow
+    segment it is hours — and until then there is no row, so the score falls back
+    to the campaign's category prior. That fallback is a product decision: bid on
+    the category, or do not bid at all.
+
+    **The fallback path must be cheaper than the SLO, not faster than the
+    failure.** When a shard is unavailable the scorer returns a rules-only
+    estimate from the dense features and the historical prior, costing about 3 ms
+    and losing the calibration you spent a quarter fitting. It is still better
+    than a 200 ms timeout, because the auction closes in 30 ms and a late bid is
+    worth zero.
+
+    The dashboard that matters is not AUC. It is the ratio of predicted to
+    observed clicks per segment, the p99 per shard, and the fraction of requests
+    served by the fallback. The first catches calibration drift, the second
+    catches heat, and the third catches the slow degradation where a shard is up
+    but timing out on 1% of requests and the model quietly gets worse everywhere
+    at once.
+
+    ## Where the analogy breaks
+
+    The library catalogue is read-only. This one is rewritten while it is read:
+    every impression produces a gradient, so the same query returns a different
+    answer an hour later, and a model that was well calibrated last week can be
+    20% off today.
+
+    And the catalogue only contains books someone already fetched. An ad never
+    shown has no meaningful row, so its embedding is whatever the initialisation
+    said — the feedback loop, wearing a retrieval costume.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A billion-feature CTR model is **a memory system with a small neural network attached**. One billion IDs at 64 dimensions is 256 GB of embedding — 768 GB once Adam keeps two moments — against roughly 800 KFLOP of dense arithmetic per example. Every design decision that matters is about where those bytes live, how they are sharded, and how many bytes you can pull per request inside a 30 ms p99.
+
+    ### The analogy, in full
+
+    A library with a billion books and one reader per second. You do not read the library to answer a question — you keep a card catalogue, pull the twelve cards the question names, and reason over those. The catalogue is the model; the reasoning is a rounding error. Which is why libraries are judged by how fast a card can be fetched, not by how clever the librarian is. A brilliant librarian behind a slow catalogue loses to a mediocre one with the cards in hand. Two ways the analogy breaks. First, the catalogue is being rewritten while it is read: every impression produces a gradient, so the cards change under the reader and the same query returns a different answer an hour later. Second, the librarian only sees the books that were already fetched — an item never shown has no card, which is the feedback loop wearing a retrieval costume.
+
+    ### Failure modes, in full
+
+    - You size the model by parameter count and conclude it fits on one GPU: 1e9 features at 64 dimensions is 256 GB before the optimizer, which is 3.2 times the memory of an 80 GB device. The number you needed was bytes, not parameters.
+    - You shard the embedding table by hash and one shard melts: a handful of high-frequency IDs (hour-of-day, device-type, top campaigns) send a fifth of all lookups to whichever shard owns them, and the p99 is set by the hottest shard, not the average.
+    - You report AUC 0.81 and the auction loses money, because bids are pCTR times value and the model is uncalibrated: predicting 1.2% where the truth is 1.0% means you pay 20% more per click than the click is worth.
+    - You retrain nightly and the model is always a day stale, which is exactly the window in which a new campaign's CTR collapses. Online learning is not a sophistication contest here; it is the difference between describing yesterday's traffic and today's.
+    - You put the feature fetch inside the model server and the p99 goes to 45 ms. The budget was 30 ms total, and eight of those milliseconds were already allocated to a feature store you replaced with a synchronous call.
+
+    ### The mechanisms, in full
+
+    - **Bytes, not parameters, decide the deployment.** 1e9 features x 64 dimensions x 4 bytes = **256 GB** of embedding, and Adam's first and second moments triple it to **768 GB**. At 80 GB per device that is 9.6 devices before replication — so the honest minimum is **12 shards of 64 GB**, and the model that "fits in a GPU" does not exist.
+    - **The dense network is noise.** Bottom MLP 13 to 512, three DCN-v2 cross layers at d = 512, top MLP 512-512-256-1: **800,256 FLOP per example**, which at peak traffic is **55.6 GFLOP/s**. One GPU does 400 TFLOP/s. The dense part is 0.014% of the device; optimising it is a hobby, not engineering.
+    - **Gather bandwidth is the real budget.** 1,000 lookups x 64 dims x 4 bytes = **256 KB per request**, which at 69,444 peak rps is **17.8 GB/s** of embedding traffic (5.9 GB/s at mean). That is small for a cluster and enormous for one shard, which is why sharding is a bandwidth decision.
+    - **Shard the table by feature namespace, not by hash.** Hashing spreads count but not heat: a namespace like hour-of-day has 24 values and an unbounded lookup rate. Put low-cardinality, high-frequency namespaces on replicated read-only shards and hash only the long tail; a hot shard carrying 20% of peak lookups absorbs **1.39e7 lookups/s** alone.
+    - **Collisions are a capacity decision.** Hashing 1e9 IDs into 2^24 = 16.7M buckets averages 60 IDs per bucket, so two unrelated features share an embedding and their gradients average. Keep the full 1e9-row table when each ID has enough impressions to learn; hash only below a frequency threshold, and remember the threshold is per-feature, not global.
+    - **The 30 ms budget decomposes unevenly.** Feature fetch 8 ms, embedding gather plus DCN-v2 plus MLP 12 ms, network 4 ms, auction and calibration 3 ms, slack 3 ms — **30 ms**. Twelve of those milliseconds are model, eight are storage, and the remaining ten are the parts nobody budgets for.
+    - **Online learning is a freshness argument with a serving cost.** A batch retrain at 24-hour cadence means the model describes yesterday's campaign mix. Streaming updates every 5-15 minutes fix that, but they force the parameter server to serve reads and absorb gradient writes on the same shards — which is why hot features need replication, not a bigger shard.
+    - **Calibration is where the money is.** The auction bids pCTR x value, so a 20% overprediction is a 20% overpayment per click for the same value. Fit isotonic or Platt calibration on a held-out window and monitor the ratio of predicted to observed CTR per traffic segment; a model with better AUC and worse calibration loses money.
+    - **Sparse-only training needs a frequency floor.** Features seen fewer than ~100 times carry noise, not signal, and their embeddings move on every example. Count-min sketch the stream, drop below the floor, and you trade a little recall for a table you can actually shard and a model that does not chase one-off IDs.
+  derivations:
+    - title: "Table bytes with optimizer state"
+      latex: |
+        For $n$ rows, dimension $d$ and $b$ bytes per parameter, the serving
+        table is $n d b$. Adam adds two moments, so training state is
+        $$M = 3\,n\,d\,b.$$
+        At $n = 10^{9}$, $d = 64$, $b = 4$:
+        $$M = 3 \times 10^{9} \times 64 \times 4 = 7.68\times10^{11}\ \text{B}
+        = 768\ \text{GB}.$$
+      prose: >-
+        Divide by device memory to get the shard floor: 768/80 = 9.6, so ten
+        devices minimum and twelve with headroom. Note that the factor of three
+        is a training artefact: a serving-only copy is 256 GB, which is why
+        inference and training fleets are sized differently.
+    - title: "Gather bandwidth per request"
+      latex: |
+        With $k$ lookups of dimension $d$ at $b$ bytes, per-request bytes are
+        $kdb$, and at rate $R$ the bandwidth is
+        $$B = R\,k\,d\,b.$$
+        At $R = 69{,}444$, $k = 1{,}000$, $d = 64$, $b = 4$:
+        $$B = 69{,}444 \times 1{,}000 \times 64 \times 4
+        = 1.78\times10^{10}\ \text{B/s}.$$
+      prose: >-
+        17.8 GB/s. The same arithmetic per shard, with $R$ replaced by the
+        traffic a single namespace attracts, is what produces the 1.39e7
+        lookups/s hot-shard figure — and the reason replication, not a larger
+        shard, is the mitigation.
+    - title: "Why hash balance is not load balance"
+      latex: |
+        If a namespace with $v$ values attracts fraction $f$ of requests, uniform
+        hashing assigns it to one of $S$ shards, so that shard's share is
+        $$\text{load}_{\text{hot}} = \frac{f R k}{1}\quad\text{versus}\quad
+        \text{load}_{\text{avg}} = \frac{R k}{S}.$$
+        The ratio is $fS$: at $f = 0.2$ and $S = 12$ it is $2.4$, and at $S = 64$
+        it is $12.8$.
+      prose: >-
+        The ratio grows with the shard count, which is the counter-intuitive
+        part: adding shards makes the hot shard relatively hotter. That is the
+        argument for replicating hot namespaces instead of subdividing the table
+        further.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        It is a memory system with a small network attached. Size the table in
+        bytes including optimizer state, then find the shard that carries the
+        heat, then check whether your probability is calibrated enough to be
+        multiplied by money.
+      blocks:
+        - kind: checklist
+          body: |
+            - 1e9 x 64 x 4 x 3 = 768 GB, not "a billion parameters"
+            - Dense network is 800 KFLOP: irrelevant to capacity
+            - 256 KB per request x 69,444 rps = 17.8 GB/s of gathers
+            - Hot namespace on one shard = 1.39e7 lookups/s
+            - Auction needs calibrated pCTR, not just good ranking
+      checkpoint: >-
+        If you halve the embedding dimension from 64 to 32, what happens to shard
+        count and to gather bandwidth, and what do you lose?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Start from impressions per second, then table bytes, then per-shard
+        traffic, then the latency waterfall. Only after those four numbers agree
+        should you pick DLRM or DCN-v2 — both fit inside the same 12 ms.
+      blocks:
+        - kind: checklist
+          body: |
+            - Impressions/day to rps, then multiply by peak factor
+            - Table bytes = rows x dim x 4, tripled for Adam
+            - Per-shard load = namespace share x rps x lookups
+            - Waterfall must sum under p99 with room for queueing
+            - Calibration monitored per segment, hourly
+      checkpoint: >-
+        Where does the design break first if traffic doubles but the catalogue of
+        feature IDs stays fixed?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The capacity model and the serving path in about fifteen lines.
+      blocks:
+        - kind: pseudocode
+          body: |
+            rps      = impressions_per_day / 86400
+            peak     = rps * peak_factor
+            table_b  = n_ids * dim * 4 * 3           # Adam moments
+            shards   = ceil(table_b / gpu_bytes)
+            gather   = peak * lookups * dim * 4      # bytes/s
+            hot      = namespace_share * peak * lookups
+
+            score(request):
+              ids, dense = resolve(request)            # 8 ms
+              vecs       = gather(ids, shards)         # 12 ms with net
+              logit      = dcn_v2(vecs, dense)
+              p          = calibrate(sigmoid(logit), segment)
+              return p                                 # auction multiplies by value
+      checkpoint: >-
+        Which line changes if the product team asks for 64-dimensional embeddings
+        instead of 32, and by how much?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three results worth memorising: table bytes, gather bandwidth, hot-shard
+        ratio.
+      blocks:
+        - kind: math
+          body: |
+            **Table.** $M = 3ndb$. At $n=10^9$, $d=64$, $b=4$: 768 GB.
+
+            **Gather.** $B = Rkdb$. At $R=69{,}444$, $k=10^3$: 17.8 GB/s.
+
+            **Hot shard.** $\text{ratio} = fS$. At $f=0.2$, $S=12$: 2.4x the
+            average shard.
+
+            **Dense FLOPs.** $(13d + d^2 + d \cdot 256 + 256)\times 2$ with
+            $d=512$: 800,256 FLOP/example, 55.6 GFLOP/s at peak.
+      checkpoint: >-
+        Why does the hot-shard ratio get worse as you add shards, and what does
+        that imply for the placement policy?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The capacity model, the placement rule, and the calibration gate.
+      blocks:
+        - kind: warning
+          body: >-
+            The most common failure is sizing on parameters and then discovering
+            that 768 GB of state does not fit the fleet you provisioned. The
+            second most common is shipping on AUC and losing money on a 20%
+            calibration bias.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+            def capacity(n_ids=1e9, dim=64, bytes_per=4, gpu_gb=80,
+                         impressions=2e9, peak=3.0, lookups=1000):
+                rps = impressions / 86400
+                table_gb = n_ids * dim * bytes_per * 3 / 1e9
+                return {
+                    "mean_rps": rps,
+                    "peak_rps": rps * peak,
+                    "table_gb": table_gb,
+                    "shards": math.ceil(table_gb / gpu_gb),
+                    "gather_gbs": rps * peak * lookups * dim * bytes_per / 1e9,
+                }
+      checkpoint: >-
+        At 12 shards the model costs 768 GB of state. What is the bill if you
+        keep three replicas of every shard for availability?
+  try_it: >-
+    Compute the table in bytes, not parameters: 1e9 IDs x 64 dims x 4 bytes is
+    256 GB, and Adam's two moments make it 768 GB — 9.6 devices of 80 GB, so 12
+    shards of 64 GB. Then multiply 1,000 lookups x 64 x 4 bytes by 69,444 peak
+    rps and check whether 17.8 GB/s is a cluster problem or a single-shard
+    problem. It is the second, and the arithmetic that shows it is one line.
+  interview_questions:
+    - question: "You have a billion features and a 30 ms budget. Where does the time actually go?"
+      level: staff
+      key_points:
+        - "Feature fetch 8 ms, gather plus DCN-v2 plus MLP 12 ms, network 4 ms, auction and calibration 3 ms, 3 ms slack — 30 ms total, so there is no room for a retry."
+        - "Dense compute is 800,256 FLOP per example, about 55.6 GFLOP/s at peak: 0.014% of one device, so the network architecture is not a performance decision."
+        - "The table is 768 GB with optimizer state, so at least ten 80 GB devices; twelve shards of 64 GB gives headroom and lets one fail."
+        - "Because the slack is 3 ms, the fleet runs near 50% utilisation — queueing at 90% would add several times the service time at p99."
+      follow_up: "If the product team wants 128-dimensional embeddings, what breaks first and what would you trade to keep the SLO?"
+    - question: "Your AUC improved but revenue per impression fell. How is that possible?"
+      level: senior
+      key_points:
+        - "The auction bids pCTR times value and charges second price, so the level of the prediction sets the price paid, not just the ranking."
+        - "A model predicting 1.2% where the truth is 1.0% wins the same auctions and overpays 20% per click; AUC is invariant to that bias."
+        - "Calibration must be fit per traffic segment on a held-out time window, because a global isotonic fit is dominated by the largest segment."
+        - "Monitor the predicted-to-observed ratio hourly with a 5% alert and gate rollouts on calibration error as well as ranking metrics."
+      follow_up: "How would you separate a calibration bug from a genuine change in user behaviour?"
+    - question: "One shard is at 90% network utilisation and the others are at 30%. What happened?"
+      level: staff
+      key_points:
+        - "Hash partitioning balances row count but not heat: a 24-value namespace like hour-of-day lands entirely on one shard and carries a large share of every request."
+        - "At 20% of 69,444 peak rps that is 1.39e7 lookups/s on one machine, and p99 is set by the hottest shard rather than the average."
+        - "The ratio worsens as shard count grows (f times S), so subdividing the table makes the imbalance relatively worse."
+        - "Mitigate by replicating low-cardinality namespaces read-only and hashing only the long tail; add per-shard request budgets so one namespace cannot own the link."
+      follow_up: "What consistency problem does replicating an embedding row introduce for streaming updates?"
+    - question: "Why is online learning worth its complexity here, and what does it cost?"
+      level: senior
+      key_points:
+        - "A nightly retrain scores a morning campaign launch with a model that has never seen its ID, which is a systematic cold-start hole in the first hours of every launch."
+        - "Sparse updates bound the write path: a 65,536-example batch touches at most 6.6e7 rows against 1e9, so write volume tracks distinct IDs, not table size."
+        - "The cost is consistency: asynchronous updates let readers see half-applied rows and let a straggler's gradient land minutes late."
+        - "Versioned snapshots restore reproducibility at the price of doubling memory during the switch — 768 GB to 1.5 TB."
+      follow_up: "Which would you choose for a system already at p99 29 ms, and what would you measure to know you were wrong?"
+  common_mistakes:
+    - "Sizing by parameter count instead of bytes: 1e9 features x 64 dims is 256 GB of serving state and 768 GB with Adam, which is 9.6 devices, not one."
+    - "Optimising the dense network when it is 800 KFLOP per example — 0.014% of a device — while the gather path decides p99."
+    - "Shipping on AUC alone to an auction that multiplies pCTR by value, where a 20% overprediction is a 20% overpayment per click."
+    - "Hash-partitioning everything and then wondering why one shard times out: heat follows the namespace, not the hash."
+  further_reading:
+    - label: "Naumov et al., Deep Learning Recommendation Model for Personalization and Recommendation Systems, 2019"
+    - label: "Wang, Shivanna, Cheng, Jain, Lin, Hong, Chi, DCN V2: Improved Deep and Cross Network and Practical Lessons, 2021"
+    - label: "Chilimbi, Suzue, Apacible, Kalyanaraman, Project Adam: Building an Efficient and Scalable Deep Learning Training System, OSDI 2014"
+  implementations:
+    - language: python
+      title: "Embedding bytes, gather bandwidth, and Platt calibration"
+      note: >-
+        The table is 256 GB and Adam state triples it; the gather is 17.8 GB/s at peak, so the model is a memory system with a small network attached. The calibration half fits Platt scaling by Newton steps on synthetic logits whose true CTR sits 0.8 logits below the raw score: mean predicted CTR moves from 0.498 to the actual 0.363. It is a toy calibration set, not a substitute for isotonic fitting on a held-out window.
+      code: |
+        import numpy as np
+
+        N_FEATURES, DIM, BYTES = 1_000_000_000, 64, 4
+        LOOKUPS, RPS_PEAK, RPS_MEAN = 1_000, 69_444, 23_000
+
+
+        def state_bytes(n=N_FEATURES, d=DIM, b=BYTES):
+            """Parameters, fp32 master copy and two Adam moments: 16 bytes per parameter."""
+            table = n * d * b
+            return table, 3 * table
+
+
+        def gather_gbps(lookups=LOOKUPS, d=DIM, b=BYTES, rps=RPS_PEAK):
+            return lookups * d * b * rps / 1e9
+
+
+        def fit_platt(logits, y, iters=50):
+            """Platt scaling: p = sigmoid(a*logit + b), fitted by Newton steps."""
+            a, b = 1.0, 0.0
+            for _ in range(iters):
+                p = 1.0 / (1.0 + np.exp(-(a * logits + b)))
+                w = p * (1 - p) + 1e-12
+                grad = np.array([np.sum((p - y) * logits), np.sum(p - y)])
+                hess = np.array([[np.sum(w * logits**2), np.sum(w * logits)],
+                                 [np.sum(w * logits), np.sum(w)]])
+                step = np.linalg.solve(hess + 1e-9 * np.eye(2), grad)
+                a, b = a - step[0], b - step[1]
+            return a, b
+
+
+        def main():
+            table, total = state_bytes()
+            print(f"embedding table: {table/1e9:.0f} GB; with Adam state: {total/1e9:.0f} GB")
+            print(f"gather at peak: {gather_gbps():.1f} GB/s; "
+                  f"at mean: {gather_gbps(rps=RPS_MEAN):.1f} GB/s")
+
+            # A model that overpredicts; calibration must remove the bias.
+            rng = np.random.default_rng(7)
+            logits = rng.normal(0.0, 1.5, 20_000)
+            true_p = 1 / (1 + np.exp(-(logits - 0.8)))
+            y = rng.random(logits.size) < true_p
+            raw = 1 / (1 + np.exp(-logits))
+            a, b = fit_platt(logits, y)
+            cal = 1 / (1 + np.exp(-(a * logits + b)))
+            print(f"mean predicted CTR raw={raw.mean():.3f} "
+                  f"calibrated={cal.mean():.3f} actual={y.mean():.3f}")
+
+            assert total == 3 * table and table == 256e9
+            assert abs(gather_gbps() - 17.8) < 0.1
+            assert abs(cal.mean() - y.mean()) < 0.01
+            assert abs(raw.mean() - y.mean()) > 0.05
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-ctr-embedding-state
+      title: "Size the embedding state"
+      difficulty: easy
+      prompt: >-
+        A feature table has `features` rows of `dim` float32 values. Adam keeps a parameter copy
+        and two moments, so the total state is three times the table. Return the total in GB.
+      language: python
+      entry: total_state_gb
+      testCases:
+        - input: '{}'
+          expected: "768"
+          tolerance: 1e-6
+        - input: '{"features": 1000000000, "dim": 16}'
+          expected: "192"
+          tolerance: 1e-6
+      solution: |
+        def total_state_gb(features=1_000_000_000, dim=64):
+            return features * dim * 4 * 3 / 1e9
+      solutionExplanation: >-
+        1e9 * 64 * 4 = 256 GB for the table; three copies is 768 GB, the number that forces
+        sharding before any model code is written.
+      tags: [memory, embeddings]

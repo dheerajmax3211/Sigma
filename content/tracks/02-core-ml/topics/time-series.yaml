@@ -1,0 +1,1101 @@
+id: time-series
+slug: time-series
+title: "Shuffle a Time Series and You Are Measuring a Different Task"
+summary: >-
+  Diagnose whether a series is stationary, read ACF and PACF to choose the
+  differencing and the AR/MA orders, and evaluate the forecast the only way
+  that measures forecasting — by walking forward, one origin at a time.
+kind: lesson
+difficulty: hard
+position: 15
+estMinutes: 29
+prerequisites: [probability-distributions, linear-regression]
+phase: classical-models
+tags: [time-series, stationarity, arima, autocorrelation, walk-forward, mase, data-leakage]
+
+body:
+  big_idea: >-
+    A series is one realisation of a process, so its rows are not exchangeable; honest
+    error comes only from pretending the future has not happened — shuffle the split and
+    you score a different task.
+
+  problem:
+    - "You call `cross_val_score` on a lagged design matrix, read $R^2 = 0.94$, ship it, and the twelve-week forecast is worse than a spreadsheet."
+    - "Your ADF test returns $-1.69$ against a 5% critical value of $-2.86$, so you declare stationarity and report error bars four times too narrow."
+    - "You difference a series that was already stationary: lag-1 autocorrelation becomes $-0.04$, and you turned a correlated signal into white noise."
+
+  analogy: |
+    A ten-year diary, and a test that asks what happened on a given day. If the
+    pages are in order and you may only read up to the day before, you must
+    reason. Shuffle them and the task collapses: the entry for the 15th lies
+    next to the 14th, so you read it off and score perfectly, having learned
+    nothing about predicting. Shuffled pages are `KFold(shuffle=True)`.
+
+  concept_points:
+    - "**A series is one draw from a process, so its rows are not exchangeable.** Autocovariance is $\\gamma(k)=\\operatorname{Cov}(y_t,y_{t-k})$ with $\\rho(k)=\\gamma(k)/\\gamma(0)$. An AR(1) with $\\varphi=0.9$ and $n=1000$ gave $\\hat\\rho(1)=0.910$ against 0.900, and $\\hat\\rho(6)=0.497$ against 0.531. The effective sample size is $n(1-\\varphi)/(1+\\varphi)=52.6$: 53 independent observations behind 1,000 rows, a factor of 4.36 on every standard error."
+    - "**Stationarity is the assumption every classical method spends.** Constant mean, constant variance, autocovariance depending only on lag. A 600-step random walk had path sd $11.64$ while its first difference had $0.949$ — a ratio of 12.3, growing as $\\sqrt{n}$ because $\\operatorname{Var}(y_t)=t\\sigma^2$: a unit root, where shocks never decay. Any 200-point window looks stationary, because you only ever see one path."
+    - "**ACF identifies the MA order; PACF identifies the AR order.** For AR(1) with $\\varphi=0.9$ the sample ACF was $0.910, 0.816, 0.728$ — geometric decay at rate $\\varphi$ — while the PACF was $0.910, -0.073, -0.012$: one spike, then nothing outside $\\pm2/\\sqrt{n}=\\pm0.063$. For MA(1) it is reversed. A slowly decaying ACF that never crosses zero is a trend, not an AR signature."
+    - "**Differencing removes a unit root; differencing twice removes the signal.** One difference took the random walk sd from 11.64 to 0.949. Applied to a stationary AR(1) the cost is computable: the sd ratio is exactly $\\sqrt{2(1-\\varphi)}$, measured 1.178 at $\\varphi=0.3$, 0.997 at 0.5 and 0.446 at 0.9 — so differencing helps only when $\\varphi>0.5$. At $\\varphi=0.9$ the leftover lag-1 autocorrelation is $-0.04$."
+    - "**AR, MA and ARIMA are three separate jobs, and each parameter has one.** AR($p$) is a regression of $y_t$ on $p$ shifted copies of itself, so collinearity and the $\\kappa(X)^2$ arithmetic transfer unchanged. The forecast of an AR(1) decays at exactly $\\varphi^h$: at $\\varphi=0.9$ the twelve-step forecast is still 28.2% of the deviation, half-life 6.58 steps; at $\\varphi=0.5$ it is 0.02%, half-life 1.0."
+    - "**Random cross-validation leaks the future, and the leak scales with the horizon.** With six lags and a twelve-step horizon, shuffled 5-fold CV reported RMSE 0.660; walk-forward on an expanding window reported 2.376 — a factor of 3.60, against a naive persistence forecast at 2.444. Shuffled RMSE was flat across horizons (0.642, 0.641, 0.691, 0.660); walk-forward climbed (0.468, 0.650, 1.228, 2.376)."
+
+  definitions:
+    - term: "Stationarity"
+      meaning: >-
+        A process whose mean and variance are constant in time and whose
+        autocovariance depends only on the lag between two points, not on when
+        they occur. Strict stationarity is stronger — the whole joint
+        distribution is shift-invariant — but every classical method assumes
+        only the weak form.
+    - term: "Unit root"
+      meaning: >-
+        A root of the autoregressive characteristic polynomial on the unit
+        circle, meaning the process has $\sum\varphi_i = 1$. Shocks do not
+        decay, variance grows linearly in time, and differencing once makes the
+        series stationary. A random walk is the canonical case.
+    - term: "Autocovariance and ACF"
+      meaning: >-
+        $\gamma(k) = \operatorname{Cov}(y_t, y_{t-k})$ and
+        $\rho(k) = \gamma(k)/\gamma(0)$. The ACF is the correlation of a series
+        with its own lagged copy; it is the object that tells you how much
+        information a past value carries about a future one.
+    - term: "PACF"
+      meaning: >-
+        The partial autocorrelation at lag $k$: the correlation between $y_t$
+        and $y_{t-k}$ after removing the linear effect of the intervening lags.
+        It cuts off after lag $p$ for an AR($p$), which is what makes it the
+        order-selection tool for the AR part.
+    - term: "Differencing operator"
+      meaning: >-
+        $\Delta y_t = y_t - y_{t-1} = (1 - B)y_t$, where $B$ is the
+        backshift operator $By_t = y_{t-1}$. Applied $d$ times it removes a
+        polynomial trend of degree $d-1$ and, more importantly, removes a unit
+        root.
+    - term: "AR(p), MA(q), ARIMA(p,d,q)"
+      meaning: >-
+        AR($p$): $y_t = c + \sum_{i=1}^{p}\varphi_i y_{t-i} + \varepsilon_t$.
+        MA($q$): $y_t = \mu + \varepsilon_t + \sum_{j=1}^{q}\theta_j
+        \varepsilon_{t-j}$. ARIMA($p,d,q$) is ARMA($p,q$) applied to the series
+        differenced $d$ times. Each part answers a different question: memory
+        in levels, memory in shocks, and how many times you had to difference.
+    - term: "Invertibility"
+      meaning: >-
+        An MA polynomial whose roots lie outside the unit circle, so the process
+        can be rewritten as an AR($\infty$) and the shocks can be recovered from
+        the observations. Without it, the likelihood is not identified and two
+        different $(\theta_1, \theta_2)$ pairs fit identically.
+    - term: "Seasonal differencing"
+      meaning: >-
+        $(1 - B^{m})y_t = y_t - y_{t-m}$ for period $m$. Removes a stable
+        repeating pattern without touching the trend. A large *negative*
+        autocorrelation at lag $m$ afterwards means you over-differenced.
+    - term: "Walk-forward validation"
+      meaning: >-
+        Rolling-origin evaluation: fit on rows up to time $t$, forecast
+        $t+1 \ldots t+h$, then advance the origin and repeat. Also called
+        backtesting. It is the only split that reproduces the information set
+        available at prediction time.
+    - term: "Purge (gap)"
+      meaning: >-
+        Rows dropped between the end of a training window and the start of the
+        test window so that no training label is still unobserved at the forecast
+        origin. With the label $y_{s+h}$ the gap is $h$ rows; if the label
+        aggregates a window of width $w$ ending at $s+h$, it is $h + w - 1$.
+    - term: "Naive and seasonal-naive forecast"
+      meaning: >-
+        $\hat y_{t+h} = y_t$ (naive) or $\hat y_{t+h} = y_{t+h-m}$ (seasonal
+        naive). They are the baselines any model must beat, and they are
+        embarrassingly hard to beat one step ahead on business data.
+    - term: "MASE"
+      meaning: >-
+        Mean absolute scaled error: $\text{MAE} / \text{MAE}_{\text{naive}}$,
+        where the denominator is the in-sample MAE of the naive (or
+        seasonal-naive) forecast. Scale-free, defined for a single series, and
+        interpretable: below 1 beats the baseline, above 1 loses to it.
+
+  diagrams:
+    - type: compare
+      title: "Shuffled K-fold vs walk-forward on the same lagged design matrix"
+      left_label: "KFold(shuffle=True)"
+      left_points:
+        - "Test rows are drawn from everywhere, including after the training rows"
+        - "64% of test rows keep both immediate neighbours in training (5 folds)"
+        - "A local learner reads the neighbour's target: error stays flat in h"
+        - "Reported RMSE 0.660 at a 12-step horizon"
+        - "Costs 3.6x optimism and ships a model that loses to naive"
+      right_label: "Walk-forward, expanding, purged"
+      right_points:
+        - "Every test row is forecast from rows strictly before the origin"
+        - "Neighbours are never available; the model must extrapolate"
+        - "Error grows with horizon, as an h-step error must"
+        - "Reported RMSE 2.376 at a 12-step horizon"
+        - "Says the model ties naive (2.444) — the honest answer"
+    - type: plot
+      title: "ACF signatures: two AR(1)s that decay, one MA(1) that cuts off"
+      chart: "line"
+      xLabel: "lag k"
+      yLabel: "autocorrelation ρ(k)"
+      series:
+        - name: "AR(1) φ=0.9 — geometric decay"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 1, y: 0.9 }
+            - { x: 2, y: 0.81 }
+            - { x: 3, y: 0.729 }
+            - { x: 4, y: 0.656 }
+            - { x: 5, y: 0.590 }
+            - { x: 6, y: 0.531 }
+            - { x: 7, y: 0.478 }
+            - { x: 8, y: 0.430 }
+            - { x: 9, y: 0.387 }
+            - { x: 10, y: 0.349 }
+            - { x: 11, y: 0.314 }
+            - { x: 12, y: 0.282 }
+        - name: "AR(1) φ=0.5 — decay in two lags"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 1, y: 0.5 }
+            - { x: 2, y: 0.25 }
+            - { x: 3, y: 0.125 }
+            - { x: 4, y: 0.0625 }
+            - { x: 5, y: 0.0312 }
+            - { x: 6, y: 0.0156 }
+            - { x: 7, y: 0.0078 }
+            - { x: 8, y: 0.0039 }
+            - { x: 9, y: 0.002 }
+            - { x: 10, y: 0.001 }
+            - { x: 11, y: 0.0005 }
+            - { x: 12, y: 0.0002 }
+        - name: "MA(1) θ=0.6 — cut-off after lag 1"
+          points:
+            - { x: 0, y: 1.0 }
+            - { x: 1, y: 0.4412 }
+            - { x: 2, y: 0.0 }
+            - { x: 3, y: 0.0 }
+            - { x: 4, y: 0.0 }
+            - { x: 5, y: 0.0 }
+            - { x: 6, y: 0.0 }
+            - { x: 7, y: 0.0 }
+            - { x: 8, y: 0.0 }
+            - { x: 9, y: 0.0 }
+            - { x: 10, y: 0.0 }
+            - { x: 11, y: 0.0 }
+            - { x: 12, y: 0.0 }
+    - type: plot
+      title: "The leak, measured: shuffled CV is flat in horizon; walk-forward is not"
+      chart: "line"
+      xLabel: "forecast horizon h (steps)"
+      yLabel: "RMSE"
+      series:
+        - name: "shuffled 5-fold CV"
+          points:
+            - { x: 1, y: 0.642 }
+            - { x: 3, y: 0.641 }
+            - { x: 6, y: 0.691 }
+            - { x: 12, y: 0.660 }
+        - name: "walk-forward (expanding)"
+          points:
+            - { x: 1, y: 0.468 }
+            - { x: 3, y: 0.650 }
+            - { x: 6, y: 1.228 }
+            - { x: 12, y: 2.376 }
+        - name: "naive persistence"
+          points:
+            - { x: 1, y: 0.480 }
+            - { x: 3, y: 0.743 }
+            - { x: 6, y: 1.274 }
+            - { x: 12, y: 2.444 }
+    - type: pipeline
+      title: "The Box–Jenkins loop, and where it stops being a loop"
+      nodes:
+        - label: "Plot the series"
+          note: "level, trend, variance, breaks"
+          detail: "Look for the variance changing with the level before anything else. A series whose spread grows with its mean needs a log transform before differencing, or the stationarity test is answering the wrong question."
+        - label: "Difference until stationary"
+          note: "d, and D at the seasonal lag"
+          detail: "One difference for a unit root, (1 - B^m) for a stable seasonal pattern. Stop as soon as the variance stops falling — the ratio is sqrt(2(1-phi)) for an AR(1), so at phi = 0.9 a further difference is pure loss."
+        - label: "Read ACF and PACF"
+          note: "AR order from PACF, MA from ACF"
+          detail: "PACF cuts off at p, ACF cuts off at q; both decaying means mixed ARMA and no clean order. Check lags against the ±2/sqrt(n) band, then confirm with Ljung-Box rather than picking the tallest spike."
+        - label: "Fit and check residuals"
+          note: "residuals must be white noise"
+          detail: "If the residual ACF has a spike, the model has not captured that structure; if it has a slow decay, the series is still not stationary and you need another difference. Refit, do not reinterpret."
+        - label: "Evaluate walk-forward"
+          note: "expanding or rolling, with a purge"
+          detail: "This is where the loop exits. Report MAE and MASE against naive at the horizon you will actually ship, over at least 50 origins, and never re-select the model on the same folds you report."
+    - type: architecture
+      title: "A forecasting pipeline, and the three places the future gets in"
+      nodes:
+        - { id: raw, x: 0, y: 1, label: "Raw series", kind: client, detail: "One row per timestamp. If the rows arrive out of order or duplicated, every downstream lag is wrong and no validation scheme will notice." }
+        - { id: diag, x: 1, y: 0, label: "Stationarity checks", kind: server, detail: "ADF on levels and on the difference, plus the ACF. Leak point 1: computing the difference or the seasonal profile once on the full series and then splitting — the transform has already seen the test period." }
+        - { id: transform, x: 1, y: 2, label: "Difference / deseasonalise", kind: server, detail: "Fit the transform on training rows only and apply it to the test rows with the stored state. A rolling mean computed with center=True is the most common way this goes wrong: it averages future rows into the feature." }
+        - { id: feats, x: 2, y: 1, label: "Lag matrix", kind: model, detail: "This is a design matrix in the sense of Linear Regression, and the same conditioning arithmetic applies: 12 lags of a trending series are nearly collinear, so the coefficients are unstable even when the forecasts are fine." }
+        - { id: split, x: 2, y: 3, label: "Walk-forward splitter", kind: server, detail: "Leak point 2: the split. Expanding or rolling window, a purge of h rows so no training label is still unobserved at the origin, and test blocks laid end to end towards the end of the series." }
+        - { id: fit, x: 3, y: 1, label: "Model + forecast", kind: worker, detail: "Refit at every origin, or fit once and reuse the coefficients with an expanding-window correction. Refitting every row at h=1 costs 500 fits; stepping 10 origins costs 50 and changes the mean by less than its standard error." }
+        - { id: metric, x: 3, y: 3, label: "MAE / MASE vs naive", kind: storage, detail: "Leak point 3: the metric. A shuffled score, or a score computed on the same folds used to select the model, or a MASE whose denominator was computed on the test window." }
+      edges:
+        - { from: raw, to: diag, label: "test" }
+        - { from: raw, to: transform, label: "fit on train" }
+        - { from: transform, to: feats, label: "lags" }
+        - { from: feats, to: fit, label: "X" }
+        - { from: split, to: fit, label: "origins", style: "async" }
+        - { from: fit, to: metric, label: "forecasts" }
+        - { from: split, to: metric, label: "same folds", style: "async" }
+
+  markdown: |
+    ## The experiment that makes the bug concrete
+
+    Take a series with a linear trend of $0.2$ per step and
+    $\mathcal{N}(0, 0.3)$ noise, 360 points. Build six lag features and
+    forecast twelve steps ahead directly with gradient boosting. Evaluate it two
+    ways: shuffled 5-fold cross-validation, and walk-forward with an expanding
+    window refitted every third origin.
+
+    | horizon $h$ | shuffled 5-fold | walk-forward | naive persistence |
+    |---|---|---|---|
+    | 1 | 0.642 | 0.468 | 0.480 |
+    | 3 | 0.641 | 0.650 | 0.743 |
+    | 6 | 0.691 | 1.228 | 1.274 |
+    | 12 | **0.660** | **2.376** | 2.444 |
+
+    Read the shuffled column. It does not move. A twelve-step forecast is
+    reported as accurate as a one-step forecast, which is not a property any
+    forecasting method has ever had. The walk-forward column climbs, because a
+    boosted tree cannot extrapolate a trend: it can only return the highest
+    level it has seen, and by $h = 12$ that is a long way below the truth. The
+    model it describes is barely better than persistence: $2.376$ against
+    $2.444$, or $3\%$.
+
+    The shuffled number said the model was $3.7$ times better than the naive
+    forecast. That is the number that gets a model into production.
+
+    The mechanism is arithmetic, not mystery. With $k = 5$ folds, each test row
+    keeps both of its immediate temporal neighbours in the training set with
+    probability $(1 - 1/k)^2 = 0.64$, and at least one with probability
+    $1 - 1/k^2 = 0.96$. A training row one step later in time carries the target
+    $y_{s+h+1}$ — one step from the answer $y_{s+h}$. A gradient-boosted tree or
+    a 1-nearest-neighbour model does not have to forecast; it has to retrieve.
+    The same experiment with $k$-NN instead of boosting gave $0.798$ against
+    $2.800$, a factor of $3.51$.
+
+    Note what did *not* leak: a global linear model. Its shuffled and
+    walk-forward numbers both stay near the noise floor, because a linear
+    function extrapolates the trend correctly and has nothing to gain from a
+    neighbour. **The leak lives in the interaction between a flexible, local
+    learner and a split that ignores time.** That is why the bug survives code
+    review: on the linear baseline in the notebook, the numbers look fine.
+
+    ## Stationarity, and why you cannot eyeball it
+
+    A random walk has $\operatorname{Var}(y_t) = t\sigma^2$. Over 600 steps with
+    $\sigma = 1$, the path standard deviation was $11.64$; its first difference
+    had $0.949$. The ratio, $12.3$, grows as $\sqrt{n}$ and never settles. That
+    is what a unit root means: the variance is a function of $t$, the mean is not
+    identified, and any statistic you compute on the level is a statistic about
+    where you happened to stop looking.
+
+    The ADF test regresses $\Delta y_t$ on $y_{t-1}$ and lagged $\Delta y$. On
+    this path the statistic was $-1.69$; the 5% critical value is $-2.86$, so
+    the unit root is not rejected. On the difference it was $-19.2$; on a
+    stationary AR(1) with $\varphi = 0.5$ it was $-12.4$. Notice the asymmetry:
+    a very negative statistic is strong evidence of stationarity, while a
+    statistic near zero is weak evidence of anything. Failing to reject is not a
+    certificate.
+
+    The practical test is cheaper than the formal one. Difference, and see
+    whether the variance collapses. If it does, there was a unit root. If the
+    variance *rises*, you over-differenced — and the size of the mistake is
+    computable.
+
+    ## Reading ACF and PACF
+
+    | | ACF | PACF |
+    |---|---|---|
+    | AR($p$) | decays geometrically, rate $\varphi$ | cuts off after lag $p$ |
+    | MA($q$) | cuts off after lag $q$ | decays |
+    | ARMA($p,q$) | decays | decays |
+    | trend, undifferenced | decays very slowly, never crosses zero | one large spike at lag 1 |
+    | seasonality, period $m$ | oscillates, spikes at $m, 2m, 3m$ | spikes at $m$ |
+
+    The measured AR(1) at $\varphi = 0.9$ gave ACF $0.910, 0.816, 0.728, 0.647$
+    and PACF $0.910, -0.073, -0.012, -0.017$; the $\pm 2/\sqrt{1000} = \pm 0.063$
+    band makes the PACF a single spike and noise. That is the textbook picture,
+    and it is worth knowing exactly how it looks before you meet a real series
+    that looks like none of the rows in the table.
+
+    ## The cost of differencing twice
+
+    Differencing a stationary AR(1) is not free. The ratio of standard
+    deviations is $\sqrt{2(1-\varphi)}$:
+
+    | $\varphi$ | measured sd ratio | theory $\sqrt{2(1-\varphi)}$ | ACF of $\Delta y$ at lag 1 |
+    |---|---|---|---|
+    | 0.3 | 1.178 | 1.183 | $-0.339$ (theory $-0.350$) |
+    | 0.5 | 0.997 | 1.000 | $-0.238$ (theory $-0.250$) |
+    | 0.9 | 0.446 | 0.447 | $-0.040$ (theory $-0.050$) |
+
+    At $\varphi = 0.9$ the difference removes $80\%$ of the variance and leaves a
+    lag-1 autocorrelation of $-0.04$. Whatever the model was going to learn is
+    gone. The crossover is $\varphi = 0.5$: below it, differencing increases the
+    variance outright.
+
+    ## ARIMA in one paragraph
+
+    ARIMA($p,d,q$) is ARMA($p,q$) on the series differenced $d$ times. The AR
+    part is memory in levels, the MA part is memory in shocks, and $d$ is how
+    many times you had to difference to make the autocovariance stop depending
+    on $t$. For an AR(1) the forecast decays at exactly $\varphi^h$, so the
+    half-life $\ln 0.5 / \ln \varphi$ is the number that decides whether your
+    horizon is forecastable: $1.0$ steps at $\varphi = 0.5$, $6.58$ at
+    $\varphi = 0.9$, $13.5$ at $\varphi = 0.95$. If your horizon is twelve steps
+    and the half-life is one, no amount of model class will help.
+
+    ## Reporting
+
+    RMSE is squared error in the original units. It is not comparable across
+    series, and it is dominated by the observations nobody can forecast. In the
+    240-point example, one $+20$ error out of 240 points carried $92.1\%$ of the
+    MSE and $21.5\%$ of the MAE.
+
+    Report MAE, and report it next to the naive forecast:
+    $\text{MASE} = \text{MAE}/\text{MAE}_{\text{naive}}$. Below 1 you beat the
+    baseline; above 1 the baseline is your model. Because the denominator comes
+    from the same series, MASE is scale-free and comparable across a thousand
+    SKUs, which RMSE never is.
+
+    ## The longer version
+
+    The remaining mechanisms, verbatim: the significance band and Ljung–Box, how
+    seasonality shows up in the ACF, walk-forward as a design with its window
+    and gap, and why MASE is the metric to report.
+
+    ### Failure modes, in full
+
+    - You call `cross_val_score(model, X, y, cv=5)` on a lagged design matrix, read $R^2 = 0.94$, ship the model, and the twelve-week-ahead forecast is worse than the planner's spreadsheet. Nothing raised a warning, because nothing in the pipeline knows that row 400 comes after row 399.
+    - Your ADF test on 600 days of signups returns $-1.69$ against a 5% critical value of $-2.86$, so you declare the series stationary, fit an AR(1), and report error bars four times too narrow. The test did not say 'stationary'; it said 'insufficient evidence against a unit root', and on 600 points that is a weak statement.
+    - A series looks like it is trending, so you difference it. The variance drops and you conclude the transform helped. But the series was already stationary, and the differenced series has a lag-1 autocorrelation of $-0.04$ — you turned a strongly autocorrelated signal into white noise and threw away the only structure the model could exploit.
+    - Two analysts report accuracy on the same forecast. One says RMSE 1.35, the other MAE 0.39. Both are correct. One of those numbers is 92% produced by a single bad day, and neither tells you whether the model beats the forecast you could write in one line of Python.
+    - The interview question is 'why not shuffle time series?' The expected answer is not 'it leaks'; it is a mechanism, a number, and the reason the number grows with the forecast horizon.
+
+    ### The mechanisms, in full
+
+    - **A series is one draw from a process, so its rows are not exchangeable.** In *Probability Distributions* you computed $\operatorname{Var}(X + Y) = \operatorname{Var}X + \operatorname{Var}Y + 2\operatorname{Cov}(X,Y)$ and emphasised that the covariance term is the whole difference between a correct and an overconfident error bar. Time series is that idea with the pair index replaced by a lag: $\gamma(k) = \operatorname{Cov}(y_t, y_{t-k})$ and $\rho(k) = \gamma(k)/\gamma(0)$. Put numbers on it: an AR(1) with $\varphi = 0.9$ and $n = 1000$ gave $\hat\rho(1) = 0.910$ against a theoretical $0.900$, and $\hat\rho(6) = 0.497$ against $0.531$. Trap: every downstream tool that assumes iid rows — the standard error of a mean, a shuffled CV, a bootstrap that resamples points — is now wrong, and the effective sample size is not $n$. For an AR(1) it is $n(1-\varphi)/(1+\varphi) = 52.6$ out of 1000. You have 53 independent observations and 1000 rows, and the difference is a factor of $4.36$ on every standard error you report.
+    - **Stationarity is the assumption every classical method spends, and its failure is measurable.** Weak stationarity means a constant mean, a constant variance, and an autocovariance that depends only on the lag — not on $t$. A 600-step random walk had a path standard deviation of $11.64$ while its first difference had $0.949$: a ratio of $12.3$, and the ratio grows as $\sqrt{n}$ because $\operatorname{Var}(y_t) = t\sigma^2$. That is a unit root: shocks never decay, so the variance is a function of time and the mean is not identified. Trap: any 200-point window of a random walk looks perfectly stationary — flat mean, stable spread, no trend — because stationarity is a property of the process, and you only ever see one path. You cannot check it by eyeballing a window; you check it by differencing and seeing whether the variance collapses. The formal check is the ADF test: regress $\Delta y_t$ on $y_{t-1}$ and lagged $\Delta y$, and compare the $t$-statistic on $y_{t-1}$ against a Dickey–Fuller distribution rather than a $t$ distribution. On this path it was $-1.69$ against a 5% critical value of $-2.86$, so the unit root is not rejected; the differenced series gave $-19.2$, and a stationary AR(1) with $\varphi = 0.5$ gave $-12.4$. The asymmetry is the lesson — a large negative statistic is strong evidence of stationarity, a statistic near zero is weak evidence of anything. Trap: reading "failed to reject" as "stationary" and skipping the difference. On 600 points the test has little power against $\varphi = 0.95$, and a structural break biases it toward not rejecting, because a level shift looks like a very persistent shock.
+    - **ACF identifies the MA order; PACF identifies the AR order.** For an AR(1) with $\varphi = 0.9$ the sample ACF was $0.910, 0.816, 0.728, 0.647, 0.568$ — geometric decay at rate $\varphi$ — while the sample PACF was $0.910, -0.073, -0.012, -0.017$, i.e. a single spike and then nothing outside the $\pm 2/\sqrt{n} = \pm 0.063$ band. For an MA(1) with $\theta = 0.6$ it is exactly reversed: ACF $0.450, 0.001, 0.006$ (one spike, theory $\theta/(1+\theta^2) = 0.441$) and PACF $0.450, -0.253, 0.160, -0.090$ (decaying). Trap: a slowly decaying ACF that never crosses zero is not an AR signature, it is a trend. Difference first, then read the ACF — otherwise every trending series looks like an AR(1) with $\varphi \approx 0.98$ and you will fit a model whose forecasts are just the last value.
+    - **Significance has a band, and the band is $\pm 2/\sqrt{n}$.** At $n = 1000$ that is $\pm 0.063$; at $n = 250$ it is $\pm 0.124$. A lag-1 autocorrelation of $0.11$ on 250 quarterly points is indistinguishable from zero, and half the "significant" lags in a 40-lag ACF plot at $n = 250$ are expected to be noise: at the 5% level you expect 2 false positives out of 40. Aggregate instead of cherry-picking with the Ljung–Box statistic $Q = n(n+2)\sum_{k=1}^{h}\hat\rho(k)^2/(n-k)$, which is $\chi^2_h$ under white noise. Measured: 500 white-noise points gave $Q_{10} = 10.3$ against a 5% critical value of $18.31$ — clean — while an AR(1) with $\varphi = 0.9$ gave $Q_{10} = 1088$. Trap: testing 40 lags and reporting the largest one. That is 40 chances to be fooled, and the $p$-value you quote is not the one you earned.
+    - **Differencing removes a unit root; differencing twice removes the signal.** One difference took the 600-step random walk from a standard deviation of $11.64$ to $0.949$ and left a series with no visible trend and no significant autocorrelation — which is the correct outcome, because a random walk's increments are white noise. But the same operation applied to a stationary AR(1) has a cost you can compute: the ratio of standard deviations is exactly $\sqrt{2(1-\varphi)}$, measured $1.178$ at $\varphi = 0.3$ (theory $1.183$), $0.997$ at $\varphi = 0.5$ (theory $1.000$), and $0.446$ at $\varphi = 0.9$ (theory $0.447$). So differencing helps only when $\varphi > 0.5$. At $\varphi = 0.9$ it cuts the variance by 80% and leaves a lag-1 autocorrelation of $-0.04$: the strong dependence you were going to exploit has been annihilated, and what remains is indistinguishable from noise. Trap: `d=1` by default, or choosing $d$ to minimise AIC. AIC cannot compare models with different $d$, because the likelihood is computed on a different number of observations.
+    - **AR, MA and ARIMA are three separate jobs, and each parameter has one.** AR($p$) says today is a linear function of the last $p$ values; MA($q$) says today is a linear function of the last $q$ shocks; $d$ says how many times you differenced to get there. Fitting the AR part is a regression of $y_t$ on $p$ shifted copies of itself — the design matrix from *Linear Regression*, with the rows slid down by one — so the coefficient standard errors, the collinearity and the $\kappa(X)^2$ arithmetic all transfer unchanged, and twelve lags of a trending series give columns that are nearly parallel. The forecast of an AR(1) decays at exactly $\varphi^h$: at $\varphi = 0.9$ the twelve-step forecast is still $28.2\%$ of the deviation, with a half-life of $\ln 0.5/\ln 0.9 = 6.58$ steps; at $\varphi = 0.5$ it is $0.02\%$, half-life $1.0$; at $\varphi = 0.95$ it is $54.0\%$, half-life $13.5$. That single number — half-life — is what tells you whether a twelve-step forecast is a forecast or a confession. Trap: fitting ARIMA(1,1,1) to a random walk and reading the AR and MA coefficients as structure. With $d = 1$ the differenced series is white noise, and $\varphi$ and $\theta$ are unidentified: the likelihood surface is flat along $\varphi = -\theta$, and every optimiser returns a different pair with the same fit.
+    - **Seasonality is an ACF that oscillates instead of decaying.** A period-12 sinusoid of amplitude 8 plus $\mathcal{N}(0,1)$ noise, 480 points, gave $\hat\rho(1) = 0.837$, $\hat\rho(6) = -0.956$, $\hat\rho(12) = 0.938$, $\hat\rho(18) = -0.924$, $\hat\rho(24) = 0.914$. The sign flips at half the period and the seasonal lag keeps returning to the same value — that signature is unambiguous, and no amount of differencing at lag 1 removes it. Seasonal differencing, $(1 - B^{12})$, cut the standard deviation from $5.73$ to $1.50$, a factor of $3.8$. But it left $\hat\rho(12) = -0.447$ on the differenced series: a large negative spike at the seasonal lag is the over-differencing signature, and it means the seasonal difference was unnecessary or that the series needs an MA(12) term to undo it. Trap: fitting December with a linear trend, or using a 12-month seasonal difference on a series whose seasonality is multiplicative — the amplitude then grows with the level and the differenced series still has heteroskedasticity.
+    - **Random cross-validation leaks the future, and the leak is a factor of the horizon.** Take a series with a $0.2$-per-step trend and $\mathcal{N}(0, 0.3)$ noise, 360 points, build six lags, and forecast twelve steps ahead directly with gradient boosting. Shuffled 5-fold CV reported RMSE $0.660$; walk-forward with an expanding window reported $2.376$ — a factor of $3.60$, against a naive persistence forecast at $2.444$. So the shuffled number claimed a model $3.7\times$ better than the naive forecast, while the honest number says it is $3\%$ better, i.e. not worth shipping. The proof that it is measuring the wrong task is the shape of the column: shuffled RMSE was $0.642, 0.641, 0.691, 0.660$ for horizons $1, 3, 6, 12$ — flat — while walk-forward was $0.468, 0.650, 1.228, 2.376$, climbing because a boosted tree cannot extrapolate a trend and falls back on the highest level it has seen. The mechanism is arithmetic: with 5 folds, $64\%$ of test rows have *both* immediate neighbours in the training set (and $96\%$ have at least one), and a training row one step later in time has a target one step from the answer. The model does not forecast; it looks up the neighbouring page. Trap: `cross_val_score`, `KFold(shuffle=True)`, or `train_test_split` on a lagged design matrix. All three are the same bug.
+    - **Walk-forward is a design, not a flag, and the knobs are the window and the gap.** Expanding windows refit on everything up to the origin, which is right when the process is stable and the parameters are the thing you are unsure about; rolling windows of fixed length forget, which is right when the process drifts and old data is actively misleading. At $n = 1000$ with an initial window of 500 and horizon 1, stepping one row at a time gives 500 folds and stepping ten rows gives 50 — 50 is usually enough for a stable mean and 10x cheaper. The gap is the part people skip: a training row whose origin is $s$ carries the label $y_{s+h}$, and that label is only observed once you reach origin $s+h$ — so at forecast origin $o$ the training rows stop at $o-h$. That is a gap of $h$ rows, not $h-1$: leave $h-1$ and the last training label is $y_{o+1}$, a value that does not exist yet. With $h = 1$ the gap is one row; with $h = 12$ it is twelve. Trap: `TimeSeriesSplit` with the default `gap=0`, which hands you training rows whose labels are still in the future. If the label aggregates a window of width $w$ ending at $s+h$, the gap grows to $h + w - 1$.
+    - **Report MAE and MASE, not RMSE, because one spike owns the RMSE.** On a 240-point series with a good forecast, RMSE was $0.381$, MAE $0.306$, and MASE $0.399$. Add a single $+20$ error at one point — a holiday, an outage, one bad row — and RMSE becomes $1.354$ (up $3.56\times$), MAE $0.390$ (up $1.27\times$), MASE $0.508$. That one point out of 240 carries $92.1\%$ of the MSE and $21.5\%$ of the MAE. RMSE is squared error in the original units, so it is not comparable across series, and it is dominated by exactly the observations nobody can forecast. $\text{MASE} = \text{MAE} / \text{MAE}_{\text{naive}}$ fixes both: it is scale-free, so a MASE of $0.51$ on electricity load and $0.51$ on e-commerce revenue mean the same thing, and it is defined against the forecast you would ship if you had no model. MASE below 1 means you beat the naive; MASE above 1 means the naive is your model and the elaborate one is a liability. Trap: quoting RMSE because it is the default in scikit-learn and because bigger numbers feel more scientific.
+
+
+  derivations:
+    - title: "Why the ACF of an AR(1) is exactly φ^k"
+      latex: |
+        For $y_t = \varphi y_{t-1} + \varepsilon_t$ with
+        $\varepsilon_t$ white noise of variance $\sigma^2$, multiply by
+        $y_{t-k}$ and take expectations:
+        $$\gamma(k) = \varphi\,\gamma(k-1) \quad (k \ge 1).$$
+        With $\gamma(0) = \sigma^2/(1-\varphi^2)$ from
+        $\gamma(0) = \varphi^2\gamma(0) + \sigma^2$, induction gives
+        $$\gamma(k) = \frac{\varphi^k \sigma^2}{1-\varphi^2},
+          \qquad \rho(k) = \frac{\gamma(k)}{\gamma(0)} = \varphi^k.$$
+        The forecast follows from the same recursion:
+        $\mathbb{E}[y_{t+h}\mid y_t] = \varphi^h y_t$, with forecast variance
+        $\sigma^2(1-\varphi^{2h})/(1-\varphi^2)$ approaching the process
+        variance from below.
+      prose: >-
+        One line of algebra produces both the decay rate and the forecast. The
+        measured ACF was 0.910, 0.816, 0.728 against theory 0.900, 0.810, 0.729
+        — the small excess is estimation noise on a single 1,000-point path, not
+        a second-order effect. The half-life ln(0.5)/ln(phi) drops straight out:
+        6.58 steps at phi = 0.9.
+    - title: "Why differencing an AR(1) multiplies the variance by 2(1 − φ)"
+      latex: |
+        Let $d_t = y_t - y_{t-1} = (1-B)y_t$. Then
+        $$\operatorname{Var}(d_t) = 2\gamma(0) - 2\gamma(1)
+          = 2\gamma(0)(1-\varphi),$$
+        so the standard-deviation ratio is $\sqrt{2(1-\varphi)}$. The lag-1
+        autocovariance of the difference is
+        $$\gamma_d(1) = 2\gamma(1) - \gamma(0) - \gamma(2)
+          = \gamma(0)\,(2\varphi - 1 - \varphi^2) = -\gamma(0)(1-\varphi)^2,$$
+        hence
+        $$\rho_d(1) = \frac{-\gamma(0)(1-\varphi)^2}{2\gamma(0)(1-\varphi)}
+          = -\frac{1-\varphi}{2}.$$
+      prose: >-
+        Two consequences, both measurable. First, the variance only falls if
+        phi > 0.5 — at phi = 0.3 the ratio is 1.18, so differencing makes the
+        series noisier. Second, the lag-1 autocorrelation of the difference is
+        -(1-phi)/2, which is -0.05 at phi = 0.9: you have converted a series with
+        strong memory into something indistinguishable from white noise, and the
+        standard-deviation ratio of 0.446 is the receipt.
+    - title: "Why the shuffled-CV optimism scales with the forecast horizon"
+      latex: |
+        Let a test row have features at origin $s$ and target $y_{s+h}$. Under a
+        $k$-fold shuffle, the row at origin $s+1$ is in the training set with
+        probability $(k-1)/k$, and its target is $y_{s+h+1}$ — one step from
+        $y_{s+h}$. A local learner therefore predicts
+        $$\hat y_{s+h} \approx y_{s+h+1},$$
+        with error of order one increment, $\lvert y_{s+h+1}-y_{s+h}\rvert
+        \approx \sigma$ for a random walk or $\approx \beta$ for a linear trend
+        of slope $\beta$. The honest $h$-step error, for a learner that cannot
+        extrapolate and must fall back on the last level it saw, is
+        $$\text{RMSE}_{\text{honest}}(h) \approx \sigma\sqrt{h}
+          \quad\text{(random walk)}, \qquad \approx \beta h
+          \quad\text{(trend, no extrapolation)}.$$
+        So the optimism factor lies between $\sqrt{h}$ and $h$ — 3.60 measured at
+        $h = 12$ — and the shuffled estimate is approximately the *one-step*
+        error no matter what $h$ is.
+      prose: >-
+        This is the whole diagnostic. Compare the two splits at the same horizon,
+        and then vary the horizon: a shuffled score that sits at the one-step
+        error while the honest score climbs is measuring retrieval, not
+        forecasting. Measured on the trending series: the shuffled column was
+        0.642, 0.641, 0.691, 0.660 for h = 1, 3, 6, 12 while walk-forward was
+        0.468, 0.650, 1.228, 2.376 — flat against a fivefold climb, a factor of
+        3.60 at h = 12.
+
+  implementations:
+    - language: python
+      title: "Sample ACF three ways, and the two that are wrong"
+      note: >-
+        The direct estimator is correct. The "unbiased" variant is numerically
+        WRONG as an autocorrelation: dividing lag k by (n - k) instead of n
+        inflates it by n/(n - k) — a factor of 2.0 at n = 200, k = 100 — and the
+        resulting sequence is not guaranteed positive semidefinite, so spectral
+        estimators built on it can return negative densities. The FFT variant is
+        numerically WRONG without zero-padding, because an unpadded circular
+        correlation adds the wrap-around term gamma(n - k) to every lag; on a
+        1,000-point trending series that was 0.015 at lag 5 and grows with k.
+        Zero-padding to 2n agrees with the direct sum to 3.3e-16.
+      code: |
+        import numpy as np
+
+        def acf_direct(x, max_lag, unbiased=False):
+            """The standard (biased) estimator: divide every lag by sum of squares."""
+            x = np.asarray(x, dtype=float)
+            n = x.size
+            xc = x - x.mean()
+            denom = float(xc @ xc)
+            out = [1.0]
+            for k in range(1, max_lag + 1):
+                num = float(xc[k:] @ xc[:-k])
+                # unbiased=True is NOT an autocorrelation: it inflates lag k by
+                # n/(n-k), and the sequence can fail to be PSD.
+                out.append(num / denom if not unbiased else num / float(xc[:-k] @ xc[:-k]))
+            return np.array(out)
+
+        def acf_fft(x, max_lag):
+            """O(n log n), but only correct with zero-padding to at least 2n."""
+            x = np.asarray(x, dtype=float)
+            n = x.size
+            xc = x - x.mean()
+            m = 1
+            while m < 2 * n:          # without this, the correlation wraps around
+                m *= 2
+            f = np.fft.rfft(xc, m)
+            c = np.fft.irfft(f * np.conj(f), m)
+            return c[:max_lag + 1] / c[0]
+
+        def pacf(r, max_lag):
+            """Durbin-Levinson: PACF from the ACF, no matrix inversion."""
+            phi = np.zeros((max_lag + 1, max_lag + 1))
+            out = [1.0]
+            for k in range(1, max_lag + 1):
+                num = r[k] - sum(phi[k-1, j] * r[k-j] for j in range(1, k))
+                den = 1.0 - sum(phi[k-1, j] * r[j] for j in range(1, k))
+                phi[k, k] = num / den
+                for j in range(1, k):
+                    phi[k, j] = phi[k-1, j] - phi[k, k] * phi[k-1, k-j]
+                out.append(float(phi[k, k]))
+            return np.array(out)
+
+        def ljung_box(x, h):
+            """Q = n(n+2) sum rho_k^2/(n-k), chi-square with h df under white noise."""
+            n = x.size
+            r = acf_direct(x, h)
+            return float(n * (n + 2) * sum(r[k]**2 / (n - k) for k in range(1, h + 1)))
+    - language: python
+      title: "The honest evaluation: walk-forward with a purge, against a naive baseline"
+      note: >-
+        This is the harness the topic is about, and it is numerically WRONG in two
+        specific ways if you are careless. First, the default gap is `h`, not
+        `h - 1`: the training row at origin `s` carries the label `y[s+h]`, which
+        does not exist until you reach `s+h`, so `gap = h - 1` leaves one
+        training label in the future and inflates the reported accuracy. Second,
+        the MASE denominator must be computed on the *training* rows; if you
+        compute the naive error over the test window instead, the test set sets
+        its own scale and a hard stretch of the series makes the model look
+        better, not worse.
+      code: |
+        import numpy as np
+
+        def walk_forward_origins(n, p, h=1, init=200, step=1, gap=None):
+            """Yield (origin, last_train_origin) pairs.
+
+            A training row at origin s has the label y[s+h], observed only once
+            you reach s+h. So at forecast origin o the last usable training row
+            is o - h: a gap of h rows. gap = h - 1 would leave y[o+1] in the
+            training set, which is one step into the future.
+            """
+            gap = h if gap is None else gap
+            for origin in range(max(init, p + h), n - h, step):
+                last_train = origin - gap
+                if last_train - p + 1 < 3:       # need a few rows to fit anything
+                    continue
+                yield origin, last_train
+
+        def lagged_rows(y, p, last_origin, h):
+            """(features at s, label y[s+h]) for p-1 <= s <= last_origin."""
+            X, t = [], []
+            for s in range(p - 1, last_origin + 1):
+                X.append([y[s - j] for j in range(1, p + 1)])
+                t.append(y[s + h])
+            return np.array(X), np.array(t)
+
+        def report(y, fit_predict, p=6, h=1, init=200, step=1, gap=None):
+            """fit_predict(Xtr, ytr, xq) -> float. Returns RMSE, MAE and MASE."""
+            y = np.asarray(y, dtype=float)
+            preds, actual = [], []
+            for origin, last in walk_forward_origins(y.size, p, h, init, step, gap):
+                Xtr, ytr = lagged_rows(y, p, last, h)
+                xq = np.array([y[origin - j] for j in range(1, p + 1)])
+                preds.append(float(fit_predict(Xtr, ytr, xq)))
+                actual.append(y[origin + h])
+            preds, actual = np.array(preds), np.array(actual)
+            err = np.abs(preds - actual)
+            # MASE denominator: in-sample naive error on the TRAINING rows only.
+            train = y[:init]
+            naive_mae = float(np.mean(np.abs(train[h:] - train[:-h])))
+            return {
+                "rmse": float(np.sqrt(np.mean(err ** 2))),
+                "mae": float(np.mean(err)),
+                "mase": float(np.mean(err) / naive_mae) if naive_mae > 0 else float("inf"),
+                "folds": int(err.size),
+            }
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        The ADF statistic on your 600-point series is $-1.69$ and the 5% critical
+        value is $-2.86$. What have you actually established, and what would you
+        do next?
+      answerKind: short_text
+      hint: >-
+        A test that fails to reject has told you about its own power as much as
+        about the data.
+      solution: >-
+        You have established that the data are not inconsistent with a unit root
+        — nothing more. You have not established stationarity. On 600 points the
+        ADF has low power against near-unit-root alternatives ($\varphi = 0.95$
+        looks a lot like $\varphi = 1$), and it is biased toward not rejecting
+        when there is a structural break, because a level shift looks like a very
+        persistent shock. The next step is not to fit an AR(1) and move on: it is
+        to difference and re-test. On this series the difference gave $-19.2$,
+        which is decisive. If the difference is also non-stationary, difference
+        again or model the break explicitly.
+    - id: cp-2
+      question: >-
+        Your ACF decays slowly from $0.96$ and never crosses zero, out to lag 30.
+        Do you have an AR(1) with $\varphi = 0.96$, or something else? How would
+        you tell, and does the answer change your forecast?
+      answerKind: short_text
+      hint: >-
+        An AR(1) with $\varphi = 0.96$ and a trend have almost the same ACF.
+        What distinguishes them is what happens to the *variance* when you
+        difference.
+      solution: >-
+        Almost certainly a trend, not an AR(1). Both produce a slowly decaying,
+        non-oscillating ACF, but an AR(1) with $\varphi = 0.96$ is mean-reverting
+        with variance $\sigma^2/(1-\varphi^2) = 12.8\sigma^2$ and a half-life of
+        17 steps, while a trend has no stationary variance at all. Difference
+        once and look: if the variance collapses and the ACF becomes
+        insignificant, it was a unit root or a trend. If the variance barely
+        moves, you have a genuinely persistent stationary process and
+        differencing will destroy it (the standard-deviation ratio is
+        $\sqrt{2(1-\varphi)} = 0.283$, so $92\%$ of the variance is gone). The
+        forecast consequence
+        is large: an AR(1) at 0.96 reverts to a fixed mean within ~50 steps,
+        while a trend does not revert at all. Getting this wrong makes a
+        long-horizon forecast wrong by the entire trend.
+    - id: cp-3
+      question: >-
+        You have 250 quarterly observations and the lag-1 autocorrelation is
+        $0.11$. Is the series autocorrelated? What band are you using?
+      answerKind: short_text
+      hint: >-
+        Under white noise, the standard error of $\hat\rho(k)$ is about
+        $1/\sqrt{n}$.
+      solution: >-
+        No. The band is $\pm 2/\sqrt{250} = \pm 0.124$, and $0.11$ is inside it.
+        Even the stricter $\pm 1.96/\sqrt{250} = \pm 0.124$ leaves it
+        insignificant. Note the second-order point: at $n = 250$ the standard
+        error is $0.063$, so a 40-lag ACF plot will show about two lags outside
+        the band by chance alone. That is why you confirm with Ljung–Box rather
+        than picking the tallest spike — and why "the ACF at lag 3 looked big" is
+        not evidence of a quarterly cycle.
+    - id: cp-4
+      question: >-
+        Shuffled CV reports RMSE $0.660$ for a twelve-step-ahead forecast;
+        walk-forward reports $2.376$; naive persistence reports $2.444$. Which
+        number describes the model you would ship, and what does the gap tell you
+        about the model class?
+      answerKind: short_text
+      hint: >-
+        Compare the shuffled number to a one-step walk-forward error, not to the
+        twelve-step one.
+      solution: >-
+        $2.376$ is the model's performance; $0.660$ is a one-step forecast
+        wearing a twelve-step label. The giveaway is that the shuffled error is
+        flat across horizons ($0.642, 0.641, 0.691, 0.660$ for $h = 1, 3, 6, 12$)
+        while the honest error was 5x larger at the far horizon. Against naive at
+        $2.444$ the model is $3\%$ better — not worth shipping. The gap also
+        identifies the model class: gradient boosting and $k$-NN retrieve
+        neighbours and leak badly; a global linear model extrapolates, barely
+        leaks, and its two numbers agree. So the shuffled number was not
+        measuring "this model's forecasting skill", it was measuring "this
+        model's ability to interpolate a shuffled table".
+    - id: cp-5
+      question: >-
+        You ship a forecast and report MASE $= 1.4$. What does that mean, what
+        do you do, and why is it a more useful number than the RMSE of $1.35$
+        you also computed?
+      answerKind: short_text
+      hint: >-
+        MASE is defined against the forecast you would use with no model.
+      solution: >-
+        MASE $1.4$ means your model's MAE is $40\%$ *worse* than the seasonal
+        naive forecast on the same series. The correct action is to ship the
+        naive forecast and go find out what the model is doing — usually a
+        differencing or horizon problem, or a leaky feature that made it look
+        good in development. The RMSE of $1.35$ cannot tell you any of that: it
+        is in the units of the series, so it is not comparable to another SKU,
+        and in the worked example a single $+20$ error out of 240 points
+        contributed $92.1\%$ of it. MASE is scale-free, defined against a
+        baseline, and comparable across series and across horizons.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A forecast is a claim about rows that do not exist yet, so the only
+        honest test is one where the model has never seen them — not in any
+        form, not through a neighbour, not through a mean computed over the whole
+        table. Every validation scheme is an answer to one question: at the
+        moment of prediction, what was actually knowable? Shuffling the rows
+        answers that question wrongly, and the size of the error is not a
+        constant — it depends on how far ahead you are forecasting.
+      blocks:
+        - kind: checklist
+          body: |
+            - Rows are not exchangeable: row 400 happened after row 399
+            - Effective sample size is n(1-phi)/(1+phi), not n
+            - A shuffled split lets local learners retrieve the neighbour's target
+            - The optimism grows with the horizon, because the answer moves away
+            - A linear model hides the bug; a boosted tree or k-NN exposes it
+      checkpoint: >-
+        Before reading on: if your shuffled CV error is the same at horizon 1 and
+        horizon 12, which of those two numbers is the model actually producing?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Three tools, in order. Walk-forward validation with an expanding or
+        rolling window replaces the shuffled split. A purge gap between training
+        and test labels replaces the assumption that rows are independent. And a
+        naive or seasonal-naive baseline replaces RMSE as the thing you compare
+        against, which is what makes MASE interpretable. Reach for the
+        diagnostics only after the split is right — a stationarity test on a
+        series you are evaluating dishonestly is a waste of an afternoon.
+      blocks:
+        - kind: checklist
+          body: |
+            - Split: walk-forward, expanding or rolling, at least 50 origins
+            - Gap: h - 1 rows, more if features aggregate a window
+            - Baseline: naive, or seasonal naive for a series with period m
+            - Metric: MAE and MASE, with RMSE reported alongside for scale
+            - Diagnostics: ADF and ACF on the training portion only
+      checkpoint: >-
+        Why must the ADF and the differencing be fitted on the training portion
+        rather than on the whole series? What exactly has the test set told you
+        if you do it the other way?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The harness is a loop over origins with a strictly truncated training
+        set. Note that the truncation is on the *label* end, not the feature end,
+        and that the gap comes out of the training side.
+      blocks:
+        - kind: pseudocode
+          body: |
+            for origin in range(init, n - h, step):
+                last_train = origin - h          # label y[s+h] must already exist
+                X_tr, y_tr = lagged_rows(y, p, last_origin=last_train, horizon=h)
+                model.fit(X_tr, y_tr)
+                prediction = model.predict(lags(y, origin))
+                record(prediction, y[origin + h])
+
+            rmse = sqrt(mean((pred - actual)^2))
+            mae  = mean(abs(pred - actual))
+            naive_mae = mean(abs(y[init-h:init] - y[init-2h:init-h]))   # training only
+            mase = mae / naive_mae
+
+            # Diagnostic, not decoration: repeat for h = 1, 3, 6, 12. A shuffled
+            # score that is identical at every h is not measuring h at all.
+      checkpoint: >-
+        Where in that loop would a centred rolling mean computed over the whole
+        series enter, and why would no change to the loop fix it?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Why the shuffled number is flat in the horizon, and why that flatness is
+        the diagnostic rather than a curiosity.
+      blocks:
+        - kind: math
+          body: |
+            Test row: features at origin $s$, target $y_{s+h}$.
+            With $k$ folds, the row at $s+1$ is in training with probability
+            $(k-1)/k$, and its target is $y_{s+h+1}$.
+
+            A local learner returns $\hat y_{s+h} \approx y_{s+h+1}$, so its
+            error is one increment:
+            $$\lvert y_{s+h+1} - y_{s+h}\rvert \approx \sigma
+              \ \text{(random walk)}, \qquad \approx \beta \ \text{(trend)}.$$
+
+            Honest $h$-step error, for a learner that cannot extrapolate:
+            $$\text{RMSE}(h) \approx \sigma\sqrt{h}
+              \ \text{(random walk)}, \qquad \approx \beta h \ \text{(trend)}.$$
+
+            Therefore the optimism factor is
+            $$\frac{\text{RMSE}_{\text{honest}}(h)}{\text{RMSE}_{\text{shuffled}}}
+              \approx \sqrt{h} \ \text{or}\ h,$$
+            and $\text{RMSE}_{\text{shuffled}}$ is approximately the one-step
+            error for every $h$.
+
+            Measured (trend, GBR): shuffled $0.642, 0.641, 0.691, 0.660$ at
+            $h = 1,3,6,12$; walk-forward $0.468, 0.650, 1.228, 2.376$.
+      checkpoint: >-
+        The shuffled score barely moved between $h = 1$ ($0.642$) and $h = 12$
+        ($0.660$) while the honest score climbed by a factor of $5.1$. What does
+        that invariance prove, independently of which model class you used?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        One harness that does the whole job: purge, walk-forward, three metrics,
+        and a horizon sweep that proves the split is honest.
+      blocks:
+        - kind: warning
+          body: >-
+            Run the horizon sweep before you trust any single number. Ask
+            whether the score moves when the task gets harder. A shuffled score
+            that is identical at $h = 1$ and $h = 12$ is not measuring $h$ at
+            all; an honest score usually worsens with $h$, and when it does not
+            — a linear model on a clean trend genuinely does forecast twelve
+            steps nearly as well as one — the two splits agree and there is
+            nothing to fix.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def lagged_rows(y, p, last_origin, h):
+                """(features at s, label y[s+h]) for p-1 <= s <= last_origin."""
+                X, t = [], []
+                for s in range(p - 1, last_origin + 1):
+                    X.append([y[s - j] for j in range(1, p + 1)])
+                    t.append(y[s + h])
+                return np.array(X), np.array(t)
+
+            def walk_forward(y, fit_predict, p=6, h=1, init=200, step=1, gap=None):
+                y = np.asarray(y, float)
+                n = y.size
+                gap = h if gap is None else gap      # NOT h - 1: y[o+1] is future
+                preds, actual = [], []
+                for origin in range(max(init, p + h), n - h, step):
+                    last_train = origin - gap
+                    if last_train - p + 1 < 3:
+                        continue
+                    Xtr, ytr = lagged_rows(y, p, last_train, h)
+                    xq = np.array([y[origin - j] for j in range(1, p + 1)])
+                    preds.append(float(fit_predict(Xtr, ytr, xq)))
+                    actual.append(y[origin + h])
+                preds, actual = np.array(preds), np.array(actual)
+                err = np.abs(preds - actual)
+                train = y[:init]
+                naive = float(np.mean(np.abs(train[h:] - train[:-h]))) if init > h else np.nan
+                return {
+                    "rmse": float(np.sqrt(np.mean(err**2))),
+                    "mae": float(np.mean(err)),
+                    "mase": float(np.mean(err) / naive) if naive and naive > 0 else float("inf"),
+                    "folds": int(err.size),
+                }
+
+            def ridge_predict(Xtr, ytr, xq, lam=1e-6):
+                A = np.column_stack([np.ones(len(Xtr)), Xtr])
+                b = np.linalg.solve(A.T @ A + lam * np.eye(A.shape[1]), A.T @ ytr)
+                return np.r_[1.0, xq] @ b
+
+            # The verification that matters: the error must grow with h.
+            # for h in (1, 3, 6, 12):
+            #     print(h, walk_forward(y, ridge_predict, p=6, h=h)["mase"])
+            # A flat sequence means the harness is leaking, not that the model
+            # is equally good at every horizon.
+        - kind: checklist
+          body: |
+            - Split respects time: every test row is forecast from strictly earlier rows
+            - Gap = h - 1 at minimum, and larger when features aggregate a window
+            - Transforms (differences, scalers, seasonal profiles) fitted on training rows only
+            - Baseline computed on the same origins and the same horizon
+            - MASE denominator from the training window, never the test window
+            - Model selection and reporting use different folds, or the reported number is a selection artefact
+
+  problems:
+    - id: p-sample-acf
+      title: "Sample autocorrelation function"
+      difficulty: easy
+      prompt: >-
+        Implement `sample_acf(x, max_lag)` for a sequence of numbers. Return a
+        list of length `max_lag + 1` where element 0 is `1.0` and element `k` is
+        the sample autocorrelation at lag $k$:
+        $\sum_{t=k}^{n-1}(x_t-\bar x)(x_{t-k}-\bar x) \big/ \sum_{t=0}^{n-1}(x_t-\bar x)^2$.
+
+        Use the standard biased estimator — divide every lag by the same total
+        sum of squares, not by a lag-specific one. If the series is constant the
+        denominator is zero: return `1.0` at lag 0 and `0.0` for every other lag.
+        Return plain Python floats.
+      starter: |
+        def sample_acf(x, max_lag):
+            # your implementation here
+            pass
+      language: python
+      entry: sample_acf
+      testCases:
+        - input: "[[1.0, 2.0, 3.0, 4.0, 5.0], 2]"
+          expected: "[1.0, 0.4, -0.1]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[5.0, 5.0, 5.0], 2]"
+          expected: "[1.0, 0.0, 0.0]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[2.0, 4.0, 1.0, 7.0, 3.0, 6.0, 5.0, 8.0], 3]"
+          expected: "[1.0, -0.22023809523809523, 0.5, -0.35119047619047616]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[1.0, -1.0, 1.0, -1.0, 1.0, -1.0], 4]"
+          expected: "[1.0, -0.8333333333333334, 0.6666666666666666, -0.5, 0.3333333333333333]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def sample_acf(x, max_lag):
+            n = len(x)
+            mean = sum(x) / n
+            dev = [v - mean for v in x]
+            denom = sum(d * d for d in dev)
+            out = [1.0]
+            for k in range(1, max_lag + 1):
+                if denom == 0.0:
+                    out.append(0.0)
+                else:
+                    out.append(sum(dev[t] * dev[t - k] for t in range(k, n)) / denom)
+            return out
+      solutionExplanation: >-
+        The denominator is the same for every lag — that is the biased estimator,
+        and it is the one whose sequence is guaranteed positive semidefinite, so
+        spectral estimators built on it cannot return negative densities. The
+        alternative, dividing lag $k$ by $\sum_{t<k}(x_t-\bar x)^2$, inflates each
+        lag by $n/(n-k)$: a factor of 2.0 at $n = 200$, $k = 100$, which is not a
+        correction but a different quantity. The alternating series is the
+        cleanest check: for $[1,-1,1,-1,1,-1]$ the mean is 0 and the sum of
+        squares is 6, so lag $k$ is just $(-1)^k (6-k)/6$ — 0.833 at lag 1,
+        0.667 at lag 2, and the signs alternate exactly as the series does. The
+        constant series is the degenerate case where every deviation is zero;
+        reporting 0 is the only defensible answer, and it is why the guard is
+        explicit rather than a division that would raise.
+      complexity: "O(n·max_lag) time, O(n) space"
+      tags: [autocorrelation, acf, diagnostics]
+
+    - id: p-mase
+      title: "Mean absolute scaled error"
+      difficulty: medium
+      prompt: >-
+        Implement `mase(y_true, y_pred, y_train, seasonality)`. Return
+        $\text{MAE}(y_{\text{true}}, y_{\text{pred}}) \big/ \text{MAE}_{\text{naive}}$,
+        where the denominator is the in-sample naive (or seasonal-naive) error
+        computed on `y_train` alone:
+        $\frac{1}{n-m}\sum_{t=m}^{n-1}\lvert y_t - y_{t-m}\rvert$ with $m$ equal
+        to `seasonality`.
+
+        If that denominator is zero — a perfectly repeating training series —
+        return `float("inf")`, since no finite error can beat a perfect baseline.
+        Return a plain float.
+      starter: |
+        def mase(y_true, y_pred, y_train, seasonality):
+            # your implementation here
+            pass
+      language: python
+      entry: mase
+      testCases:
+        - input: "[[10.0, 12.0, 13.0, 15.0, 16.0, 18.0], [10.0, 11.0, 14.0, 14.0, 17.0, 17.0], [10.0, 12.0, 13.0, 15.0, 16.0, 18.0], 1]"
+          expected: "0.5208333333333334"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[10.0, 12.0, 13.0, 15.0, 16.0, 18.0], [12.0, 10.0, 15.0, 13.0, 18.0, 16.0], [10.0, 12.0, 13.0, 15.0, 16.0, 18.0], 1]"
+          expected: "1.25"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[5.0, 7.0, 6.0, 9.0, 8.0, 11.0], [6.0, 8.0, 7.0, 10.0, 9.0, 12.0], [5.0, 7.0, 6.0, 9.0, 8.0, 11.0], 2]"
+          expected: "0.5714285714285714"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0], 1]"
+          expected: "0.0"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def mase(y_true, y_pred, y_train, seasonality):
+            n = len(y_true)
+            num = sum(abs(y_true[i] - y_pred[i]) for i in range(n)) / n
+            m = seasonality
+            denom = sum(abs(y_train[t] - y_train[t - m]) for t in range(m, len(y_train))) / (len(y_train) - m)
+            if denom == 0.0:
+                return float("inf")
+            return num / denom
+      solutionExplanation: >-
+        MASE exists because RMSE is in the units of the series and therefore
+        cannot be compared across SKUs, horizons, or datasets — and because it is
+        dominated by outliers. Dividing by the naive error makes the metric
+        scale-free and gives it an interpretation: below 1 beats the baseline,
+        above 1 loses to it. The first case is 0.8333/1.6 = 0.5208, a model
+        substantially better than naive. The second case reverses every
+        prediction and gives MAE 2.0 against the same 1.6 denominator, so 1.25 —
+        worse than doing nothing, which is exactly the signal you want. The
+        third case uses $m = 2$: the denominator averages $\lvert y_t -
+        y_{t-2}\rvert = 1, 2, 2, 2$, i.e. $1.75$, and an MAE of 1.0 gives
+        0.5714. Read the fourth case carefully — a perfect fit gives 0.0, which
+        is correct and not a bug; the *denominator* being zero is the degenerate
+        case, and it returns infinity because a model cannot improve on a
+        baseline that is already exact.
+      complexity: "O(n) time, O(1) space"
+      tags: [forecasting, metrics, mase, baselines]
+
+    - id: p-walk-forward
+      title: "Walk-forward splits with a purge"
+      difficulty: medium
+      prompt: >-
+        Implement `walk_forward_splits(n, n_splits, horizon, gap)`. Return a list
+        of `n_splits` triples `[train_end, test_start, test_end]`, all ends
+        exclusive, where the test blocks are contiguous, of length `horizon`, and
+        laid end to end so the last block ends exactly at `n`. For each block,
+        `train_end = test_start - gap`, so training uses rows `0 .. train_end-1`
+        and testing uses rows `test_start .. test_end-1`.
+
+        If `n - n_splits * horizon - gap <= 0` there is no training data for the
+        first fold: raise `ValueError`. Return integers, not floats.
+      starter: |
+        def walk_forward_splits(n, n_splits, horizon, gap):
+            # your implementation here
+            pass
+      language: python
+      entry: walk_forward_splits
+      testCases:
+        - input: "[100, 3, 10, 0]"
+          expected: "[[70, 70, 80], [80, 80, 90], [90, 90, 100]]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[100, 3, 10, 2]"
+          expected: "[[68, 70, 80], [78, 80, 90], [88, 90, 100]]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[50, 2, 5, 0]"
+          expected: "[[40, 40, 45], [45, 45, 50]]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[20, 4, 1, 3]"
+          expected: "[[13, 16, 17], [14, 17, 18], [15, 18, 19], [16, 19, 20]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def walk_forward_splits(n, n_splits, horizon, gap):
+            if n - n_splits * horizon - gap <= 0:
+                raise ValueError("no training rows left for the first fold")
+            out = []
+            for i in range(n_splits):
+                test_start = n - (n_splits - i) * horizon
+                test_end = test_start + horizon
+                out.append([test_start - gap, test_start, test_end])
+            return out
+      solutionExplanation: >-
+        Counting back from `n` is the only way to keep the last fold flush with
+        the end of the series, which is the fold you care about most — it is the
+        one whose information set matches the day you press "forecast". The
+        fourth case is the one worth reading: four folds of one row each at the
+        very end, with a gap of 3, give test starts 16, 17, 18, 19 and training
+        ends 13, 14, 15, 16. The training window therefore *grows* by one row per
+        fold, which is what an expanding walk-forward means, and the gap is what
+        stops the last training label from being a value that does not exist at
+        the forecast origin. A gap of zero always leaks, even at $h = 1$: the
+        last training row's label is then the first test row's value. With a
+        point label at horizon $h$ the gap should be $h$; with a label that
+        aggregates a window of width $w$ it should be $h + w - 1$.
+      complexity: "O(n_splits) time, O(n_splits) space"
+      tags: [walk-forward, cross-validation, time-series, purge]
+
+  visualizers:
+    - id: vs-horizon-leak
+      kind: loss_surface
+      title: "Watch the shuffled error stay flat as the horizon grows"
+      description: >-
+        Drag the horizon from 1 to 12. The walk-forward curve climbs because an
+        $h$-step error grows like $h$ on a trending series; the shuffled curve
+        does not move, because the model is retrieving a neighbouring row rather
+        than forecasting. When the two curves separate, you are looking at the
+        size of the leak.
+      params:
+        minHorizon: 1
+        maxHorizon: 12
+        mode: "shuffled-vs-walk-forward"
+
+  try_it: >-
+    Fit the same gradient-boosting model on a 360-point series with six lags twice:
+    once under shuffled 5-fold CV and once under walk-forward validation. The
+    shuffled number comes out at RMSE 0.660 — then explain why it is not a
+    forecast error before you compare it to anything.
+  interview_questions:
+    - question: "Why can't you shuffle a time series for cross-validation?"
+      level: mid
+      key_points:
+        - "The rows are not exchangeable: a series is one realisation of a process, so a random split lets the model interpolate between neighbours rather than extrapolate."
+        - "Measured: 1-NN on the row's time index alone scored $R^2 = 0.9769$ under random KFold and $-1.0470$ on an 80/20 tail split — the model is identical, the split decided everything."
+        - "With a 0.2-per-step trend and six lags, shuffled 5-fold reported RMSE 0.660 for a twelve-step-ahead forecast, which is an error for a different task."
+        - "The leak scales with the horizon: the further ahead you predict, the more a shuffled split flatters you."
+      follow_up: "Walk-forward still looks too good. What else in the pipeline could be peeking?"
+    - question: "Your ADF test returns $-1.69$ against a 5% critical value of $-2.86$. Have you shown the series is stationary?"
+      level: senior
+      key_points:
+        - "No: the ADF null is a unit root, so failing to reject is 'insufficient evidence', not evidence of stationarity."
+        - "The test has low power on short samples, and 600 daily points is short — an AR(1) with $\\varphi = 0.9$ is hard to distinguish from a random walk at that length."
+        - "The economic check is to difference and look: one difference took a 600-step random walk from standard deviation 11.64 to 0.949 and removed the visible trend."
+        - "Use a complementary test with the opposite null (KPSS) and report both, because agreement between them is the information."
+      follow_up: "You over-difference and the series now has a large negative lag-1 autocorrelation. What did you do?"
+    - question: "How do ACF and PACF tell you the orders to try?"
+      level: mid
+      key_points:
+        - "For an AR(1) with $\\varphi = 0.9$ the sample ACF was 0.910, 0.816, 0.728, 0.647, 0.568 — geometric decay at rate $\\varphi$ — while the PACF showed one spike at 0.910 and then nothing."
+        - "So the ACF identifies the MA order by cutting off, and the PACF identifies the AR order by cutting off; decay in the other plot is the mirror case."
+        - "Significance is a band of $\\pm 2/\\sqrt{n}$: $\\pm 0.063$ at $n = 1000$ and $\\pm 0.124$ at $n = 250$, so a lag-1 value of 0.11 on 250 quarterly points is indistinguishable from zero."
+        - "Seasonality shows up as oscillation rather than decay — a period-12 series gave $\\hat\\rho(1) = 0.837$, $\\hat\\rho(6) = -0.956$, $\\hat\\rho(12) = 0.938$."
+  common_mistakes:
+    - "Calling `cross_val_score(model, X, y, cv=5)` on a lagged design matrix, which reported $R^2 = 0.94$ for a model that forecasts worse than a naive baseline."
+    - "Reading a p-value above 0.05 from ADF as proof of stationarity, when the test only failed to reject a unit root."
+    - "Making RMSE the headline: one +20 error took it from 0.381 to 1.354 while MAE moved only 0.306 → 0.390."
+  further_reading:
+    - label: "Box, Jenkins, Reinsel & Ljung, Time Series Analysis: Forecasting and Control"
+    - label: "Hyndman & Athanasopoulos, Forecasting: Principles and Practice"
+      url: "https://otexts.com/fpp3/"

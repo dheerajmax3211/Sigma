@@ -1,0 +1,1487 @@
+id: score-based-matching
+slug: score-based-matching
+title: "Score-Based Matching and SDEs"
+summary: >-
+  A score model learns the gradient of the log-density, so the partition function
+  cancels out of the objective and out of the network's job. That one vector field
+  gives you denoising score matching (a regression on the noise you already
+  predict), Tweedie's denoiser, Anderson's reverse SDE (whose Euler step is
+  DDPM), and the probability-flow ODE (whose first-order integrator is DDIM).
+kind: lesson
+difficulty: hard
+position: 4
+estMinutes: 29
+prerequisites: [diffusion-models, matrix-calculus]
+phase: vision-foundations
+tags:
+  - score-matching
+  - score-function
+  - sde
+  - probability-flow-ode
+  - tweedie
+  - denoising-score-matching
+  - langevin
+  - likelihood
+  - ddim
+  - sampler
+
+body:
+  big_idea: >-
+    A diffusion model learns the gradient of the log-density, not the density:
+    the normaliser becomes irrelevant, the sampler is a choice of integrator,
+    and noise prediction is score matching in other units.
+
+  problem:
+    - >-
+      You inherit a noise-predicting checkpoint and a paper written in scores,
+      with the opposite sign and an unexplained square root.
+    - >-
+      Your normaliser is an integral over 12,288 dimensions, and "the gradient
+      kills the partition function" moves the difficulty into a Jacobian trace
+      you cannot afford.
+    - >-
+      You want to condition on an inpainting mask and every recipe says "add a
+      term to the score", without saying why addition is right.
+
+  analogy: |
+    A hiker in fog with an altimeter that reads slope and nothing else. At
+    every point they feel which way is uphill in probability and how steep,
+    which is enough to walk to a summit — no map, no idea how many summits
+    exist, no idea how tall. Sampling is that walk backwards, with a shove at
+    every step so the hiker does not wedge against a wall.
+
+  concept_points:
+    - >-
+      **The score is a vector field, and the partition function is a constant as far as it is concerned.**
+      With $p = \tilde p/Z$ and $Z$ free of $x$,
+      $\nabla\log p = \nabla\log\tilde p$. Scaling the density by $10^{-30}$
+      moves $\log p$ by **-69.078** and leaves all 12,288 derivatives fixed.
+      But the field's scale is not free: for a Gaussian
+      $s = \Sigma^{-1}(x-\mu)$ gives **-100** at $\sigma = 0.01$.
+    - >-
+      **Deleting $Z$ does not make the objective computable, because the gradient of a density you cannot evaluate is still a density you cannot evaluate.**
+      Hyvärinen's integration by parts gives
+      $\mathbb{E}_p[\tfrac12\|s_\theta\|^2 + \operatorname{tr}\nabla_x s_\theta]$
+      — no $Z$, but a trace over a $12{,}288 \times 12{,}288$ Jacobian. A
+      Hutchinson estimator has relative standard deviation $\sqrt{2/d}$:
+      measured **1.272%** at $d = 12{,}288$ against 1.276% predicted, and
+      every probe is another backward pass.
+    - >-
+      **Denoising score matching replaces the trace with a regression whose target you can write down in one line.**
+      Conditioning on a clean $x_0$, the kernel's score is
+      $-(x_t-\sqrt{\bar\alpha_t}x_0)/(1-\bar\alpha_t)$ — no $\theta$ in it, no
+      network needed. Regressing on it is exact:
+      $\mathbb{E}_{q(x_t\mid x_0)}[\nabla\log q(x_t\mid x_0)\mid x_t] = \nabla\log p_t(x_t)$,
+      checked by quadrature on a two-mode mixture over 1001 grid points to
+      **$3.3\times10^{-6}$**. One target, zero extra backward passes.
+    - >-
+      **The VP kernel turns the conversion into a square root: $\epsilon_\theta = -\sqrt{1-\bar\alpha_t}\,s_\theta$.**
+      With $x_t = \sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\epsilon$ the
+      conditional score is $-\epsilon/\sqrt{1-\bar\alpha_t}$, so the score
+      target is the noise target divided by $\sigma_t$. At $t=1$ that divisor
+      is **0.010000** and the score target's standard deviation is **100.0**;
+      at $t=1000$ it is 0.999980 and 1.0000 — a 100x spread in the units the
+      network emits.
+    - >-
+      **The two losses are one loss under a per-timestep weight, and that weight is the whole design space.**
+      Pointwise,
+      $\|\epsilon-\epsilon_\theta\|^2 = (1-\bar\alpha_t)\|s-s_\theta\|^2$, so
+      plain noise MSE *is* denoising score matching with weight
+      $(1-\bar\alpha_t)$: **$1.000\times10^{-4}$** at $t=1$ to **0.999960** at
+      $t=1000$. Over the linear schedule that weight sums to **724.49** rather
+      than 1000, and the first hundred steps carry 3.704 against the last
+      hundred's 99.988 — a 27.0x asymmetry.
+    - >-
+      **Scores add, which is why conditioning is one line and why guidance works at all.**
+      $\nabla\log p(x\mid y) = \nabla\log p(x) + \nabla\log p(y\mid x)$; for a
+      linear Gaussian measurement $y = Ax + \sigma_n n$ the second term is
+      $\frac{1}{\sigma_n^2}A^\top(y-Ax)$ — no classifier, no retraining.
+      Measured with $\sigma_n = 0.05$, that term's magnitude is **480.0**
+      where the prior's whole score is 0.745: a 645x ratio.
+
+  definitions:
+    - term: "Score function"
+      meaning: >-
+        $s(x) = \nabla_x \log p(x)$, the gradient of the log-density with respect
+        to the state. It is a vector field of the same shape as $x$, it is
+        undefined where $p = 0$, and it is invariant to any constant rescaling of
+        $p$ because the gradient kills the normaliser.
+    - term: "Explicit score matching"
+      meaning: >-
+        Hyvärinen's objective $\mathbb{E}_p[\tfrac12\|s_\theta\|^2 +
+        \operatorname{tr}\nabla_x s_\theta]$, which removes the partition function
+        by integrating by parts but replaces it with the trace of the network's
+        Jacobian — $d$ numbers per example, estimated by Hutchinson probes.
+    - term: "Denoising score matching"
+      meaning: >-
+        The objective $\mathbb{E}_{x_0}\mathbb{E}_{q(x_t\mid x_0)}
+        \|s_\theta(x_t,t) - \nabla_{x_t}\log q(x_t\mid x_0)\|^2$. It needs no
+        trace and no normaliser, its target is closed-form for a Gaussian kernel,
+        and it has the same minimiser as explicit score matching because the two
+        differ by a constant that contains no parameters.
+    - term: "Tweedie's formula"
+      meaning: >-
+        $\mathbb{E}[x_0\mid x_t] = (x_t + \sigma_t^2\,\nabla\log p_t)/\sqrt{\bar\alpha_t}$,
+        with $\sigma_t^2 = 1-\bar\alpha_t$. It converts a score into the
+        minimum-mean-squared-error denoised estimate, which is the identity that
+        makes "the network predicts noise" and "the network is a denoiser" the
+        same statement.
+    - term: "Partition function"
+      meaning: >-
+        $Z = \int \tilde p(x)\,dx$, the normaliser. It is the reason maximum
+        likelihood is intractable for an unnormalised model, and it is exactly
+        what the score deletes: $\nabla\log p = \nabla\log\tilde p$ pointwise,
+        with no integration anywhere.
+    - term: "VP-SDE"
+      meaning: >-
+        The variance-preserving forward process $dx = -\tfrac12\beta(t)x\,dt +
+        \sqrt{\beta(t)}\,dw$ on $t\in[0,1]$. Its marginals are
+        $\mathcal{N}(\sqrt{\bar\alpha_t}x_0, (1-\bar\alpha_t)I)$ with
+        $\bar\alpha_t = e^{-\int_0^t\beta}$, which is the continuous limit of the
+        discrete schedule from *Diffusion Models*.
+    - term: "Reverse-time SDE"
+      meaning: >-
+        Anderson's time reversal, $dx = [f - g^2\nabla\log p_t]\,dt +
+        g\,d\bar w$, run with a negative time step. It has the same marginals as
+        the forward process, traversed in the opposite direction, and it is the
+        object DDPM's ancestor sampler discretises.
+    - term: "Probability-flow ODE"
+      meaning: >-
+        $\frac{dx}{dt} = f - \tfrac12 g^2\nabla\log p_t$. Same marginals, no
+        noise, deterministic and invertible map. It is what DDIM integrates, and
+        it is the only one of the two that supports exact likelihoods via the
+        instantaneous change of variables.
+    - term: "NFE"
+      meaning: >-
+        Number of function evaluations — how many times the network is called to
+        produce one sample. The honest unit for comparing samplers, because a
+        Heun step costs two calls and an Euler step costs one; a 20-step Heun
+        sampler and a 40-step Euler sampler are the only fair comparison.
+    - term: "Predictor-corrector"
+      meaning: >-
+        A sampler that alternates one step of a numerical SDE or ODE solver (the
+        predictor) with one or more Langevin steps at fixed $t$ (the corrector),
+        $x \leftarrow x + \epsilon s_\theta(x,t) + \sqrt{2\epsilon}\,z$. The
+        corrector pulls the sample back onto the correct marginal, and it has its
+        own step-size bias: stationary variance
+        $2\epsilon/(1-(1-\epsilon/v)^2)$, which is $+3.16\%$ in standard deviation
+        at $\epsilon = 0.5$ and $v = 4$.
+
+  diagrams:
+    - type: graph
+      title: "One field, and everything read off it"
+      nodes:
+        - { id: score, label: "score s(x,t) = grad log p_t(x)" }
+        - { id: dsm, label: "denoising score matching" }
+        - { id: eps, label: "noise predictor eps_theta" }
+        - { id: tweedie, label: "Tweedie denoiser E[x0 | x_t]" }
+        - { id: sde, label: "reverse-time SDE" }
+        - { id: ode, label: "probability-flow ODE" }
+        - { id: ddpm, label: "DDPM ancestor step" }
+        - { id: ddim, label: "DDIM step" }
+        - { id: like, label: "exact log-likelihood" }
+        - { id: guide, label: "guidance and inpainting" }
+      edges:
+        - { from: dsm, to: score, label: "regresses on minus eps over sigma" }
+        - { from: score, to: eps, label: "eps = -sigma s" }
+        - { from: eps, to: dsm, label: "same regression, other units" }
+        - { from: score, to: tweedie, label: "x0 = (x + sigma^2 s) / sqrt(ab)" }
+        - { from: score, to: sde, label: "Anderson reversal" }
+        - { from: score, to: ode, label: "drop noise, halve the score term" }
+        - { from: sde, to: ddpm, label: "Euler-Maruyama, dt = 1" }
+        - { from: ode, to: ddim, label: "first-order integrator" }
+        - { from: ode, to: like, label: "change of variables" }
+        - { from: score, to: guide, label: "scores add" }
+
+    - type: compare
+      title: "Reverse SDE or probability-flow ODE: same marginals, different price"
+      left_label: "Reverse-time SDE"
+      left_points:
+        - "Drift 0.5 b x + b s: the score term carries the full g^2"
+        - "Fresh noise every step, so two runs from the same start differ"
+        - "Euler-Maruyama at 10 steps is 4.019% high in std; 0.410% at 100"
+        - "Its discretisation error is random and partly self-correcting, which is why correctors help"
+        - "Correct the drift error with Langevin steps at fixed t, at the cost of one call each"
+        - "No likelihood: the map is not invertible"
+      right_label: "Probability-flow ODE"
+      right_points:
+        - "Drift 0.5 b x + 0.5 b s: the score term is halved and no noise is added"
+        - "Deterministic: the same x_T gives the same x_0 bit for bit"
+        - "Euler at 10 steps is 4.593% low in std; Heun at 20 calls is 0.971% low"
+        - "Error is a smooth bias, so a higher-order solver attacks it directly"
+        - "Integrates with any ODE solver: Euler, Heun, RK45, all reusing one score network"
+        - "Exact log-likelihood via the divergence integral along the trajectory"
+
+    - type: plot
+      title: "Measured sampler error against network evaluations"
+      chart: line
+      xLabel: "network evaluations (NFE)"
+      yLabel: "sample standard deviation (target 2.0)"
+      series:
+        - name: "Euler, probability flow"
+          points:
+            - { x: 5, y: 1.80849 }
+            - { x: 10, y: 1.90814 }
+            - { x: 20, y: 1.95494 }
+            - { x: 40, y: 1.97766 }
+            - { x: 100, y: 1.99111 }
+            - { x: 200, y: 1.99556 }
+            - { x: 400, y: 1.99778 }
+            - { x: 1000, y: 1.99911 }
+        - name: "Heun, probability flow"
+          points:
+            - { x: 5, y: 1.55764 }
+            - { x: 10, y: 1.91662 }
+            - { x: 20, y: 1.98059 }
+            - { x: 40, y: 1.99548 }
+            - { x: 100, y: 1.99932 }
+            - { x: 200, y: 1.99983 }
+            - { x: 400, y: 1.99996 }
+            - { x: 1000, y: 1.99999 }
+        - name: "Euler-Maruyama, reverse SDE"
+          points:
+            - { x: 5, y: 2.19609 }
+            - { x: 10, y: 2.08038 }
+            - { x: 20, y: 2.04037 }
+            - { x: 40, y: 2.02037 }
+            - { x: 100, y: 2.00820 }
+            - { x: 200, y: 2.00411 }
+            - { x: 400, y: 2.00206 }
+            - { x: 1000, y: 2.00082 }
+        - name: "true standard deviation"
+          points:
+            - { x: 5, y: 2.0 }
+            - { x: 1000, y: 2.0 }
+
+    - type: plot
+      title: "The epsilon-to-score conversion factor is not a constant"
+      chart: line
+      xLabel: "timestep t (linear schedule, T = 1000)"
+      yLabel: "weight 1 - alpha_bar_t"
+      series:
+        - name: "weight that turns a score error into an eps error"
+          points:
+            - { x: 1, y: 0.0001 }
+            - { x: 10, y: 0.0018948 }
+            - { x: 50, y: 0.0289843 }
+            - { x: 100, y: 0.102982 }
+            - { x: 250, y: 0.475915 }
+            - { x: 500, y: 0.921413 }
+            - { x: 750, y: 0.996649 }
+            - { x: 1000, y: 0.999960 }
+
+    - type: pipeline
+      title: "From a trained noise predictor to a sampler, with no retraining"
+      nodes:
+        - label: "eps_theta(x_t, t) at 1000 noise levels"
+          note: "the only trained object"
+          detail: "One network, one loss. Every stage below reuses these weights; nothing is fine-tuned per sampler."
+        - label: "divide by sqrt(1 - alpha_bar_t)"
+          note: "now it outputs a score"
+          detail: "At t = 1 the divisor is 0.010000, so a score error is 100x the eps error. At t = 1000 it is 0.999980."
+        - label: "Anderson reversal: add g^2 s to the forward drift"
+          note: "the process now runs backwards"
+          detail: "For the VP SDE the reverse drift in reverse time is 0.5 b x + b s, with b = beta(t)."
+        - label: "branch A: keep the noise"
+          note: "reverse-time SDE"
+          detail: "Euler-Maruyama with dt = 1 in the discrete index reproduces DDPM's ancestor step to 2.5e-4 relative at the noisiest step."
+        - label: "branch B: drop the noise, halve the score term"
+          note: "probability-flow ODE"
+          detail: "Same marginals, deterministic map. DDIM is its first-order integrator; Heun or RK45 need the same one network."
+        - label: "spend the NFE budget"
+          note: "solver order first, then steps, then correctors"
+          detail: "Heun at 20 calls is 0.971% low where Euler at 20 calls is 2.253% low. Below 10 calls the ordering reverses."
+
+  markdown: |
+    ## A field, not a density
+
+    Take the forward process from *Diffusion Models* as given — one line, no
+    re-derivation:
+
+    $$q(x_t \mid x_0) = \mathcal{N}\!\left(\sqrt{\bar\alpha_t}\,x_0,\;
+      (1-\bar\alpha_t)I\right).$$
+
+    The object this topic is about is the gradient of its log-density with
+    respect to the *state*, not the parameters:
+
+    $$s_t(x) = \nabla_x \log p_t(x).$$
+
+    This is the operator from *Matrix Calculus* — a scalar field differentiated
+    with respect to a vector, giving a field of the same shape as $x$ — and the
+    same one that appears in *Probability Distributions* as the derivative of a
+    log-density. For a Gaussian it is the Mahalanobis solve
+    $s(x) = -\Sigma^{-1}(x-\mu)$. For a mixture it is the posterior-weighted
+    average of the component scores, which is Bayes' rule applied to gradients:
+    at the midpoint of a $0.7/0.3$ mixture of two $\sigma = 0.4$ bumps at
+    $\pm1.5$, each component pulls with magnitude $9.375$ and the resulting
+    field is $-3.75$ — the difference of the two pulls, not either of them.
+
+    Three properties carry everything. It is a *field*: one vector per point,
+    defined without reference to any sample. It is *free of the normaliser*,
+    because $\log p = \log\tilde p - \log Z$ and $Z$ has no $x$ in it. And its
+    *magnitude is $1/\sigma$*, so it means nothing without the noise level it was
+    evaluated at.
+
+    ## Where the normaliser goes, and where the difficulty goes instead
+
+    The pitch is that the partition function disappears:
+
+    $$\nabla_x\log p(x) = \nabla_x\log\frac{\tilde p(x)}{Z}
+      = \nabla_x\log\tilde p(x) - \underbrace{\nabla_x\log Z}_{=\,0}.$$
+
+    True, and not the end of the story. Hyvärinen's integration by parts gives an
+    objective that also never evaluates a density:
+
+    $$J_{\mathrm{ESM}}(\theta) = \mathbb{E}_{p}\!\left[
+      \tfrac12\|s_\theta(x)\|^2 + \operatorname{tr}\nabla_x s_\theta(x)\right].$$
+
+    The trace is $d$-dimensional: a $12{,}288 \times 12{,}288$ Jacobian for a
+    $3\times64\times64$ image. Hutchinson probes give it unbiasedly at a relative
+    error of $\sqrt{2/d} = 1.28\%$ each — and each probe is a vector-Jacobian
+    product, one more backward pass. The intractable integral was traded for an
+    intractable trace.
+
+    | Quantity | Cost | Why it is not the answer |
+    |---|---|---|
+    | $\log Z$ | one integral over $\mathbb{R}^d$ | no closed form, no unbiased estimator |
+    | $\operatorname{tr}\nabla_x s_\theta$ | one VJP per probe | $1.28\%$ error per probe at $d = 12{,}288$ |
+    | $\nabla\log q(x_t\mid x_0)$ | one line of algebra | nothing — this is the way out |
+
+    ## The lemma that makes the cheap objective exact
+
+    Condition on the clean image. The kernel is Gaussian, so its score is
+    available with no network, no trace and no normaliser:
+
+    $$\nabla_{x_t}\log q(x_t\mid x_0)
+      = -\frac{x_t - \sqrt{\bar\alpha_t}\,x_0}{1-\bar\alpha_t}.$$
+
+    Regressing on that target is not a heuristic. The conditional score depends
+    on both variables, and $\nabla_{x_t}\log q(x_t\mid x_0) = \nabla_{x_t}\log q(x_t,x_0)$
+    because $\log q(x_0)$ has no $x_t$ in it. So
+
+    $$\int \nabla_{x_t}\log q(x_t,x_0)\,q(x_0\mid x_t)\,dx_0
+      = \frac{1}{p_t(x_t)}\int \nabla_{x_t}q(x_t,x_0)\,dx_0
+      = \nabla_{x_t}\log p_t(x_t),$$
+
+    which is the tower property doing its job: the conditional score, averaged
+    over the posterior of $x_0$ given $x_t$, is the marginal score. Quadrature on
+    the mixture agrees to $3.3\times10^{-6}$. Expand the square and the cross
+    term becomes $-2\,s_\theta^\top\nabla\log p_t$, exactly the cross term of the
+    explicit objective; the leftover
+    $\mathbb{E}\|\nabla\log q\|^2 - \mathbb{E}\|\nabla\log p_t\|^2$ has no
+    $\theta$ in it. Same minimiser, one backward pass, no $d$-dimensional trace.
+
+    ## The bridge to the network you already trained
+
+    Substitute $x_t - \sqrt{\bar\alpha_t}x_0 = \sqrt{1-\bar\alpha_t}\,\epsilon$
+    into the conditional score:
+
+    $$\nabla_{x_t}\log q(x_t\mid x_0) = -\frac{\epsilon}{\sqrt{1-\bar\alpha_t}}
+      \qquad\Longrightarrow\qquad
+      \epsilon_\theta = -\sqrt{1-\bar\alpha_t}\;s_\theta.$$
+
+    So epsilon-prediction *is* score prediction, and the loss you already run is
+    score matching with a weight:
+
+    $$\|\epsilon - \epsilon_\theta\|^2
+      = (1-\bar\alpha_t)\,\|s - s_\theta\|^2.$$
+
+    | $t$ | $\bar\alpha_t$ | $\sqrt{1-\bar\alpha_t}$ | score-target std | $1-\bar\alpha_t$ |
+    |---|---|---|---|---|
+    | 1 | 0.99990 | 0.010000 | 100.0 | $1.000\times10^{-4}$ |
+    | 100 | 0.89702 | 0.32091 | 3.116 | 0.10298 |
+    | 250 | 0.52409 | 0.68987 | 1.450 | 0.47591 |
+    | 500 | 0.078587 | 0.95990 | 1.042 | 0.92141 |
+    | 1000 | $4.0358\times10^{-5}$ | 0.99998 | 1.000 | 0.99996 |
+
+    The weight is not a detail. Summed over the chain it totals $724.49$ instead
+    of $1000$, and the first hundred steps carry $3.704$ of it against the last
+    hundred's $99.988$ — a 27.0× asymmetry in what the "simple" loss actually
+    asks for. Tweedie's formula closes the loop by giving the denoiser:
+
+    $$\mathbb{E}[x_0\mid x_t] = \frac{x_t + (1-\bar\alpha_t)\nabla\log
+      p_t(x_t)}{\sqrt{\bar\alpha_t}},$$
+
+    which is the same function again, and which holds to $8.9\times10^{-16}$ on
+    the mixture when the score is exact and errs by $1.155$ when it is a single
+    Gaussian fitted to the same marginal.
+
+    ## Time reversal
+
+    For a forward SDE $dx = f\,dt + g\,dw$ with marginals $p_t$, Anderson's
+    reversal is
+
+    $$dx = \left[f(x,t) - g(t)^2\nabla_x\log p_t(x)\right]dt + g(t)\,d\bar w,$$
+
+    run with a negative time step. For the VP choice $f = -\tfrac12\beta x$ and
+    $g = \sqrt{\beta}$, the reverse-time drift in $s = 1-t$ is
+
+    $$\frac{dx}{ds} = \tfrac12\beta x + \beta\, s_\theta(x,t).$$
+
+    Discretise with a step of $\Delta s = 1$ and you have
+
+    $$x \leftarrow x + \tfrac12\beta x + \beta s_\theta + \sqrt{\beta}\,z,$$
+
+    which is DDPM's ancestor step after expanding
+    $1/\sqrt{\alpha} = 1 + \tfrac{\beta}{2} + O(\beta^2)$: measured relative
+    difference $2.5\times10^{-4}$ at
+    $\beta = 0.02$ and $6.3\times10^{-9}$ at $\beta = 10^{-4}$. The thousand-step
+    chain was never a different process; it was this one, integrated badly enough
+    to be called a chain.
+
+    ## Two samplers, one field
+
+    Removing the noise and halving the score term gives the probability-flow ODE
+
+    $$\frac{dx}{dt} = f - \tfrac12 g^2\nabla\log p_t
+      \quad\Longleftrightarrow\quad
+      \frac{dx}{ds} = \tfrac12\beta x + \tfrac12\beta s_\theta,$$
+
+    which has the same Fokker–Planck equation and therefore the same marginals at
+    every $t$, with a deterministic map. Determinism buys two things: any ODE
+    solver can be pointed at it, and the likelihood is exact,
+
+    $$\log p_0(x_0) = \log p_T(x_T) - \int_0^T \nabla\cdot f_t(x_t)\,dt.$$
+
+    Measured on a linear Gaussian problem with $v_0 = 4$, both sides of that
+    identity are $-1.612086$, with $\log c = 0.693082$; a sign error gives
+    $-0.225921$, wrong by $1.386 = 2\log c$.
+
+    | NFE | Euler, std | Heun, std | Euler-Maruyama, std | exact |
+    |---|---|---|---|---|
+    | 10 | 1.90814 | 1.91662 | 2.08038 | 2.0 |
+    | 20 | 1.95494 | 1.98059 | 2.04037 | 2.0 |
+    | 40 | 1.97766 | 1.99548 | 2.02037 | 2.0 |
+    | 100 | 1.99111 | 1.99932 | 2.00820 | 2.0 |
+    | 1000 | 1.99911 | 1.99999 | 2.00082 | 2.0 |
+
+    Two things to read off it. The deterministic samplers err *low* and the
+    stochastic one errs *high* at the same budget, so "the samples look flat" and
+    "the samples look blown out" are diagnostics of which one you ran. And Heun
+    is not automatically better: at 5 evaluations it is $22.12\%$ off against
+    Euler's $9.576\%$, because a second-order method needs to be inside its
+    asymptotic regime before the extra order pays.
+
+    ## What the field cannot tell you
+
+    A score gives you the direction of increasing probability and nothing about
+    magnitude in absolute terms, so two disconnected modes cannot be compared
+    without integrating the divergence between them. It is undefined wherever the
+    density vanishes. And it belongs to one marginal, so two scores from
+    different noise schedules add to a field that is not the gradient of anything.
+
+    ## The longer version
+
+    A diffusion model never learns a distribution — it learns the gradient field
+    of the log-density, and once you have that field the normaliser is irrelevant,
+    the sampler is a choice of ODE or SDE integrator, and the noise-prediction
+    loss you already train is the score-matching objective written in different
+    units.
+
+    A hiker in fog with an altimeter that reads slope and nothing else. At every
+    point they can feel which way is uphill in probability and how steep it is,
+    which is enough to walk to a summit: no map, no idea how many summits exist,
+    and no idea how tall any of them are. Sampling from a score model is that
+    walk run backwards — start at a random point in the fog and follow the slope
+    downhill in probability, with a shove at every step so the hiker does not
+    wedge against a wall.
+
+    The analogy breaks in three places, and all three are this topic. First,
+    slope carries no height: you can find the summits but you cannot rank them,
+    so a score gives you samples and not likelihoods unless you also track the
+    divergence along the path. Second, on the ridge between two equally tall
+    peaks the slope is exactly zero, so a pure walk stops in the emptiest place
+    in the space — which is why the sampler is an SDE and not a gradient ascent.
+    Third, the altimeter reads the slope of the landscape *at the fog level you
+    are standing in*: the same map at a different noise level is a different
+    landscape, so every reading must be labelled with the level it was taken at.
+
+    ### What goes wrong
+
+    - You inherit a checkpoint that predicts noise and a paper written
+      entirely in scores, with the opposite sign and an unexplained square
+      root. You cannot tell whether you need to retrain, negate, rescale, or
+      all three — and the wrong choice produces samples that look merely "a
+      bit off" rather than broken, so nothing in the stack tells you.
+    - Your normaliser is an integral over 12,288 dimensions and maximum
+      likelihood is off the table. "The gradient kills the partition function"
+      sounds like a trick until you discover that the difficulty did not
+      disappear, it moved into a trace of a Jacobian you cannot afford either.
+    - Product wants four network calls per image and you have a thousand.
+      Every fast-sampler paper turns out to be an ODE-solver paper in
+      disguise, and you cannot map "Heun", "predictor-corrector" or
+      "probability flow" onto a U-Net that outputs epsilon.
+    - You want a likelihood, not a sample. The ELBO is a bound, and you cannot
+      tell whether the gap is the looseness of the bound or the quality of the
+      model; the probability-flow ODE hands you an exact number and you do not
+      know why it is allowed to.
+    - You want to condition on a measurement — an inpainted region, a class
+      label, a physics forward model — and every recipe says "add a term to
+      the score". You do not know why addition is the right operation, or when
+      the two things you are adding stop being commensurable.
+
+    ### The full treatment
+
+    **The score is a vector field, and the partition function is a constant as
+    far as it is concerned.** Write $s(x) = \nabla_x \log p(x)$; with
+    $p = \tilde p / Z$ and $Z = \int \tilde p$ free of $x$, the chain rule gives
+    $\nabla \log p = \nabla \log \tilde p - \nabla \log Z = \nabla \log \tilde
+    p$. Scaling an unnormalised density by $10^{-30}$ moves $\log p$ by
+    $-69.078$ and leaves every one of its 12,288 partial derivatives exactly
+    where it was. That is the whole reason the framework exists: the object
+    that makes maximum likelihood intractable is annihilated by the derivative.
+    But the field's *scale* is not free either — for a Gaussian it is
+    $\Sigma^{-1}(x-\mu)$, so at $\sigma = 0.01$ a point one standard deviation
+    from the mean has score $-100$, and at $\sigma = 10$ the same displacement
+    has score $-0.1$. A factor of 1000 between two noise levels. The trap is
+    reading score magnitude as confidence: it is $1/\sigma$ first and
+    information second.
+
+    **Deleting $Z$ does not make the objective computable, because the gradient
+    of a density you cannot evaluate is still a density you cannot evaluate.**
+    Hyvärinen's integration by parts gives
+    $\mathbb{E}_p[\tfrac12\|s_\theta\|^2 + \operatorname{tr}\nabla_x
+    s_\theta]$ — no $Z$, but the trace of the network's Jacobian, which is
+    $12{,}288 \times 12{,}288$ for a $3\times64\times64$ image. A Hutchinson
+    estimator with Gaussian probes is unbiased and has relative standard
+    deviation $\sqrt{2/d}$: measured at $d = 12{,}288$ over 2000 probes it is
+    $1.272\%$ against the predicted $1.276\%$. And every probe is a
+    vector-Jacobian product, i.e. another backward pass through the U-Net. So
+    explicit score matching is not wrong, it is expensive and noisy in exactly
+    the dimension images live in. The trap is thinking the trace is a
+    formality: it carries all the curvature, and dropping it leaves
+    $\tfrac12\|s_\theta\|^2$, whose minimum is the zero field.
+
+    **Denoising score matching replaces the trace with a regression whose
+    target you can write down in one line.** Condition on a clean $x_0$: the
+    kernel is Gaussian, so $\nabla_{x_t}\log q(x_t\mid x_0) =
+    -(x_t-\sqrt{\bar\alpha_t}x_0)/(1-\bar\alpha_t)$ has no $\theta$ in it and
+    needs no network to evaluate. Regressing on it is exact because of one
+    lemma: $\mathbb{E}_{q(x_t\mid x_0)}[\nabla_{x_t}\log q(x_t\mid x_0)\mid
+    x_t] = \nabla_{x_t}\log p_t(x_t)$. Checked by quadrature on a two-mode
+    mixture over 1001 grid points, the two sides agree to $3.3\times10^{-6}$,
+    which is quadrature error and not identity error. The consequence: the
+    objective differs from explicit score matching by
+    $\mathbb{E}\|\nabla\log q\|^2 - \mathbb{E}\|\nabla\log p_t\|^2$, which has
+    no $\theta$ in it, so the minimisers coincide. One target, zero extra
+    backward passes. The trap is the word "denoising" — the network is not
+    being taught to remove noise, it is being taught to report the gradient of
+    a Gaussian, which happens to be proportional to the noise.
+
+    **The VP kernel turns the conversion into a square root:
+    $\epsilon_\theta = -\sqrt{1-\bar\alpha_t}\,s_\theta$.** With
+    $x_t = \sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\epsilon$ the
+    conditional score is $-\epsilon/\sqrt{1-\bar\alpha_t}$, so the score target
+    is the noise target divided by $\sigma_t = \sqrt{1-\bar\alpha_t}$. At
+    $t=1$ that divisor is $0.010000$ and the score target has standard
+    deviation $100.0$; at $t=1000$ it is $0.999980$ and the target's standard
+    deviation is $1.0000$ — a 100× spread in the units the network is asked to
+    emit. That is the entire content of "epsilon-prediction is score
+    prediction": same weights, one scale factor per timestep. The trap runs in
+    reverse when you convert a checkpoint: multiplying an epsilon error by
+    $1/\sigma_t$ means an error of $0.01$ at $t=1$ becomes a score error of
+    $1.0$, which is 100× the score error the same model makes at $t=1000$.
+
+    **The two losses are one loss under a per-timestep weight, and that weight
+    is the entire design space.** Pointwise,
+    $\|\epsilon-\epsilon_\theta\|^2 = (1-\bar\alpha_t)\|s-s_\theta\|^2$. So
+    training on plain noise MSE *is* denoising score matching with weight
+    $(1-\bar\alpha_t)$, which runs from $1.000\times10^{-4}$ at $t=1$ to
+    $0.999960$ at $t=1000$. Over the 1000-step linear schedule that weight sums
+    to $724.49$ rather than $1000$, and it is distributed with a 27.0×
+    asymmetry: the first hundred steps carry $3.704$ and the last hundred
+    $99.988$. Every published objective is a choice of this weight — the
+    ELBO's $\beta_t^2/(2\sigma_t^2\alpha_t(1-\bar\alpha_t))$, the "simple"
+    loss's 1, the min-SNR weights — and none of them changes what the network
+    represents, only where it spends capacity. The trap is believing you are
+    choosing between objectives: a weighting that is too flat at small $t$
+    leaves the clean end of the field unlearned, which shows up later as a
+    sampler that cannot resolve fine detail.
+
+    **Tweedie's formula: the optimal denoiser and the score are the same
+    function.**
+    $\mathbb{E}[x_0\mid x_t] = (x_t + (1-\bar\alpha_t)\nabla\log p_t(x_t))/\sqrt{\bar\alpha_t}$.
+    On the two-mode mixture this holds to
+    $8.9\times10^{-16}$ over 1001 grid points — float round-off — while a
+    single Gaussian fitted to the same marginal and pushed through the same
+    formula errs by $1.155$ at the worst point, because the true score is
+    bimodal and no affine field is. So every "predict $x_0$" network is a score
+    network and every "predict $\epsilon$" network is a denoiser: three
+    parameterisations, one function. The trap is the posterior mean itself. For
+    a mixture, $\mathbb{E}[x_0\mid x]$ is not $\sum_i w_i\mu_i$ over the
+    posterior weights $w_i$; each component's mean is first shrunk toward $x$
+    by $\sigma_i^2/(\sigma_i^2+\sigma_n^2) = 0.6098$ on this mixture. Dropping
+    that shrinkage errs by $0.9756$ on the same grid, which is exactly the
+    mistake that makes a hand-written Tweedie check look like the formula is
+    false.
+
+    **Anderson's reversal turns the forward SDE into a sampler, and DDPM's
+    ancestor step is its Euler–Maruyama discretisation at $\Delta t = 1$.**
+    For $dx = f\,dt + g\,dw$ the reverse-time process is
+    $dx = [f - g^2\nabla\log p_t]\,dt + g\,d\bar w$ with $dt$ a negative
+    increment; for the VP choice $f = -\tfrac12\beta x$, $g = \sqrt\beta$,
+    written in reverse time $s$ that is
+    $\frac{dx}{ds} = +\tfrac12\beta x + \beta s_\theta(x,t)$. DDPM's update in
+    score form is $x_{t-1} = (x_t + \beta_t s_\theta)/\sqrt{\alpha_t}$, and
+    $1/\sqrt\alpha = 1 + \tfrac\beta2 + O(\beta^2)$, so the two maps agree to
+    $2.5\times10^{-4}$ relative at the noisiest step ($\beta = 0.02$) and to
+    $6.3\times10^{-9}$ at $t=1$. Nothing was re-derived: the thousand-step
+    chain was always one SDE, discretised with a step of 1 in the index. The
+    trap is treating the two schedules as interchangeable — the discrete
+    $\beta_t$ and the continuous $\beta(t)$ differ by the time rescaling that
+    produced them, and mixing them mismatches every noise level by a constant.
+
+    **Dropping the noise and halving the score term gives an ODE with the same
+    marginals.** $\frac{dx}{dt} = f - \tfrac12 g^2\nabla\log p_t$, which in
+    reverse time is $\frac{dx}{ds} = \tfrac12\beta x + \tfrac12\beta
+    s_\theta$: the same continuity equation, hence the same $p_t$ at every $t$,
+    but a deterministic and invertible map. That is what makes exact likelihoods
+    possible, $\log p_0(x_0) = \log p_T(x_T) - \int_0^T \nabla\cdot f_t\,dt$,
+    and on the linear Gaussian problem with $v_0 = 4$ both sides are
+    $-1.612086$ with the Jacobian $\log c = 0.693082$ entering with a minus
+    sign. Get that sign wrong and you get $-0.225921$, off by $1.386 = 2\log
+    c$. The trap is calling the ODE an approximation. It is exact in continuous
+    time and cheaper than the SDE at equal accuracy, which is why the 2.20
+    CIFAR-10 FID in the original paper came from predictor-corrector sampling
+    while the 2.99 bits/dim likelihood came from the ODE.
+
+    **Sampler quality is an NFE budget, and the order of the solver matters
+    more than the step count once you are in the asymptotic regime.** Exact
+    recursions on a linear Gaussian problem (no Monte Carlo) with standard
+    deviation 2.0: Euler on the probability-flow ODE is $4.593\%$ low at 10
+    network evaluations, $2.253\%$ at 20 and $1.117\%$ at 40; Heun at the same
+    number of evaluations is $4.169\%$, $0.971\%$ and $0.226\%$. Below that,
+    the ordering reverses — at 5 evaluations Heun is $22.12\%$ off against
+    Euler's $9.576\%$ — because a second-order method outside its asymptotic
+    regime is a more expensive wrong answer. The stochastic sampler errs in the
+    opposite direction: Euler–Maruyama is $4.019\%$ *high* at 10 steps and
+    $0.410\%$ high at 100. Correctors are the third currency: at
+    $\epsilon = 0.5$ two Langevin steps take an 8-step Euler sampler from
+    $5.83\%$ low to $1.98\%$ low, but the corrector has its own fixed point,
+    variance $2\epsilon/(1-(1-\epsilon/v)^2)$, which is $+3.16\%$ in standard
+    deviation at $\epsilon = 0.5$ and $+6.79\%$ at $\epsilon = 1.0$. A
+    corrector with too large a step does not correct; it quietly resamples
+    from a slightly wrong distribution.
+
+    **Scores add, which is why conditioning is one line and why guidance works
+    at all.** $\nabla\log p(x\mid y) = \nabla\log p(x) + \nabla\log p(y\mid
+    x)$. For a linear Gaussian measurement $y = Ax + \sigma_n n$ the second
+    term is $\tfrac{1}{\sigma_n^2}A^\top(y-Ax)$ — no classifier, no
+    retraining, no normaliser. Measured on a two-dimensional problem with
+    $\sigma_n = 0.05$ and one observed coordinate, that term has magnitude
+    $480.0$ where the prior's entire score has magnitude $0.745$: one
+    moderately precise pixel outnumbers the prior by 645×, which is why
+    inpainting with a score model is stable and why naive guidance at large $w$
+    deletes modes instead of sharpening them. Classifier-free guidance is the
+    same identity with the conditional score replaced by its difference from
+    the unconditional one, $\hat s = (1+w)s_c - w s_u$, and since
+    $\epsilon = -\sigma_t s$ the noise-prediction form is identical. The trap
+    is the word "add": the identity is exact for the true scores of the *same*
+    marginal, so two networks trained at different noise schedules or on
+    differently normalised data cannot be added without first putting them in
+    the same units.
+
+
+  derivations:
+    - title: "From the Gaussian kernel to epsilon equals minus sigma times s"
+      latex: |
+        The conditional log-density and its gradient with respect to the state:
+
+        $$\log q(x_t\mid x_0) = -\frac{\|x_t - \sqrt{\bar\alpha_t}x_0\|^2}
+          {2(1-\bar\alpha_t)} + C
+          \quad\Longrightarrow\quad
+          \nabla_{x_t}\log q(x_t\mid x_0)
+          = -\frac{x_t - \sqrt{\bar\alpha_t}x_0}{1-\bar\alpha_t}.$$
+
+        The residual is the noise, scaled by $\sqrt{1-\bar\alpha_t}$:
+
+        $$x_t - \sqrt{\bar\alpha_t}x_0 = \sqrt{1-\bar\alpha_t}\,\epsilon
+          \quad\Longrightarrow\quad
+          \nabla_{x_t}\log q = -\frac{\epsilon}{\sqrt{1-\bar\alpha_t}}.$$
+
+        So the denoising target *is* the score target divided by
+        $\sigma_t = \sqrt{1-\bar\alpha_t}$, and inverting the relation:
+
+        $$\epsilon_\theta(x_t,t) = -\sqrt{1-\bar\alpha_t}\;
+          s_\theta(x_t,t).$$
+      prose: >-
+        The divisor is a square root, not a variance, and that single fact is the
+        most common arithmetic error in a hand-written conversion. At $t=1$ the
+        factor is $0.010000$; at $t=1000$ it is $0.999980$. Squaring it would put
+        the low-noise end out by a factor of 100 in the wrong direction, and
+        because the two are equal at $t=1000$ the bug is invisible unless you test
+        at small $t$.
+
+    - title: "Denoising score matching differs from explicit score matching by a constant"
+      latex: |
+        Expand the DSM integrand for a fixed $x_0$:
+
+        $$\left\|s_\theta - \nabla\log q\right\|^2
+          = \left\|s_\theta\right\|^2
+          - 2\,s_\theta^\top \nabla\log q
+          + \left\|\nabla\log q\right\|^2 .$$
+
+        Take the expectation over $q(x_t\mid x_0)$ and apply the tower property to
+        the cross term,
+        $\mathbb{E}[\nabla\log q(x_t\mid x_0)\mid x_t] = \nabla\log p_t(x_t)$:
+
+        $$\mathbb{E}_{q}\left\|s_\theta - \nabla\log q\right\|^2
+          = \left\|s_\theta\right\|^2
+          - 2\,s_\theta^\top\nabla\log p_t
+          + \mathbb{E}_{q}\left\|\nabla\log q\right\|^2 .$$
+
+        The first two terms are exactly the integrand of
+        $J_{\mathrm{ESM}} = \mathbb{E}_{p_t}\|s_\theta - \nabla\log p_t\|^2$
+        after the same expansion, so
+
+        $$J_{\mathrm{DSM}}(\theta) = J_{\mathrm{ESM}}(\theta)
+          + \mathbb{E}\left\|\nabla\log q(x_t\mid x_0)\right\|^2
+          - \mathbb{E}\left\|\nabla\log p_t(x_t)\right\|^2,$$
+
+        and the last two terms contain no $\theta$.
+      prose: >-
+        This is the entire justification for the objective everyone uses. The
+        constant is not small — it is the difference between the conditional and
+        marginal Fisher information, which grows as $1/\sigma_t^2$ at the clean
+        end — but it is constant in $\theta$, so the gradient is unchanged and the
+        minimiser is the same. What you lose is the value of the loss: a DSM
+        number is not comparable across noise schedules, because the constant is
+        not.
+
+    - title: "The reverse SDE and the probability-flow ODE share a Fokker-Planck equation"
+      latex: |
+        The forward marginal solves
+        $\partial_t p = -\nabla\cdot(fp) + \tfrac12 g^2\Delta p$. Let
+        $\tilde p_s = p_{T-s}$, so $\partial_s\tilde p = -\partial_t p$.
+
+        **Reverse SDE.** With drift $\tilde f = f - g^2\nabla\log p$ and diffusion
+        $g$,
+
+        $$\partial_s\tilde p = -\nabla\cdot(\tilde f\tilde p)
+          + \tfrac12 g^2\Delta\tilde p
+          = \nabla\cdot(fp) - g^2\nabla\cdot(p\nabla\log p)
+          + \tfrac12 g^2\Delta\tilde p .$$
+
+        Since $p\nabla\log p = \nabla p$, the middle term is
+        $g^2\Delta p$, leaving
+        $\partial_s\tilde p = \nabla\cdot(fp) - \tfrac12 g^2\Delta p = -\partial_t p$.
+
+        **Probability flow.** With drift $\hat f = f - \tfrac12 g^2\nabla\log p$
+        and no diffusion,
+
+        $$\partial_s\tilde p = -\nabla\cdot(\hat f\tilde p)
+          = \nabla\cdot(fp) - \tfrac12 g^2\Delta p
+          = -\partial_t p.$$
+      prose: >-
+        Both drifts satisfy the same continuity equation, so both transport the
+        same $p_t$ at every $t$ — the SDE by spreading probability with noise, the
+        ODE by stretching it deterministically. The only difference in the two
+        formulas is a factor of two on the score term and the presence of the
+        Laplacian, which is exactly the trade a sampler makes: pay for noise and
+        get a correction mechanism, or drop the noise and get an invertible map
+        you can integrate to a likelihood.
+
+  implementations:
+    - language: python
+      title: "The mixture score, Tweedie's identity, and the shrinkage people drop"
+      note: >-
+        Every number printed here is reproduced in the text: the score is
+        $-3.75$ at the midpoint of a $0.7/0.3$ mixture whose components each pull
+        with magnitude $9.375$, and the Tweedie identity holds to
+        $8.9\times10^{-16}$. The second printout is the **numerically wrong but
+        plausible** version, and it is included because it is the mistake almost
+        everyone makes on the first attempt: `posterior_mean_naive` averages the
+        component means with the posterior weights, which is right for a
+        *classification* problem and wrong for a *regression* one. Each
+        component's mean must first be shrunk toward the observation by
+        $\sigma_i^2/(\sigma_i^2+\sigma_n^2) = 0.6098$ on this mixture, and
+        omitting the shrinkage errs by $0.9756$ — more than twice the component
+        width — so the check looks like the identity is false rather than like the
+        code is wrong.
+      code: |
+        import numpy as np
+
+        MU = np.array([-1.5, 1.5])
+        SIG = np.array([0.4, 0.4])
+        PI = np.array([0.7, 0.3])
+
+
+        def components(mu, sig, pi, x):
+            """Per-component densities and the marginal, elementwise over x."""
+            x = np.asarray(x, dtype=float)
+            comp = pi[:, None] * np.exp(
+                -0.5 * ((x[None, :] - mu[:, None]) / sig[:, None]) ** 2
+            ) / (sig[:, None] * np.sqrt(2.0 * np.pi))
+            return comp, comp.sum(0)
+
+
+        def score(mu, sig, pi, x):
+            """grad_x log p(x): the posterior-weighted average of component pulls."""
+            comp, p = components(mu, sig, pi, x)
+            pull = -(x[None, :] - mu[:, None]) / sig[:, None] ** 2
+            return (comp * pull).sum(0) / p
+
+
+        def tweedie(x, s, noise_var):
+            """E[x0 | x] for x = x0 + N(0, noise_var), using the score alone."""
+            return x + noise_var * s
+
+
+        def posterior_mean(mu, sig, pi, x, noise_var):
+            """Exact E[x0 | x]: each component mean shrinks toward x."""
+            total = sig ** 2 + noise_var
+            comp, p = components(mu, np.sqrt(total), pi, x)
+            shrink = (mu[:, None] * noise_var
+                      + x[None, :] * (sig ** 2)[:, None]) / total[:, None]
+            return (comp * shrink).sum(0) / p
+
+
+        def posterior_mean_naive(mu, sig, pi, x, noise_var):
+            """WRONG: no shrinkage. Right for classification, wrong for regression."""
+            comp, p = components(mu, np.sqrt(sig ** 2 + noise_var), pi, x)
+            return (comp * mu[:, None]).sum(0) / p
+
+
+        if __name__ == "__main__":
+            grid = np.linspace(-4.0, 4.0, 1001)
+            s = score(MU, SIG, PI, grid)
+            print("score at -1.5, 0, +1.5:",
+                  [round(float(v), 5) for v in np.interp([-1.5, 0.0, 1.5], grid, s)])
+            # [0.0, -3.75, -0.0]   zero at each mode, not zero between them
+
+            var = 0.25
+            s_n = score(MU, np.sqrt(SIG ** 2 + var), PI, grid)
+            print("Tweedie err:",
+                  float(np.abs(tweedie(grid, s_n, var)
+                               - posterior_mean(MU, SIG, PI, grid, var)).max()))
+            # 8.881784197001252e-16
+
+            print("no-shrinkage err:",
+                  float(np.abs(posterior_mean_naive(MU, SIG, PI, grid, var)
+                               - posterior_mean(MU, SIG, PI, grid, var)).max()))
+            # 0.9756  -- more than twice the component width
+
+    - language: python
+      title: "Three samplers on one score field, and the factor-of-two that annihilates the sample"
+      note: >-
+        `sample(wrong=True)` is **numerically wrong on purpose**: it uses $g^2$
+        where the probability-flow ODE needs $\tfrac12 g^2$, which is the exact
+        mistake you make when you copy DDPM's drift into a deterministic sampler.
+        It does not crash and it does not warn. Measured with 200,000 samples and
+        an exact score, it returns standard deviation **0.0257** at 1000 steps
+        against a target of 2.0 — the sample has been shrunk by a factor of about
+        78, so the output is numerically zero and every pixel is black.
+        The mirror image is worse because it looks alive: putting $\tfrac12 g^2$
+        through the *stochastic* recursion instead returns **6.217**, three times
+        too wide. The table quoted in this topic comes from the exact linear
+        recursion rather than from sampling — 2.08038 for Euler-Maruyama at 10
+        steps, 1.90814 for Euler on the probability-flow ODE, 1.99999 for Heun at
+        500 steps — and the sampler below reproduces those to Monte Carlo error,
+        which is a few tenths of a percent on 200,000 samples. Read its printout
+        as a sanity check and the recursion as the measurement.
+      code: |
+        import numpy as np
+
+        BETA_MIN, BETA_MAX, V0 = 0.1, 20.0, 4.0
+
+
+        def beta(t):
+            return BETA_MIN + t * (BETA_MAX - BETA_MIN)
+
+
+        def alpha_bar(t):
+            return np.exp(-(BETA_MIN * t + 0.5 * (BETA_MAX - BETA_MIN) * t ** 2))
+
+
+        def var_t(t):
+            return V0 * alpha_bar(t) + (1.0 - alpha_bar(t))
+
+
+        def score(x, t):
+            """Exact score of N(0, var_t): the model we would have trained."""
+            return -x / var_t(t)
+
+
+        def reverse_step(x, t, t_next, noise, probability_flow):
+            """One reverse-time Euler step. noise=None gives the deterministic ODE."""
+            b = beta(t)
+            ds = t - t_next
+            half = 0.5 if probability_flow else 1.0
+            x = x + (0.5 * b * x + half * b * score(x, t)) * ds
+            if noise is None:
+                return x
+            return x + np.sqrt(b * ds) * noise
+
+
+        def sample(rng, n_steps, n=200_000, probability_flow=True, wrong=False):
+            """wrong=True uses g^2 in the ODE drift: numerically wrong, silently."""
+            x = rng.normal(scale=np.sqrt(var_t(1.0)), size=n)
+            ts = np.linspace(1.0, 0.0, n_steps + 1)
+            for i in range(n_steps):
+                t, tn = ts[i], ts[i + 1]
+                if probability_flow:
+                    b = beta(t)
+                    half = 1.0 if wrong else 0.5
+                    x = x + (0.5 * b * x + half * b * score(x, t)) * (t - tn)
+                else:
+                    x = reverse_step(x, t, tn, rng.normal(size=n), False)
+            return x
+
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            print("target std 2.0")
+            for n in (10, 100, 1000):
+                print("EM    N=%4d std=%.4f"
+                      % (n, float(sample(rng, n, probability_flow=False).std())))
+            for n in (10, 100, 1000):
+                print("Euler N=%4d std=%.4f"
+                      % (n, float(sample(rng, n).std())))
+            for n in (10, 100, 1000):
+                print("WRONG N=%4d std=%.4f"
+                      % (n, float(sample(rng, n, wrong=True).std())))
+
+  checkpoints:
+    - id: cp-1
+      question: "The score has no normaliser in it. What did you lose, and what does it cost to get it back?"
+      answerKind: short_text
+      hint: "A gradient is defined up to a constant. Which constant, and what does integrating along a path recover?"
+      solution: >-
+        You lost the absolute scale of the density: $s$ determines $\log p$ only
+        up to an additive constant, so two disconnected components cannot be
+        compared without integrating between them. You also lost the value at
+        points where $p = 0$, where the score is undefined. Getting it back costs
+        a divergence: along a probability-flow-ODE trajectory,
+        $\log p_0(x_0) = \log p_T(x_T) - \int_0^T\nabla\cdot f_t\,dt$, which is one
+        trace of a Jacobian per step — the same $d$-dimensional object that
+        explicit score matching was trying to avoid. On the linear Gaussian
+        problem the two sides agree at $-1.612086$, so the identity is exact; what
+        it is not is free.
+    - id: cp-2
+      question: "A colleague hands you an epsilon-predicting checkpoint and asks for the score. Write the conversion, then say at which timestep their model's error is worst after conversion, and by how much."
+      answerKind: short_text
+      hint: "Divide by the right root. Then ask what happens to a fixed error when you divide by something small."
+      solution: >-
+        $\epsilon_\theta = -\sqrt{1-\bar\alpha_t}\,s_\theta$, so
+        $s_\theta = -\epsilon_\theta/\sqrt{1-\bar\alpha_t}$. The conversion
+        amplifies error by $1/\sqrt{1-\bar\alpha_t}$, which is $100.0$ at $t=1$
+        and $1.00002$ at $t=1000$. So the worst amplification is at the *cleanest*
+        timestep, by a factor of 100 relative to the noisiest — an epsilon error of
+        0.01 that is invisible at $t=1$ becomes a score error of 1.0 there. That
+        is why a corrector step size must be scheduled in $t$ rather than fixed:
+        the same $\epsilon$ that is stable at $t=1000$ is 100× too aggressive in
+        score units at $t=1$.
+    - id: cp-3
+      question: "Two people implement DDPM sampling. One writes the Euler-Maruyama step for the reverse VP-SDE, the other writes Ho et al.'s update. Their samples differ by 2.5e-4 relative. Who is wrong?"
+      answerKind: short_text
+      hint: "Expand 1/sqrt(alpha) to second order. Which term is the SDE step missing?"
+      solution: >-
+        Neither. DDPM's update is $x_{t-1} = (x_t + \beta_t s_\theta)/\sqrt{
+        \alpha_t}$ and $1/\sqrt\alpha = 1 + \tfrac\beta2 + \tfrac38\beta^2 + \dots$,
+        while Euler-Maruyama with $\Delta s = 1$ gives $x + \tfrac12\beta x +
+        \beta s + \sqrt\beta z$. They agree to first order in $\beta$ and differ at
+        $O(\beta^2)$: measured $2.5\times10^{-4}$ at $\beta = 0.02$ and
+        $6.3\times10^{-9}$ at $\beta = 10^{-4}$. DDPM is the discretisation of the
+        SDE, not a separate algorithm; the residual is the discretisation error of
+        one step of size 1, which at $\beta = 0.02$ is a quarter of a percent.
+    - id: cp-4
+      question: "Heun is second order and Euler is first. Give a regime where Heun is strictly worse at the same number of network evaluations, with the measured numbers."
+      answerKind: short_text
+      hint: "Second-order convergence is asymptotic. What happens below the regime where the expansion holds?"
+      solution: >-
+        Below about 10 evaluations. Measured on the linear Gaussian problem at 5
+        network evaluations, Heun (2 steps of 2 calls) returns standard deviation
+        1.55764 and Euler (5 steps) returns 1.80849, against a target of 2.0 — so
+        Heun is $22.12\%$ low and Euler is $9.576\%$ low. From 10 evaluations
+        upward the ordering is permanent: at 20 calls Heun is $0.971\%$ low against
+        Euler's $2.253\%$, at 40 calls $0.226\%$ against $1.117\%$, and at 100
+        calls $0.034\%$ against $0.445\%$. The practical rule is that solver order
+        is a multiplier on accuracy *inside* the asymptotic regime and a tax
+        outside it, so a 4-step budget belongs to Euler, not to Heun.
+    - id: cp-5
+      question: "You add a classifier-free guidance term to an inpainting score and the result is a mess of duplicated edges. The algebra is right. What did you add that you should not have?"
+      answerKind: short_text
+      hint: "The identity needs two scores of the same marginal. What are the units of each term you added?"
+      solution: >-
+        Two fields that are not gradients of the same marginal. The identity
+        $\nabla\log p(x\mid y) = \nabla\log p(x) + \nabla\log p(y\mid x)$ is exact
+        for the true scores of one $p_t$; if the prior term came from a network
+        trained on a different noise schedule, or on data normalised to a
+        different range, the two vectors are in different units and their sum is
+        not a score. In the measured example a single coordinate observed at
+        $\sigma_n = 0.05$ contributes a term of magnitude $480.0$ against a prior
+        score of $0.745$ — a ratio of 645 — so a 10% units mismatch in the prior
+        is invisible while a 10% mismatch in the likelihood term moves the sample
+        by 48, i.e. across the whole data range. Fix the units, or anneal the
+        likelihood term, before blaming the guidance weight.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Separate what the network *represents* from how you *use* it. The network
+        represents a direction and a magnitude at every point of the noisy space,
+        at every noise level: "which way is more probable, and how fast does
+        probability fall off if I move". That object is a gradient, so any
+        constant that multiplies the density disappears when you differentiate,
+        and the thing that made the density hard to write down disappears with it.
+        Everything else in this topic is a consequence: the training objective is
+        a regression on a gradient you can compute in closed form, the denoiser is
+        the same function read at a different scale, and a sampler is a numerical
+        integrator of a differential equation built from that field. The choice
+        between samplers is a choice of how much noise you inject, and noise
+        injection is a choice about error correction, not about correctness.
+      blocks:
+        - kind: checklist
+          body: |
+            - A gradient of a log-density: one vector per point, per noise level
+            - Constants in front of the density vanish; that is the entire selling point
+            - The magnitude scales like one over the noise level, so it is meaningless unlabelled
+            - Training regresses on a closed-form conditional field, not on a density
+            - Sampling integrates a differential equation; the noise term is optional
+            - Every sampler difference is a difference in that integrator
+      checkpoint: >-
+        If two people train on the same data with the same architecture but
+        different loss weightings across noise levels, do they end up representing
+        different fields, or the same field approximated differently? Say which,
+        and what evidence you would look for.
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in the normalised variable $x_t/\sqrt{\bar\alpha_t}$ when you are
+        unsure, because it makes the signal coefficient 1 and everything else a
+        ratio. Then fix the three conversions before writing any sampler: from the
+        network's output to a score, from a score to a denoiser estimate, and from
+        a score to a drift. Each is one multiplication by a power of
+        $\sqrt{1-\bar\alpha_t}$, and each is a place where people use the wrong
+        power. For the sampler, decide first whether you want a likelihood or a
+        sample: only the deterministic one gives you a likelihood, and only the
+        stochastic one has an error that corrector steps can fix. Then decide the
+        budget in network evaluations rather than steps, because a step is not a
+        unit.
+      blocks:
+        - kind: checklist
+          body: |
+            - Conversion 1: score = -eps / sqrt(1 - alpha_bar); check the sign at t = 1
+            - Conversion 2: x0_hat = (x + (1 - alpha_bar) * score) / sqrt(alpha_bar)
+            - Conversion 3: drift = 0.5 * beta * x + c * beta * score, c = 1 for SDE, 0.5 for ODE
+            - Deterministic sampler for likelihoods, stochastic for correctable error
+            - Count network evaluations, not steps: a Heun step is two calls
+            - Below ten evaluations, prefer the lower-order solver
+      checkpoint: >-
+        Which of those three conversions changes if you switch from the VP
+        parameterisation to a variance-exploding one, and which is invariant
+        because it only involves a ratio?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Seven procedures. The training target needs no network; the two drifts
+        differ in one coefficient; the corrector is a Langevin step at fixed time.
+        Write the score conversion once and call it everywhere, because two copies
+        of it will drift apart.
+      blocks:
+        - kind: pseudocode
+          body: |
+            score_from_eps(eps, ab_t):
+                return -eps / sqrt(1 - ab_t)
+
+            eps_from_score(s, ab_t):
+                return -sqrt(1 - ab_t) * s
+
+            dsm_target(x0, xt, ab_t):
+                # grad of log q(xt | x0); no network, no normaliser
+                return -(xt - sqrt(ab_t) * x0) / (1 - ab_t)
+
+            tweedie(xt, s, ab_t):
+                return (xt + (1 - ab_t) * s) / sqrt(ab_t)
+
+            reverse_drift(x, s, t, probability_flow):
+                factor = 0.5 if probability_flow else 1.0
+                return 0.5 * beta(t) * x + factor * beta(t) * s
+
+            step(x, t, t_next, probability_flow, noise):
+                ds   = t - t_next                     # positive, backwards in t
+                x    = x + reverse_drift(x, s(x, t), t, probability_flow) * ds
+                if noise is not None:
+                    x = x + sqrt(beta(t) * ds) * noise
+                return x
+
+            correct(x, t, eps_len, noise):
+                return x + eps_len * s(x, t) + sqrt(2 * eps_len) * noise
+      checkpoint: >-
+        In `step`, the noise coefficient is `sqrt(beta * ds)` and the corrector's
+        is `sqrt(2 * eps)`. Both have the same form. What would break in each if
+        you dropped the square root, and which of the two failures would you
+        notice first from a single sample?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three lines carry the topic: the conditional score of a Gaussian kernel,
+        the tower property that makes regressing on it equivalent to matching the
+        marginal score, and the factor of two that separates the SDE from the ODE.
+      blocks:
+        - kind: math
+          body: |
+            Conditional score. With
+            $q(x_t\mid x_0) = \mathcal{N}(\sqrt{\bar\alpha_t}x_0, (1-\bar\alpha_t)I)$,
+
+            $$\nabla_{x_t}\log q(x_t\mid x_0)
+              = -\frac{x_t - \sqrt{\bar\alpha_t}x_0}{1-\bar\alpha_t}
+              = -\frac{\epsilon}{\sqrt{1-\bar\alpha_t}},$$
+
+            hence $\epsilon_\theta = -\sqrt{1-\bar\alpha_t}\,s_\theta$.
+
+            Tower property. For the cross term of the expanded square,
+
+            $$\mathbb{E}_{q(x_t\mid x_0)}\!\left[\nabla\log q \mid x_t\right]
+              = \int \nabla\log q\,q(x_0\mid x_t)\,dx_0
+              = \nabla\log p_t(x_t),$$
+
+            because $\nabla\log q = \nabla\log p(x_t,x_0)$ and the
+            $\log p(x_0)$ part integrates to a constant. So
+            $J_{\mathrm{DSM}} = J_{\mathrm{ESM}} + C(\theta\text{-free})$.
+
+            Factor of two. The forward Fokker–Planck equation is
+            $\partial_t p = -\nabla\cdot(fp) + \tfrac12 g^2\Delta p$. Reversing
+            with drift $f - g^2\nabla\log p$ and diffusion $g$ reproduces it;
+            reversing with drift $f - \tfrac12 g^2\nabla\log p$ and no diffusion
+            also reproduces it, because
+            $\tfrac12 g^2\nabla\cdot(p\nabla\log p) = \tfrac12 g^2\Delta p$ fills
+            in for the missing noise exactly.
+      checkpoint: >-
+        The ODE needs exactly half the score term the SDE needs. Explain in one
+        sentence what the other half was buying, and why the answer is "the
+        Laplacian".
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The field, the conversions, the two drifts, and a measurement that
+        separates each correct line from its plausible wrong version.
+      blocks:
+        - kind: warning
+          body: >-
+            Three failures that produce valid tensors and no warnings. Using
+            `sqrt(1 - ab)` where `(1 - ab)` belongs (or the reverse) puts the
+            conversion out by a factor of 100 at $t=1$ and by nothing at $t=1000$,
+            so a test at the noisy end passes. Using $g^2$ in the
+            probability-flow drift shrinks the sample by a factor of about 78 and
+            returns near-zeros with a perfect loss curve. Adding two scores
+            trained on different schedules gives a vector that is not a gradient
+            of anything, so sampling from it drifts rather than converges. All
+            three are visible in one number: the standard deviation of a batch of
+            samples against the data's.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            # s_theta(x, t) is the trained score network; only its signature matters here.
+
+
+            def score_from_eps(eps, ab_t):
+                return -eps / np.sqrt(1.0 - ab_t)
+
+
+            def dsm_target(x0, xt, ab_t):
+                return -(xt - np.sqrt(ab_t) * x0) / (1.0 - ab_t)
+
+
+            def tweedie(xt, s, ab_t):
+                return (xt + (1.0 - ab_t) * s) / np.sqrt(ab_t)
+
+
+            def reverse_drift(x, s, beta_t, probability_flow):
+                factor = 0.5 if probability_flow else 1.0
+                return 0.5 * beta_t * x + factor * beta_t * s
+
+
+            def reverse_step(x, t, t_next, beta_t, probability_flow, noise):
+                ds = t - t_next
+                x = x + reverse_drift(x, s_theta(x, t), beta_t, probability_flow) * ds
+                if noise is None:
+                    return x
+                return x + np.sqrt(beta_t * ds) * noise
+
+
+            def langevin(x, t, eps_len, noise):
+                return x + eps_len * s_theta(x, t) + np.sqrt(2.0 * eps_len) * noise
+
+
+            if __name__ == "__main__":
+                print(dsm_target(np.array([1.0]), np.array([1.5]), 0.64))
+                # [-1.9444444444444444]
+                print(score_from_eps(np.array([0.5]), 0.75))
+                # [-1.0]
+                print(tweedie(np.array([1.0]), np.array([-2.0]), 0.75))
+                # [0.5773502691896258]   sqrt(0.75) in the denominator, not 0.75
+                print(reverse_drift(np.array([2.0]), np.array([-1.0]), 0.5, True))
+                # [0.25]
+      checkpoint: >-
+        `reverse_step` with `probability_flow=True` and `noise=None` is a
+        deterministic map from $x_1$ to $x_0$. Apply it twice from the same start
+        and you get the same answer. Now apply the stochastic version twice — what
+        is different about the two outputs, and which of the two is a sample from
+        the model in the sense of "an independent draw"?
+
+  problems:
+    - id: p-score-target
+      title: "The denoising score target"
+      difficulty: easy
+      prompt: >-
+        Implement `score_target(x0, x_t, alpha_bar)`: the denoising score-matching
+        target, elementwise. Given a clean sample `x0` and a noisy sample `x_t`,
+        return $\nabla_{x_t}\log q(x_t\mid x_0) =
+        -(x_t - \sqrt{\bar\alpha_t}\,x_0)/(1-\bar\alpha_t)$, as nested Python
+        lists of the same shape. This is the regression target that needs no
+        network, no trace and no normaliser, and it is the identity that connects
+        the noise-prediction loss to score matching — so get the powers right. The
+        denominator is the variance, not its square root, and the numerator is a
+        difference, not a ratio.
+      starter: |
+        import numpy as np
+
+        def score_target(x0, x_t, alpha_bar):
+            # your implementation here
+            pass
+      language: python
+      entry: score_target
+      testCases:
+        - input: '[[[1.0, 2.0], [3.0, 4.0]], [[1.5, 1.0], [2.0, 5.0]], 0.64]'
+          expected: '[[-1.9444444444444444, 1.666666666666667], [1.111111111111112, -5.0]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.0], [0.0]], [[1.0], [-1.0]], 0.75]'
+          expected: '[[-4.0], [4.0]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[2.0, -1.0]], [[2.0, -1.0]], 0.36]'
+          expected: '[[-1.25, 0.625]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, -2.0], [0.5, 0.0]], [[1.0, -2.0], [0.5, 0.19]], 0.81]'
+          expected: '[[-0.5263157894736843, 1.0526315789473686], [-0.26315789473684215, -1.0000000000000002]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0]], [[1.1]], 0.9999]'
+          expected: '[[-1000.500012500736]]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def score_target(x0, x_t, alpha_bar):
+            if not (0.0 < alpha_bar < 1.0):
+                raise ValueError("alpha_bar must lie strictly between 0 and 1")
+            x0 = np.asarray(x0, dtype=float)
+            xt = np.asarray(x_t, dtype=float)
+            if x0.shape != xt.shape:
+                raise ValueError("x0 and x_t must have the same shape")
+            return (-(xt - np.sqrt(alpha_bar) * x0) / (1.0 - alpha_bar)).tolist()
+      solutionExplanation: >-
+        Two powers of two are at stake. The numerator uses $\sqrt{\bar\alpha_t}$,
+        the coefficient of the signal in $x_t = \sqrt{\bar\alpha_t}x_0 +
+        \sqrt{1-\bar\alpha_t}\epsilon$; the denominator uses $1-\bar\alpha_t$, the
+        variance of the kernel. A solution that used $\bar\alpha_t$ in the
+        numerator passes test case 2, where `x0` is zero and the term vanishes
+        either way, and fails case 3, where it returns $-(2-0.6\cdot2)/0.64 =
+        -1.25$ only by coincidence of the numbers. Test case 5 is the
+        amplification case: at $\bar\alpha = 0.9999$ the denominator is
+        $1.0\times10^{-4}$, so a numerator of $0.1$ becomes a score of $-1000.5$.
+        It is also the case that catches the commonest error of all — dividing by
+        $\sqrt{1-\bar\alpha} = 0.01$ instead of $1-\bar\alpha$, which returns
+        $-10.005$ and is off by exactly a factor of 100. Test case 1 has mixed
+        signs in both arguments, so a solution that dropped a sign in one of the
+        two terms would still pass cases that use only positive values.
+      complexity: "O(n) time and space in the number of elements; two square roots per call"
+      tags: [score-matching, dsm, reparameterisation, broadcasting]
+
+    - id: p-reverse-drift
+      title: "Reverse drift: the factor of two that separates the sampler from the ODE"
+      difficulty: medium
+      prompt: >-
+        Implement `reverse_drift(x, score, beta, probability_flow)`, elementwise:
+        the reverse-time drift of the variance-preserving diffusion, in reverse
+        time, so that the result is the $dx/ds$ of a *forward* integration from
+        noise to data. The drift is $\tfrac12\beta x + c\,\beta\,s$ with $c = 1$
+        for the reverse-time SDE (where the score term carries the full $g^2 =
+        \beta$) and $c = \tfrac12$ for the probability-flow ODE (where it carries
+        $\tfrac12 g^2$). Return nested lists. Note the sign of the first term: it
+        is $+\tfrac12\beta x$, not $-\tfrac12\beta x$, because the process is
+        being run backwards.
+      starter: |
+        import numpy as np
+
+        def reverse_drift(x, score, beta, probability_flow):
+            # your implementation here
+            pass
+      language: python
+      entry: reverse_drift
+      testCases:
+        - input: '[[1.0, -1.0], [0.5, -0.5], 0.2, false]'
+          expected: '[0.2, -0.2]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1.0, -1.0], [0.5, -0.5], 0.2, true]'
+          expected: '[0.15000000000000002, -0.15000000000000002]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[2.0], [-1.0], 0.5, false]'
+          expected: '[0.0]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[2.0], [-1.0], 0.5, true]'
+          expected: '[0.25]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[0.0, 4.0], [1.0, -1.0], 0.1, false]'
+          expected: '[0.1, 0.1]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[0.0, 4.0], [1.0, -1.0], 0.1, true]'
+          expected: '[0.05, 0.15000000000000002]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def reverse_drift(x, score, beta, probability_flow):
+            if not (0.0 <= beta < 1.0):
+                raise ValueError("beta must lie in [0, 1) for the VP schedule")
+            x = np.asarray(x, dtype=float)
+            s = np.asarray(score, dtype=float)
+            if x.shape != s.shape:
+                raise ValueError("x and score must have the same shape")
+            factor = 0.5 if probability_flow else 1.0
+            return (0.5 * beta * x + factor * beta * s).tolist()
+      solutionExplanation: >-
+        The two terms do different jobs and their coefficients are the whole
+        content. The first, $\tfrac12\beta x$, is the reversed forward drift and
+        it expands the sample as time runs backwards; the second is the score
+        term, and its coefficient is $g^2$ for the SDE and $\tfrac12 g^2$ for the
+        ODE — the factor of two that the missing Laplacian pays for. Test cases 3
+        and 4 pin it exactly: $x = 2$, $s = -1$, $\beta = 0.5$, so the first term
+        is $0.5$ and the score term is $-0.5$ for the SDE (sum $0.0$) or $-0.25$
+        for the ODE (sum $0.25$). A solution that used the same coefficient in
+        both branches returns $0.0$ twice; one that negated the first term returns
+        $-0.5$ and $-0.25$; one that used $\beta/2$ for both returns $0.0$ twice
+        again. Test case 1 separates a missing $\beta$ from a missing $\tfrac12$
+        because both terms are non-zero and of opposite sign.
+      complexity: "O(n) time and space; four multiplications per element"
+      tags: [sde, probability-flow-ode, drift, diffusion]
+
+    - id: p-langevin
+      title: "One Langevin corrector step"
+      difficulty: medium
+      prompt: >-
+        Implement `langevin_step(x, score, eps, noise)`, elementwise:
+        $x + \epsilon\,s_\theta(x) + \sqrt{2\epsilon}\,z$ with `z` supplied as
+        `noise` rather than drawn, so the function is deterministic and testable.
+        This is the corrector in a predictor-corrector sampler and the only place
+        in the topic where the noise coefficient is $\sqrt{2\epsilon}$ rather than
+        $\sqrt{\beta\,\Delta t}$ — both have the same shape and neither is
+        interchangeable with $\epsilon$ or $2\epsilon$.
+      starter: |
+        import numpy as np
+
+        def langevin_step(x, score, eps, noise):
+            # your implementation here
+            pass
+      language: python
+      entry: langevin_step
+      testCases:
+        - input: '[[0.0, 1.0], [-1.0, 0.0], 0.5, [1.0, 0.0]]'
+          expected: '[0.5, 1.0]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1.0], [0.0], 0.02, [2.0]]'
+          expected: '[1.4]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[-2.0, 3.0], [2.0, -3.0], 0.125, [1.0, -1.0]]'
+          expected: '[-1.25, 2.125]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[0.5, -0.5], [0.5, -0.5], 0.0, [9.0, 9.0]]'
+          expected: '[0.5, -0.5]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[1.0], [-0.25], 2.0, [1.0]]'
+          expected: '[2.5]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def langevin_step(x, score, eps, noise):
+            if eps < 0.0:
+                raise ValueError("eps must be non-negative")
+            x = np.asarray(x, dtype=float)
+            s = np.asarray(score, dtype=float)
+            z = np.asarray(noise, dtype=float)
+            if not (x.shape == s.shape == z.shape):
+                raise ValueError("x, score and noise must have the same shape")
+            return (x + eps * s + np.sqrt(2.0 * eps) * z).tolist()
+      solutionExplanation: >-
+        The update is a gradient step plus a Gaussian whose variance is exactly
+        twice the step size, and that ratio is what makes the stationary
+        distribution the one you want: the fixed point of
+        $x \leftarrow (1-\epsilon/v)x + \sqrt{2\epsilon}z$ is variance
+        $2\epsilon/(1-(1-\epsilon/v)^2)$, which equals $v$ only to first order in
+        $\epsilon$ — the $+3.16\%$ bias at $\epsilon = 0.5$ quoted in the text.
+        Test case 5 is the one that separates the three plausible coefficient
+        errors: with $x = 1$, $s = -0.25$, $\epsilon = 2$ and $z = 1$, the correct
+        answer is $1 - 0.5 + 2 = 2.5$; using $2\epsilon$ instead of
+        $\sqrt{2\epsilon}$ gives $4.5$, using $\sqrt{\epsilon}$ gives
+        $1.914$, and dropping the noise entirely gives $0.5$. Test case 4 pins the
+        $\epsilon = 0$ boundary — the output must be the input exactly, which fails
+        if the noise coefficient is hard-coded rather than taken from
+        $\sqrt{2\epsilon}$.
+      complexity: "O(n) time and space; one square root per call"
+      tags: [langevin, corrector, sampling, score-matching]
+
+  try_it: >-
+    Take one noise prediction eps_theta = −0.4 and convert it twice: at a timestep where
+    sqrt(1 − bar_alpha_t) = 0.01 the implied score is −eps/0.01 = 40, and at one where the
+    divisor is 0.99998 it is 0.4. Then take a third timestep with bar_alpha_t = 0.81 and
+    x_t = 1.2, and check that Tweedie's formula and the epsilon form of x_0 both return 1.527.
+  interview_questions:
+    - question: "The score kills the partition function. What difficulty replaces it, and how does denoising score matching remove that one too?"
+      level: mid
+      key_points:
+        - "With p = p_tilde / Z and Z free of x, grad log p = grad log p_tilde, so scaling the density by 1e−30 moves log p by −69.078 and leaves all 12,288 partial derivatives unchanged."
+        - "Explicit score matching then needs the trace of the network Jacobian — 12,288×12,288 for a 3×64×64 image — estimated with Hutchinson probes at relative standard deviation sqrt(2/d) = 1.272%, each probe another backward pass."
+        - "Denoising score matching replaces it with a regression on grad log q(x_t | x_0) = −(x_t − sqrt(bar_alpha_t) x_0)/(1 − bar_alpha_t), a target with no theta in it that needs one line to write."
+        - "The substitution is exact because the conditional expectation of that target equals grad log p_t, checked by quadrature to 3.3e−6, and the two objectives differ only by a theta-free constant."
+      follow_up: "The two objectives differ by a term with no theta in it. Why does that make their minimisers identical rather than merely close?"
+    - question: "You inherit an epsilon-prediction checkpoint and a paper written in scores. Show the conversion and say where it bites."
+      level: mid
+      key_points:
+        - "For the VP kernel, eps_theta = −sqrt(1 − bar_alpha_t) times s_theta, because the conditional score of the Gaussian kernel is −eps divided by sigma_t."
+        - "The divisor runs from 0.010000 at t = 1 to 0.999980 at t = 1000, so the score target's standard deviation runs from 100.0 to 1.0000 — a 100× spread in the units the network emits."
+        - "Converting the other way, an epsilon error of 0.01 at t = 1 becomes a score error of 1.0, which is 100× the score error the same model makes at t = 1000."
+        - "A plain noise MSE is denoising score matching with weight (1 − bar_alpha_t), running from 1.000e−4 at t = 1 to 0.99996 at t = 1000 and summing to 724.49 over the schedule rather than 1000."
+      follow_up: "Which end of the chain does a flat weight under-train, and how does that show up at sampling time?"
+    - question: "Anderson's reverse SDE, the probability-flow ODE and the DDPM update: how are the three related, and why prefer the ODE?"
+      level: senior
+      key_points:
+        - "For dx = f dt + g dw the reverse process is dx = [f − g² grad log p_t] dt + g dw-bar; with the VP choice f = −beta x / 2 and g = sqrt(beta)."
+        - "DDPM's ancestor step is that SDE's Euler–Maruyama discretisation at Δt = 1: in score form x_{t−1} = (x_t + beta_t s_theta)/sqrt(alpha_t), and 1/sqrt(alpha) = 1 + beta/2 + O(beta²) agrees to 2.5e−4 relative at beta = 0.02 and 6.3e−9 at t = 1."
+        - "Dropping the noise and halving the score term gives the probability-flow ODE, which has the same marginals at every t but is deterministic and invertible, which is what makes exact likelihood possible."
+        - "The ODE is exact in continuous time and cheaper at equal accuracy: the original paper's 2.20 CIFAR-10 FID came from predictor-corrector sampling while 2.99 bits/dim came from the ODE."
+      follow_up: "Exactness in continuous time did not stop Euler from being 4.6% off at 10 evaluations. Why not?"
+  common_mistakes:
+    - "Reading score magnitude as confidence — for a Gaussian it is 1/sigma first, so a point one standard deviation out has score −100 at sigma = 0.01 and −0.1 at sigma = 10."
+    - "Dropping the trace term from explicit score matching and minimising one half of the squared norm of s_theta, whose minimum is the zero field."
+    - "Adding two scores from networks trained at different noise schedules or on differently normalised data, when the identity only holds for true scores of the same marginal."
+  further_reading:
+    - label: "Song, Sohl-Dickstein, Kingma, Kumar, Ermon, Poole, Score-Based Generative Modeling through Stochastic Differential Equations, ICLR 2021"
+    - label: "Vincent, A Connection Between Score Matching and Denoising Autoencoders, Neural Computation 2011"

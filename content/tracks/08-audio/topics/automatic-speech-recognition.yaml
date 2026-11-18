@@ -1,0 +1,748 @@
+id: automatic-speech-recognition
+slug: automatic-speech-recognition
+title: "Automatic Speech Recognition: CTC, RNN-T, and Whisper"
+summary: >-
+  ASR is a sequence mapping with no alignment: 100 audio frames per second on one
+  side, a few characters per second on the other, and no labels saying which frame
+  produced which letter. CTC marginalises over every monotonic alignment and pays
+  with conditional independence; RNN-T keeps a language model inside the lattice
+  and pays with a two-dimensional search; Whisper attends over a fixed 30-second
+  window and pays with latency and hallucination on silence.
+kind: lesson
+difficulty: medium
+position: 3
+estMinutes: 24
+prerequisites: [speech-synthesis-tts]
+
+body:
+  big_idea: >-
+    Every ASR architecture answers one question: how to train when nobody said
+    which frame produced which character. CTC sums monotonic alignments, RNN-T
+    a lattice with history, attention a soft alignment.
+  problem:
+    - "You have 100 frames per second and four characters, the transcript has no timestamps, and a plain cross-entropy over frames has nothing to train against."
+    - "You build CTC, it trains, and its output is repeated letters and blanks: getting the collapse rule wrong turns \"hello\" into \"helo\" silently."
+    - "You ship Whisper as streaming and the first partial arrives 30 s late: every input is padded to 30 s and encoded bidirectionally."
+  analogy: >-
+    Transcribing a meeting from a recording whose timestamps are lost. You
+    know the words and the length, not where each word starts. CTC's answer is
+    to consider every monotonic placement, score each, and sum — training the
+    acoustic model so the total probability of all placements that spell the
+    transcript goes up. It never commits to one alignment, which is why it
+    needs a blank symbol.
+  concept_points:
+    - "**The frame rate sets the size of the problem.** 16 kHz audio with a 10 ms hop is 100 frames per second; a 30-second window is 3,000 frames, and one stride-2 convolution in the encoder halves that to 1,500 positions. Frame-synchronous decoders therefore make 100 decisions per second, most of which are \\\"nothing happened\\\" — which is what the CTC blank is for."
+    - "**Whisper's encoder is a fixed 30-second, fully bidirectional transformer.** It takes 80 log-mel bins, pads or trims every input to 30 seconds, and produces 1,500 positions. Self-attention over 1,500 positions is $1{,}500^2 = 2.25$ million scores per head per layer; with 20 heads and 32 layers that is **1.44 billion scores** per window, 2.88 GB in fp16 if materialised — hence fused attention kernels."
+    - "**Padding to 30 seconds makes cost independent of clip length.** A 2-second clip and a 30-second clip both run 1,500 encoder positions, so the short clip costs fifteen times its proportional share. For a voice agent sending 2-second utterances this is the largest avoidable compute cost in the stack, and the fix is a different model, not a shorter window."
+    - "**CTC trains by marginalising, and marginalising buys conditional independence.** It maximises $\\log \\sum_{\\pi \\in \\mathcal{B}^{-1}(y)} p(\\pi \\mid x)$ with $p(\\pi \\mid x) = \\prod_t p(\\pi_t \\mid x)$: given the input, every frame's label is independent of every other frame's. That makes the sum tractable by forward-backward over $T \\times (2U+1)$ states, and it means the model has no internal language model."
+    - "**The collapse rule is where CTC is implemented wrong.** Merge consecutive identical labels, then delete blanks. \\\"hello\\\" is $h, e, l, l, o$: the two $l$'s must be separated by a blank or they merge, so a valid path is $\\varnothing, h, \\varnothing, e, \\varnothing, l, \\varnothing, l, \\varnothing, o, \\varnothing$. Drop that blank and the same path decodes to \\\"helo\\\". The blank is a separator, not a pause."
+    - "**RNN-T keeps history and pays in two dimensions.** The encoder emits $h_t$, a prediction network emits $g_u$ from previously emitted labels, and a joiner scores every pair at each lattice point $(t, u)$: 1,000 frames and 21 labels is **21,000 joiner evaluations**. Because the encoder can be causal and the prediction network needs only the past, RNN-T streams naturally, and seeing both sides calibrates it better than CTC."
+  definitions:
+    - term: "Log-mel spectrogram"
+      meaning: >-
+        The input representation: a mel filterbank applied to a short-time Fourier
+        transform, then a logarithm. Whisper uses 80 bins (128 in large-v3) with a
+        10 ms hop at 16 kHz, so 30 seconds is 3,000 frames before the encoder's
+        stride-2 convolution halves it to 1,500 positions.
+    - term: "CTC (connectionist temporal classification)"
+      meaning: >-
+        A loss that marginalises over all monotonic alignments between frames and
+        labels by introducing a blank symbol and summing path probabilities with a
+        forward-backward recursion. It is non-autoregressive at inference and
+        assumes conditional independence across frames.
+    - term: "Blank token"
+      meaning: >-
+        The extra output symbol that means "no label here". It absorbs the majority
+        of frames, separates repeated labels during collapse, and is the reason a
+        frame-synchronous model can emit nothing at all.
+    - term: "Collapse function"
+      meaning: >-
+        The deterministic map from a frame-level path to a label sequence: merge
+        consecutive duplicates, then remove blanks. Every CTC decoder ends with it,
+        and every CTC bug starts with it.
+    - term: "Conditional independence"
+      meaning: >-
+        The assumption that $p(\pi \mid x) = \prod_t p(\pi_t \mid x)$ — frame
+        labels are independent given the acoustics. It makes CTC's sum tractable
+        and removes any internal language model, which is why CTC output benefits so
+        much from an external LM.
+    - term: "RNN-Transducer (RNN-T)"
+      meaning: >-
+        An architecture with an encoder, a prediction network over previous labels,
+        and a joiner that scores every (frame, label) pair. It defines a
+        distribution over monotonic alignments on a 2-D lattice, streams with a
+        causal encoder, and is the default for on-device dictation.
+    - term: "Prediction network"
+      meaning: >-
+        The label-side recurrent (or transformer) stack in an RNN-T. It plays the
+        role of an internal language model: it turns the labels emitted so far into
+        a vector the joiner can combine with the encoder state.
+    - term: "Joiner"
+      meaning: >-
+        The small network that combines encoder state $h_t$ and prediction state
+        $g_u$ into a distribution over the vocabulary plus blank. It is evaluated
+        once per lattice point, which is what makes RNN-T training memory-hungry.
+    - term: "Cross-attention"
+      meaning: >-
+        Decoder-to-encoder attention in a seq2seq ASR model. Unlike CTC's implicit
+        alignment it is learned and unconstrained, so it can skip, revisit, or
+        attend to padding — the mechanism behind hallucination on silence.
+    - term: "Word error rate (WER)"
+      meaning: >-
+        $(S + D + I)/N$ over words, computed from the minimum-edit-distance
+        alignment. A few percent on clean read speech, and substantially worse on
+        accented, noisy or domain-shifted audio — which is why the corpus matters
+        more than the second decimal place.
+    - term: "Chunked attention"
+      meaning: >-
+        An attention mask that limits each position to a fixed left context and a
+        small right lookahead, so the encoder can run incrementally. Chunk size
+        sets the latency floor, left context sets the compute, lookahead sets the
+        accuracy on coarticulated sounds.
+    - term: "Timestamp tokens"
+      meaning: >-
+        Special vocabulary entries that mark time in Whisper's output, letting one
+        decoder produce both text and alignment. They are what makes long-form
+        transcription possible without a separate aligner.
+
+  diagrams:
+    - type: architecture
+      title: "Whisper: a padded 30-second window through a bidirectional encoder"
+      caption: >-
+        Every input is padded to 30 seconds, so the encoder always runs 1,500
+        positions and a 2-second clip costs fifteen times its share. The decoder is
+        autoregressive over text and timestamp tokens.
+      nodes:
+        - id: wav
+          x: 0
+          y: 1
+          label: "16 kHz audio, padded to 30 s"
+          kind: client
+          detail: "480,000 samples whether the clip is 2 seconds or 30. The padding is the reason short utterances are expensive."
+        - id: mel
+          x: 1
+          y: 1
+          label: "log-mel, 80 x 3,000"
+          kind: storage
+          detail: "10 ms hop gives 100 frames per second, so 30 seconds is 3,000 frames. large-v3 uses 128 bins for a little more high-frequency detail."
+        - id: enc
+          x: 2
+          y: 1
+          label: "encoder, stride 2, 1,500 positions"
+          kind: gpu
+          detail: "32 layers, 20 heads, width 1,280 in the large model. Self-attention is 1,500 squared = 2.25M scores per head per layer."
+        - id: dec
+          x: 3
+          y: 1
+          label: "decoder, autoregressive text"
+          kind: model
+          detail: "Cross-attends over the 1,500 encoder positions. Emits BPE tokens plus timestamp and task tokens; no monotonicity constraint on attention."
+        - id: out
+          x: 4
+          y: 1
+          label: "transcript + timestamps"
+          kind: client
+          detail: "Word-level timing comes from timestamp tokens, not from attention weights. Attention weights are not a reliable aligner."
+        - id: silent
+          x: 3
+          y: 2
+          label: "silence -> fluent hallucination"
+          kind: external
+          detail: "With weak audio evidence the language-model prior dominates, and the decoder writes a plausible sentence. A VAD and a no-speech token are the mitigation, not a better encoder."
+      edges:
+        - { from: wav, to: mel, label: "STFT, 10 ms hop" }
+        - { from: mel, to: enc, label: "conv stride 2" }
+        - { from: enc, to: dec, label: "cross-attention" }
+        - { from: dec, to: out, label: "token by token" }
+        - { from: enc, to: silent, label: "when the window is noise", style: async }
+
+    - type: compare
+      title: "CTC and RNN-T: same lattice, different independence assumption"
+      left_label: "CTC"
+      left_points:
+        - "Outputs are conditionally independent given the input: p(pi|x) factorises over frames"
+        - "Forward-backward over T x (2U+1) states; one blank symbol separates repeated labels"
+        - "Non-autoregressive at inference: one frame-synchronous pass, then collapse"
+        - "No internal language model, so an external LM helps a lot — and is often mandatory"
+        - "Streams trivially, because each frame's decision depends only on the encoder state"
+      right_label: "RNN-T"
+      right_points:
+        - "The joiner sees the encoder state and the prediction network's state, so history is modelled inside the model"
+        - "Forward-backward over a T x (U+1) lattice of frame and label positions; blank means advance the frame, a label means advance the label"
+        - "Autoregressive in the label dimension but not in time, so it streams with a causal encoder"
+        - "Training needs the full lattice — 1,000 frames x 21 positions is 21,000 joiner evaluations for a 10 s clip — which is why pruned losses exist"
+        - "Better accuracy and calibration than CTC at the same encoder size, at roughly the cost of the extra joiner compute"
+
+    - type: plot
+      title: "Encoder self-attention is quadratic in the window"
+      chart: line
+      xLabel: "window length (seconds)"
+      yLabel: "attention scores per head per layer (millions)"
+      series:
+        - name: "10 ms hop, stride 2 (positions = 50 x seconds)"
+          points:
+            - { x: 2, y: 0.01 }
+            - { x: 5, y: 0.0625 }
+            - { x: 10, y: 0.25 }
+            - { x: 15, y: 0.5625 }
+            - { x: 30, y: 2.25 }
+
+    - type: mermaid
+      title: "The CTC lattice for the label sequence a, b"
+      code: |
+        flowchart LR
+          S["start"] --> B0["blank"]
+          B0 -->|"stay"| B0
+          B0 -->|"emit a"| A["a"]
+          A -->|"stay: a a a"| A
+          A -->|"blank"| B1["blank"]
+          A -->|"emit b (skip)"| Bb["b"]
+          B1 -->|"emit b"| Bb
+          Bb -->|"stay"| Bb
+          Bb --> E["end"]
+          Bb -.-> note["Skipping the blank is only legal when the two labels differ; a repeated label needs the blank between them."]
+
+  markdown: |
+    ## The alignment problem
+
+    A second of 16 kHz audio is 16,000 samples, and a log-mel front end with a
+    10 ms hop turns it into 100 frames. A second of speech is about 2.5 words, so
+    the transcript side is a handful of characters. The training data gives you
+    the audio and the transcript and nothing else: no frame-level labels, no word
+    boundaries, no phoneme timings.
+
+    Every ASR architecture is a way of training through that missing label. CTC
+    sums over all monotonic alignments. RNN-T sums over a two-dimensional lattice
+    of frames and labels. An attention encoder-decoder learns a soft alignment and
+    does not constrain it to be monotonic. Each choice buys something and pays for
+    it somewhere else.
+
+    ## Whisper: pad to 30 seconds and attend
+
+    Whisper is an encoder-decoder transformer over a fixed 30-second window. The
+    front end produces 80 log-mel bins at a 10 ms hop, so 30 seconds is 3,000
+    frames; a stride-2 convolution in the encoder halves that to 1,500 positions,
+    and 32 layers of self-attention run over them.
+
+    The cost is quadratic in the window:
+
+    | window | positions | scores per head per layer |
+    |---|---|---|
+    | 2 s | 100 | 10,000 |
+    | 10 s | 500 | 250,000 |
+    | 30 s | 1,500 | 2,250,000 |
+
+    At 20 heads and 32 layers the 30-second figure is 1.44 billion scores per
+    window, 2.88 GB in fp16 if you materialise the matrix. Nobody does, which is
+    why fused attention kernels are not an optimisation here but a precondition.
+
+    Two consequences follow from the padding. First, a 2-second request costs the
+    same encoder as a 30-second one — fifteen times its proportional share, which
+    is the dominant cost in a voice agent that sends short utterances. Second, the
+    encoder is bidirectional over the whole window, so nothing can be emitted until
+    the window closes: Whisper is not a streaming model, and wrapping it in a loop
+    over 30-second chunks gives you a latency floor of 30 seconds.
+
+    The decoder is autoregressive over BPE tokens and cross-attends over the 1,500
+    encoder positions. Nothing constrains that attention to move forward, which is
+    exactly the freedom that produces Whisper's most-reported failure: on silence,
+    music, or heavy noise it emits a fluent sentence that was never spoken. The
+    audio evidence is weak, the language-model prior is strong, and the decoder
+    writes what a transcript usually looks like.
+
+    ## CTC: blanks, collapse, and a sum over alignments
+
+    CTC adds one symbol to the vocabulary — blank — and defines a distribution over
+    length-$T$ paths over the alphabet plus blank. A path collapses to a label
+    sequence by merging consecutive duplicates and then deleting blanks. The loss
+    maximises the total probability of every path that collapses to the reference:
+
+    $$p(y \mid x) = \sum_{\pi \in \mathcal{B}^{-1}(y)} \prod_{t=1}^{T} p(\pi_t \mid x).$$
+
+    The product is the assumption. Given the input, each frame's label is
+    independent of every other frame's, which makes the sum computable with a
+    forward-backward recursion over $T \times (2U+1)$ states and means the model
+    contains no language model at all.
+
+    The collapse rule is where implementations go wrong. For "hello" the label
+    sequence is $h, e, l, l, o$, and the two $l$'s must be separated by a blank:
+
+    | frame path | collapse | result |
+    |---|---|---|
+    | ∅ h ∅ e ∅ l ∅ l ∅ o ∅ | merge, delete blanks | hello |
+    | h e l l o | merge the two l's | helo |
+    | ∅ h h ∅ e ∅ l l ∅ o | merge duplicates | helo |
+
+    The blank is not a pause. It is the separator that makes a doubled letter
+    representable, and a decoder that "cleans up" repeated blanks before collapsing
+    deletes exactly the letters that needed them.
+
+    Because CTC is non-autoregressive — one frame-synchronous pass, then collapse —
+    it streams trivially and it is fast. It is also over-confident and locally
+    greedy, which is why a CTC system in production almost always has an external
+    language model fused into the beam search, and why its output benefits more
+    from that LM than an RNN-T's does.
+
+    ## RNN-T: put the language model inside
+
+    An RNN-Transducer has three parts. The encoder turns frames into $h_t$. A
+    prediction network turns the labels emitted so far into $g_u$. A joiner scores
+    the pair and produces a distribution over the vocabulary plus blank.
+
+    The lattice has a node for every $(t, u)$ pair. From $(t, u)$ a blank moves to
+    $(t+1, u)$ and a label moves to $(t, u+1)$, and the loss sums over every path
+    from $(1, 0)$ to $(T, U)$. For a 10-second clip — 1,000 frames — with 20 output
+    tokens, that is $1{,}000 \times 21 = 21{,}000$ joiner evaluations, which is why
+    RNN-T training is memory-hungry and why pruned or factorised losses exist.
+
+    What the lattice buys is history. The prediction network is an internal
+    language model, so the model does not need an external LM to avoid
+    grammatically impossible output, and because the encoder can be causal it
+    streams with a latency set by the chunk size rather than the window. That
+    combination — streaming, history, good calibration — is why RNN-T is the
+    default for on-device dictation.
+
+    ## Streaming is an attention mask
+
+    A bidirectional encoder over 30 seconds cannot emit anything early, no matter
+    how fast the decoder is. Streaming therefore starts with the encoder: restrict
+    each position to a fixed left context and a small right lookahead.
+
+    | parameter | value | what it controls |
+    |---|---|---|
+    | chunk | 320 ms = 32 frames | latency floor |
+    | left context | 2 s = 200 frames | compute and accuracy |
+    | lookahead | 160 ms = 16 frames | accuracy on coarticulation |
+    | total latency | chunk + lookahead | what the user feels |
+
+    Left context is free in latency terms because it is in the past; it costs
+    compute that grows with the context length. Lookahead is latency. Every
+    streaming ASR configuration is a point on that trade, and the reason Whisper
+    cannot simply be re-plumbed into one is that its encoder has no mask at all.
+
+    ## WER, computed rather than quoted
+
+    Word error rate is the normalised edit distance between the reference and the
+    hypothesis, after a minimum-edit-distance alignment:
+
+    $$\text{WER} = \frac{S + D + I}{N},$$
+
+    where $S$ is substitutions, $D$ deletions, $I$ insertions and $N$ the number of
+    reference words.
+
+    | reference | hypothesis | S | D | I | WER |
+    |---|---|---|---|---|---|
+    | the cat sat on the mat | the cat sat on a mat | 1 | 0 | 0 | 1/6 = 16.7% |
+    | please call stella | please call stella and ask her | 0 | 0 | 3 | 3/3 = 100% |
+    | twelve words, two wrong | ... | 2 | 1 | 3 | 6/12 = 50% |
+
+    Insertions do not add to the denominator, which is why WER can exceed 100% and
+    why a model that hallucinates on silence can look catastrophic on a benchmark
+    full of short clips. Normalisation matters as much: lowercasing, stripping
+    punctuation, spelling out numbers and removing fillers can move the number by
+    more than a model upgrade does.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Every ASR architecture is an answer to one question — how do you train a model when nobody told you which audio frame produced which character? CTC sums over all monotonic alignments and assumes frames are independent given the input; RNN-T sums over a two-dimensional lattice of frames and labels and keeps a prediction network, so it can stream and still model history; an attention-based encoder-decoder learns a soft alignment with no monotonicity constraint, which buys accuracy and costs the guarantee that it cannot invent words.
+
+    ### The analogy, in full
+
+    Transcribing a meeting from a recording whose timestamps have been lost. You know the words that were said and you know the recording is ten minutes long, but not where each word starts. CTC's answer is to consider every possible monotonic placement of the words in the recording, score each one, and sum the scores — then train the acoustic model so that the total probability of all placements that spell the transcript goes up. It never commits to one alignment, which is why it needs a blank symbol to absorb the frames where nothing is being said. The analogy breaks where the independence assumption lives. CTC scores each frame as if the transcript up to that point did not exist, so the "language model" is entirely external; a human transcriber would never write a grammatically impossible word just because it sounded right. RNN-T fixes this by carrying a prediction network that knows what has been written so far, at the cost of searching a grid rather than a line. And an attention model fixes it by looking at the whole recording at once, which is the best transcription and the worst streaming system.
+
+    ### Failure modes, in full
+
+    - You have 100 audio frames for every second of speech and four characters. The transcript has no timestamps, so there is no supervised label for "which frame is this letter" — and without that label, a plain cross-entropy over frames has nothing to train against.
+    - You build a CTC model, it trains, and its output is a stream of repeated letters and blanks that decodes to something almost right. The collapse rule is one line and getting it wrong turns "hello" into "helo" with no error anywhere.
+    - You ship Whisper as a streaming ASR and the first partial arrives 30 seconds late, because every input is padded to a 30-second window and the encoder is bidirectional over all of it.
+    - You report a word error rate of 8% and a reviewer asks whether that is after normalisation, whether insertions count in the denominator, and what happens on the 2% of clips where the model emitted a fluent sentence that was never spoken.
+
+    ### The mechanisms, in full
+
+    - **The frame rate sets the size of the problem.** 16 kHz audio with a 10 ms hop is 100 frames per second; a 30-second window is 3,000 frames, and a single stride-2 convolution in the encoder halves that to 1,500 positions. Frame-synchronous decoders therefore make 100 decisions per second, most of which are "nothing happened", which is what the CTC blank is for.
+    - **Whisper's encoder is a fixed 30-second, fully bidirectional transformer.** It takes 80 log-mel bins (128 in the largest variant), pads or trims every input to 30 seconds, and produces 1,500 positions. Self-attention over 1,500 positions is $1{,}500^2 = 2.25$ million scores per head per layer; with 20 heads and 32 layers that is $2.25\text{M} \times 640 = 1.44$ billion scores per window, or 2.88 GB in fp16 if materialised — which is why every serious implementation uses a fused attention kernel that never writes the matrix.
+    - **Padding to 30 seconds makes cost independent of clip length.** A 2-second clip and a 30-second clip both run 1,500 encoder positions, so the short clip costs fifteen times its proportional share. For a voice agent sending 2-second utterances this is the single largest avoidable compute cost in the stack, and the fix is a different model rather than a shorter window.
+    - **CTC trains by marginalising, and marginalising buys conditional independence.** For input $x$ and label sequence $y$ of length $U$, CTC defines a distribution over all length-$T$ paths over the alphabet plus blank that collapse to $y$, and maximises $\log \sum_{\pi \in \mathcal{B}^{-1}(y)} p(\pi \mid x)$ with $p(\pi \mid x) = \prod_t p(\pi_t \mid x)$. That factorisation is the assumption: given the input, every frame's label is independent of every other frame's. It makes the sum tractable with a forward-backward recursion over $T \times (2U+1)$ states, and it means the model has no internal language model.
+    - **The collapse rule is where CTC is implemented wrong.** Merge consecutive identical labels, then delete blanks. "hello" is $h, e, l, l, o$: the two $l$'s must be separated by a blank or they merge into one, so a valid path is $\varnothing, h, \varnothing, e, \varnothing, l, \varnothing, l, \varnothing, o, \varnothing$. Drop the blank between them and the same path decodes to "helo". The blank is not a pause symbol; it is the separator that makes repeated labels distinguishable.
+    - **RNN-T keeps history and pays in two dimensions.** The encoder emits $h_t$, a prediction network emits $g_u$ from the previously emitted labels, and a joiner scores every pair, producing a distribution over the vocabulary plus blank at each lattice point $(t, u)$. For 1,000 frames and 20 output tokens that is $1{,}000 \times 21 = 21{,}000$ joiner evaluations. Because the encoder can be causal and the prediction network only needs the past, RNN-T streams naturally; because the joiner sees both sides, its output is far better calibrated than CTC's.
+    - **Attention-based seq2seq drops monotonicity and hallucinates on silence.** A decoder cross-attends over the encoder states with no constraint that attention must move forward, so it can attend anywhere, return to an earlier position, or attend to padding. That is what produces Whisper's characteristic failure: on silence or noise it emits a fluent sentence that was never spoken, because the language model prior is strong and the audio evidence is weak. The mitigation is not a better acoustic model; it is a voice activity detector, a no-speech token, and a confidence check.
+    - **Streaming is an attention-mask decision, not a decoding trick.** A bidirectional encoder over 30 seconds cannot emit anything until the window closes, so the floor on latency is the window. Chunked attention restricts each position to a fixed left context and a small right lookahead: 320 ms chunks at 100 frames/s is 32 frames per chunk, with 2 seconds of left context (200 frames) and 160 ms of lookahead (16 frames). The left context costs compute and nothing in latency; the lookahead is latency.
+    - **WER is a normalised edit distance and it is easy to compute wrongly.** $\text{WER} = (S + D + I)/N$ where $N$ is the number of reference words. Insertions raise the numerator without raising the denominator, so WER can exceed 100%: three spurious words against a three-word reference is 100%, and five is 167%. Normalisation — casing, punctuation, number formatting, filler words — changes the number more than most model changes do, which is why a WER without a stated normalisation is not a measurement.
+  derivations:
+    - title: "CTC's sum over alignments, and why it is tractable"
+      latex: |
+        Let $\mathcal{B}$ map a frame path to a label sequence. CTC defines
+
+        $$p(y \mid x) = \sum_{\pi \in \mathcal{B}^{-1}(y)} p(\pi \mid x),
+          \qquad p(\pi \mid x) = \prod_{t=1}^{T} p(\pi_t \mid x).$$
+
+        The number of paths grows combinatorially in $T$ and $U$, so the sum is
+        never enumerated. Instead define $\alpha_t(s)$, the total probability of
+        all paths that reach lattice state $s$ at frame $t$, over the $2U+1$ states
+        of the extended label sequence $\ell = (\varnothing, y_1, \varnothing,
+        y_2, \dots, y_U, \varnothing)$. Then
+
+        $$\alpha_t(s) = \Big(\alpha_{t-1}(s) + \alpha_{t-1}(s-1)
+          + [\ell_s \neq \varnothing \wedge \ell_s \neq \ell_{s-2}]\,
+          \alpha_{t-1}(s-2)\Big)\, p(\ell_s \mid x_t),$$
+
+        and $p(y \mid x) = \alpha_T(2U) + \alpha_T(2U+1)$. The recursion is
+        $O(T \cdot U)$.
+      prose: >-
+        The bracket is the whole subtlety. Staying in the same state allows a label
+        to repeat across frames; moving one state forward emits the next label;
+        skipping a blank state is legal only when the two neighbouring labels
+        differ, because otherwise the skip would let two identical labels collapse
+        into one. That single condition is why the same recursion cannot be used
+        with a blank-free alphabet, and why the extended sequence has $2U+1$ states
+        rather than $U$.
+
+    - title: "WER is an edit distance with an asymmetric denominator"
+      latex: |
+        For reference words $r_{1..N}$ and hypothesis words $h_{1..M}$, let
+        $d(i, j)$ be the minimum edit distance between prefixes, with the three
+        operations being deletion at cost 1, insertion at cost 1, and match or
+        substitution at cost $[r_i \neq h_j]$:
+
+        $$d(i, j) = \min\big(d(i-1, j) + 1,\ d(i, j-1) + 1,\
+          d(i-1, j-1) + [r_i \neq h_j]\big),$$
+
+        and the operation counts come from the backtrace, with
+        $\text{WER} = (S + D + I)/N$. Since $M$ can exceed $N$, the numerator can
+        exceed $N$:
+
+        $$I = 5,\ N = 3 \quad\Longrightarrow\quad \text{WER} = 167\%.$$
+      prose: >-
+        The asymmetry is deliberate: WER is recall-oriented, charging the system
+        for every word it failed to produce and for every word it produced that was
+        not there, but normalising only by the words that were. That is why a
+        deletion-heavy system and an insertion-heavy system with the same edit
+        distance can have different WERs on the same corpus — the denominator is
+        fixed by the reference, not by the hypothesis. It is also why the metric
+        punishes a hallucinating model on short clips so heavily: three spurious
+        words against a three-word reference is 100%.
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A 2-second clip and a 30-second clip both go through Whisper's encoder.
+        What are the position counts, and what does that imply about cost per
+        second of audio?
+      answerKind: short_text
+      hint: "Positions are the padded window, not the clip. 50 positions per second of audio at 10 ms hop with stride 2."
+      solution: >-
+        Both run 1,500 positions, because both are padded to 30 seconds. The
+        2-second clip therefore spends 15× its proportional compute: 1,500
+        positions for 2 seconds is 750 per second, against 50 per second for a
+        30-second clip. That is the argument for a shorter-window or streaming
+        model in a voice agent, and it is not fixable by batching alone.
+
+    - id: cp-2
+      question: >-
+        A CTC model emits the frame path h, h, e, l, l, o with no blanks. What
+        does it decode to, and what would the path have to be to decode to
+        "hello"?
+      answerKind: short_text
+      hint: "Collapse merges consecutive duplicates first, then removes blanks."
+      solution: >-
+        It decodes to "helo": merging duplicates turns $h,h,e,l,l,o$ into
+        $h,e,l,o$. To get "hello" the two $l$'s must be separated, so a valid path
+        is $h, e, l, \varnothing, l, o$ — the blank keeps them distinct through the
+        merge step and is then deleted.
+
+    - id: cp-3
+      question: >-
+        Why does a CTC model benefit more from an external language model than an
+        RNN-T does?
+      answerKind: short_text
+      hint: "Which model has a language model inside it, and what does conditional independence rule out?"
+      solution: >-
+        CTC assumes frame labels are conditionally independent given the input, so
+        its output distribution contains no sequence-level prior at all: every frame
+        is scored alone. An RNN-T's prediction network conditions on the labels
+        emitted so far, so it already carries an internal language model. Fusing an
+        external LM into CTC therefore adds information the model cannot represent,
+        while for RNN-T it mostly adjusts an existing prior.
+
+  try_it: >-
+    Take the reference "the quick brown fox jumps over the lazy dog" and three
+    hypotheses, and compute S, D, I and WER for each by hand — one that drops a
+    word, one that substitutes "fox" with "box", and one that inserts three words
+    at the end. Then check whether any of them exceeds 100%.
+
+  interview_questions:
+    - question: "Explain CTC to someone who knows sequence models but has never seen the blank token."
+      level: mid
+      key_points:
+        - "There are no frame-level labels, so the loss sums over every monotonic alignment that collapses to the reference; the sum is computed with a forward-backward recursion over T x (2U+1) states."
+        - "The blank separates repeated labels, because merge-then-delete would otherwise turn two l's into one."
+        - "The factorisation p(pi|x) = prod p(pi_t|x) is a conditional independence assumption, which is why there is no internal language model and why an external LM helps."
+        - "Inference is non-autoregressive: one frame-synchronous pass and a collapse, so it streams and it is fast."
+      follow_up: "What does the blank buy you that a 'repeat' symbol would not?"
+    - question: "Why can Whisper not be used for streaming ASR, and what would you have to change?"
+      level: senior
+      key_points:
+        - "The encoder is bidirectional over a padded 30-second window, so no position has seen less than the whole window; the latency floor is the window itself."
+        - "Every input is padded to 30 seconds, so short clips pay the full encoder cost — 1,500 positions regardless of duration."
+        - "Streaming needs a chunked attention mask: a fixed left context (compute only) plus a small right lookahead (latency)."
+        - "The decoder is autoregressive over text, so the decoder is not the obstacle; the encoder's lack of a mask is."
+      follow_up: "What happens to WER when you reduce the lookahead to zero, and which sounds degrade first?"
+    - question: "You have a CTC model at 9% WER and an RNN-T at 7% WER. When would you ship the CTC model anyway?"
+      level: senior
+      key_points:
+        - "Latency and streaming: CTC is one frame-synchronous pass, while RNN-T pays the joiner at every lattice point and needs a causal encoder."
+        - "Compute and memory: RNN-T training requires the full T x (U+1) lattice, and its inference cost scales with output length."
+        - "Controllability: CTC plus a small external LM is easier to bias toward a domain vocabulary than an RNN-T's internal LM."
+        - "Robustness: CTC's independence assumption makes it less prone to fluent hallucination on silence, which matters for always-on microphones."
+      follow_up: "How would you bias either model toward a list of product names without retraining it?"
+
+  common_mistakes:
+    - "Collapsing a CTC path by removing blanks before merging duplicates, which turns every doubled letter into one."
+    - "Computing WER without a normalisation step and comparing it against a published number that had one."
+    - "Assuming an attention-based model's attention weights are an alignment you can use for timestamps — they are not, and Whisper's timestamp tokens exist for that reason."
+    - "Wrapping a 30-second-window model in a loop and calling it streaming, when the latency floor is the window."
+
+  further_reading:
+    - label: "Graves, Fernández, Gomez & Schmidhuber, Connectionist Temporal Classification (ICML 2006)"
+    - label: "Graves, Sequence Transduction with Recurrent Neural Networks (RNN-T, 2012)"
+    - label: "Radford, Kim, Xu, Brockman, McLeavey & Sutskever, Robust Speech Recognition via Large-Scale Weak Supervision (Whisper, 2022)"
+    - label: "Chan, Jaitly, Le & Vinyals, Listen, Attend and Spell (2015)"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        There are no frame labels, so every method has to invent a way to train
+        without them. CTC sums over alignments and adds a blank. RNN-T sums over a
+        grid and keeps a prediction network. Attention learns an alignment. Pick
+        which one you are looking at by asking what its lattice is.
+      blocks:
+        - kind: checklist
+          body: |
+            - 100 frames per second at a 10 ms hop
+            - CTC: T x (2U+1) states, blank separates repeats
+            - RNN-T: T x (U+1) lattice, one joiner call per node
+            - attention: no monotonic constraint, no streaming
+            - WER: (S + D + I) / N, with N the reference word count
+      checkpoint: >-
+        Which of the three can emit a word before the sentence ends, and what
+        property of its encoder makes that possible?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Decide latency first. If the product needs partials under 500 ms, the
+        choice is a causal encoder with chunked attention and either CTC or RNN-T
+        on top. If it needs the best transcript and can wait for a window, an
+        attention encoder-decoder is the strongest option — and then guard it with
+        a VAD so silence does not become a hallucination.
+      blocks:
+        - kind: checklist
+          body: |
+            - window 30 s -> 3,000 mel frames -> 1,500 positions
+            - attention cost is positions squared: 1,500 squared = 2.25M per head per layer
+            - chunk 320 ms = 32 frames; 2 s left context = 200 frames
+            - CTC: one pass; RNN-T: 21,000 joiner calls for 1,000 frames x 21 tokens
+      checkpoint: >-
+        Which latency term does the lookahead belong to, and which one does the left
+        context belong to?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three decoders, one collapse. The collapse function is shared and it is four
+        lines.
+      blocks:
+        - kind: pseudocode
+          body: |
+            collapse(path, blank):
+                out = []
+                prev = None
+                for p in path:
+                    if p != prev and p != blank:
+                        out.append(p)
+                    prev = p
+                return out
+
+            ctc_decode(logits):            # logits: T x (V+1)
+                return collapse(argmax(logits, axis=1))
+
+            rnnt_decode(h, predictor, joiner, max_u):
+                u = 0; out = []
+                for t in range(len(h)):
+                    while u < max_u:
+                        p = joiner(h[t], predictor(out))
+                        if argmax(p) == blank: break
+                        out.append(argmax(p)); u += 1
+                return out
+      checkpoint: >-
+        In `rnnt_decode`, why can the inner loop emit several labels at one frame,
+        and what does that imply about output timing?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The CTC forward recursion and the WER edit distance, both written out.
+      blocks:
+        - kind: math
+          body: |
+            CTC, over the extended label sequence
+            $\ell = (\varnothing, y_1, \varnothing, \dots, y_U, \varnothing)$:
+
+            $$\alpha_t(s) = \Big(\alpha_{t-1}(s) + \alpha_{t-1}(s-1)
+              + [\ell_s \neq \varnothing \wedge \ell_s \neq \ell_{s-2}]\,
+              \alpha_{t-1}(s-2)\Big) p(\ell_s \mid x_t).$$
+
+            $$p(y \mid x) = \alpha_T(2U) + \alpha_T(2U+1).$$
+
+            WER:
+
+            $$d(i,j) = \min\{d(i-1,j)+1,\ d(i,j-1)+1,\
+              d(i-1,j-1)+[r_i \neq h_j]\},$$
+
+            $$\text{WER} = \frac{S + D + I}{N}.$$
+      checkpoint: >-
+        Why is the skip transition conditioned on the two labels being different,
+        and what would break if it were unconditional?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        Collapse and WER, implemented and checked against the worked examples in the
+        text.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            def collapse(path, blank=0):
+                out, prev = [], None
+                for p in path:
+                    if p != prev and p != blank:
+                        out.append(p)
+                    prev = p
+                return out
+
+            # collapse([1, 2, 3, 3, 4])          -> [1, 2, 3, 4]      "helo"
+            # collapse([0,1,0,2,0,3,0,3,0,4,0])  -> [1, 2, 3, 3, 4]  "hello"
+
+            def wer(ref, hyp):
+                r, h = ref.split(), hyp.split()
+                n, m = len(r), len(h)
+                d = [[0] * (m + 1) for _ in range(n + 1)]
+                for i in range(n + 1): d[i][0] = i
+                for j in range(m + 1): d[0][j] = j
+                for i in range(1, n + 1):
+                    for j in range(1, m + 1):
+                        d[i][j] = min(d[i-1][j] + 1, d[i][j-1] + 1,
+                                      d[i-1][j-1] + (r[i-1] != h[j-1]))
+                return d[n][m] / n
+
+            # wer("the cat sat on the mat", "the cat sat on a mat")  -> 0.1667
+            # wer("please call stella", "please call stella and ask her") -> 1.0
+      checkpoint: >-
+        The WER function returns edit distance over N. What does it return for an
+        empty reference, and why is that case worth guarding?
+  implementations:
+    - language: python
+      title: "CTC forward against brute force, and the collapse rule"
+      note: >-
+        Computes the CTC marginal for two labels over three frames with the forward algorithm and checks it against brute-force enumeration of all 27 paths, so the blank-skipping transition is verified rather than asserted. The collapse examples show why a repeated label needs a blank between its emissions, and the 3x3 shape is the only reason enumeration is possible: the real forward pass runs in log space over thousands of frames.
+      code: |
+        import itertools
+        import numpy as np
+
+        BLANK = 0
+
+
+        def logsumexp(x):
+            m = np.max(x)
+            return -np.inf if not np.isfinite(m) else m + np.log(np.exp(x - m).sum())
+
+        def ctc_logprob(logp, labels):
+            ext = [BLANK]
+            for y in labels:
+                ext += [y, BLANK]
+            T, S = len(logp), len(ext)
+            a = np.full((T, S), -np.inf)
+            a[0, 0] = logp[0, BLANK]
+            if S > 1:
+                a[0, 1] = logp[0, ext[1]]
+            for t in range(1, T):
+                for s in range(S):
+                    opts = [a[t - 1, s]]
+                    if s >= 1:
+                        opts.append(a[t - 1, s - 1])
+                    if s >= 2 and ext[s] != BLANK and ext[s] != ext[s - 2]:
+                        opts.append(a[t - 1, s - 2])
+                    a[t, s] = logsumexp(np.array(opts)) + logp[t, ext[s]]
+            return logsumexp(a[T - 1, max(S - 2, 0):])
+
+        def collapse(path):
+            out, prev = [], None
+            for p in path:
+                if p != prev and p != BLANK:
+                    out.append(int(p))
+                prev = p
+            return out
+
+
+        def brute_force(logp, labels):
+            total = -np.inf
+            for path in itertools.product(range(logp.shape[1]), repeat=len(logp)):
+                if collapse(path) == list(labels):
+                    total = np.logaddexp(total, sum(logp[t, p] for t, p in enumerate(path)))
+            return total
+
+        def main():
+            logp = np.log(np.array([[.6, .3, .1], [.1, .6, .3], [.6, .3, .1]]))
+            labels = [1, 2]
+            fwd, bf = ctc_logprob(logp, labels), brute_force(logp, labels)
+            print(f"CTC forward log P = {fwd:.6f}; brute force = {bf:.6f}")
+            print(f"collapse([1,1,0,2]) = {collapse([1, 1, 0, 2])}; "
+                  f"[1,0,1,2] = {collapse([1, 0, 1, 2])}")
+
+            assert abs(fwd - bf) < 1e-9
+            assert collapse([1, 1, 0, 2]) == [1, 2] and collapse([1, 0, 1, 2]) == [1, 1, 2]
+            assert collapse([2, 2, 0, 1]) == [2, 1]
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: asr-ctc-collapse
+      title: "Apply the CTC collapse rule"
+      difficulty: easy
+      prompt: >-
+        Merge consecutive repeated labels, then delete blanks (0). Return the resulting label
+        sequence for a frame-level path.
+      language: python
+      entry: collapse
+      testCases:
+        - input: '{"path": [1, 1, 0, 2]}'
+          expected: "[1, 2]"
+          tolerance: 1e-6
+        - input: '{"path": [1, 0, 1, 2]}'
+          expected: "[1, 1, 2]"
+          tolerance: 1e-6
+        - input: '{"path": [0, 0, 3, 3, 0]}'
+          expected: "[3]"
+          tolerance: 1e-6
+      solution: |
+        def collapse(path, blank=0):
+            out, prev = [], None
+            for p in path:
+                if p != prev and p != blank:
+                    out.append(p)
+                prev = p
+            return out
+      solutionExplanation: >-
+        The repeated 1 merges to one, but two 1s separated by a blank stay separate. Without the
+        blank, hello's double l is impossible to emit.
+      tags: [asr, ctc]

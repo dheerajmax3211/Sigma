@@ -1,0 +1,1458 @@
+id: custom-kernels-triton
+slug: custom-kernels-triton
+title: "Custom Kernels: Triton and CUDA Basics"
+summary: >-
+  A kernel is a schedule for a memory hierarchy, and the schedule is arithmetic:
+  a 128x256 output tile reuses every byte it loads 85 times, a 128x128 tile 63
+  times, and the 147.7 FLOP-per-byte ridge point decides which of your kernels
+  can ever reach peak. This topic derives the tile size from the register file
+  rather than from taste, prices fusion at 3.33x fewer bytes for a
+  LayerNorm-GELU-dropout-residual block, and covers the warp primitives and the
+  Triton block-program model that turn the schedule into code.
+kind: lesson
+difficulty: expert
+position: 9
+estMinutes: 31
+prerequisites: [numerical-linear-algebra, numerical-linear-algebra]
+phase: kernels
+tags: [triton, cuda, gpu-kernels, tiling, shared-memory, arithmetic-intensity, roofline, bank-conflicts, warp-shuffle, kernel-fusion, memory-hierarchy, num-warps]
+
+body:
+  big_idea: >-
+    A GPU kernel is a schedule for a memory hierarchy, not a loop over
+    arithmetic: with 8.88x between shared memory and HBM, the only question is
+    how often each loaded byte is reused.
+  problem:
+    - "Four elementwise kernels around one LayerNorm are a third of the step's wall clock, each reading and writing the full 67.11 MB activation."
+    - "Your first Triton kernel runs at 380 GB/s on a 3.35 TB/s card: 384 words per program is too little in flight to cover latency."
+    - "A fused kernel is numerically wrong only at K=1000 — max error 61.52, 47.9% relative — because `K // TILE_K` silently drops the remainder."
+  analogy: >-
+    Pantry down the hall, cutting board at your elbow. A cook who fetches one
+    onion at a time does one chop per twenty-second walk; mise en place —
+    carry out everything the dish needs, arrange it on the board — does fifty.
+    Same knife, same onions: the difference is how often the walk happened,
+    and the board is 227 KiB of shared memory.
+  concept_points:
+    - "**The hierarchy is five numbers: 8.88x in bandwidth, 500x in latency.** An H100 SM has 227 KiB of shared memory at 128 B/clk — 29.74 TB/s across 132 SMs — against HBM's **3.35 TB/s**, or **14.42 B/clk/SM**. Little's law then sets the in-flight bytes: **7,210 per SM**, 14.1 128-bit loads, which is why a 384-word block reaches 380 GB/s, 28.4% of peak."
+    - "**The ridge point is 147.7 FLOP per byte.** 494.7 TFLOP/s over 3.35 TB/s. Below it you buy bytes and the arithmetic is free; above it the reverse. Intensity: tanh **1.5**, a softmax row **0.31**, GEMV **1.0**, a 128x128-tiled GEMM **63.0**, tiled attention **120.5** — so at AI 1.5 the memory system delivers 1.0% of the figure on the box."
+    - "**A tile's intensity is $t_m t_n/(t_m+t_n)$, so tiling is arithmetic.** 128x128 gives **64.0**, 256x256 **128.0**; two levels take a 4096-cubed GEMM from **274.91 GB to 2.181 GB**. The ceiling is registers, not shared memory: 128x256 fp32 accumulators are **128 registers per thread, half the 65,536-word file**, capping an SM at **83.6 FLOP/byte**."
+    - "**Elementwise kernels are pure traffic, and fusion divides the bytes by the number of passes.** One pass over an 8192x4096 fp16 activation is **134.22 MB, 40.06 us**; five unfused passes move **671.09 MB**. Measured: one in-place pass 7.39 ms, five 39.34 ms — **5.321x for 5x the bytes**, at the same achieved bandwidth. Arithmetic inside them cannot help."
+    - "**The warp is the unit of access, and a bank conflict costs 32x: multiplicity $\\gcd(s, 32)$.** A column read of a row-major [32][32] fp32 tile has stride 32, so every lane lands on bank $(32r + c) \\bmod 32 = c$: one bank, 32 transactions. Padding to 33 columns gives $(r + c) \\bmod 32$: 32 banks, one transaction. Stride 34 is 2-way."
+    - "**Triton replaces the thread with a block program; the compiler owns the warp.** A `@triton.jit` kernel builds offsets with `tl.arange`, masks with `tl.load(..., mask=..., other=0.0)`, computes with `tl.dot`; a `tl.sum` becomes the shuffle tree. `num_warps` wants $\\text{BLOCK}/(32 \\cdot \\text{num\\_warps}) \\in \\{4,8\\}$ elements per thread; `num_stages` is the pipeline — a 48 KiB stage fits four times in 227 KiB."
+  definitions:
+    - term: "Kernel"
+      meaning: >-
+        One function launched over a grid of blocks. It is the unit of
+        scheduling on a GPU and, in this topic, the unit of *memory scheduling*:
+        a kernel's performance is set by which bytes it loads, how often, and
+        from which level of the hierarchy.
+    - term: "HBM"
+      meaning: >-
+        High-bandwidth memory, the off-chip pool: 80 GiB at 3.35 TB/s and about
+        500 cycles on an H100. Every tensor a framework materialises lives here
+        unless a kernel explicitly keeps it on chip, which is the distinction
+        between a naive op and a fused one.
+    - term: "Shared memory (SRAM)"
+      meaning: >-
+        The 227 KiB per SM that a block addresses directly, at 128 bytes per
+        clock per SM — about 8.88x HBM's aggregate bandwidth and 30 cycles of
+        latency. Explicitly managed: you decide what goes in it, which is the
+        whole content of writing a tiled kernel.
+    - term: "Register file"
+      meaning: >-
+        256 KiB per SM, 65,536 32-bit words, one cycle. The binding constraint
+        on tile size, because fp32 accumulators live here: a 128x256 tile is
+        32,768 words, half the file, and 256x256 is all of it.
+    - term: "Arithmetic intensity"
+      meaning: >-
+        FLOPs performed per byte moved from HBM. It is the x-axis of the
+        roofline and the only number that decides whether a kernel is
+        bandwidth-bound. A 128x128-tiled GEMM is 63.0; an elementwise tanh is
+        1.5.
+    - term: "Ridge point"
+      meaning: >-
+        $P/B$, the intensity at which a kernel stops being bandwidth-bound:
+        494.7 TFLOP/s of dense fp16 over 3.35 TB/s is **147.7**. Below it, more
+        FLOPs are free; above it, more bytes are free. Every convention choice
+        moves it by at most 2x, and the margins here are larger than that.
+    - term: "Tile (block tile)"
+      meaning: >-
+        The patch of the output a single block computes, $t_m \times t_n$, with
+        a k-slice staged through shared memory. Its size sets the reuse ratio
+        $t_m t_n/(t_m+t_n)$ and therefore the intensity; its shape is bounded by
+        registers and its k-depth by shared memory.
+    - term: "Warp"
+      meaning: >-
+        32 lanes that execute one instruction together. The unit of memory
+        coalescing (32 contiguous fp32 words = 128 bytes = one transaction), of
+        divergence, and of every shuffle primitive.
+    - term: "Coalescing"
+      meaning: >-
+        Having the 32 lanes of a warp touch 32 consecutive words, so one
+        instruction becomes one 128-byte transaction. Not coalesced, the same
+        instruction becomes as many transactions as there are distinct
+        128-byte segments, and bandwidth falls by that factor.
+    - term: "Bank conflict"
+      meaning: >-
+        Two lanes in one warp accessing the same shared-memory bank with
+        different addresses, which serialises the request. The multiplicity for
+        a stride-$s$ fp32 access is $\gcd(s, 32)$: 32 for an unpadded [32][32]
+        transpose, 1 after padding to 33 columns.
+    - term: "Occupancy"
+      meaning: >-
+        Resident warps per SM as a fraction of the 64 the hardware allows. It is
+        what you spend to buy tiling: a 128x256 tile with 192 KiB of pipeline
+        buffers leaves room for one block per SM, and the reuse has to be worth
+        the latency hiding you gave up.
+    - term: "Kernel fusion"
+      meaning: >-
+        Computing several ops in one kernel so the intermediate never reaches
+        HBM. For pointwise chains the whole benefit is the byte count — 3.33x
+        for LayerNorm-GELU-dropout-residual — and the whole cost is register
+        pressure and the loss of per-op debuggability.
+    - term: "Software pipelining (num_stages)"
+      meaning: >-
+        Prefetching the next k-slice into shared memory while the tensor cores
+        consume the current one. In Triton it is one integer; in CUDA it is
+        double buffering and a barrier placement you have to get right. It is
+        the only knob that buys latency hiding without occupancy.
+    - term: "Block program (Triton)"
+      meaning: >-
+        Triton's unit of work: one program owns one tile, addressed by
+        `tl.program_id`, and expresses it as whole-tile operations on
+        `tl.arange` offsets. Threads and barriers are the compiler's problem,
+        which is why a Triton kernel is 30 lines where the CUDA version is 200.
+    - term: "Register spilling"
+      meaning: >-
+        What the compiler does when a kernel needs more live values than the
+        255 registers per thread allow: it writes them to local memory, which is
+        backed by HBM. A fused kernel that spills is slower than the unfused
+        chain it replaced, and the profiler reports it as local-memory traffic
+        rather than as an error.
+    - term: "Grid swizzling"
+      meaning: >-
+        Launching output tiles in an order that keeps a K-panel's consumers
+        resident in L2 at the same time — a blocked or grouped ordering instead
+        of row-major. It changes no arithmetic and no bytes-per-tile, and it is
+        worth up to 2x on a large GEMM.
+
+  diagrams:
+    - type: stack
+      title: "The hierarchy, priced per SM"
+      layers:
+        - "Registers: 256 KiB per SM, 1 cycle, 65,536 words"
+        - "Shared memory: 227 KiB per SM, 128 B per clock, about 30 cycles"
+        - "L2: 50 MiB shared by 132 SMs, about 200 cycles"
+        - "HBM: 80 GiB at 3.35 TB/s, 14.42 B per clock per SM, about 500 cycles"
+        - "The gap in one line: 8.88x the bandwidth, 16.7x the latency"
+        - "A 128x128 fp16 tile: 32 KiB, so 7 of them fit in one SM's shared memory"
+
+    - type: architecture
+      title: "One tiled GEMM block, from HBM to accumulators"
+      nodes:
+        - id: hbm
+          x: 0
+          y: 0
+          label: "HBM: A and B panels"
+          kind: storage
+          detail: "4096-cubed fp16 at 128x256 tiles moves 1.644 GB here, against 274.91 GB for the cache-free triple loop. Every byte is loaded once per output tile that needs it, unless the L2 intervenes."
+        - id: l2
+          x: 1
+          y: 0
+          label: "L2: 50 MiB, the halo"
+          kind: cache
+          detail: "A K-panel of B is read by every output tile in its row of the grid. If those tiles are resident together the panel crosses HBM once and is served 32 times from here, which is the difference between 43% and 85% of peak."
+        - id: smem
+          x: 2
+          y: 0
+          label: "Shared memory: 48 KiB per stage"
+          kind: cache
+          detail: "A 128x64 fp16 slice of A is 16 KiB and a 64x256 slice of B is 32 KiB. Four pipeline stages is 192 KiB of the 227 KiB available, so num_stages=5 does not fit at this tile size."
+        - id: mma
+          x: 3
+          y: 0
+          label: "Accumulators: 128x256 fp32"
+          kind: gpu
+          detail: "32,768 words, which is 128 registers per thread at 256 threads and half of the 65,536-word register file. A 256x256 tile would be the entire file with nothing left for operands."
+        - id: out
+          x: 3
+          y: 1
+          label: "Store: one tile, once"
+          kind: storage
+          detail: "The output is written exactly once per tile, which is 134.22 MB for a 4096-squared fp16 result. This is the only traffic the naive loop and the tiled kernel share."
+        - id: kloop
+          x: 2
+          y: 1
+          label: "K loop: 64 slices per tile"
+          kind: worker
+          detail: "K=4096 in 64-deep slices is 64 iterations, each prefetching the next slice while the tensor cores consume the current one. This is what num_stages overlaps, and it is the only latency hiding that does not cost occupancy."
+      edges:
+        - { from: hbm, to: l2, label: "1.644 GB, once" }
+        - { from: l2, to: smem, label: "48 KiB per stage" }
+        - { from: smem, to: mma, label: "each element used 256x" }
+        - { from: mma, to: out, label: "write once" }
+        - { from: kloop, to: smem, label: "prefetch next", style: async }
+      caption: "The tile is chosen by registers, the k-depth by shared memory, and the reuse by the L2. Miss any of the three and the kernel runs at the bandwidth of the level it actually hit."
+
+    - type: compare
+      title: "Four kernels against one, on the same activation"
+      left_label: "Unfused: 4 launches, 671.09 MB"
+      left_points:
+        - "LayerNorm: reads 67.11 MB, writes 67.11 MB"
+        - "GELU: reads 67.11 MB, writes 67.11 MB"
+        - "Dropout: reads 67.11 MB, writes 67.11 MB"
+        - "Residual add: reads two tensors, writes one, 201.33 MB"
+        - "Total 671.09 MB, 200.32 us at 3.35 TB/s"
+        - "Four launch latencies, four intermediates in HBM, four chances to be paged out"
+      right_label: "Fused: 1 launch, 201.33 MB"
+      right_points:
+        - "Reads the activation once: 67.11 MB"
+        - "Reads the residual once: 67.11 MB"
+        - "Writes the result once: 67.11 MB"
+        - "Total 201.33 MB, 60.07 us"
+        - "3.33x fewer bytes, identical arithmetic and identical rounding"
+        - "The cost: every intermediate is now a live register, and spilling puts it back in HBM"
+
+    - type: plot
+      title: "Roofline: where real kernels sit against 147.7 FLOP per byte"
+      chart: line
+      xLabel: "arithmetic intensity (FLOP/byte)"
+      yLabel: "TFLOP/s"
+      series:
+        - name: "roofline (3.35 TB/s, 494.7 TFLOP/s)"
+          points:
+            - { x: 0.25, y: 0.84 }
+            - { x: 1.0, y: 3.35 }
+            - { x: 8.0, y: 26.8 }
+            - { x: 32.0, y: 107.2 }
+            - { x: 64.0, y: 214.4 }
+            - { x: 128.0, y: 428.8 }
+            - { x: 147.7, y: 494.7 }
+            - { x: 512.0, y: 494.7 }
+        - name: "kernels from this topic"
+          points:
+            - { x: 0.31, y: 1.05 }
+            - { x: 1.0, y: 3.35 }
+            - { x: 1.5, y: 5.03 }
+            - { x: 63.0, y: 211.1 }
+            - { x: 83.6, y: 280.0 }
+            - { x: 120.5, y: 403.7 }
+      caption: "Everything left of 147.7 is decided by bytes. A 4096-cubed GEMM at 128x256 tiles is 57% of peak before the L2 helps; a softmax row is 1.05 TFLOP/s and no scheduling change moves it."
+
+    - type: pipeline
+      title: "One Triton program, from grid index to store"
+      nodes:
+        - label: "Grid launch"
+          note: "one program per output tile"
+          detail: "grid = (ceil(M/BLOCK_M) * ceil(N/BLOCK_N),). Each program is independent: no cross-program communication, no barriers, no shared state."
+        - label: "program_id and offsets"
+          note: "tl.arange over the block"
+          detail: "rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M); cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N). Offsets are whole-tile vectors, not per-thread indices."
+        - label: "Masked load"
+          note: "tl.load(ptr + offs, mask=, other=0.0)"
+          detail: "The mask is what makes the last tile of an indivisible shape correct. other=0.0 keeps the arithmetic finite; a mask that is right for A and wrong for B is the most common Triton bug."
+        - label: "K loop with tl.dot"
+          note: "accumulate over 64-deep slices"
+          detail: "acc += tl.dot(a, b) inside a loop over K. num_stages turns this into a software pipeline: the next slice is in flight while the MMA consumes the current one."
+        - label: "Reduction or store"
+          note: "tl.sum, tl.max, tl.store"
+          detail: "A tl.sum across a block axis compiles to a warp shuffle tree (5 steps for 32 lanes) plus a shared-memory combine across warps. You never write the barrier."
+        - label: "Autotune"
+          note: "BLOCK_M, BLOCK_N, num_warps, num_stages"
+          detail: "Configs are keyed on shape. Four knobs, a dozen plausible configs, and a benchmark that runs each once — this is the part of CUDA kernel writing Triton deletes entirely."
+
+    - type: mermaid
+      title: "Is this kernel worth writing?"
+      code: |
+        graph TD
+          A[Measure the op's FLOPs and bytes] --> B{Intensity above 147.7?}
+          B -->|no| C[It is bandwidth-bound: fuse, do not tune arithmetic]
+          B -->|yes| D{Is a library kernel already near peak?}
+          C --> E{Bytes dominated by one pass?}
+          E -->|yes| F[Merge the passes: expect the ratio of pass counts]
+          E -->|no| G[Reduce reloads: tile, and check the L2 halo]
+          D -->|yes| H[Stop: cuBLAS or cuDNN is the answer]
+          D -->|no| I{Can Triton express the schedule?}
+          I -->|yes| J[Write it in Triton, autotune four knobs]
+          I -->|no| K[CUDA: custom smem layout, warp specialisation, TMA, clusters]
+
+  markdown: |
+    ## Two ratios and one number
+
+    An H100 SM touches four memories, and every kernel decision follows from
+    their prices.
+
+    | level | capacity | bandwidth | latency |
+    |---|---|---|---|
+    | registers | 256 KiB/SM | one cycle operand access | 1 cycle |
+    | shared memory | 227 KiB/SM | 128 B/clk/SM = 225.3 GB/s per SM | ~30 cycles |
+    | L2 | 50 MiB, whole GPU | roughly twice HBM | ~200 cycles |
+    | HBM | 80 GiB | 3.35 TB/s = 14.42 B/clk/SM | ~500 cycles |
+
+    Shared memory across 132 SMs is $128 \times 1.76 \times 10^9 \times 132 =
+    29.74$ TB/s, which is **8.88x** HBM. That ratio is the reason the hierarchy
+    exists: a byte fetched from HBM has to be used roughly nine times out of
+    shared memory before its round trip is paid for. The latency ratio is 500
+    cycles against 30, and it produces a second constraint that has nothing to
+    do with bandwidth:
+
+    $$B_{\text{in flight}} = \frac{3.35 \times 10^{12}}{132 \times 1.76 \times
+      10^9} \times 500 = 7{,}210\ \text{bytes per SM}$$
+
+    One warp issuing one 128-bit load per lane has 512 bytes outstanding, so
+    **14.1 such loads** must be in flight. Four warps with one load each is
+    2,048 bytes — **28.4%** of peak — which is the number your first kernel
+    reports. Nothing about the arithmetic is wrong; there is not enough work in
+    flight to cover the walk.
+
+    ## Arithmetic intensity decides which side you are on
+
+    $$I = \frac{\text{FLOPs}}{\text{bytes moved from HBM}}, \qquad
+      I^{\star} = \frac{P}{B} = \frac{494.7 \times 10^{12}}{3.35 \times 10^{12}}
+      = 147.7$$
+
+    | kernel | FLOPs | bytes | intensity | bound by |
+    |---|---|---|---|---|
+    | elementwise add, fp16 | 1 per element | 6 per element | 0.17 | bytes |
+    | softmax row, 4 passes | 5 per element | 16 per element | 0.31 | bytes |
+    | GEMV, 4096x4096 decode | $2nk$ | $2nk$ | 1.0 | bytes |
+    | elementwise tanh | 6 per element | 4 per element | 1.5 | bytes |
+    | GEMM, 32x32 tile | $2mnk$ | 15.9 per FLOP | 15.9 | bytes |
+    | GEMM, 128x128 tile | $2mnk$ | | 63.0 | bytes |
+    | GEMM, 256x128 tile | $2mnk$ | | 83.6 | bytes |
+    | FlashAttention fwd, $B_q = 128$ | $4n^2d$ | | 120.5 | bytes |
+    | any GEMM above 296x296 | | | > 147.7 | FLOPs |
+
+    The table is the topic. Everything except a large GEMM is two orders of
+    magnitude below the ridge, so "the kernel is slow because the arithmetic is
+    slow" is almost never true.
+
+    ## Tiling, derived
+
+    A block computes a $t_m \times t_n$ patch of $C$, reading $t_m k$ elements
+    of $A$ and $k t_n$ of $B$ for $2 t_m t_n k$ FLOPs. In fp16:
+
+    $$I_{\text{tile}} = \frac{2 t_m t_n k}{2k(t_m + t_n)}
+      = \frac{t_m t_n}{t_m + t_n}$$
+
+    which is 64.0 at 128x128, 85.3 at 256x128 and 128.0 at 256x256. Solving
+    $t^2 / 2t \ge 147.7$ for a square tile gives $t \ge 295$: no tile you can
+    hold on one SM reaches the ridge on its own.
+
+    What bounds the tile is the accumulator, not shared memory. A k-slice of a
+    128x256 tile is 48 KiB — four of them fit in 227 KiB — but 128x256 fp32
+    accumulators are 32,768 words, **128 registers per thread at 256 threads,
+    half the register file**. A 256x256 tile is 65,536 words: the entire
+    65,536-word file, with nothing left for operands, addresses or masks. So
+    the practical ceiling is 128x256 at 83.6 FLOP/byte, 57% of the ridge.
+
+    The remaining factor of two is the L2's job, and it is a property of the
+    *launch order*, not of the kernel. Each K-panel of $B$ is wanted by every
+    tile in its row of the grid; schedule those tiles together and the panel
+    crosses HBM once and is served 32 times from 50 MiB of L2. That is why the
+    same kernel is 43% of peak with a row-major grid and 85% with a swizzled
+    one, and why a card with a larger L2 makes your model look wrong.
+
+    ## Why elementwise is hopeless
+
+    A pass over $n$ elements reads $n$ and writes $n$, so $k$ unfused passes
+    move $2knb$ bytes and one fused kernel moves $2nb$:
+
+    $$\frac{B_{\text{unfused}}}{B_{\text{fused}}} = k$$
+
+    For an 8192x4096 fp16 activation, $2nb = 134.22$ MB, which is 40.06 us at
+    3.35 TB/s. Five passes: 671.09 MB, 200.32 us. A LayerNorm, GELU, dropout and
+    residual add around the same tensor is 671.09 MB unfused against 201.33 MB
+    fused — 3.33x, 200.32 us against 60.07 us — with identical arithmetic.
+    Measured on the authoring machine over a 268.4 MB array, one in-place pass
+    takes 7.39 ms at 72.61 GB/s and five take 39.34 ms at 68.23 GB/s: **5.321x
+    for 5x the bytes, at the same achieved bandwidth**. The law is traffic.
+
+    ## The canonical non-elementwise tile
+
+    Attention is the case where the intermediate is quadratic: $n^2$ scores per
+    head, 33.55 MB at 4096 tokens and $d = 128$, 1.074 GB per layer at 32 heads,
+    137.44 GB of traffic for a 32-layer forward pass if it is materialised and
+    read back four times. Tiled, Q, K and V are read once and O written once:
+    5.37 GB, 25.6x less. The tile is only half the trick — the softmax is a
+    reduction along a row that no longer fits, so the kernel carries a running
+    max $m$, a running sum $\ell$, and rescales its accumulator when $m$ grows:
+
+    $$\ell \leftarrow \ell\, e^{m - m'} + \sum_j e^{x_j - m'}, \qquad
+      O \leftarrow O\, e^{m - m'} + \sum_j e^{x_j - m'} V_j$$
+
+    Drop the $e^{m - m'}$ factors and the kernel still runs and still normalises
+    — measured at **0.6223 maximum absolute, 71.1% relative** against the
+    reference softmax. That is the single most common way a fused attention
+    kernel is wrong.
+
+    ## The warp, and why padding is arithmetic
+
+    Shared memory has 32 banks of 4 bytes. Lane $r$ of a warp reading row $r$ of
+    a row-major $[32][32]$ fp32 tile touches bank $(32r + c) \bmod 32 = c$ — one
+    bank, **32 transactions**. Pad the tile to 33 columns and the bank becomes
+    $(33r + c) \bmod 32 = (r + c) \bmod 32$, which is 32 distinct banks and one
+    transaction. In general the multiplicity is
+
+    $$w = \gcd(s, 32), \qquad \text{distinct banks} = \frac{32}{\gcd(s, 32)}$$
+
+    for a stride $s$ in 4-byte elements: 32 ways at $s = 32$, 1 at $s = 33$, 2 at
+    $s = 34$. The corollary is the part people miss — padding an already
+    conflict-free tile (33 to 34) makes it twice as slow. The same argument
+    explains the warp reduction: 5 shuffle steps for 32 lanes, against 62
+    shared-memory accesses and 5 barriers for a hand-written tree.
+
+    ## Triton's model
+
+    Triton replaces the thread with a block program. One `@triton.jit` function
+    is launched over a grid, each program computes `tl.program_id`, expresses
+    its tile as `tl.arange` offsets, and works in whole-tile ops:
+    `tl.load(ptr + offs, mask=offs < n, other=0.0)`, `tl.dot`, `tl.sum`,
+    `tl.store`. Warps, shared memory and barriers are the compiler's problem.
+    Three knobs matter: the block shape, `num_warps`, and `num_stages`. Keep
+    $\text{BLOCK}/(32 \cdot \text{num\_warps})$ at 4 or 8 elements per thread so
+    each thread issues 128-bit vector loads; keep `num_stages` times the stage
+    footprint under 227 KiB. What Triton will not do is choose a shared-memory
+    layout for you, warp-specialise, or use TMA and thread-block clusters. That
+    list is exactly what CUDA is for, and the price is every barrier you now
+    place by hand.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A GPU kernel is not a loop over arithmetic, it is a schedule for a memory hierarchy — and because the hierarchy is 8.88x between shared memory and HBM, the only question a kernel author answers is how many times each loaded byte gets used before it is evicted.
+
+    ### The analogy, in full
+
+    A kitchen with a pantry down the hall, a service counter in the next room, and a cutting board at your elbow. The pantry holds a week of ingredients and takes twenty seconds to walk to; the cutting board holds one prep and is instantaneous. A cook who fetches one onion at a time does one chop per twenty-second walk. A cook who does mise en place — reads the whole recipe, carries out every ingredient the dish needs in one trip, arranges them on the board — does fifty chops per walk. Same cook, same knife, same onions; the difference is entirely in how many times the walk happened, and the walk is not slow so much as *narrow*: the corridor delivers 3.35 tonnes a second as long as everyone walks in step. Three things map exactly. The board is shared memory: 227 KiB, and the whole art is choosing a prep small enough to fit on it. The walk is a memory transaction: 32 cooks must carry one contiguous tray, which is coalescing, and if each of the 32 reaches for a different shelf in the same cabinet — the same bank — the trip happens 32 times over, which is a bank conflict. And mise en place has a cost the analogy captures badly: the board is small, so a bigger prep means fewer cooks can work at once, and occupancy is what you paid for the reuse. The analogy breaks where the arithmetic does. A pantry trip is *serial* per cook; HBM is a wide bus that serves every SM at once, so the 3.35 TB/s is shared, not per-cook, and adding cooks does not add bandwidth. It also has no room for the fact that the board's bandwidth is 8.88x the corridor's rather than infinite, so reuse has a *price* and not just a benefit: after about nine uses, moving data from shared memory into registers is itself the bottleneck.
+
+    ### Failure modes, in full
+
+    - You profile a training step and four elementwise kernels around one LayerNorm account for a third of the wall clock while contributing essentially no FLOPs. Every one of them reads the full 67.11 MB activation and writes it back, and the fusion that would fix it is three lines in Triton — but you cannot tell from the profiler whether the problem is the traffic or the launch overhead, so you tune the wrong thing.
+    - You write your first Triton kernel, it works, and it runs at 380 GB/s on a card that does 3.35 TB/s. Nothing errors. The block size is a power of two, the masks are right, and the kernel is 9x slower than the hardware because 384 contiguous words per program is not enough in flight to cover a 500-cycle memory latency, which is a fact about Little's law and not about your code.
+    - A colleague says "just write it in CUDA if you care about performance" and you have no framework for the trade: Triton cannot express the shared-memory layout you want, cannot warp-specialise, and cannot use TMA or thread-block clusters — and CUDA can, at the price of placing every barrier yourself.
+    - A fused kernel you wrote is numerically wrong on one input shape and right on every shape you tested: the K loop runs over `K // TILE_K` blocks and silently drops the remainder. Measured on a 128x1000x128 matmul with a 256-deep K tile: max absolute error **61.52**, 47.9% relative, and exactly zero on the same code at K = 1024.
+    - Someone reruns your kernel on a GPU with a bigger L2 and it gets *faster than your model predicted*, so you conclude the model is wrong. It is not: the model assumed each K-panel crossed HBM once, and the bigger L2 let it cross once per row of the grid instead of once per tile.
+
+    ### The mechanisms, in full
+
+    - **The hierarchy is five numbers, and the ratios are 8.88x in bandwidth and 500x in latency.** An H100 SM has 256 KiB of registers at roughly a cycle, 227 KiB of shared memory at **128 bytes per clock per SM** — 225.28 GB/s per SM, **29.74 TB/s across 132 SMs**, about 30 cycles — 50 MiB of L2 at about 200 cycles, and 80 GiB of HBM3 at **3.35 TB/s** and about 500 cycles. Divide HBM's bandwidth by the SM count and the clock and you get **14.42 bytes per clock per SM** against shared memory's 128: a factor of **8.88**. That factor is the reason shared memory exists — a byte fetched from HBM has to be used about nine times out of that SM's shared memory to earn its round trip, and a kernel that reads each byte once leaves 89% of the hierarchy unused.
+    - **Little's law says how many bytes must be in flight, and it is why block size is not a style choice.** 14.42 B/clk/SM times 500 cycles of latency is **7,210 bytes in flight per SM** to keep HBM busy. One warp issuing one 128-bit-per-lane load has 512 bytes outstanding, so you need **14.1 such loads in flight** — four warps with one load each is 2,048 bytes and **28.4%** of peak bandwidth, which is exactly the 380 GB/s the naive first kernel reaches. The fix is more independent loads per thread (a bigger block, unrolled over `num_stages`) rather than more arithmetic.
+    - **The ridge point is 147.7 FLOP per byte, and every kernel you write sits on one side of it.** 494.7 TFLOP/s of dense fp16 over 3.35 TB/s. Below it you are buying bytes and the arithmetic is free; above it you are buying FLOPs and the bytes are free. The intensity table is the topic in one screen: an elementwise tanh at **1.5**, a softmax row at **0.31**, a GEMV at **1.0**, a 128x128-tiled GEMM at **63.0**, a tiled attention forward pass at **120.5**. Not one kernel outside a large GEMM is within 100x of the ridge, so "optimise the arithmetic" is the wrong instinct for all of them. The trap is that peak TFLOP/s is a tensor-core number: at AI 1.5 the memory system delivers **5.03 TFLOP/s, which is 1.0% of the figure on the box**.
+    - **A tile's arithmetic intensity is $t_m t_n / (t_m + t_n)$, so tiling is arithmetic and not craft.** Per output tile you read $t_m k$ elements of $A$ and $k t_n$ of $B$ for $2 t_m t_n k$ FLOPs, so in fp16 the intensity is $t_m t_n/(t_m+t_n)$: **64.0** at 128x128, **85.3** at 256x128, **128.0** at 256x256. Two levels of tiling get a 4096-cubed GEMM from **274.91 GB** down to **2.181 GB at 128x128** and **1.644 GB at 256x128** — 126x and 167x less traffic than the cache-free triple loop. Nothing about the multiplication changed; only how many times each element was read.
+    - **The tile ceiling is the register file, not shared memory.** A k-slice of a 128x256 tile in fp16 is only **48 KiB** (16 KiB of $A$ plus 32 KiB of $B$), which fits 227 KiB four times over. The accumulators are what bind: 128x256 fp32 is **32,768 words = 128 registers per thread at 256 threads = half the 65,536-word register file**, and 256x256 is 65,536 words, **the entire register file with nothing left for operands or addresses**. That is why the practical ceiling on one SM is a 128x256 tile at **83.6 FLOP/byte, 57% of the ridge** — and why the last factor of two has to come from somewhere else.
+    - **The last factor of two comes from the L2, so tile *order* matters as much as tile *size*.** At 128x256 the GEMM moves 1.644 GB and would run at **280.0 TFLOP/s, 56.6% of peak**, if HBM were the only source. It runs faster because each K-panel of $B$ is read by every output tile in its row of the grid: if those tiles are resident together, the panel crosses HBM once and is served 32 times from the **50 MiB L2**. That is what grid swizzling buys — the difference between 43% and 85% of peak on the same tile size — and it is invisible in the kernel, which is why the same kernel benchmarks differently on two cards with different L2 capacities.
+    - **Elementwise kernels are pure traffic, and fusion divides the bytes by the number of passes: 5.321x measured.** One pass over an 8192x4096 fp16 activation is 67.11 MB in and 67.11 MB out — **134.22 MB, 40.06 us at 3.35 TB/s**. Five unfused ops move **671.09 MB** and take 200.32 us; one fused kernel moves 134.22 MB and takes 40.06 us. Measured on the authoring machine over a 268.4 MB float64 array: one in-place pass **7.39 ms at 72.61 GB/s**, five in-place passes **39.34 ms at 68.23 GB/s** — a ratio of **5.321 for exactly 5x the bytes**, with the same achieved bandwidth in both, which is the proof that the law is traffic and not instruction count. The trap: five passes at 6 FLOP per element is AI 1.5, and no amount of arithmetic skill inside them helps.
+    - **The normalization block of a transformer is 3.33x more traffic unfused, and that is the whole of "kernel fusion" for pointwise chains.** Over the same 67.11 MB tensor: LayerNorm reads and writes 134.22 MB, GELU 134.22, dropout 134.22, and the residual add reads two and writes one for 201.33 — **671.09 MB**, 200.32 us. Fused into one kernel that reads the activation, reads the residual and writes the result: **201.33 MB, 60.07 us**, 3.33x less, with byte-identical arithmetic. The limit is register pressure: fusion is free until the fused kernel has more live values than registers, at which point it spills to local memory — which is HBM — and you have written the unfused version with extra steps.
+    - **Decode is permanently bandwidth-bound because a GEMV is AI 1.0, and the wrong tile makes it 0.5.** A 4096x4096 fp16 weight matrix is **33.55 MB**; one token reads all of it for 33.55 MFLOPs, so the intensity is 0.99 for a 1x128 tile and the roof is **3.35 TFLOP/s, 0.68% of peak**. Run the same problem through the 128x128 tile a prefill kernel uses and `ceil(1/128)` is one tile row, so the kernel loads 128 rows of $A$ to compute one: the intensity falls to **0.4999** and the tiled version is **exactly as expensive as the naive loop**, 67.12 MB either way. The fix is a different tile, not a better kernel — or a bigger batch, which is the inference cost model's argument arriving from the other direction.
+    - **FlashAttention is this argument applied to a non-elementwise op: 25.6x fewer bytes at 4k.** Naive attention writes the score matrix — 33.55 MB per head, **1.074 GB per layer** at 32 heads — and reads it back, four passes over $n^2$: **137.44 GB** for one 32-layer forward pass at 4096 tokens. The tiled kernel reads Q, K and V once and writes O once: **5.37 GB**, 25.6x less, with the score matrix never existing as a tensor. What makes it a *kernel* topic rather than an algebra one is that the softmax is a reduction over a row that no longer fits anywhere: the online rescale by $e^{m_{\text{old}} - m_{\text{new}}}$ is what makes one streaming pass exact, and two floats per row are the only state the backward pass needs. Copy the tiling without the rescale and the kernel runs, the output is normalised, and the answer is **71.1% wrong, measured**.
+    - **The warp is the unit of memory access, and a bank conflict costs 32x: the multiplicity is $\gcd(s, 32)$.** A warp load of 32 contiguous fp32 is 128 bytes, one transaction. A column read of a row-major [32][32] fp32 tile, lane $r$ on row $r$, has stride 32, so every lane lands on bank $(32r + c) \bmod 32 = c$: **one bank, 32 transactions**, and the instruction takes 32 times as long. Pad to 33 columns and the bank becomes $(33r + c) \bmod 32 = (r + c) \bmod 32$: **32 banks, one transaction**. Counted, not guessed: stride 32 gives 32 ways and 1 bank, 33 gives 1 way and 32 banks, 34 gives 2 ways and 16 banks — and padding a tile that was already conflict-free (33 to 34) makes it **2x worse**, which is why the plus-one is a fix for a specific stride and not a ritual. A warp reduction is the same story from the other side: **5 shuffles** for 32 lanes, against **62 shared-memory accesses and 5 barriers** for the tree you would write by hand.
+    - **Triton replaces the thread with a block program, and the compiler owns the warp — so the knobs are the block shape, `num_warps` and `num_stages`.** A `@triton.jit` kernel is launched over a grid; each program computes `tl.program_id(0)`, builds offsets with `tl.arange`, loads with `tl.load(ptr + offs, mask=offs < n, other=0.0)`, computes with `tl.dot` and `tl.sum`, and writes with `tl.store`. There is no `threadIdx`, no `__syncthreads` and no shared-memory declaration: a `tl.dot` on two block tiles becomes an MMA over shared-memory tiles and a `tl.sum` becomes the shuffle tree. `num_warps` decides how the block is spread over warps, and the rule is $\text{BLOCK}/(32 \cdot \text{num\_warps}) \in \{4, 8\}$ elements per thread: 1024 elements at 4 warps is 8 per thread, 16 bytes, one 128-bit vector load; at 8 warps it is 4 per thread and 8 bytes, so you doubled the warps without doubling the bytes in flight. `num_stages` is the software pipeline — a 128x256 tile with a 64-deep k-slice is **48 KiB per stage**, so four stages is **192 KiB of the 227 KiB** and the fifth does not fit.
+  derivations:
+    - title: "The tile intensity, and the register file that caps it"
+      latex: |
+        A block owns a $t_m \times t_n$ patch of $C$ and loops over $K$ in
+        slices. Per output tile it touches
+
+        $$t_m k \ \text{elements of } A, \qquad k t_n \ \text{elements of } B,
+          \qquad t_m t_n \ \text{elements of } C .$$
+
+        The FLOPs are $2 t_m t_n k$, and in fp16 the bytes are $2(t_m k + k t_n)$
+        plus the output write, so the intensity is
+
+        $$I_{\text{tile}}
+          = \frac{2 t_m t_n k}{2k(t_m + t_n)}
+          = \frac{t_m t_n}{t_m + t_n} .$$
+
+        At $t_m = t_n = 128$ that is 64.0; at $t_m t_n = 128 \times 256$ it is
+        85.3. Set it equal to the ridge point and solve for a square tile:
+
+        $$\frac{t^2}{2t} = \frac{t}{2} = 147.7 \quad\Longrightarrow\quad
+          t = 295.4 .$$
+
+        Now ask whether such a tile fits. An fp32 accumulator per output element
+        is 4 bytes, so
+
+        $$R(t_m, t_n) = 4\, t_m t_n \ \text{bytes of register file},$$
+
+        and 128x256 is 131,072 bytes — half of the 262,144-byte (65,536-word)
+        file — while 256x256 is 262,144 bytes, the entire file. At 256 threads
+        the 128x256 tile is 128 registers per thread for accumulators alone,
+        leaving 127 for operands, addresses and masks inside the 255-register
+        limit. The shared-memory side is not close to binding: a 64-deep k-slice
+        of $A$ is $128 \times 64 \times 2 = 16$ KiB and of $B$ is $64 \times 256
+        \times 2 = 32$ KiB, 48 KiB per stage, four stages in 192 KiB of 227.
+
+        So the largest practical tile is 128x256 at 83.6 FLOP/byte — **56.6% of
+        the ridge** — and the rest must come from the L2.
+      prose: >-
+        This is the derivation that turns tile size from a tuning parameter into
+        a consequence. Registers, not shared memory, decide the ceiling: any
+        tile bigger than 128x256 needs more accumulator words than the SM has,
+        so the kernel spills to local memory, which is HBM, and the reuse you
+        were buying evaporates in the spill traffic.
+
+    - title: "Fusion: bytes scale with the number of passes"
+      latex: |
+        An elementwise op over $n$ elements reads all of them and writes all of
+        them, so one pass in fp16 moves $2nb$ bytes with $b = 2$. A chain of $k$
+        ops, each materialising its output, moves
+
+        $$B_{\text{unfused}} = 2knb, \qquad B_{\text{fused}} = 2nb,$$
+
+        and their ratio is exactly $k$ — the number of times the tensor crossed
+        the bus. Time follows at the achieved bandwidth:
+
+        $$T_{\text{fused}} = \frac{2nb}{B_{\text{eff}}}, \qquad
+          \Delta T = \frac{2nb(k-1)}{B_{\text{eff}}} .$$
+
+        For $n = 8192 \times 4096 = 33{,}554{,}432$, $b = 2$: $2nb = 134.22$ MB
+        and $T_{\text{fused}} = 40.06$ us at 3.35 TB/s. With $k = 5$ the unfused
+        chain is 671.09 MB and 200.32 us.
+
+        The arithmetic-intensity consequence is brutal. Five elementwise ops at
+        6 FLOPs each over 4 bytes per element gives $I = 30/4 = 7.5$; one fused
+        op gives $I = 6/4 = 1.5$, and the roof is
+
+        $$I \cdot B = 1.5 \times 3.35 \times 10^{12} = 5.03\ \text{TFLOP/s}
+          = 1.0\% \text{ of } 494.7 .$$
+
+        Fusing *raises* the intensity (fewer bytes for the same FLOPs) and
+        lowers the roof in absolute terms only because the fused kernel now
+        moves four bytes per element instead of twenty.
+      prose: >-
+        The measured form of this law is the check that matters: one in-place
+        pass over a 268.4 MB float64 array ran at 72.61 GB/s and five at 68.23
+        GB/s, for a wall-clock ratio of 5.321 against a byte ratio of 5.000. If
+        the ratio had come out near 1, the kernel was compute-bound and fusion
+        would have bought nothing; if it had come out at 40, something other
+        than the traffic was dominating.
+
+    - title: "Bank conflicts are modular arithmetic, and the fix is gcd"
+      latex: |
+        Shared memory is 32 banks of 4 bytes, and a request is serialised by the
+        largest number of distinct addresses that land in one bank. Write the
+        tile row-major with $s$ elements per row and let lane $r$ read column
+        $c$ of row $r$; the element index is $rs + c$ and the bank is
+
+        $$\beta(r) = (rs + c) \bmod 32 .$$
+
+        The set $\{\beta(r) : r = 0 \ldots 31\}$ is the coset
+        $c + \{rs \bmod 32\}$, which is the subgroup generated by $s$ in
+        $\mathbb{Z}_{32}$ — of size $32/\gcd(s, 32)$. Each of those banks is hit
+        by $\gcd(s, 32)$ lanes, so
+
+        $$w(s) = \gcd(s, 32), \qquad |\{\beta\}| = \frac{32}{\gcd(s, 32)} .$$
+
+        At $s = 32$: $\gcd = 32$, one bank, 32 ways. At $s = 33$: $\gcd = 1$,
+        32 banks, one way. At $s = 34$: $\gcd = 2$, 16 banks, 2 ways. Counted in
+        the reference implementation, not assumed: 32/1, 1/32, 2/16 exactly.
+
+        The cost is linear in the multiplicity, because each way is a separate
+        transaction:
+
+        $$T_{\text{conflict}} = w(s) \cdot T_{\text{free}},$$
+
+        so a 32x32 transpose at stride 32 spends 32x the shared-memory time it
+        needs, and the +1 column recovers all but the last few percent.
+      prose: >-
+        The derivation explains the two things people get wrong about padding.
+        It is a fix for a specific stride, not a ritual — padding 33 to 34 makes
+        gcd 2 and doubles the cost — and the same arithmetic governs a warp
+        reduction, where a shuffle is one instruction with no bank at all
+        against a shared-memory tree of 62 accesses and 5 barriers.
+
+  implementations:
+    - language: python
+      title: "A tile traffic model, checked against a real tiled matmul"
+      note: >-
+        Correct, and doubly so: the traffic is counted from the tile geometry
+        rather than typed in, and the tiled matmul is verified against BLAS at
+        **6.395e-14 maximum absolute** on a 256x192x320 problem. The table it
+        prints is the arithmetic-intensity argument in one screen — 32x32 tiles
+        reach 15.94 FLOP/byte and 10.8% of peak, 128x128 reaches 63.02 and
+        42.7%, 256x128 reaches 83.59 and 56.6%, and nothing reaches the 147.7
+        ridge, which is why the L2 has to supply the rest. Single-process
+        caveat: this models the schedule and its bytes; it measures no
+        bandwidth, because there is no GPU here and no shared memory for the
+        tile to live in.
+      code: |
+        import math
+        import numpy as np
+
+        PEAK, BW, RIDGE = 494.7e12, 3.35e12, 494.7e12 / 3.35e12
+
+
+        def traffic(m, n, k, tm, tn, dtype_bytes=2):
+            """Bytes one GEMM moves, cache-free vs tiled. Edge tiles load full rows."""
+            tiles = math.ceil(m / tm) * math.ceil(n / tn)
+            naive = (2 * m * n * k + m * n) * dtype_bytes
+            tiled = tiles * (tm * k + k * tn) * dtype_bytes + m * n * dtype_bytes
+            return naive, tiled
+
+
+        def tiled_matmul(A, B, tm, tn, tk=32):
+            """The schedule, in numpy. One k-slice is one shared-memory stage."""
+            m, k = A.shape
+            _, n = B.shape
+            C = np.zeros((m, n))
+            for i in range(0, m, tm):
+                for j in range(0, n, tn):
+                    acc = np.zeros((min(tm, m - i), min(tn, n - j)))
+                    for p in range(0, k, tk):
+                        acc += A[i:i + tm, p:p + tk] @ B[p:p + tk, j:j + tn]
+                    C[i:i + tm, j:j + tn] = acc
+            return C
+
+
+        rng = np.random.default_rng(0)
+        A, B = rng.standard_normal((256, 192)), rng.standard_normal((192, 320))
+        print("tiled vs BLAS: max|d| %.3e" % np.max(np.abs(tiled_matmul(A, B, 64, 64) - A @ B)))
+
+        print("tile       bytes(MB)   FLOP/B   roof(TFLOP/s)  %peak")
+        for tm, tn in ((32, 32), (64, 64), (128, 128), (256, 128), (256, 256)):
+            _, tiled = traffic(4096, 4096, 4096, tm, tn)
+            ai = 2 * 4096 ** 3 / tiled
+            roof = min(PEAK, ai * BW)
+            print("%3dx%-5d %9.2f %8.2f %13.2f %7.1f%%"
+                  % (tm, tn, tiled / 1e6, ai, roof / 1e12, 100 * roof / PEAK))
+        print("naive triple loop: %.2f GB" % (traffic(4096, 4096, 4096, 128, 128)[0] / 1e9))
+        print("ridge point: %.2f FLOP/byte" % RIDGE)
+
+        # tiled vs BLAS: max|d| 6.395e-14
+        # tile       bytes(MB)   FLOP/B   roof(TFLOP/s)  %peak
+        # 32x32     8623.49    15.94         53.39    10.8%
+        # 64x64     4328.52    31.75        106.37    21.5%
+        # 128x128   2181.04    63.02        211.10    42.7%
+        # 256x128   1644.17    83.59        280.03    56.6%
+        # 256x256   1107.30   124.12        415.81    84.1%
+        # naive triple loop: 274.91 GB
+        # ridge point: 147.67 FLOP/byte
+
+    - language: python
+      title: "Two silent kernel bugs: the missing rescale and the lost remainder — numerically WRONG"
+      note: >-
+        Both of these are wrong on purpose and neither raises an exception, logs
+        a warning or produces a NaN. The first drops the online-softmax rescale,
+        the factor $e^{m - m'}$ by which the running accumulator must be
+        corrected every time the running maximum grows: **0.6223 maximum
+        absolute, 71.1% relative** against the reference softmax, on an output
+        that still sums to one along each row. The second runs a k-loop over
+        `K // TILE_K` blocks and drops the remainder, which is exactly right at
+        K = 1024 (**2.98e-13, a rounding difference**) and wrong by **61.52
+        maximum, 47.9% relative** at K = 1000. That is the shape of the bug that
+        ships: every unit test uses a power of two and every real model has a
+        hidden dimension of 11008.
+      code: |
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+
+
+        def softmax_ref(x):
+            e = np.exp(x - x.max(1, keepdims=True))
+            return e / e.sum(1, keepdims=True)
+
+
+        def softmax_stream(x, block=64, rescale=True):
+            """One pass over the row, carrying a running max and sum."""
+            m = np.full(x.shape[0], -np.inf)
+            l = np.zeros(x.shape[0])
+            acc = np.zeros_like(x)
+            for s in range(0, x.shape[1], block):
+                t = x[:, s:s + block]
+                m_new = np.maximum(m, t.max(1))
+                corr = np.exp(m - m_new)
+                p = np.exp(t - m_new[:, None])
+                if rescale:
+                    acc = acc * corr[:, None]      # BUG 1 is the missing line
+                    l = l * corr
+                acc[:, s:s + block] += p
+                l += p.sum(1)
+                m = m_new
+            return acc / l[:, None]
+
+
+        x = rng.standard_normal((8, 512)) * 3.0
+        r = softmax_ref(x)
+        for name, rs in (("no rescale", False), ("rescaled", True)):
+            o = softmax_stream(x, rescale=rs)
+            print("%-11s max|d| %.4e  rel %.4e"
+                  % (name, np.max(np.abs(o - r)), np.linalg.norm(o - r) / np.linalg.norm(r)))
+
+
+        def tiled_bad(A, B, tm, tn, tk):
+            m, k = A.shape
+            _, n = B.shape
+            C = np.zeros((m, n))
+            for i in range(0, m, tm):
+                for j in range(0, n, tn):
+                    acc = np.zeros((min(tm, m - i), min(tn, n - j)))
+                    for p in range(0, (k // tk) * tk, tk):   # BUG 2: remainder dropped
+                        acc += A[i:i + tm, p:p + tk] @ B[p:p + tk, j:j + tn]
+                    C[i:i + tm, j:j + tn] = acc
+            return C
+
+
+        for k in (1024, 1000):
+            A, B = rng.standard_normal((128, k)), rng.standard_normal((k, 128))
+            ref, out = A @ B, tiled_bad(A, B, 64, 64, 256)
+            print("K=%4d  max|d| %.4e  rel %.4e"
+                  % (k, np.max(np.abs(out - ref)),
+                     np.linalg.norm(out - ref) / np.linalg.norm(ref)))
+
+        # no rescale  max|d| 6.2230e-01  rel 7.1149e-01
+        # rescaled    max|d| 2.2204e-16  rel 1.9889e-16
+        # K=1024  max|d| 2.9843e-13  rel 1.1313e-15
+        # K=1000  max|d| 6.1516e+01  rel 4.7949e-01
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        Your 128x128-tiled GEMM reaches 42.7% of dense fp16 peak and you have
+        already tuned the block size, the k-slice and num_stages. You move to a
+        256x128 tile and get 56.6%. Why is 256x256 — which the intensity formula
+        says would give 84.1% — not the next step?
+      answerKind: short_text
+      hint: >-
+        Count the accumulator words, not the FLOPs. Then ask where a fused
+        multiply-add keeps its partial sums.
+      solution: >-
+        A 256x256 fp32 accumulator tile is 65,536 words — 262,144 bytes — which
+        is the entire 256 KiB register file of one SM, leaving nothing for
+        operands, addresses, masks or the pipeline. The compiler has no choice
+        but to spill, and spilled accumulators live in local memory, which is
+        HBM: the kernel then moves more bytes than the 32x32 version it was
+        meant to replace. The 128x256 tile is 32,768 words, 128 registers per
+        thread at 256 threads, which fits with about 127 registers left over —
+        that is the ceiling, and it is why the intensity table stops at 84.1%
+        for a tile no real kernel uses. The remaining factor of two between 57%
+        and peak comes from the L2 serving the K-panel halo, which is a launch
+        order question rather than a tile size one.
+    - id: cp-2
+      question: >-
+        You fuse LayerNorm, GELU, dropout and the residual add into one Triton
+        kernel expecting 3.33x, and it runs 1.4x *slower* than the four separate
+        kernels. Give the two most likely causes and the measurement that
+        distinguishes them.
+      answerKind: short_text
+      hint: >-
+        One cause is about the number of live values, the other is about the
+        number of blocks. They have different signatures in the profiler.
+      solution: >-
+        Register pressure first: the fused kernel keeps the mean, the variance,
+        the normalised value, the GELU output, the mask and the residual live at
+        once, and if that exceeds 255 registers per thread the compiler spills
+        to local memory — which is HBM — so you have written the unfused chain
+        with extra steps and worse scheduling. The signature is local-memory
+        traffic in the profiler (or `ptxas info: spill stores` at compile time)
+        and a lower achieved occupancy than the unfused kernels. Second, the
+        grid: the four unfused kernels each launch thousands of blocks over a
+        33.55M-element tensor, while a fused kernel with a 1024-element block
+        and 4096 elements per program launches 8,192 programs, which may not
+        saturate 132 SMs with enough warps to hide the 500-cycle latency — the
+        signature is high bandwidth per block but low aggregate bandwidth, and
+        the fix is a larger BLOCK or a persistent kernel with a grid-stride
+        loop. The measurement that separates them: compare achieved HBM
+        bandwidth against 3.35 TB/s. If it is low with low occupancy, it is the
+        grid; if it is low with high local-memory traffic, it is the spill.
+    - id: cp-3
+      question: >-
+        A teammate pads every shared-memory tile by one column "because bank
+        conflicts". Their transpose kernel gets slower after the change. What
+        happened, and what is the rule?
+      answerKind: short_text
+      hint: >-
+        Write the bank index as (r*s + c) mod 32 and compute gcd for both
+        strides.
+      solution: >-
+        If the tile was already conflict-free the padding breaks it. A
+        row-major [32][33] fp32 tile has stride 33 and gcd(33, 32) = 1, so the
+        32 lanes hit 32 distinct banks and the access costs one transaction.
+        Padding that to 34 gives gcd(34, 32) = 2, so lanes pair up on 16 banks
+        and every request costs two transactions — 2x slower, measured. The rule
+        is multiplicity = gcd(stride, 32) with 32/gcd distinct banks, so the +1
+        is a fix for strides that are multiples of 32 (or of any divisor of 32
+        that matters, like 16 or 8) and is actively harmful otherwise. The
+        correct procedure is to compute gcd for the stride you actually have
+        before adding anything.
+    - id: cp-4
+      question: >-
+        You write a fused softmax over a 32k-token row in one pass and it is
+        slower than the three-pass version, even though it moves a third of the
+        bytes. Why?
+      answerKind: short_text
+      hint: >-
+        The online rescale is O(row length) per block, not O(1). Compare it with
+        what flash attention actually rescales.
+      solution: >-
+        Because a streaming softmax over a full row has to rescale the entire
+        accumulated row every time the running maximum grows: acc = acc * corr
+        is 32,768 elements per block, so the total work is O(n^2 / B) and the
+        "one pass" is quadratic in the number of blocks. Flash attention avoids
+        this because its accumulator is the output tile, which has d = 128
+        columns, not n — the rescale is O(d) per row per block and the total is
+        O(nd), linear. So for a plain softmax the right kernel is two passes
+        (max, then exp-and-sum with the max already known, then divide — or two
+        if you fuse the divide into the epilogue), and for attention the right
+        kernel is the online one. The distinction is which dimension the
+        accumulator lives in, and it is the difference between a linear and a
+        quadratic rescale.
+    - id: cp-5
+      question: >-
+        You need 3x on a kernel that cuBLAS already runs at 80% of peak. What do
+        you do, and what does Triton cost you if you insist on writing it?
+      answerKind: short_text
+      hint: >-
+        Where is 80% of peak relative to the roofline for that shape? And which
+        of Triton's abstractions hides the thing that would get you the rest?
+      solution: >-
+        First check whether the op is even the right target: at 80% of peak the
+        remaining 20% is worth 1.25x, not 3x, so the 3x has to come from
+        somewhere else — fewer bytes (fusion with a neighbouring op), a lower
+        precision (fp8 doubles the peak), or not doing the work (a better
+        algorithm, which is what flash attention was). If the kernel really is
+        the target, Triton will get you the tile, the pipeline and the warp
+        count, and it will not get you a shared-memory layout it did not choose,
+        warp specialisation with a producer warp issuing TMA loads, thread-block
+        clusters, or inline PTX. Those are exactly the mechanisms the last 20%
+        on Hopper lives in, so the honest answer is: Triton to within about 10%
+        of cuBLAS on standard shapes, CUDA when you need the layout or the
+        scheduler, and neither when the arithmetic should have been avoided.
+    - id: cp-6
+      question: >-
+        A kernel reads 100 MB and does 30 GFLOP. Is it bandwidth-bound, and what
+        is the most it can achieve? Then: the same kernel on a link running at
+        900 GB/s instead of 3.35 TB/s?
+      answerKind: short_text
+      hint: >-
+        Intensity first, then compare with 147.7. The second part is the whole
+        point of a roofline: one number changes.
+      solution: >-
+        Intensity is 30e9 / 100e6 = 300 FLOP/byte, which is above the 147.7
+        ridge, so it is compute-bound and the most it can achieve is 494.7
+        TFLOP/s — the bytes need only 100 MB / 3.35 TB/s = 29.9 us while the
+        arithmetic needs 30 GFLOP / 494.7 TFLOP/s = 60.6 us, so the compute is
+        the critical path by 2x. On a 900 GB/s link the bytes take 111.1 us
+        against 60.6 us of compute: the same kernel is now bandwidth-bound, at
+        111.1 us instead of 60.6. Nothing about the kernel changed. This is why
+        the ridge point is a property of the *machine* and every "is this kernel
+        efficient" question has to name the hardware it is efficient on.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A GPU is not fast because it does arithmetic quickly; it is fast because
+        it can reuse data out of a small, very fast memory next to the
+        arithmetic units. The hierarchy has four levels and two ratios that
+        matter: shared memory is about nine times HBM's bandwidth and about
+        seventeen times closer, so a byte that is used once costs you the whole
+        hierarchy and a byte that is used nine times is free.
+
+        Every kernel question reduces to two numbers. How many FLOPs per byte
+        does this computation perform? And how many FLOPs per byte can the
+        machine sustain before it is waiting on memory? If the first is smaller,
+        the kernel is a data-movement problem and the only fixes are moving
+        fewer bytes or reusing each byte more times. If it is larger, it is an
+        arithmetic problem and the fixes are tensor cores and precision.
+
+        Tiling is how "reuse each byte more times" is spelled in code: a block
+        loads a patch of the inputs into shared memory, computes a patch of the
+        output from it, and every element it loaded is used as many times as the
+        patch is wide. Fusion is the other spelling: if two ops are pointwise,
+        doing them in one kernel means the intermediate never leaves the chip.
+      blocks:
+        - kind: checklist
+          body: |
+            - Four levels: registers, shared memory, L2, HBM
+            - 8.88x bandwidth between shared memory and HBM; 500 cycles of latency
+            - Ridge point 147.7 FLOP/byte: below it you are buying bytes
+            - Tiling intensity is t_m * t_n / (t_m + t_n)
+            - Fusion divides bytes by the number of passes, and changes no arithmetic
+            - The warp is the unit of memory access; a conflict costs gcd(stride, 32)
+            - Triton gives you whole-tile ops and three knobs
+      checkpoint: >-
+        Before reading on: an elementwise kernel and a 4096-cubed GEMM both run
+        at about 60% of the machine's peak FLOPs. Which one is close to its roof
+        and which one has 100x of headroom it will never use?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Answer five questions in order, and stop as soon as one of them
+        settles it.
+
+        *What is the intensity?* FLOPs divided by bytes from HBM. Compare it
+        with 147.7. Everything with a pointwise or reduction structure lands
+        between 0.1 and 2, which is 100x below the ridge, and no amount of
+        scheduling work closes that.
+
+        *How many times does each byte get used?* For a tile that is
+        $t_m t_n / (t_m + t_n)$; for a chain of passes it is the number of
+        passes. If it is one, you are paying retail for every byte.
+
+        *What bounds the tile?* Accumulators in the register file, not the
+        shared-memory budget: 4 bytes per output element against 65,536 words.
+        Then check that `num_stages` times the per-stage footprint still fits in
+        227 KiB.
+
+        *Is the traffic hitting the level you think?* A tile's K-panel is shared
+        by a row of the output grid; if the launch order does not put those
+        tiles together, the L2 cannot help and your model is 2x optimistic.
+
+        *Do you need CUDA?* Only for a shared-memory layout Triton will not
+        choose, warp specialisation, TMA or clusters. Everything else is four
+        Triton knobs and an autotuner.
+      blocks:
+        - kind: checklist
+          body: |
+            - Intensity first: FLOPs / bytes, against 147.7
+            - Pointwise and reduction kernels are 0.1 to 2: they are traffic problems
+            - Reuse factor: t_m*t_n/(t_m+t_n) for a tile, k for k passes
+            - Tile ceiling: 128x256 fp32 accumulators = half the register file
+            - Pipeline budget: num_stages * stage footprint < 227 KiB
+            - L2 halo: does the grid order keep a K-panel's consumers resident?
+            - CUDA only for layout, warp specialisation, TMA, clusters
+      checkpoint: >-
+        You have a kernel at AI 0.31 that you cannot make faster. What are the
+        only two levers that exist, and which one does a softmax kernel
+        actually have?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Write the schedule before the code: what is loaded, into which level,
+        how many times it is used, and what is written back. The Triton program
+        is then a direct transcription of that paragraph.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. price it before you write it
+            intensity = flops(op) / bytes_from_hbm(op)
+            if intensity < 147.7:  it is a traffic problem, not an arithmetic one
+
+            # 2. the tiled kernel, in Triton's vocabulary
+            @triton.jit
+            def kernel(A, B, C, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K):
+                pid = program_id(0); grid_m = ceil(M / BLOCK_M)
+                pm, pn = pid // grid_n, pid % grid_n        # or a swizzled order
+                rows = pm*BLOCK_M + arange(0, BLOCK_M)
+                cols = pn*BLOCK_N + arange(0, BLOCK_N)
+                acc = zeros((BLOCK_M, BLOCK_N))
+                for k0 in range(0, K, BLOCK_K):
+                    a = load(A + rows[:,None]*K + (k0+arange(0,BLOCK_K))[None,:],
+                             mask=rows[:,None] < M, other=0.0)
+                    b = load(B + (k0+arange(0,BLOCK_K))[:,None]*N + cols[None,:],
+                             mask=cols[None,:] < N, other=0.0)
+                    acc += dot(a, b)                    # num_stages pipelines this
+                store(C + rows[:,None]*N + cols[None,:], acc,
+                      mask=(rows[:,None] < M) & (cols[None,:] < N))
+
+            # 3. the three knobs
+            BLOCK_M, BLOCK_N = 128, 256          # registers, not shared memory
+            elements_per_thread = BLOCK_M*BLOCK_N / (32*num_warps)   # want 4 or 8
+            stage_bytes = (BLOCK_M + BLOCK_N) * BLOCK_K * 2
+            num_stages * stage_bytes <= 227*1024
+
+            # 4. the fused elementwise kernel
+            for each 1024-element block:
+                x = load(x_ptr + offs, mask=offs < n, other=0.0)
+                r = load(res_ptr + offs, mask=offs < n, other=0.0)
+                store(out_ptr + offs, gelu(layernorm(x)) + r, mask=offs < n)
+                # 4 passes of traffic become 2 reads and 1 write
+      checkpoint: >-
+        In the tiled kernel, which line would you change to fix a 16-way bank
+        conflict on the shared-memory staging, and how would you know from the
+        formulas that the change helped rather than hurt?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Intensity decides the bound, the tile sets the intensity, the register
+        file sets the tile, and the pass count sets the fusion win. Four
+        formulas, all of them one line.
+      blocks:
+        - kind: math
+          body: |
+            Ridge point of the machine:
+
+            $$I^{\star} = \frac{P}{B} = \frac{494.7 \times 10^{12}}{3.35 \times
+              10^{12}} = 147.7 \ \text{FLOP/byte}$$
+
+            Intensity of a tile (fp16, $t_m \times t_n$ output patch, k-slice
+            staged through shared memory):
+
+            $$I_{\text{tile}} = \frac{2 t_m t_n k}{2k(t_m + t_n)}
+              = \frac{t_m t_n}{t_m + t_n} \;\Rightarrow\; 64.0,\ 85.3,\ 128.0$$
+
+            Register cost of the accumulators, and the ceiling:
+
+            $$R = 4 t_m t_n, \qquad R(128, 256) = 131{,}072\ \text{B}
+              = \tfrac{1}{2}\ \text{of}\ 262{,}144, \qquad
+              R(256, 256) = 262{,}144\ \text{B} = \text{the whole file}$$
+
+            Bytes in flight needed to cover latency (Little's law):
+
+            $$B_{\text{flight}} = \frac{B}{n_{\text{SM}} f} \cdot L
+              = 14.42 \times 500 = 7{,}210\ \text{B per SM}$$
+
+            Fusion, and the roof it lands on:
+
+            $$\frac{B_{\text{unfused}}}{B_{\text{fused}}} = k, \qquad
+              T = \frac{2nbk}{B_{\text{eff}}}, \qquad
+              I_{\text{elem}} = \frac{6}{4} = 1.5 \Rightarrow 5.03\
+              \text{TFLOP/s} = 1.0\%$$
+
+            Bank-conflict multiplicity for stride $s$:
+
+            $$w(s) = \gcd(s, 32), \qquad |\{\beta\}| = \frac{32}{\gcd(s, 32)}
+              \;\Rightarrow\; w(32) = 32,\ w(33) = 1,\ w(34) = 2$$
+      checkpoint: >-
+        The tile formula and the register formula disagree about what the best
+        tile is: the first wants 296x296, the second forbids anything above
+        128x256. Which one is a hard constraint, and what does the soft one get
+        replaced by?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete picture: price the kernel, choose the tile from the
+        register file, order the grid for the L2, fuse the pointwise chain, and
+        keep the online rescale in anything that streams a reduction.
+      blocks:
+        - kind: warning
+          body: >-
+            Every failure in this topic is silent. A 32x32 tile is a correct
+            kernel at 10.8% of peak. A fused kernel that spills is a correct
+            kernel that is slower than the one it replaced. A streaming softmax
+            without the rescale is a normalised, plausible, 71.1%-wrong answer.
+            A k-loop that drops the remainder is exact on every power-of-two
+            shape in your test suite and 47.9% wrong at K = 1000. None of these
+            raise; all of them are caught by the same three habits — compare
+            against a reference implementation, compute the byte count
+            independently of the code, and test a shape that is not divisible by
+            the tile.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+            PEAK, BW = 494.7e12, 3.35e12          # dense fp16, HBM3
+            RIDGE = PEAK / BW                     # 147.7 FLOP/byte
+            RF_WORDS = 65536                      # 256 KiB of registers per SM
+
+
+            def tile_intensity(tm, tn):
+                return tm * tn / (tm + tn)
+
+
+            def largest_tile(budget_bytes=RF_WORDS * 4 // 2, dtype_bytes=4):
+                """Largest square-ish tm x tn fp32 accumulator inside a budget."""
+                best = (0, 0)
+                for tm in (64, 128, 256):
+                    tn = budget_bytes // (dtype_bytes * tm)
+                    tn = 2 ** int(math.log2(tn))
+                    if tm * tn > best[0] * best[1]:
+                        best = (tm, tn)
+                return best
+
+
+            def traffic(m, n, k, tm, tn, dtype_bytes=2):
+                tiles = math.ceil(m / tm) * math.ceil(n / tn)
+                return (tiles * (tm * k + k * tn) * dtype_bytes
+                        + m * n * dtype_bytes)
+
+
+            def roof(m, n, k, tm, tn, dtype_bytes=2):
+                b = traffic(m, n, k, tm, tn, dtype_bytes)
+                ai = 2 * m * n * k / b
+                return ai, min(PEAK, ai * BW) / 1e12, b
+
+
+            def fused_bytes(n, k, dtype_bytes=2):
+                return 2 * n * dtype_bytes, 2 * k * n * dtype_bytes
+
+
+            def bank_ways(stride):
+                return math.gcd(stride, 32), 32 // math.gcd(stride, 32)
+
+
+            def check_k_loop(k, tk):
+                """False when the k-loop silently drops a remainder."""
+                return k % tk == 0
+
+
+            if __name__ == "__main__":
+                print("ridge %.2f, best tile %s at %.1f FLOP/B"
+                      % (RIDGE, largest_tile(), tile_intensity(*largest_tile())))
+                for tm, tn in ((32, 32), (128, 128), (256, 128)):
+                    ai, tf, b = roof(4096, 4096, 4096, tm, tn)
+                    print("%3dx%-4d %.2f FLOP/B  %.1f TFLOP/s  %.2f GB"
+                          % (tm, tn, ai, tf, b / 1e9))
+                for s in (30, 32, 33, 34, 64):
+                    print("stride %2d -> %d ways, %d banks" % ((s,) + bank_ways(s)))
+        - kind: math
+          body: |
+            The decision procedure, in the order the numbers arrive:
+
+            $$I = \frac{2mnk}{B_{\text{tile}}} \quad\text{vs}\quad 147.7,
+              \qquad t_{\max} = \arg\max\ 4 t_m t_n \le \tfrac{1}{2}\cdot
+              262{,}144, \qquad
+              \frac{B_{\text{unfused}}}{B_{\text{fused}}} = k .$$
+
+            A 4096-cubed GEMM at 128x256: $I = 83.6$, $B = 1.644$ GB, roof
+            280.0 TFLOP/s = 56.6% of peak, with the L2 supplying the rest. A
+            LayerNorm-GELU-dropout-residual chain: $k = 3.33$ passes saved,
+            671.09 MB to 201.33 MB, 200.32 us to 60.07 us. A warp reduction: 5
+            shuffles against 62 shared-memory accesses and 5 barriers.
+      checkpoint: >-
+        `check_k_loop(11008, 256)` returns False and `check_k_loop(11008, 64)`
+        returns True. Which of those two configurations would you ship, and what
+        does the False tell you about the other one?
+
+  problems:
+    - id: p-tile-roofline
+      title: "Price a GEMM tile before you write it"
+      difficulty: medium
+      prompt: >-
+        Implement `gemm_tile_traffic(m, n, k, tile_m, tile_n, dtype_bytes=2,
+        bandwidth_gbs=3350.0, peak_tflops=494.7)` returning a dict with exactly
+        seven keys, all numbers except `bound`:
+
+        `bytes_naive` — the cache-free triple loop, which reads both operands
+        once per multiply-accumulate: `(2*m*n*k + m*n) * dtype_bytes`;
+
+        `bytes_tiled` — `ceil(m/tile_m) * ceil(n/tile_n)` output tiles, each
+        loading `tile_m*k` elements of A and `k*tile_n` of B, plus the output
+        written once. A partly-filled edge tile loads its full rows, exactly as
+        a masked block program does;
+
+        `intensity` — `2*m*n*k / bytes_tiled`, in FLOP per byte;
+
+        `speedup` — `bytes_naive / bytes_tiled`;
+
+        `bound` — the string `"compute"` when `intensity` is at least
+        `peak_tflops*1e12 / (bandwidth_gbs*1e9)`, otherwise `"bandwidth"`;
+
+        `time_ms` — `bytes_tiled` at `bandwidth_gbs` gigabytes per second,
+        in milliseconds;
+
+        `tflops_roof` — `min(peak, intensity * bandwidth)` in TFLOP/s, i.e.
+        where the roofline puts this kernel.
+      starter: |
+        def gemm_tile_traffic(m, n, k, tile_m, tile_n, dtype_bytes=2,
+                              bandwidth_gbs=3350.0, peak_tflops=494.7):
+            # your implementation here
+            pass
+      language: python
+      entry: gemm_tile_traffic
+      testCases:
+        - input: '[4096, 4096, 4096, 128, 128]'
+          expected: '{"bytes_naive": 274911461376.0, "bytes_tiled": 2181038080.0, "intensity": 63.01538461538462, "speedup": 126.04615384615384, "bound": "bandwidth", "time_ms": 0.6510561432835821, "tflops_roof": 211.10153846153847}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[4096, 4096, 4096, 256, 128]'
+          expected: '{"bytes_naive": 274911461376.0, "bytes_tiled": 1644167168.0, "intensity": 83.59183673469387, "speedup": 167.20408163265307, "bound": "bandwidth", "time_ms": 0.4907961695522388, "tflops_roof": 280.0326530612245}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[4096, 4096, 4096, 32, 32]'
+          expected: '{"bytes_naive": 274911461376.0, "bytes_tiled": 8623489024.0, "intensity": 15.937743190661479, "speedup": 31.879377431906615, "bound": "bandwidth", "time_ms": 2.5741758280597016, "tflops_roof": 53.391439688715955}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[8192, 8192, 8192, 128, 256]'
+          expected: '{"bytes_naive": 2199157473280.0, "bytes_tiled": 13019119616.0, "intensity": 84.45360824742268, "speedup": 168.91752577319588, "bound": "bandwidth", "time_ms": 3.8863043629850744, "tflops_roof": 282.919587628866}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[1, 4096, 4096, 128, 128]'
+          expected: '{"bytes_naive": 67117056.0, "bytes_tiled": 67117056.0, "intensity": 0.4999389722934212, "speedup": 1.0, "bound": "bandwidth", "time_ms": 0.020034942089552237, "tflops_roof": 1.6747955571829611}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[1, 4096, 4096, 1, 128]'
+          expected: '{"bytes_naive": 67117056.0, "bytes_tiled": 33824768.0, "intensity": 0.9920080125951888, "speedup": 1.984258362900429, "bound": "bandwidth", "time_ms": 0.01009720488039601, "tflops_roof": 3.323226802193882}'
+          mode: json
+          tolerance: 1e-6
+        - input: '[4096, 4096, 4096, 128, 128, 2, 900.0, 494.7]'
+          expected: '{"bytes_naive": 274911461376.0, "bytes_tiled": 2181038080.0, "intensity": 63.01538461538462, "speedup": 126.04615384615384, "bound": "bandwidth", "time_ms": 2.4233756444444445, "tflops_roof": 56.713846153846156}'
+          mode: json
+          tolerance: 1.0e-09
+      solution: |
+        import math
+
+
+        def gemm_tile_traffic(m, n, k, tile_m, tile_n, dtype_bytes=2,
+                              bandwidth_gbs=3350.0, peak_tflops=494.7):
+            m, n, k = int(m), int(n), int(k)
+            tm, tn = int(tile_m), int(tile_n)
+            flops = 2.0 * m * n * k
+            bytes_naive = (2.0 * m * n * k + m * n) * dtype_bytes
+            tiles = math.ceil(m / tm) * math.ceil(n / tn)
+            bytes_tiled = tiles * (tm * k + k * tn) * dtype_bytes + m * n * dtype_bytes
+            intensity = flops / bytes_tiled
+            bw = bandwidth_gbs * 1e9
+            peak = peak_tflops * 1e12
+            return {"bytes_naive": float(bytes_naive),
+                    "bytes_tiled": float(bytes_tiled),
+                    "intensity": float(intensity),
+                    "speedup": float(bytes_naive / bytes_tiled),
+                    "bound": "compute" if intensity >= peak / bw else "bandwidth",
+                    "time_ms": float(bytes_tiled / bw * 1e3),
+                    "tflops_roof": float(min(peak, intensity * bw) / 1e12)}
+      solutionExplanation: >-
+        Read the first three cases as one sentence: the tile is the only thing
+        that changed, and the roof went 53.39, 211.10, 280.03 TFLOP/s. A 32x32
+        tile is a *correct* GEMM at 10.8% of peak and 15.94 FLOP/byte; 128x128
+        is 42.7% at 63.02; 256x128 is 56.6% at 83.59. None of them reaches the
+        147.7 ridge, and the reason is in the arithmetic rather than in the
+        code: the intensity is $t_m t_n/(t_m+t_n)$, which for a square tile is
+        $t/2$ and only crosses 147.7 at $t = 296$. The 8192-cubed case is the
+        same tile on eight times the problem and lands at 84.45, which is the
+        point — intensity is a function of the tile and the dtype, not the
+        problem size. The last two cases are the ones worth arguing about. At
+        m = 1 with a 128-row tile, `ceil(1/128)` is one tile row, so the kernel
+        loads 128 rows of A to compute one: intensity 0.4999 and a speedup of
+        exactly 1.0 over the naive loop, 67.12 MB either way. Change only the
+        tile to 1x128 and the same problem reaches 0.9920 and 1.98x. That is a
+        decode-shaped GEMM, and it is why batching — not a better kernel — is
+        what fixes inference throughput. The 900 GB/s case changes nothing but
+        the link: same 2.181 GB, same 63.02 intensity, and the roof falls from
+        211.10 to 56.71 TFLOP/s, because the ridge point moved from 147.7 to
+        549.7 and every kernel on the card became more bandwidth-bound.
+      complexity: "O(1) time and space"
+      tags: [tiling, arithmetic-intensity, roofline, gemm]
+
+    - id: p-fusion-budget
+      title: "What a fused chain saves, in bytes and in microseconds"
+      difficulty: easy
+      prompt: >-
+        Implement `chain_traffic(n_elements, n_ops, dtype_bytes=2,
+        bandwidth_gbs=3350.0)` returning a dict with exactly six keys, all
+        floats except none:
+
+        `bytes_fused` — one kernel reading the input once and writing the output
+        once: `2 * n_elements * dtype_bytes`;
+
+        `bytes_unfused` — `n_ops` passes, each reading and writing everything:
+        `2 * n_ops * n_elements * dtype_bytes`;
+
+        `ratio` — `bytes_unfused / bytes_fused`, i.e. the number of passes;
+
+        `fused_us` — the fused kernel's time in **microseconds** at
+        `bandwidth_gbs` gigabytes per second;
+
+        `unfused_us` — the same for the unfused chain;
+
+        `saved_us` — `unfused_us - fused_us`.
+
+        `n_ops = 1` is legal and must give a ratio of exactly 1 and zero
+        savings: an unfused chain of one op *is* the fused kernel.
+      starter: |
+        def chain_traffic(n_elements, n_ops, dtype_bytes=2, bandwidth_gbs=3350.0):
+            # your implementation here
+            pass
+      language: python
+      entry: chain_traffic
+      testCases:
+        - input: '[33554432, 5]'
+          expected: '{"bytes_fused": 134217728.0, "bytes_unfused": 671088640.0, "ratio": 5.0, "fused_us": 40.06499343283582, "unfused_us": 200.3249671641791, "saved_us": 160.25997373134328}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[33554432, 1]'
+          expected: '{"bytes_fused": 134217728.0, "bytes_unfused": 134217728.0, "ratio": 1.0, "fused_us": 40.06499343283582, "unfused_us": 40.06499343283582, "saved_us": 0.0}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[1000000, 3, 4, 3350.0]'
+          expected: '{"bytes_fused": 8000000.0, "bytes_unfused": 24000000.0, "ratio": 3.0, "fused_us": 2.388059701492537, "unfused_us": 7.164179104477612, "saved_us": 4.776119402985074}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[33554432, 4, 2, 900.0]'
+          expected: '{"bytes_fused": 134217728.0, "bytes_unfused": 536870912.0, "ratio": 4.0, "fused_us": 149.1308088888889, "unfused_us": 596.5232355555556, "saved_us": 447.39242666666667}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[67108864, 6, 2, 3350.0]'
+          expected: '{"bytes_fused": 268435456.0, "bytes_unfused": 1610612736.0, "ratio": 6.0, "fused_us": 80.12998686567164, "unfused_us": 480.77992119402984, "saved_us": 400.6499343283582}'
+          mode: json
+          tolerance: 1.0e-09
+      solution: |
+        def chain_traffic(n_elements, n_ops, dtype_bytes=2, bandwidth_gbs=3350.0):
+            n, k = int(n_elements), int(n_ops)
+            fused = 2.0 * n * dtype_bytes
+            unfused = 2.0 * k * n * dtype_bytes
+            bw = bandwidth_gbs * 1e9
+            return {"bytes_fused": fused,
+                    "bytes_unfused": unfused,
+                    "ratio": float(k),
+                    "fused_us": fused / bw * 1e6,
+                    "unfused_us": unfused / bw * 1e6,
+                    "saved_us": (unfused - fused) / bw * 1e6}
+      solutionExplanation: >-
+        The whole problem is one identity and its consequences. Five passes over
+        33.55M fp16 elements move 671.09 MB; the fused kernel moves 134.22 MB;
+        the ratio is 5.0 because it is exactly the number of times the tensor
+        crossed the bus. At 3.35 TB/s that is 200.32 us against 40.06 us,
+        160.26 us saved — per layer, per token block, and there are four such
+        blocks in every transformer layer. The third case is the dtype trap:
+        fp32 doubles both sides so the ratio is still 3.0 while the absolute
+        time doubles, which is why fusing is worth more in fp32 than in fp16 and
+        worth most in fp32 on a card whose bandwidth per FLOP is falling. The
+        fourth case is the same kernel on a 900 GB/s link: same 4.0 ratio, 3.7x
+        the wall clock, which is the whole argument for fusion on a machine
+        where the link is the bottleneck. The fifth case doubles the tensor and
+        adds a pass: 268.44 MB and 1.611 GB, ratio 6.0, 400.65 us saved — and it
+        is the case that shows why the win is linear in both n and k, so a
+        longer chain over a smaller tensor and a shorter chain over a bigger one
+        can cost the same.
+      complexity: "O(1) time and space"
+      tags: [fusion, elementwise, bandwidth, bytes]
+
+    - id: p-bank-conflicts
+      title: "Bank conflicts, counted rather than guessed"
+      difficulty: medium
+      prompt: >-
+        Implement `smem_bank_conflicts(rows, cols, dtype_bytes=4)` for a
+        row-major shared-memory tile of `rows` x `cols`, in which the first
+        `min(rows, 32)` lanes of a warp read column 0, one lane per row.
+
+        Shared memory is 32 banks of 4 bytes and bank index is
+        `(element_index * dtype_bytes // 4) % 32`, so a 4-byte element's bank is
+        just `index % 32`. A request costs as many transactions as the largest
+        number of lanes that land in the same bank.
+
+        Return a dict with exactly seven keys:
+
+        `ways` — the maximum number of lanes in one bank for the unpadded tile;
+
+        `distinct_banks` — how many distinct banks those lanes touch;
+
+        `transactions` — the cost of one warp access, i.e. `ways`;
+
+        `padded_cols` — `cols + 1`, the usual fix;
+
+        `padded_ways`, `padded_transactions` — the same two numbers for the
+        padded tile;
+
+        `speedup` — `ways / padded_ways` as a float, so a value below 1 means
+        the padding made it worse.
+      starter: |
+        def smem_bank_conflicts(rows, cols, dtype_bytes=4):
+            # your implementation here
+            pass
+      language: python
+      entry: smem_bank_conflicts
+      testCases:
+        - input: '[32, 32, 4]'
+          expected: '{"ways": 32, "distinct_banks": 1, "transactions": 32, "padded_cols": 33, "padded_ways": 1, "padded_transactions": 1, "speedup": 32.0}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[32, 33, 4]'
+          expected: '{"ways": 1, "distinct_banks": 32, "transactions": 1, "padded_cols": 34, "padded_ways": 2, "padded_transactions": 2, "speedup": 0.5}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[32, 64, 4]'
+          expected: '{"ways": 32, "distinct_banks": 1, "transactions": 32, "padded_cols": 65, "padded_ways": 1, "padded_transactions": 1, "speedup": 32.0}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[64, 128, 4]'
+          expected: '{"ways": 32, "distinct_banks": 1, "transactions": 32, "padded_cols": 129, "padded_ways": 1, "padded_transactions": 1, "speedup": 32.0}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[16, 32, 4]'
+          expected: '{"ways": 16, "distinct_banks": 1, "transactions": 16, "padded_cols": 33, "padded_ways": 1, "padded_transactions": 1, "speedup": 16.0}'
+          mode: json
+          tolerance: 1.0e-09
+        - input: '[32, 32, 2]'
+          expected: '{"ways": 16, "distinct_banks": 2, "transactions": 16, "padded_cols": 33, "padded_ways": 1, "padded_transactions": 1, "speedup": 16.0}'
+          mode: json
+          tolerance: 1.0e-09
+      solution: |
+        def smem_bank_conflicts(rows, cols, dtype_bytes=4):
+            rows, cols, db = int(rows), int(cols), int(dtype_bytes)
+            lanes = min(rows, 32)
+
+            def ways(stride):
+                banks = [((r * stride) * db // 4) % 32 for r in range(lanes)]
+                counts = {}
+                for b in banks:
+                    counts[b] = counts.get(b, 0) + 1
+                return max(counts.values()), len(counts)
+
+            w, d = ways(cols)
+            pw, _ = ways(cols + 1)
+            return {"ways": w,
+                    "distinct_banks": d,
+                    "transactions": w,
+                    "padded_cols": cols + 1,
+                    "padded_ways": pw,
+                    "padded_transactions": pw,
+                    "speedup": float(w) / pw}
+      solutionExplanation: >-
+        The unpadded numbers are the textbook case: stride 32 puts all 32 lanes
+        on bank 0, so one instruction becomes 32 transactions and the transpose
+        spends 32x the shared-memory time it should — 32 ways, 1 bank, exactly.
+        Padding to 33 gives 32 distinct banks and one transaction, speedup 32.
+        The second case is the one that matters, because it is the case that
+        breaks the ritual: a tile whose stride is already 33 is conflict-free
+        (1 way, 32 banks) and padding it to 34 makes every lane pair up on 16
+        banks, so the "fix" costs 2x — speedup 0.5. That is
+        $\gcd(s,32)$doing its work: 32 is gcd 32, 33 is gcd 1, 34 is gcd 2. The
+        fifth case shows that the tile only costs what its *active* lanes cost:
+        16 rows means 16 lanes and at most 16 ways, so a 16x32 tile is half as
+        bad as a 32x32 one and no padding is needed once the row count drops
+        below 32. The last case is fp16, where two elements share a 4-byte bank:
+        bank is `(index*2)//4 % 32`, so the effective stride halves and a 32x32
+        tile is 16-way rather than 32-way, and padding still takes it to one.
+        This is why the padding number is a function of dtype as well as shape.
+      complexity: "O(min(rows, 32)) time and space"
+      tags: [shared-memory, bank-conflicts, warp, padding]
+
+  notes: >-
+    The syllabus lists this topic's prerequisite twice
+    (`prereq: [numerical-linear-algebra, numerical-linear-algebra]`); the file
+    mirrors it verbatim because the validator compares the list by length and
+    membership. The duplicate looks like a typo — the intended second entry is
+    probably `tensor-parallelism`, which this topic chains from and which sits
+    earlier in the same track at position 3.
+
+  try_it: >-
+    Take an 8192×4096 fp16 activation: one pass is 67.11 MB in and 67.11 MB out, 134.22 MB,
+    which is 40.06 microseconds at 3.35 TB/s. Multiply it by five unfused elementwise ops and
+    compare with one fused kernel: 671.09 MB and 200.32 microseconds against 134.22 MB and
+    40.06 microseconds.
+  interview_questions:
+    - question: "Your first Triton kernel runs at 380 GB/s on a card that does 3.35 TB/s. Nothing is wrong with the code. Why?"
+      level: mid
+      key_points:
+        - "HBM latency is about 500 cycles and bandwidth is 14.42 bytes per clock per SM, so keeping it busy needs 7,210 bytes in flight per SM."
+        - "One warp issuing one 128-bit-per-lane load has 512 bytes outstanding, so about 14 such loads must be in flight — several warps, or more work per thread."
+        - "384 contiguous words per program is not enough in flight, so the kernel is latency-bound: correct masks, correct block size, one ninth of the bandwidth."
+        - "The fix is more parallelism per program — bigger blocks, more warps, vectorised loads — not a smaller tile."
+      follow_up: "How would you distinguish latency-bound from bandwidth-bound without a profiler counter?"
+    - question: "When is fusing kernels worth it, and when is it wasted work?"
+      level: senior
+      key_points:
+        - "Pointwise chains are pure traffic: five ops move 671.09 MB where one fused kernel moves 134.22 MB, a measured 5.321× and 200.32 to 40.06 microseconds."
+        - "The LayerNorm, GELU, dropout and residual block is the same argument at 3.33× — 671.09 MB unfused against 201.33 MB fused."
+        - "Fusion buys nothing above the 147.7 FLOP/byte ridge point, where the arithmetic already pays for the bytes; a tiled GEMM is compute-bound already."
+        - "So fuse pointwise chains and attention, and leave matmuls to tiling."
+      follow_up: "Why is FlashAttention a fusion argument rather than a FLOP argument?"
+    - question: "A 256×256 tile has an arithmetic intensity of 128, well above the ridge point. What actually limits it?"
+      level: senior
+      key_points:
+        - "The register file, not shared memory: a k-slice of a 128×256 tile in fp16 is only 48 KiB, which fits the 227 KiB of shared memory four times over."
+        - "The fp32 accumulators are 32,768 words, which is 128 registers per thread at 256 threads — half of the 65,536-word register file — so larger tiles spill."
+        - "L2 reuse depends on tile order as much as tile size: at 128×256 HBM alone would give 280.0 TFLOP/s, 56.6% of peak, and swizzling the grid is what closes the gap."
+        - "So tile size, tile order and register budget are one decision rather than three."
+      follow_up: "Your kernel spills at 256×256. What do you change first, and what do you give up?"
+  common_mistakes:
+    - "Dropping the K-loop remainder: a 256-deep tile over K = 1000 skips 232 elements and gives maximum absolute error 61.52 and 47.9% relative error, while the same code is exact at K = 1024."
+    - "Sizing a tile by shared memory when the fp32 accumulators are what bind the register file."
+    - "Tuning an elementwise kernel for FLOPs when it sits at arithmetic intensity 1.5, two orders of magnitude below the 147.7 ridge point."
+  further_reading:
+    - label: "Dao, Fu, Ermon, Rudra, Re, FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness, NeurIPS 2022"
+    - label: "Tillet, Kung, Cox, Triton: an intermediate language and compiler for tiled neural network computations, MAPL 2019"

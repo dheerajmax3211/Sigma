@@ -1,0 +1,393 @@
+id: gemini-15-20
+title: "Gemini 1.5 and 2.0: native multimodality, a million tokens, and the ring that holds it"
+summary: >-
+  Gemini 1.5 was a sparse mixture-of-experts model that put a million-token
+  context window into a production API in February 2024, and did it by treating
+  video, audio and text as one interleaved token stream rather than as separate
+  encoders bolted onto a language model. Gemini 2.0 turned that context into
+  agency: native tool calls, multimodal output, and an agent loop. The
+  engineering interest is that the context window is a distributed-systems
+  problem, not a modelling one, and the only way to serve it is to shard the
+  sequence across chips and pass keys around a ring.
+kind: case_study
+date: "2024-02-15"
+actors: [Google DeepMind, Google]
+key_facts:
+  - "Gemini 1.5 Pro was announced on 15 February 2024 with a 1M-token context window in production and up to 10M tokens demonstrated in research."
+  - "The model is a sparse mixture-of-experts transformer trained natively on interleaved text, image, audio and video, not a language model with modality adapters."
+  - "A video frame is represented by roughly 258 tokens, so one hour of video at one frame per second is about 928,800 tokens: an hour fits in the context window."
+  - "Gemini 1.5 Flash followed in May 2024 as a distilled, cheaper sibling for high-volume, lower-latency work."
+  - "Gemini 2.0, announced 11 December 2024, added native tool use, multimodal output including image and speech generation, and an agentic surface."
+  - "The stack runs on TPU v5p pods rather than GPUs, which changes both the interconnect assumptions and the sharding strategy."
+timeline:
+  - when: Dec 2023
+    what: "Gemini 1.0 launches in Ultra, Pro and Nano sizes, with separate modality encoders and a 32k context."
+  - when: 15 Feb 2024
+    what: "Gemini 1.5 Pro: sparse MoE, native multimodality, 1M-token context in production, 10M in research."
+  - when: May 2024
+    what: "Gemini 1.5 Flash — a distilled model for high-volume work, and a 2M-token window for Pro."
+  - when: 11 Dec 2024
+    what: "Gemini 2.0 Flash: native tool use, multimodal output, agentic evaluation, and the Project Astra and Mariner prototypes."
+  - when: 2025
+    what: "2.5 generations push reasoning traces and a 1M window into the default model rather than a premium tier."
+decisions:
+  - choice: "Train natively multimodally instead of attaching encoders to a language model"
+    why: "A model trained on interleaved text, images, audio and video from the start learns cross-modal relationships in the same representation space. Bolting a vision encoder onto a frozen language model cannot teach the model that a spoken word and its written form are the same thing."
+    cost: "Every modality needs a tokeniser and a data pipeline, and the joint training run is harder to debug because a loss spike could come from any modality. It also makes the pretraining dataset vastly more complex to filter and deduplicate."
+  - choice: "Sparse MoE rather than a dense model at the same quality"
+    why: "A million-token window makes attention expensive, so the feed-forward side has to be cheap. MoE decouples total capacity from per-token FLOPs, which is the only way to keep the prefill bill finite at that context length."
+    cost: "Every expert has to be resident, so the memory footprint scales with total parameters and the serving topology has to span multiple chips regardless of batch size."
+  - choice: "Shard the sequence across chips with ring attention rather than truncate the context"
+    why: "A single chip cannot hold the KV cache for a million tokens. Splitting the sequence and passing KV blocks around a ring keeps the full window available while spreading the cache across the pod."
+    cost: "Every attention layer becomes a communication step, so long-context latency is set by interconnect bandwidth rather than by arithmetic. The ring also has a fill and drain phase where some chips idle."
+  - choice: "Ship a 1M window in the product before the ecosystem knew what to do with it"
+    why: "Context length is a capability that creates its own use cases — whole-repository analysis, hour-long video, codebase search — and none of them can be discovered from a benchmark. Shipping it let customers find the product."
+    cost: "It priced a memory reservation as a token count, and it set an expectation that every competitor had to match whether or not they could serve it economically."
+  - choice: "Move from long context to agency in 2.0"
+    why: "A long window is only useful if the model can act on what it reads. Native tool calls and multimodal output turn a document reader into something that can complete a task."
+    cost: "Agentic loops multiply token consumption, and every tool call is a new failure surface. The reliability bar moves from answer quality to task completion."
+lessons:
+  - "Context length is a memory-distribution problem. At a million tokens the KV cache is larger than any single accelerator, so the design is a ring, not a window."
+  - "Multimodality is a tokenisation decision before it is a modelling decision. Once video is 258 tokens per frame, the rest is arithmetic."
+  - "At long context the attention term dominates the parameter term. Quadratic attention, not feed-forward FLOPs, is what you are paying for."
+  - "A distilled sibling is not a downgrade, it is the volume product. Flash is what makes the family affordable at consumer scale."
+  - "Ship the capability before the use case is obvious. Long context created its own market because customers could finally paste the whole thing in."
+mistakes:
+  - "Treating 1M tokens as 1M tokens of compute. Prefill attention is quadratic, so the cost per token rises with position in the sequence."
+  - "Assuming a bigger window removes the need for retrieval. Retrieval is cheaper and often more accurate for a specific question, and a full window costs memory for the whole session."
+  - "Forgetting that a video frame is hundreds of tokens. An hour of video is roughly a million tokens, so a two-hour recording does not fit a 1M window at one frame per second."
+  - "Comparing context windows without comparing recall. A model that accepts 1M tokens but retrieves poorly in the middle is worse than a 128k model that retrieves well."
+problem_statement: >-
+  Google's problem in 2023 was that its multimodal story was assembled rather
+  than trained: separate encoders, a language model, and adapters in between.
+  That architecture cannot represent the relationship between a diagram and the
+  sentence describing it, and it cannot accept an hour of video because the
+  video path was never designed to be long. The bet behind Gemini 1.5 was to
+  tokenise every modality into one interleaved stream and train a sparse MoE on
+  it, then push the context window to a million tokens so that a whole
+  repository, a whole contract or an hour of footage becomes a single prompt.
+  The constraint that follows is brutal and simple: a million tokens of KV cache
+  does not fit on one accelerator, so attention has to become a distributed
+  computation with a communication cost per layer. Every serving decision in
+  this system is downstream of that one fact.
+requirements:
+  functional:
+    - "Accept interleaved text, images, audio and video in a single prompt, in any order, with the model reasoning across modalities."
+    - "Support a 1M-token context window in the production API, with 10M demonstrated in research settings."
+    - "Answer questions that require retrieving a specific fact from an arbitrary position in a long input, not just from the end."
+    - "Emit structured tool calls so the model can act, observe the result and continue, as a native capability rather than a prompt convention."
+    - "Produce multimodal output, including images and speech, from the same model family that reads them."
+  non_functional:
+    - "Prefill a 1M-token request in minutes rather than hours, which requires the sequence to be sharded across dozens of chips."
+    - "Keep the KV cache for a 1M-token session inside the pod's aggregate HBM, which bounds concurrency to a handful of such sessions."
+    - "Serve a cheap, low-latency sibling at high volume, which means distillation rather than a smaller context."
+    - "Keep per-token cost roughly flat across the window for decode, which is only possible if attention does not re-read the whole cache per token."
+    - "Survive a chip failure inside a ring without failing the request, or long-context requests become a reliability liability."
+clarifying_questions:
+  - question: "Is the long context a document, a video, or a conversation?"
+    why_it_matters: "A document is a one-shot prefill and many reads; a video is the same but with a much higher token density per minute; a conversation grows and must be re-attended every turn. The three have different cache lifetimes and different cost curves."
+  - question: "What is the mix of modalities by token volume?"
+    why_it_matters: "An hour of video is roughly a million tokens at one frame per second, so a single video request can consume an entire window. If video is 5% of requests but 80% of tokens, capacity planning by request count is meaningless."
+  - question: "Does the task need the whole window, or would retrieval do?"
+    why_it_matters: "Full-window attention costs memory for the session's lifetime. A retrieval pipeline over the same corpus is often cheaper and more accurate for a pointed question, and the choice determines whether you need a ring at all."
+  - question: "What is the acceptable prefill latency for a 1M-token request?"
+    why_it_matters: "The answer decides the sharding width. Sixty-four chips can prefill a million tokens in minutes; eight chips take half an hour. That is a 8x difference in hardware per request and therefore in price."
+  - question: "Is the output text only, or multimodal?"
+    why_it_matters: "Generating an image means a diffusion decoder in the serving path, which has different batching behaviour and a different cost model from token decoding. It changes the pod composition, not just the model."
+capacity_estimation:
+  assumptions:
+    - "The model is a sparse MoE with roughly 600B total and 50B active parameters, which is an assumption used to make the arithmetic concrete rather than a published figure."
+    - "A TPU v5p chip has 95 GB of HBM at about 2,760 GB/s, and a BF16 peak near 459 TFLOPS, so 40% MFU gives about 1.8e14 FLOP/s."
+    - "KV cache uses grouped-query attention with 8 KV heads at head dimension 128, 80 layers, stored in FP8 at one byte per element."
+    - "A video frame is tokenised at 258 tokens, the figure described in the Gemini 1.5 technical report."
+    - "Audio is assumed at 32 tokens per second of speech, which is an assumption for planning, not a published constant."
+  arithmetic:
+    - label: "Tokens in one hour of video"
+      calculation: "3,600 s x 1 frame/s = 3,600 frames; 3,600 x 258 tokens per frame = 928,800 tokens"
+      conclusion: "One hour of video at one frame per second is 0.93M tokens, so it fits a 1M window with almost nothing left over. This single multiplication is the reason the 1M number was chosen."
+    - label: "Tokens in a feature film"
+      calculation: "2 h x 3,600 x 1 frame/s = 7,200 frames; 7,200 x 258 = 1.86M tokens"
+      conclusion: "A two-hour film does not fit a 1M window at 1 fps. Either you drop the frame rate, which loses motion, or you need the 10M research window."
+    - label: "Tokens in one hour of audio"
+      calculation: "3,600 s x 32 tokens/s = 115,200 tokens"
+      conclusion: "Audio is cheap relative to video, about 12% of the token volume for the same duration, which is why audio-first products are economically different from video-first ones."
+    - label: "KV cache per token"
+      calculation: "8 KV heads x 128 dim x 2 for K and V x 1 byte = 2,048 bytes/token/layer; x 80 layers = 163,840 bytes = 164 KB/token"
+      conclusion: "Every token costs 164 KB. At a million tokens that is 164 GB, which is 1.7 times the HBM of a single TPU v5p chip."
+    - label: "KV cache for a 1M-token request"
+      calculation: "164 KB x 1e6 = 164 GB; 164 GB / 95 GB per chip = 1.73, so 2 chips minimum, 4 with headroom for weights and activations"
+      conclusion: "A 1M-token sequence cannot live on one chip at any batch size. Sequence parallelism is mandatory, not an optimisation, and the minimum ring width is four chips."
+    - label: "Prefill FLOPs, linear term versus attention"
+      calculation: "linear: 2 x 1e6 tokens x 50e9 active = 1.0e17 FLOPs; attention: 4 x (1e6)^2 x 8,192 dim x 80 layers = 2.6e18 FLOPs"
+      conclusion: "At 1M tokens the quadratic attention term is 26x the parameter term. Long-context cost is an attention problem, which is why ring attention and not MoE efficiency is the binding technique."
+    - label: "Prefill wall clock at two sharding widths"
+      calculation: "2.6e18 FLOPs / (64 chips x 4.59e14 x 0.4 MFU = 1.17e16) = 222 s; at 8 chips: 2.6e18 / 1.47e15 = 1,769 s = 29.5 min"
+      conclusion: "Sixty-four chips prefill a million tokens in under four minutes; eight chips take half an hour. The sharding width is the product decision, and it is set by the latency target, not by memory."
+    - label: "Ring attention traffic per forward pass"
+      calculation: "164 KB/token x 1e6 tokens / 80 layers = 2.05 GB of KV per layer; / 8-way sharding = 256 MB sent per chip per layer; x 80 layers = 20.5 GB per chip per pass; at 400 GB/s of interconnect that is 51 ms"
+      conclusion: "The ring costs about 51 ms per chip per pass at 1M tokens, which is small against a 222 s prefill but significant for decode, where every generated token pays it again."
+    - label: "Requests per pod per hour at 1M context"
+      calculation: "60 min / 3.7 min per prefill = 16 sequential prefills per hour on 64 chips; with 4 concurrent 164 GB caches needing 656 GB against 64 x 95 GB = 6.08 TB, memory allows about 37 concurrent sessions, so prefill is the binding limit"
+      conclusion: "A 64-chip pod can start about 16 full-window requests per hour. At any real volume, long-context serving is a prefill-throughput business, and caching is the only way out."
+architecture_summary: >-
+  The serving unit is a TPU pod slice, not a node, and the model is sharded along
+  three axes at once. The experts are distributed across the slice, so each chip
+  owns a subset of the MoE feed-forward blocks. The attention heads are split
+  across chips within a slice for short requests. For long requests the sequence
+  itself is split: each chip holds a contiguous chunk of the token positions and
+  therefore a chunk of the KV cache, and attention is computed by passing key and
+  value blocks around a ring so that every chip eventually sees every position.
+  The tokeniser is the other half of the architecture, because it defines the
+  economics: video frames become 258 tokens, audio becomes a few dozen tokens per
+  second, and text is byte-pair encoded, all into the same vocabulary so that a
+  prompt can interleave them. XLA compiles the whole graph with the sharding
+  annotations baked in, which is why the same model can be laid out differently
+  for a 32k request and a 1M request without a code change. Above the model sits
+  a scheduler that separates short and long requests into different pools,
+  because a 1M-token prefill and a 2k-token chat share no useful batch shape.
+deep_dives:
+  - topic: "Native multimodal tokenisation: everything is a token, and that is the design"
+    explanation: >-
+      The architectural claim behind Gemini is that modalities should not be
+      separate towers with adapters between them. Instead, images are cut into
+      patches, video into frames and then patches, and audio into short frames,
+      and each becomes a sequence of discrete or continuous tokens in a shared
+      vocabulary. A prompt is then literally an interleaved sequence: text token,
+      text token, image patch, image patch, audio frame, text token. The model
+      has one attention mechanism over one sequence, so a pronoun can attend to a
+      face in an earlier frame, and a sentence can attend to the audio that was
+      playing when it was spoken. The cost is in the tokeniser, which is where
+      the real engineering sits. A video tokeniser has to compress 24 frames per
+      second into something a transformer can attend over without losing motion,
+      and the compression ratio determines both quality and cost. At 258 tokens
+      per frame, one second of 24 fps video would be 6,192 tokens if every frame
+      were kept, so production pipelines sample at one to two frames per second
+      and rely on the model to infer motion from context. That is a modelling
+      compromise disguised as a tokeniser setting, and it is the first thing to
+      probe when a video task fails.
+    tradeoffs:
+      - option: "One shared token space across modalities"
+        pros: "Cross-modal attention is native; a single sequence handles any interleaving; one model, one set of weights, one serving path."
+        cons: "The tokeniser becomes a quality bottleneck for every modality, and a bad frame sampling rate silently degrades video understanding."
+      - option: "Separate encoders with adapters"
+        pros: "Each modality can use its best-in-class encoder; training is modular and debuggable; cheaper to iterate on one modality."
+        cons: "Cross-modal relationships are learned only in the adapter, which is a thin bottleneck; long video is impractical because the encoder was not designed for it."
+      - option: "Text-only with a captioning pre-step"
+        pros: "Cheapest possible path; no multimodal training at all; works surprisingly well for simple image questions."
+        cons: "Loses everything the caption omits: layout, expression, tone, motion. It cannot answer a question about a chart's axis or a speaker's hesitation."
+  - topic: "Ring attention: making a million tokens fit on a pod"
+    explanation: >-
+      A million tokens of KV cache is 164 GB, which is 1.7 times the HBM of one
+      TPU v5p chip. There is no quantisation trick that closes that gap, so the
+      sequence has to be split. Ring attention splits the token positions into
+      chunks, one per chip, and each chip holds the queries, keys and values for
+      its own chunk. To compute attention for its queries against the whole
+      sequence, a chip needs every other chunk's keys. So the chips form a ring:
+      each one sends its key and value block to its neighbour, computes attention
+      against the block it just received, and passes it on, while overlapping the
+      transfer with the computation on the previous block. After N steps around a
+      ring of N chips, every query has attended to every key. The elegance is
+      that the communication is O(N) per chip rather than O(N squared), because
+      each block is transmitted once per lap rather than broadcast. The cost is
+      that the ring is a latency chain: the slowest chip sets the pace of every
+      step, and the fill and drain phases at the start and end of each layer leave
+      some chips idle. That is why the measured prefill time is worse than the
+      FLOP count suggests, and why the sharding width is chosen from a latency
+      budget rather than from a memory calculation alone.
+    tradeoffs:
+      - option: "Ring attention with sequence sharding"
+        pros: "Context scales with the number of chips; communication is linear in ring width; the full window stays available with no truncation."
+        cons: "Latency is set by the slowest chip and by interconnect bandwidth; fill and drain waste cycles; a single chip failure breaks the ring."
+      - option: "Truncate or slide the window"
+        pros: "No communication at all; constant memory; the simplest possible serving."
+        cons: "The model cannot see past the window, so whole-document and whole-video tasks are impossible by construction."
+      - option: "Retrieval plus a short window"
+        pros: "Cheap, fast, scales to a corpus rather than a document; no ring infrastructure."
+        cons: "Recall is bounded by the retriever, multi-hop questions over a whole document fail, and the failure is silent."
+  - topic: "Serving sparse MoE on TPUs"
+    explanation: >-
+      The MoE half of the model has the opposite problem to attention: it is
+      memory-bound on weights and communication-bound on routing. On a TPU pod
+      the interconnect is a torus with high per-chip bandwidth, and XLA compiles
+      the all-to-all into the same executable as the matmuls, which means the
+      overlap is a compiler decision rather than a hand-written kernel. That is
+      the main structural difference from a GPU stack, where the all-to-all is
+      usually a library call the engineer has to place manually. The consequence
+      is that the topology is decided at compile time: the sharding annotations
+      tell XLA how the experts are distributed, and changing the pod shape means
+      recompiling rather than reconfiguring. That is a strength for a fixed
+      fleet and a weakness for elasticity, because a model compiled for a
+      64-chip slice cannot simply run on 32 chips at half the throughput. For
+      capacity planning this means the serving unit is quantised: you buy
+      slices, not chips, and the price per token moves in steps rather than
+      smoothly.
+    tradeoffs:
+      - option: "Compile-time sharding with XLA"
+        pros: "The compiler fuses the all-to-all with the compute; no hand-written overlap logic; excellent efficiency on a fixed topology."
+        cons: "The pod shape is baked into the executable; elasticity is poor, and a smaller slice needs a different compilation."
+      - option: "Dynamic expert placement at runtime"
+        pros: "Adapts to traffic and to expert popularity; can move hot experts closer to the requests that use them."
+        cons: "Requires a runtime that can re-shard weights, which is expensive at hundreds of gigabytes and adds a control plane that can fail."
+      - option: "Replicate the model rather than shard it"
+        pros: "No all-to-all across chips for routing; simplest failure domain; a replica can fail independently."
+        cons: "Impossible at 600B total parameters, since one replica does not fit in a slice regardless of batch size."
+  - topic: "The 1.5 to 2.0 transition: from reading to acting"
+    explanation: >-
+      Gemini 1.5's headline was a window. Gemini 2.0's headline was agency, and
+      the technical difference is that tool use moved from a prompting convention
+      to a trained capability. In 1.5, function calling was largely a matter of
+      describing a schema in the prompt and parsing JSON out of the response; it
+      worked, but it was brittle and the model had no notion of when to stop. In
+      2.0 the model is trained on trajectories where a call returns an error, a
+      second call corrects it, and the task completes, so the behaviour is in the
+      weights rather than in the prompt. The serving consequence is large: an
+      agent request is a sequence of model invocations with a growing transcript,
+      so the token volume per user request rises by an order of magnitude and the
+      latency budget is now the sum of the steps. The second half of 2.0 is
+      multimodal output. Generating an image or speech from the same model means
+      the serving path contains a decoder that is not an autoregressive text
+      loop, with different batching and different hardware characteristics, and
+      it means the product can answer with a diagram rather than a description.
+    tradeoffs:
+      - option: "Trained agentic tool use"
+        pros: "Recovers from errors without prompt scaffolding; knows when to stop; completes multi-step tasks that a prompted model abandons."
+        cons: "Multiplies token consumption and latency; every tool is a new failure surface; evaluation moves from answer quality to task success rate."
+      - option: "Prompted function calling"
+        pros: "No training data required; works with any tool schema; fully reversible per request."
+        cons: "Brittle parsing, no error recovery, and the model often calls a tool it does not need or stops before the task is done."
+      - option: "No tools, text only"
+        pros: "Cheapest and simplest; no sandbox, no permissions model, no side effects."
+        cons: "Cannot act on the world, which caps the product at advice rather than work."
+  - topic: "Why the TPU topology decides the long-context design"
+    explanation: >-
+      Ring attention is only viable if the interconnect can carry KV blocks fast
+      enough that the transfer hides behind the attention arithmetic. On a TPU
+      pod the chips are connected in a three-dimensional torus, and every chip
+      has a direct link to its six neighbours with a very high aggregate
+      bandwidth. That topology is exactly the shape a ring needs: the ring is a
+      path through the torus, and each hop is a single link rather than a switch
+      traversal. The second advantage is that XLA compiles the whole model with
+      the sharding baked in, so the all-gather for attention and the all-to-all
+      for expert routing are scheduled by the compiler rather than placed by
+      hand. The compiler knows the ring order and can overlap the send of block
+      N+1 with the attention on block N without a custom kernel. The cost is
+      elasticity. A model compiled for a 64-chip slice has its collective
+      topology in the executable, so running it on 32 chips means a different
+      compilation, a different memory layout and a different performance profile.
+      In capacity terms the serving unit is a slice, and slices come in fixed
+      shapes, so the price per token moves in steps and a partial slice is
+      wasted capacity. That is a very different planning model from a GPU fleet
+      where you can add a node at a time.
+    tradeoffs:
+      - option: "TPU pod with a torus and compile-time sharding"
+        pros: "High neighbour bandwidth makes ring attention viable; the compiler fuses collectives with compute; excellent efficiency on a fixed slice."
+        cons: "Poor elasticity; a different slice size needs a recompile; capacity is bought in quantised units."
+      - option: "GPU cluster with NVLink domains"
+        pros: "Elastic at node granularity; a huge kernel ecosystem; every inference framework targets it."
+        cons: "Ring attention must cross node boundaries at lower bandwidth, so long context is more expensive per token than on a tightly coupled fabric."
+      - option: "Single-node long context with a truncated window"
+        pros: "No interconnect cost at all; simplest possible deployment."
+        cons: "Caps the context at what one node's HBM can hold, which is well under a million tokens at these cache sizes."
+bottlenecks:
+  - failure: "Ring straggler"
+    symptom: "Long-context latency is 2 to 3x the FLOP-based prediction and varies between runs with the same prompt; one chip's utilisation is visibly lower than the rest."
+    mitigation: "Balance the sequence chunks by measured cost rather than by token count, because attention cost varies with content, and pin long requests to a dedicated slice so a straggler cannot affect short traffic."
+  - failure: "Prefill tail latency"
+    symptom: "Median time to first token is fine and the p99 is minutes; the queue is dominated by a small number of very long requests that occupy the whole slice."
+    mitigation: "A separate long-context pool with its own queue and its own price, chunked prefill so a long request does not block the slice, and a hard cap on the number of concurrent full-window prefills per pod."
+  - failure: "KV cache exhaustion at high concurrency"
+    symptom: "The scheduler admits requests until the pod is full, then thrashes: new requests evict cache for in-flight requests, which then recompute and evict someone else."
+    mitigation: "Admission control that reserves cache for the full expected lifetime of a request, preemption of the longest-running session rather than the newest, and separate pools for long and short context."
+  - failure: "Modality imbalance during pretraining"
+    symptom: "Loss falls on text and stalls on video; the model learns to ignore the visual tokens because they are noisy and rare relative to text."
+    mitigation: "Per-modality loss weighting and sampling ratios, curriculum that increases video proportion late, and held-out per-modality evaluations that are reported separately rather than averaged."
+  - failure: "Frame sampling mismatch at inference"
+    symptom: "The model performs well on benchmark clips and badly on customer footage, because the customer's frame rate or resolution differs from the training distribution."
+    mitigation: "Normalise frame rate and resolution in the ingestion pipeline rather than in the model, document the sampling assumptions in the API, and evaluate on customer-shaped data before launch."
+interview_questions:
+  - question: "An hour of video is about a million tokens. Show me the arithmetic and tell me what it implies for the product."
+    level: mid
+    key_points:
+      - "3,600 seconds at one frame per second is 3,600 frames."
+      - "At 258 tokens per frame that is 928,800 tokens, just under a 1M window."
+      - "So a one-hour recording fills the window with no room for the question or the output; a two-hour film needs 1.86M tokens."
+      - "Implication: video products must choose between frame rate, duration and resolution, and that choice is a product decision expressed as a tokeniser setting."
+    follow_up: "How would you handle a three-hour recording if the customer insists on the whole thing?"
+  - question: "Why can a million-token context not be served on a single accelerator?"
+    level: senior
+    key_points:
+      - "KV cache is 164 KB per token at 8 KV heads, 128 dim, 80 layers and FP8, so 1M tokens is 164 GB."
+      - "That exceeds a 95 GB TPU v5p chip before any weights are loaded."
+      - "Sequence parallelism is therefore mandatory, with a minimum ring width of two and a practical width of four or more."
+      - "The binding constraint is memory for the cache and bandwidth for the ring, not FLOPs."
+    follow_up: "What would you have to give up to serve it on two chips instead of sixty-four?"
+  - question: "Explain ring attention. Where does its latency come from?"
+    level: staff
+    key_points:
+      - "Split token positions across chips; each chip holds its own queries, keys and values."
+      - "Pass KV blocks around a ring and compute attention against each block as it arrives, overlapping transfer with compute."
+      - "Communication is linear in ring width per chip, not quadratic, because each block circulates once."
+      - "Latency comes from the slowest chip in the chain, the fill and drain phases, and interconnect bandwidth, not from arithmetic."
+    follow_up: "How would you choose the ring width for a service with a 4-minute p99 prefill target?"
+  - question: "At 1M tokens, which dominates: the attention term or the parameter term?"
+    level: senior
+    key_points:
+      - "Linear term is 2 x tokens x active parameters, so 2 x 1e6 x 50e9 = 1e17 FLOPs."
+      - "Attention is 4 x tokens squared x model dimension x layers, so 4 x 1e12 x 8,192 x 80 = 2.6e18 FLOPs."
+      - "Attention dominates by roughly 26x at that length, and the ratio grows linearly with context."
+      - "This is why long context is an attention-kernel and communication problem rather than an MoE-efficiency problem."
+    follow_up: "At what context length do the two terms become equal for this model?"
+  - question: "Would you build native multimodality or bolt encoders onto a language model?"
+    level: staff
+    key_points:
+      - "Native training puts every modality in one token space, so cross-modal attention is learned rather than adapted."
+      - "Bolted encoders are cheaper to iterate and let each modality use a best-in-class model, but the adapter is a thin bottleneck."
+      - "Native multimodality makes long video feasible because the video path was designed to be long."
+      - "The cost is a tokeniser per modality and a much harder joint training run to debug."
+    follow_up: "Where would a bolted architecture still win, and why?"
+  - question: "How do you price a 1M-token request so it does not destroy your margins?"
+    level: senior
+    key_points:
+      - "Cost is dominated by prefill: 2.6e18 FLOPs is about 222 chip-seconds on 64 chips, or 3.7 minutes of a whole pod."
+      - "Memory is also reserved for the session's lifetime, so the request blocks capacity even while idle."
+      - "Price either per request with a large minimum, or per token with a long-context multiplier."
+      - "Offer a batch path for document work, where latency does not matter and the pod can be packed efficiently."
+    follow_up: "What would you do about a customer who sends one 1M-token request per hour and expects interactive latency?"
+  - question: "What breaks first when you move from a 1M window to agentic tool use?"
+    level: staff
+    key_points:
+      - "Token volume per user request rises by an order of magnitude because every step resends the transcript."
+      - "Latency becomes the sum of the steps, so p99 is dominated by the longest chain rather than the slowest token."
+      - "Failure modes multiply: a bad tool result, a timeout, a permission error, and the model has to recover in-context."
+      - "Evaluation shifts from answer quality to task completion rate, which is harder to measure and easier to game."
+    follow_up: "How would you design the harness so a failed tool call does not consume the whole step budget?"
+what_to_steal:
+  - "Choose the tokeniser before the architecture. The tokens per frame decide the product's cost and its limits."
+  - "If the cache does not fit, shard the sequence. Ring attention is the difference between a demo and a window."
+  - "Report the attention term and the parameter term separately. At long context the first one is the budget."
+  - "Ship a distilled sibling. The volume product is what pays for the frontier model."
+  - "Quantise the serving unit honestly. Pod slices mean price moves in steps, and pretending otherwise breaks your forecasts."
+  - "Separate long and short request pools. They share no useful batch shape and mixing them hurts both."
+further_reading:
+  - label: "Gemini 1.5 technical report"
+    url: "https://arxiv.org/abs/2403.05530"
+  - label: "Gemini 2.0 announcement"
+    url: "https://blog.google/technology/google-deepmind/google-gemini-ai-update-december-2024/"
+  - label: "Ring Attention with Blockwise Transformers for Near-Infinite Context"
+    url: "https://arxiv.org/abs/2310.01889"
+  - label: "Gemini 1.0 technical report — the pre-native architecture"
+    url: "https://arxiv.org/abs/2312.11805"
+  - label: "FlashAttention — IO-aware exact attention"
+    url: "https://arxiv.org/abs/2205.14135"
+  - label: "Efficiently Scaling Transformer Inference"
+    url: "https://arxiv.org/abs/2211.05102"
+sources:
+  - label: "Gemini 1.5 technical report (arXiv 2403.05530)"
+    url: "https://arxiv.org/abs/2403.05530"
+  - label: "Google — Gemini 1.5 announcement, 15 Feb 2024"
+    url: "https://blog.google/technology/google-deepmind/google-gemini-ai-update-february-2024/"
+  - label: "Google — Gemini 2.0 announcement, 11 Dec 2024"
+    url: "https://blog.google/technology/google-deepmind/google-gemini-ai-update-december-2024/"
+  - label: "Ring Attention (arXiv 2310.01889)"
+    url: "https://arxiv.org/abs/2310.01889"
+tags: [multimodal, long-context, ring-attention, moe, tpu, agents]

@@ -1,0 +1,1492 @@
+id: tokenisation
+slug: tokenisation
+title: "Tokenisation: BPE, SentencePiece, and Vocabulary Design"
+summary: >-
+  Build byte-pair encoding from the merge loop up, measure what each merge buys
+  on a 116,000-word corpus, and price the vocabulary decision: embedding rows
+  against sequence length, with the crossover at 1/(6Ld). Then use the same
+  tokenizer to explain fertility across scripts and the failures it causes —
+  arithmetic, spelling, and trailing whitespace.
+kind: lesson
+difficulty: medium
+position: 6
+estMinutes: 29
+prerequisites: [regularisation-in-practice]
+phase: input-pipeline
+tags:
+  - tokenisation
+  - bpe
+  - wordpiece
+  - sentencepiece
+  - unigram
+  - vocabulary-size
+  - fertility
+  - byte-level
+  - embeddings
+  - arithmetic-failure
+
+body:
+  big_idea: >-
+    A tokenizer is a frozen, lossy compression decided before training: it
+    fixes the alphabet, sets the price of every document in tokens, and
+    explains why a model can add some numbers and not others.
+
+  problem:
+    - >-
+      A competitor reports 2.02 nats per token, you 3.00; at 4.31 characters
+      per token yours is 1.00 bit per character, theirs 1.49.
+    - >-
+      Your Hindi users cost eleven times more per character than English
+      users, because the tokeniser was trained on a corpus that was 99% ASCII.
+    - >-
+      You add a token and retrain, and every id after the insertion point now
+      points at a different embedding row, with nothing versioned.
+
+  analogy: |
+    A supermarket with fixed pack sizes: every item must be sold in one of
+    them, and a word with no pack of its own is split — "unbelievable" becomes
+    un + believ + able. Bigger packs mean fewer scans but each pack costs an
+    embedding row, and the shelf has a fixed width. The pack list is decided
+    once and cannot change without re-labelling everything.
+
+  concept_points:
+    - >-
+      **BPE is a greedy merge loop, and every merge removes exactly as many tokens as the pair occurs.**
+      From bytes at **6.1164** tokens per word, 1,000 merges give **2.0928**,
+      4,000 give **1.5449**, 8,000 give **1.4131**. The accounting is exact:
+      the 9,134 merges learned sum to **546,409** tokens removed, and 707,634
+      − 546,409 = 161,225. BPE never looks at the token count again.
+    - >-
+      **The loop is irreversible and it runs out of material.** A merge at
+      step 200 can never be undone at step 8,000, so
+      **1,230 of 9,134 learned tokens (13.47%)** are never emitted — they
+      exist only inside longer merges. And the loop exhausts: on 116,000
+      words, after 9,134 merges no adjacent pair occurs more than once, so
+      "use a 32k vocabulary" is not an option this corpus can supply.
+    - >-
+      **WordPiece scores a merge by likelihood, not frequency, and that changes the vocabulary rather than its order.**
+      Same corpus, same size: at V = 1,256 frequency-BPE gives **2.1040**
+      tokens per word and PMI-scored merging **2.1473**, 2.1% worse, and the
+      lists share only **184 of their 1,000** merges. Frequency learns" t","
+      a", "he"; PMI learns "th", "the"," the".
+    - >-
+      **Unigram is the probabilistic alternative, and it wins on tokens.**
+      Seed an inventory, fit a unigram model by EM over all segmentations,
+      prune the entries whose removal costs least likelihood. On held-out text
+      at equal vocabulary: **1.4823** tokens per word at V = 1,204 against
+      BPE's **2.0230**, 26.7% fewer; 1.4897 against 1.7286 at V = 2,102. It
+      pays by memorising whole words.
+    - >-
+      **Fertility — tokens per word — decides whether a language is affordable.**
+      With an English-trained 8,000-merge tokenizer, English is **1.19**
+      tokens per word (4.55 characters per token) and Hindi **12.58** (0.38
+      characters per token). A 128k-token window holds about **107,000**
+      English words and about **10,200** Hindi words at those rates: the same
+      window is ten times smaller in one language. Attention, cache, latency
+      and price all follow token count.
+    - >-
+      **Arithmetic fails because digits are not tokens.** Of the integers 0 to
+      999, **225** are a single token and 775 are two; of 0 to 9,999 only 245
+      are single, and only **297 of 8,000** learned tokens (3.71%) are purely
+      digits. "1234" is "12" + "34", "31415" is"3" + "14" + "15", "1000000" is"1"
+      + "000000". Column addition needs ones aligned with ones; the tokenizer
+      aligns nothing.
+
+  definitions:
+    - term: "Token"
+      meaning: >-
+        One element of the sequence a model actually consumes: a byte, a
+        character, a subword, or a whole word, depending on the vocabulary. It
+        is the unit of position, attention, KV cache and price, which is why a
+        change of tokenizer changes every cost in the system.
+    - term: "Vocabulary"
+      meaning: >-
+        The finite set of strings the tokenizer can emit, each with an integer
+        id. Its size is the number of embedding rows; its contents decide what
+        the model can represent cheaply and what it must spell out byte by byte.
+    - term: "Merge"
+      meaning: >-
+        The atomic operation of BPE: take two adjacent symbols and replace every
+        non-overlapping occurrence of that pair with one new symbol, which
+        becomes a vocabulary entry. A merge is applied at most once during
+        training and is permanent.
+    - term: "Merge rank"
+      meaning: >-
+        The index at which a merge was learned. It is the tie-breaking rule at
+        inference: when several merges apply, the lowest rank wins, and that
+        rank order - not the final vocabulary - defines the segmentation. Two
+        tokenizers with identical vocabularies and different ranks segment
+        differently.
+    - term: "Byte-level BPE"
+      meaning: >-
+        BPE whose base alphabet is the 256 byte values rather than Unicode
+        characters. Text is UTF-8 encoded first, so any byte string is
+        representable and no UNK token is needed; the cost is that non-Latin
+        scripts, at three bytes per character, start three tokens long.
+    - term: "WordPiece"
+      meaning: >-
+        The subword algorithm used by BERT: like BPE, but a merge is chosen by a
+        likelihood score (roughly the pointwise mutual information of the pair)
+        rather than by raw frequency. Word continuations are marked with a "##"
+        prefix, which is a decoding convention, not the algorithm.
+    - term: "Unigram language model tokenizer"
+      meaning: >-
+        A subword model that assigns each vocabulary entry a probability and
+        segments text by the most probable segmentation under a unigram
+        assumption, computed by Viterbi. Trained by EM and pruned by the
+        likelihood lost when an entry is removed; the algorithm behind
+        SentencePiece's unigram mode.
+    - term: "SentencePiece"
+      meaning: >-
+        A tokenizer library, not an algorithm. It works on raw text with a
+        reversible space marker (so whitespace survives), and can train either
+        a BPE model or a unigram model. "We use SentencePiece" says nothing
+        about which segmentation you have.
+    - term: "Pre-tokenisation"
+      meaning: >-
+        The regex split applied before subword merging: usually contractions,
+        letter runs, digit runs, punctuation, and whitespace, with a leading
+        space kept attached to the following word. It is what stops a merge from
+        spanning a word boundary, and it is why " the" is a token while "e t"
+        never is.
+    - term: "Fertility"
+      meaning: >-
+        Tokens per word, or tokens per character, for a given language and
+        tokenizer. It converts a context window in tokens into a number of words
+        a user can actually write, and it is the reason a multilingual bill is
+        not proportional to characters.
+    - term: "UNK token"
+      meaning: >-
+        The placeholder a word-level or character-level tokenizer emits for a
+        symbol outside its vocabulary. Every such token is information destroyed
+        before the model sees it. Byte-level BPE has none because all 256 byte
+        values are always in the alphabet.
+    - term: "Tied embeddings"
+      meaning: >-
+        Sharing one matrix between the input embedding and the output
+        unembedding, so the vocabulary costs V x d parameters instead of 2 V x d.
+        It halves the parameter bill for the vocabulary but not the bytes read
+        per decoded token: the full matrix is streamed once per step either way.
+    - term: "Bits per character"
+      meaning: >-
+        Cross-entropy converted to a tokenizer-independent unit: nats per token
+        divided by ln 2 and by characters per token. It is the only loss number
+        that can be compared across two models with different vocabularies.
+    - term: "Subword regularisation"
+      meaning: >-
+        Sampling a segmentation instead of taking the most probable one during
+        training (unigram's n-best sampling, or BPE dropout). It is text
+        augmentation applied at the token level, and the same argument as
+        dropout in Regularisation in Practice: perturb the input so the model
+        cannot rely on one exact surface form.
+
+  diagrams:
+    - type: pipeline
+      title: "Text to ids: five stages, and only one of them is learned"
+      nodes:
+        - label: "Raw text (UTF-8)"
+          note: "bytes, not characters"
+          detail: "Unicode normalisation happens here if anywhere: NFC, lowercase, digit folding. Whatever you do at this stage must be done identically at training and serving time, or the model sees a different distribution."
+        - label: "Pre-tokenise"
+          note: "regex split, ~6 patterns"
+          detail: "Contractions, letter runs, digit runs, punctuation, whitespace. A leading space stays attached to the following word, which is why ' the' and 'the' are different tokens. This stage is what prevents a merge from spanning a word boundary."
+        - label: "Merge loop (learned once)"
+          note: "9,134 merges on 116k words"
+          detail: "BPE: count adjacent pairs, merge the most frequent, repeat. Unigram: fit probabilities by EM, prune by likelihood. Either way the result is a fixed list plus a map from string to id."
+        - label: "Apply (ranked, left to right)"
+          note: "the merge list IS the algorithm"
+          detail: "At inference, repeatedly apply the lowest-ranked applicable merge. Longest-match against the final vocabulary is a different algorithm and gets 14.8% of word types wrong on the docs corpus, with almost no difference in length."
+        - label: "Ids -> embedding"
+          note: "V x d table lookup"
+          detail: "One row per id. The id assignment is part of the weight layout: a tokenizer with the same vocabulary and different ids makes every row wrong, and nothing raises."
+        - label: "Sequence of length n"
+          note: "n = words x fertility"
+          detail: "Everything downstream is priced in n: attention at 2nd per token, KV cache at 2 L n_kv d_head n bytes, latency, and the bill."
+      caption: "Stages two and four are the same function written twice, once to learn and once to apply. Everything that goes wrong with tokenisation goes wrong in the gap between them."
+
+    - type: plot
+      title: "Merge count against corpus token count: steep to 1,000, flat after 4,000"
+      chart: line
+      xLabel: "merges learned"
+      yLabel: "tokens per word on the corpus"
+      series:
+        - name: "measured, 115,695 words, byte-level BPE"
+          points:
+            - { x: 0, y: 6.1164 }
+            - { x: 100, y: 3.6101 }
+            - { x: 500, y: 2.5023 }
+            - { x: 1000, y: 2.0928 }
+            - { x: 2000, y: 1.7690 }
+            - { x: 4000, y: 1.5449 }
+            - { x: 8000, y: 1.4131 }
+            - { x: 9134, y: 1.3935 }
+      caption: "The first 1,000 merges cut the sequence by 66%. The next 8,134 cut it by another 33%, and the last 1,134 by 1.4%."
+
+    - type: plot
+      title: "Cost of one 100k-word document: it turns up at about 9,000 vocabulary entries"
+      chart: line
+      xLabel: "vocabulary size V"
+      yLabel: "TFLOPs to process 100,000 words (d=768, 12 layers)"
+      series:
+        - name: "12 layers, d = 768, tied embeddings"
+          points:
+            - { x: 1256, y: 36.36 }
+            - { x: 2256, y: 31.28 }
+            - { x: 4256, y: 28.26 }
+            - { x: 6000, y: 27.59 }
+            - { x: 8256, y: 27.59 }
+            - { x: 9390, y: 27.69 }
+      caption: "Each point uses the measured tokens-per-word at that vocabulary size. The curve is the product of two terms moving in opposite directions: more parameters per token, fewer tokens per document."
+
+    - type: plot
+      title: "The same paragraph costs 12x more per character in Hindi than in English"
+      chart: bar
+      xLabel: "1 = English, 2 = Hindi, 3 = Chinese"
+      yLabel: "tokens per character"
+      series:
+        - name: "English"
+          points:
+            - { x: 1, y: 0.2197 }
+        - name: "Hindi"
+          points:
+            - { x: 2, y: 2.6034 }
+        - name: "Chinese"
+          points:
+            - { x: 3, y: 3.0000 }
+      caption: "English-trained tokenizer, 8,000 merges. Devanagari and CJK both cost three bytes per character and the vocabulary contains no entry for either script, so every byte is its own token."
+
+    - type: compare
+      title: "Word-level and byte-level tokenizers fail in opposite directions"
+      left_label: "Word-level (6,062 types at frequency >= 2)"
+      left_points:
+        - "One token per word, so sequences are short: the cheapest possible encoding"
+        - "2.37% of tokens are OOV on its own training corpus"
+        - "100% UNK on a Hindi sample: every word is outside the vocabulary"
+        - "Vocabulary is a function of the corpus, so it cannot cover new names, code, or typos"
+        - "Zero cost for morphology: 'run' and 'running' are unrelated rows"
+      right_label: "Byte-level BPE (8,000 merges, 8,256 entries)"
+      right_points:
+        - "No UNK by construction: all 256 byte values are in the alphabet"
+        - "Sequences are 3x longer for Devanagari and CJK: 2.60 and 3.00 tokens per character"
+        - "Vocabulary is a function of frequency, so it covers anything the bytes can spell"
+        - "12 of 8,000 learned tokens are not valid UTF-8 on their own: boundaries cut characters"
+        - "Morphology is cheap: 'un', 'believ', 'able' are shared rows"
+
+  markdown: |
+    ## The unit is chosen before the model exists
+
+    A language model never sees text. It sees a sequence of integers, and the
+    map from text to those integers is a separate, smaller, older artifact: a
+    vocabulary and a segmentation rule. Everything the model can learn is
+    bounded by what those integers can express, and everything the model costs
+    is proportional to how many of them a document produces.
+
+    Byte-pair encoding is the algorithm most of them use. Start with a sequence
+    of symbols — bytes, for a byte-level tokenizer — and repeat one operation:
+
+    $$(a, b) = \arg\max_{(x,y)} \operatorname{count}(x, y), \qquad
+      \text{merge } (a,b) \text{ everywhere, left to right, non-overlapping.}$$
+
+    Each merge adds one entry to the vocabulary and shortens the corpus. The
+    bookkeeping is exact: a merge of a pair that occurs $c$ times non-overlapping
+    removes exactly $c$ tokens, so after $K$ merges
+
+    $$T_K = T_0 - \sum_{k=1}^{K} c_k .$$
+
+    On this project's own topic prose — 115,695 words, 707,634 bytes — $T_0$ is
+    707,634 and the 9,134 learned merges remove 546,409 of them, leaving
+    161,225. That is 1.3935 tokens per word, from 6.1164. The whole curve:
+
+    | merges | vocabulary | tokens | tokens/word | chars/token |
+    |---|---|---|---|---|
+    | 0 | 256 | 707,634 | 6.1164 | 0.995 |
+    | 100 | 356 | 417,673 | 3.6101 | 1.686 |
+    | 1,000 | 1,256 | 242,123 | 2.0928 | 2.909 |
+    | 4,000 | 4,256 | 178,738 | 1.5449 | 3.941 |
+    | 8,000 | 8,256 | 163,493 | 1.4131 | 4.308 |
+    | 9,134 | 9,390 | 161,225 | 1.3935 | 4.369 |
+
+    Two facts are hidden in that table: the curve is logarithmic in shape, so
+    each doubling of the vocabulary buys roughly the same relative reduction,
+    and the loop *stops* — at 9,134 merges no adjacent pair occurs more than
+    once, so a 32k vocabulary is not available from 116,000 words of text no
+    matter what the hyperparameter says.
+
+    ## Two symbols that look the same
+
+    "the" and " the" are different tokens with different ids. So are "Hello"
+    (three tokens: H, el, lo) and "Hello " (four, the last being the space).
+    This is not an accident of implementation: the pre-tokeniser keeps a leading
+    space attached to the following word, so the tokenizer is really learning
+    word-and-space units, and 60.59% of the vocabulary it uses is space-initial,
+    carrying 71.75% of the token mass.
+
+    That has an operational consequence that costs teams real time: any
+    `.strip()`, any prompt template that trims, any chat formatter that appends
+    or removes a trailing newline, moves the input to a part of the token
+    distribution the model was never trained on. Nothing errors; the model gets
+    slightly worse.
+
+    ## The two failure modes are opposite
+
+    | | word-level | character-level | byte-level BPE |
+    |---|---|---|---|
+    | vocabulary | words seen in the corpus | the script's characters | 256 bytes + merges |
+    | unknown input | UNK | UNK for unseen characters | representable |
+    | sequence length | shortest | longest | in between |
+    | morphology | none shared | none | shared subwords |
+    | failure | silent information loss | very long sequences | long sequences for non-Latin scripts |
+
+    A word-level tokenizer with 6,062 types has a 2.37% OOV rate *on the corpus
+    it was built from*, and a 100% OOV rate on Hindi. A byte-level tokenizer has
+    a 0% OOV rate everywhere and pays 2.60 tokens per Devanagari character and
+    3.00 per Chinese character, because its vocabulary contains zero entries for
+    either script and 7,962 of its 8,000 learned entries are pure ASCII.
+
+    ## WordPiece and unigram
+
+    WordPiece keeps BPE's loop and changes the score. Instead of the most
+    frequent pair it merges the pair with the highest likelihood ratio — the
+    pair whose parts co-occur far more than their frequencies predict. At
+    V = 1,256 that costs 2.1% more tokens (2.1473 against 2.1040 per word) and
+    produces a vocabulary that shares only 184 of its 1,000 merges with the
+    frequency-trained one. It buys units like "th" and "ing" early instead of
+    " t" and " a".
+
+    Unigram goes further: it treats the vocabulary as a probability distribution
+    over subwords, defines the probability of a segmentation as the product of
+    its pieces, and picks the most probable segmentation by Viterbi. Training is
+    EM over all segmentations plus pruning of the entries whose removal costs
+    least likelihood. Measured on held-out text at equal vocabulary size it is
+    the better compressor — 1.4823 tokens per word against BPE's 2.0230 at
+    V around 1,200 — because it optimises exactly the quantity BPE only
+    approximates. Its weakness is the mirror image: it memorises whole words,
+    so its advantage halves as the vocabulary doubles (13.8% at V around 2,100).
+
+    SentencePiece is the library, not the algorithm: it implements both, works on
+    raw text with a reversible space marker, and is why "we use SentencePiece"
+    tells you nothing about which segmentation your weights expect.
+
+    ## Pricing the vocabulary
+
+    A vocabulary entry is an embedding row: $2d$ parameters when the unembedding
+    is tied. It is also, if the merge is any good, a shorter document. For $W$
+    words with fertility $\tau(V)$ and a model of $P(V) = 12Ld^2 + 2Vd$
+    parameters, the compute to process the document is
+
+    $$C(V) = 2\,P(V)\,W\,\tau(V),$$
+
+    and $dC/dV = 0$ gives the exchange rate
+
+    $$-\frac{\tau'(V)}{\tau(V)} = \frac{2d}{P(V)}
+      \;\approx\; \frac{1}{6Ld}.$$
+
+    One added vocabulary entry has to save more than one part in $6Ld$ of the
+    token stream to pay for itself: $1.77\times10^{-5}$ for 12 layers at 768
+    wide, $1.27\times10^{-6}$ for 32 layers at 4096. The measured marginal gain
+    falls from $1.5\times10^{-1}$ per 1,000 entries at V = 1,256 to
+    $1.2\times10^{-2}$ at V = 9,390, so the small model crosses its threshold
+    inside the range its corpus can supply and the large one does not come close.
+
+    | V | tokens/word | marginal gain per 1,000 entries | threshold, 12x768 | threshold, 32x4096 |
+    |---|---|---|---|---|
+    | 1,256 | 2.0928 | — | 1.77e-5 | 1.27e-6 |
+    | 2,256 | 1.7690 | 1.55e-1 | 1.74e-5 | 1.27e-6 |
+    | 4,256 | 1.5449 | 6.34e-2 | 1.68e-5 | 1.26e-6 |
+    | 8,256 | 1.4131 | 1.57e-2 | 1.57e-5 | 1.26e-6 |
+    | 9,390 | 1.3935 | 1.22e-2 | 1.55e-5 | 1.26e-6 |
+
+    End to end, on one 100,000-word document: 36.36 TFLOPs at V = 1,256,
+    28.26 at 4,256, 27.59 at 8,256, and **27.69 at 9,390** — the last 1,134
+    merges make the document 0.36% more expensive. For 32 layers at 4096 the
+    same table falls monotonically, from 2,701 TFLOPs to 1,817, and never turns
+    up. That is the whole reason a 124M model and a 70B model disagree about
+    vocabulary size, and it is one line of algebra: the threshold scales as
+    $1/(6Ld)$.
+
+    ## What the vocabulary explains
+
+    Three failures that get attributed to reasoning are tokenizer artifacts.
+
+    **Arithmetic.** Place value requires columns, and columns require aligned
+    digits. "1234" is "12" + "34", "12345" is "12" + "34" + "5", "31415" is
+    "3" + "14" + "15". Only 245 of the integers 0 to 9,999 are a single token.
+    A digit-splitting pre-tokeniser, which forces every digit to be its own
+    token, fixes much of this at the cost of roughly tripling the length of
+    numbers.
+
+    **Spelling.** A model that has never seen "bureaucracy" as anything but
+    "bureau" + "cracy" cannot spell it letter by letter unless byte tokens are
+    available and it has learned to use them; spelling tasks are much easier for
+    tokenizers with a character fallback.
+
+    **Trailing whitespace.** The generation stops when EOS is sampled, but the
+    space before it is already a token. A model that emits a space and then EOS
+    produces output that looks like a formatting bug and is in fact the
+    tokenizer's most likely continuation.
+
+    ## Choosing one
+
+    The decision is not "which tokenizer is best". It is: which languages,
+    scripts, and digit-heavy content must be cheap; how large is the model (the
+    threshold is $1/(6Ld)$); how much text do you have (the merge loop exhausts);
+    and will the vocabulary ever need to change (it will not, cheaply). Byte-level
+    BPE with a vocabulary near $L d$ and a digit-splitting rule is the default
+    that survives contact with users; unigram is worth it when you can train the
+    tokenizer on the same mixture you will serve.
+
+    One link back to *Regularisation in Practice*: vocabulary size is a capacity
+    decision of the same kind as weight decay. An extra row is a parameter only a
+    handful of documents touch, so its gradient is mostly noise and its norm
+    stays near initialisation — capacity spent on weights that behave as if they
+    had already decayed. Subword regularisation (BPE dropout, unigram n-best
+    sampling) is the same move at the token level: sample a segmentation instead
+    of taking the best one, so the model cannot rely on one exact surface form.
+
+    ## The longer version
+
+    A tokenizer is a frozen, lossy compression of text decided before training:
+    it fixes the alphabet the model can see, sets the price of every document in
+    tokens, and is the reason a model can add some numbers and not others.
+
+    A supermarket with fixed pack sizes. There is one shelf of packs — small,
+    medium, large — and every item must be sold in one of them. A word that has
+    no pack of its own gets split across several: "unbelievable" is sold as
+    un + believ + able. Bigger packs mean fewer scans at the till (a shorter
+    sequence) but each pack on the shelf costs money to stock (an embedding
+    row), and the shelf has a fixed width.
+
+    Two things follow, and both are real. The pack list is decided once, by
+    whoever set up the shop, and it cannot be changed afterwards without
+    re-labelling every item already on the shelves. And a shopper who wants
+    three items that happen to be one pack pays for one scan; a shopper who
+    wants one item that is only sold inside a big pack pays for the whole pack.
+
+    The analogy breaks where it matters most: packs are nutritionally neutral
+    when combined, and tokens are not. Splitting "1234" into "12" and "34"
+    destroys the place-value information a shopper would never lose by buying
+    two packs instead of one. That is why the rest of this topic is about what
+    the segmentation *costs*, not just how long it is.
+
+    ### What goes wrong
+
+    - A competitor reports a per-token loss of 2.02 nats and you report 3.00.
+      Your model may well be better — at 4.31 characters per token against
+      their 2.91, your 3.00 nats is 1.00 bits per character and their 2.02 is
+      1.49. Per-token numbers are not comparable across tokenizers, and the
+      whole evaluation you built on them is measuring the vocabulary, not the
+      model.
+    - Your Hindi users cost eleven times more per character than your English
+      users, on the same model, at the same price. Nothing in the model card
+      says so, because the tokenizer was trained on a corpus that was 99%
+      ASCII and it allocates zero vocabulary entries to Devanagari.
+    - Somebody asks how many words fit in a 128k-token context. Without
+      fertility you cannot answer: it is 107,000 words in English and 10,200
+      in Hindi with the same tokenizer, and the number is a property of the
+      tokenizer, not of the window.
+    - You add a token to the vocabulary, retrain the embedding, and the model
+      gets worse for reasons nobody can name. Every id after the insertion
+      point now points at a different row; the tokenizer is part of the weight
+      layout, and it is not versioned like one.
+    - You are asked why the model cannot add four-digit numbers, and you
+      discover that "1234" is two tokens, "12345" is three, and "31415" is "3"
+      + "14" + "15" — the digits are not aligned to anything, so column
+      addition has no columns to work with.
+
+    ### The full treatment
+
+    **BPE is a greedy merge loop, and every merge removes exactly as many
+    tokens as the pair occurs.** Start from bytes: 707,634 bytes over 115,695
+    words is 6.1164 tokens per word. Each iteration counts adjacent symbol
+    pairs weighted by word frequency, merges the most frequent, and appends
+    one vocabulary entry. After 1,000 merges the corpus is 2.0928 tokens per
+    word; after 4,000 it is 1.5449; after 8,000 it is 1.4131. The accounting
+    is exact rather than approximate: the 9,134 merges learned before no pair
+    occurs twice sum to 546,409 tokens removed, and 707,634 - 546,409 =
+    161,225 is the final token count. The trap is thinking BPE searches for a
+    good segmentation. It applies a fixed ordered list of substitutions and
+    never looks at the token count again.
+
+    **The loop is irreversible and it runs out of material.** A merge made at
+    step 200 can never be undone at step 8,000, so a bad merge holds a
+    vocabulary slot forever: 1,230 of the 9,134 learned tokens (13.47%) are
+    never emitted as a final token anywhere in the corpus — they exist only
+    inside longer merges. And the loop *exhausts*: on 116,000 words, after
+    9,134 merges no adjacent pair occurs more than once, so "use a 32k
+    vocabulary" is not an option this corpus can supply. The trap is
+    choosing the vocabulary size by convention (32k, 50k, 128k) and
+    justifying it with parameter counts, when the real constraint is how many
+    mergeable pairs your corpus contains.
+
+    **WordPiece scores a merge by likelihood, not frequency, and that changes
+    the vocabulary rather than its order.** Same corpus, same size: at
+    V = 1,256 frequency-BPE gives 2.1040 tokens per word and a PMI-scored
+    merge gives 2.1473, 2.1% worse, and the two lists share only 184 of their
+    1,000 merges. The first merges differ in kind, not just in rank:
+    frequency learns " t", " a", "he"; PMI learns "th", "the", " the", "in",
+    "an". "th" wins under PMI because t and h co-occur far more often than
+    their individual frequencies predict, which is exactly the property that
+    makes a unit worth having. The trap is calling WordPiece "BPE with ##
+    prefixes" — the ## is a formatting convention, the criterion is the
+    difference, and it buys morphology at the cost of compression.
+
+    **Unigram is the probabilistic alternative, and it wins on tokens.** Seed
+    an inventory, fit a unigram language model by EM over all segmentations
+    (forward-backward over a lattice), then prune the entries whose removal
+    costs the least likelihood, and segment with Viterbi under the final
+    model. On held-out text at equal vocabulary: 1.4823 tokens per word at
+    V = 1,204 against BPE's 2.0230, 26.7% fewer; 1.4897 against 1.7286 at
+    V = 2,102, 13.8% fewer. It pays for this by memorising whole words —
+    "running" is one token — and its advantage halves each time the
+    vocabulary doubles. The trap is treating "SentencePiece" as an algorithm:
+    it is a library that implements BPE and unigram both, and which one made
+    your model decides whether a merge list even exists.
+
+    **Byte-level BPE cannot emit an UNK token, and that is a coverage
+    guarantee with a price.** The base vocabulary is the 256 byte values, so
+    every string in every encoding is representable — Devanagari, emoji, a
+    stray 0xFF — with no [UNK] and no lossy normalisation. The price is
+    length: the same text costs 2.60 tokens per Devanagari character and 3.00
+    per Chinese character against 0.22 per English character, because the
+    8,000-entry vocabulary contains 0 entries that are entirely Devanagari, 0
+    entirely CJK, and 7,962 entirely ASCII. The trap is reading "no UNK" as
+    "multilingual solved". Nothing is unrepresentable; everything non-Latin
+    is merely expensive.
+
+    **Fertility — tokens per word — decides whether a language is
+    affordable.** With an English-trained 8,000-merge tokenizer, English is
+    1.19 tokens per word (4.55 characters per token) and Hindi is 12.58
+    tokens per word (0.38 characters per token). A 128k-token window holds
+    about 107,000 English words and about 10,200 Hindi words at those rates:
+    the same window is ten times smaller in one language. Everything that
+    scales with token count scales with fertility — attention at 2nd, the KV
+    cache, latency, price per page. The trap is measuring fertility on the
+    training corpus, which flatters any tokenizer because it learned those
+    exact words.
+
+    **Vocabulary size trades embedding rows against sequence length at an
+    exchange rate of 1/(6Ld).** An entry costs 2d parameters (tied embedding
+    and unembedding) and is paid for on every token; a merge that shortens
+    sequences pays back on every token processed. Differentiating the
+    per-document cost gives the optimum condition -tau'/tau = 2d/P, which for
+    a model whose vocabulary is small against 6Ld is 1/(6Ld): 1.77e-5 for
+    12 layers at 768 wide, 1.27e-6 for 32 at 4096, a factor of 13.9. Measured
+    here, the marginal gain falls from 1.5e-1 per 1,000 entries at V = 1,256
+    to 1.2e-2 at V = 9,390, and the total cost of a 100k-word document is
+    36.36 TFLOPs at V = 1,256, 28.26 at 4,256, 27.59 at 8,256 and 27.69 at
+    9,390 — the curve turns up, and the last 1,134 merges cost 0.36% more
+    than they save. The trap is a slogan in either direction: the sign of the
+    trade flips with model size, and at 32 x 4096 the same table falls
+    monotonically to 1,817 TFLOPs.
+
+    **Arithmetic fails because digits are not tokens.** Of the integers 0 to
+    999, 225 are a single token and 775 are two; of 0 to 9,999 only 245 are
+    single. "1234" is "12" + "34", "12345" is "12" + "34" + "5", "31415" is
+    "3" + "14" + "15", and "1000000" is "1" + "000000". Only 297 of the 8,000
+    learned tokens (3.71%) consist purely of digits. Column addition needs
+    ones aligned with ones; the tokenizer aligns nothing, so the model has to
+    reconstruct place value from token identities that do not encode it. The
+    trap is blaming "reasoning" for what is a preprocessing artifact — a
+    digit-splitting pre-tokeniser, which makes every digit its own token,
+    removes a large part of the failure at the cost of sequence length.
+
+    **Whitespace is a token, so "the" and " the" are different symbols.**
+    "Hello" is "H" + "el" + "lo", three tokens; "Hello " is four, because the
+    trailing space is its own symbol. 60.59% of the used vocabulary is
+    space-initial and carries 71.75% of all token mass, which is why the
+    tokenizer is really a word-and-space tokenizer with a byte fallback. The
+    consequences are all operational: a prompt template that strips trailing
+    space changes the conditioning, a completion that emits a space before
+    EOS looks wrong to the user, and adding one leading space changes the
+    first token's identity. The trap is any `.strip()` in the serving path —
+    it silently moves the input off the distribution the model was trained on.
+
+    **The tokenizer is frozen into the weight layout, so a mismatch is silent
+    corruption.** The embedding is a V x d table indexed by token id:
+    38,597,376 parameters at 50,257 x 768, 31.2% of GPT-2 small, and still
+    13.0% at 8,256 x 768. Pair the weights with a tokenizer of the same size
+    but different ids and every id resolves to the wrong row: the model reads
+    noise and its cross-entropy goes to ln V — 9.15 nats at V = 9,390 against
+    roughly 3 for a working model — with no error raised anywhere. The same
+    accounting explains why per-token loss is not comparable across
+    tokenizers: 1.00 bit per character is 2.99 nats per token at 4.31
+    characters per token and 2.02 nats per token at 2.91.
+
+
+  derivations:
+    - title: "Every merge removes exactly the count of the pair it merges"
+      latex: |
+        Let $T_k$ be the total token count after $k$ merges, and let $c_k$ be
+        the frequency-weighted number of non-overlapping occurrences of the pair
+        chosen at step $k$. Merging replaces each such occurrence of two symbols
+        with one symbol, so
+
+        $$T_k = T_{k-1} - c_k
+          \qquad\Longrightarrow\qquad
+          T_K = T_0 - \sum_{k=1}^{K} c_k .$$
+
+        On the corpus used here, $T_0 = 707{,}634$,
+        $\sum_{k=1}^{9{,}134} c_k = 546{,}409$, and $T_{9{,}134} = 161{,}225$,
+        the identity holding to the token. The distinction between
+        "occurrences" and "non-overlapping occurrences" matters only for
+        self-overlapping pairs: a run of four identical symbols contains three
+        overlapping occurrences of the pair but yields only two merges, so a
+        pair counter that ignores overlap over-counts.
+
+        The same accounting gives the shape of the curve. If pair frequencies
+        decayed geometrically with the merge index, $c_k \propto r^k$, the token
+        count would be geometric in $K$; measured, fertility follows
+
+        $$\tau(V) \approx 8.44\,V^{-0.20},$$
+
+        which is why each doubling of the vocabulary buys a smaller absolute
+        reduction and why "double the vocabulary" is never worth what it looks
+        like on a napkin.
+      prose: >-
+        This is the only exact statement in tokenisation: the token count is a
+        bookkeeping consequence of the merge list. It also tells you what the
+        merge loop is optimising, which is nothing but the next pair's count —
+        not the final token count, and certainly not the model's loss.
+
+    - title: "The vocabulary crossover: an entry must save more than 1/(6Ld) of a token"
+      latex: |
+        A tied model with vocabulary $V$ has
+
+        $$P(V) = 12Ld^2 + 2Vd$$
+
+        parameters, and processes a $W$-word document in
+
+        $$n(V) = W\,\tau(V)$$
+
+        tokens, at two FLOPs per parameter per token:
+
+        $$C(V) = 2\,P(V)\,W\,\tau(V).$$
+
+        Differentiating and setting the derivative to zero,
+
+        $$C'(V) = 2W\left[2d\,\tau(V) + P(V)\,\tau'(V)\right] = 0
+          \qquad\Longrightarrow\qquad
+          -\frac{\tau'(V)}{\tau(V)} = \frac{2d}{P(V)} .$$
+
+        When $V \ll 6Ld$ the second term of $P$ is negligible and
+
+        $$-\frac{\tau'(V)}{\tau(V)} \approx \frac{2d}{12Ld^2} = \frac{1}{6Ld},$$
+
+        which evaluates to $1.77\times10^{-5}$ at $L=12$, $d=768$ and
+        $1.27\times10^{-6}$ at $L=32$, $d=4096$: a factor of $13.9$ between the
+        two thresholds, from $Ld$ alone. Substituting the measured tail
+        $\tau \propto V^{-0.20}$, so that $-\tau'/\tau = 0.20/V$, gives
+
+        $$V^\star \approx 0.20 \cdot 6Ld = 1.2\,Ld,$$
+
+        which is 11,059 for a 12x768 model (measured crossing: between 8,256 and
+        9,390) and 157,286 for 32x4096 — against Llama 3 8B's actual 128,256,
+        or $0.98\,Ld$.
+      prose: >-
+        The rule of thumb that falls out is that a model wants a vocabulary of
+        roughly $Ld$ entries and no more: 9,216 for GPT-2 small (which shipped
+        50,257 because it also carried code and multilingual text) and 131,072
+        for a 32x4096 model (Llama 3 shipped 128,256). The exponent 0.20 is
+        empirical and corpus-dependent; the $1/(6Ld)$ threshold is not.
+
+    - title: "Bits per character: the only loss that survives a change of tokenizer"
+      latex: |
+        A model reports cross-entropy in nats per token. With $\tau$ tokens per
+        word and $w$ characters per word, one token covers $w/\tau$ characters,
+        so
+
+        $$\text{bits/char} = \frac{\mathcal{L}_{\text{nats/token}}}
+          {\ln 2 \cdot (w/\tau)}
+          = \frac{\mathcal{L}_{\text{nats/token}}}{\ln 2 \cdot \text{chars/token}} .$$
+
+        At $\tau = 2.0928$ the corpus gives 2.9105 characters per token, so
+        $\mathcal{L} = 3.0$ nats/token is 1.487 bits/character. At
+        $\tau = 1.4131$ the same corpus gives 4.3104 characters per token, so
+        3.0 nats/token is 1.004 bits/character. Inverting: a model at exactly
+        1.0 bit/character reports 2.99 nats/token under the first tokenizer and
+        2.02 under the second — a 48% difference in the headline number for
+        identical quality.
+      prose: >-
+        Two models with different tokenizers cannot be compared on per-token
+        loss, perplexity, or "loss per token" curves; convert to bits per
+        character or bits per byte first. The same conversion is what makes a
+        tokenizer a compression problem: 4.31 characters per token at 1.00
+        bits/character is the model doing real work, while 2.91 characters per
+        token is a vocabulary that has not paid for itself.
+
+  implementations:
+    - language: python
+      title: "BPE from the merge loop up, measured on a real corpus"
+      note: >-
+        Correct, and deliberately naive: it re-counts every pair on every
+        iteration, which is O(merges x corpus) and takes about four seconds for
+        3,000 merges on 6,173 words. The production version keeps an incremental
+        pair index and only re-counts the words a merge touched. Read the output
+        for the two numbers the topic turns on: tokens per word falling 4.03 to
+        2.25 while characters per token rises 1.84 to 3.29, and the identity
+        check at the end — 32,318 tokens removed by the merge list equals
+        46,194 - 13,876 exactly. The corpus is the four files in `docs/`, not the
+        116,000-word topic corpus, so the numbers here are reproducible as
+        topics are added; the shape is identical.
+      code: |
+        import glob, re
+        from collections import Counter
+
+        PAT = re.compile(r"'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+")
+
+
+        def load(pattern="docs/**/*.md"):
+            text = "\n\n".join(open(f).read() for f in sorted(glob.glob(pattern, recursive=True)))
+            return re.sub(r"```.*?```", " ", text, flags=re.S)
+
+
+        def train(counts, k):
+            """Byte-level BPE. A symbol is a bytes object; a merge's rank is its id."""
+            seqs = {w: [bytes([b]) for b in w.encode()] for w in counts}
+            merges, saved = [], 0
+            for _ in range(k):
+                pairs = Counter()
+                for w, s in seqs.items():
+                    f = counts[w]
+                    for a, b in zip(s, s[1:]):
+                        pairs[(a, b)] += f
+                if not pairs:
+                    break
+                (a, b), c = sorted(pairs.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1]))[0]
+                if c < 2:
+                    break
+                merges.append((a, b))
+                before = sum(counts[w] * len(s) for w, s in seqs.items())
+                for w, s in seqs.items():
+                    out, i = [], 0
+                    while i < len(s):
+                        if i < len(s) - 1 and s[i] == a and s[i + 1] == b:
+                            out.append(a + b); i += 2
+                        else:
+                            out.append(s[i]); i += 1
+                    seqs[w] = out
+                saved += before - sum(counts[w] * len(s) for w, s in seqs.items())
+            return seqs, merges, saved
+
+
+        text = load()
+        counts = Counter(PAT.findall(text))
+        words = sum(c for t, c in counts.items() if any(ch.isalpha() for ch in t))
+        base = len(text.encode("utf-8"))
+        print(f"{len(counts)} types, {words} words, {len(text)} chars, {base} bytes")
+        for k in (250, 500, 1000, 2000, 3000):
+            seqs, merges, saved = train(counts, k)
+            tot = sum(counts[w] * len(s) for w, s in seqs.items())
+            print(f"merges {len(merges):5d}  vocab {256 + len(merges):5d}  tokens {tot:7d}  "
+                  f"tokens/word {tot / words:.4f}  chars/token {len(text) / tot:.4f}")
+        print(f"base - final = {base - tot};  measured removals = {saved};  equal = {base - tot == saved}")
+
+        # 2863 types, 6173 words, 45697 chars, 46194 bytes
+        # merges   250  vocab   506  tokens   24898  tokens/word 4.0334  chars/token 1.8354
+        # merges   500  vocab   756  tokens   21388  tokens/word 3.4648  chars/token 2.1366
+        # merges  1000  vocab  1256  tokens   18065  tokens/word 2.9265  chars/token 2.5296
+        # merges  2000  vocab  2256  tokens   15038  tokens/word 2.4361  chars/token 3.0388
+        # merges  2581  vocab  2837  tokens   13876  tokens/word 2.2479  chars/token 3.2932
+        # base - final = 32318;  measured removals = 32318;  equal = True
+
+    - language: python
+      title: "Greedy longest-match segmentation — numerically WRONG"
+      note: >-
+        Wrong, and wrong in the way production code is wrong: it trains a
+        perfectly good merge list and then applies it by longest match against
+        the resulting vocabulary, which is a different algorithm. BPE's
+        definition is rank order — repeatedly apply the lowest-ranked applicable
+        merge — so a word like "matters" is " m" + "atters" under BPE and
+        " mat" + "ter" + "s" under longest match; "main" is "m" + "ain" against
+        "ma" + "in". Measured on the docs corpus at 2,000 merges: 425 of 2,863
+        word types (14.84%) get a different segmentation, 286 of them with the
+        *same number of tokens*, and the total token count differs by only 81 in
+        15,038 (0.54%). That is the dangerous part — the length is right to
+        within half a percent, the ids are wrong for one word in seven, so every
+        embedding lookup beyond that point is reading a token the model was not
+        trained to read. Nothing raises, and perplexity degrades by an amount
+        that looks like a data problem.
+      code: |
+        def encode_ranked(word, merges):
+            """Correct: apply merges in rank order, left to right, non-overlapping."""
+            rank = {m: i for i, m in enumerate(merges)}
+            s = [bytes([b]) for b in word.encode()]
+            while len(s) > 1:
+                best, at = None, None
+                for i in range(len(s) - 1):
+                    r = rank.get((s[i], s[i + 1]))
+                    if r is not None and (best is None or r < best):
+                        best, at = r, i
+                if best is None:
+                    break
+                s = s[:at] + [s[at] + s[at + 1]] + s[at + 2:]
+            return s
+
+
+        def encode_greedy(word, vocab, maxlen):
+            """WRONG: longest match in the vocabulary. This is not BPE."""
+            b, out, i = word.encode(), [], 0
+            while i < len(b):
+                for L in range(min(maxlen, len(b) - i), 0, -1):
+                    if b[i:i + L] in vocab:
+                        out.append(b[i:i + L]); i += L; break
+                else:
+                    out.append(b[i:i + 1]); i += 1
+            return out
+
+        # rank order and longest match disagree on 14.84% of word types:
+        #   'matters'  ranked [' m', 'atters']        greedy [' mat', 'ter', 's']
+        #   'main'     ranked ['m', 'ain']            greedy ['ma', 'in']
+        #   ' lines'   ranked [' l', 'ines']          greedy [' line', 's']
+        #   token delta over the corpus: +81 in 15,038 = 0.54%
+
+  checkpoints:
+    - id: cp-merges-exhaust
+      question: >-
+        You are told to train a 32,000-entry byte-level BPE on a 116,000-word
+        corpus. What actually happens, and what does the answer tell you about
+        how vocabulary size should be chosen?
+      answerKind: short_text
+      hint: >-
+        The loop stops when the best pair occurs once. Ask what that implies
+        about the number of distinct adjacent pairs in the corpus.
+      solution: >-
+        The loop stops early. On the 116,000-word corpus used here it learned
+        9,134 merges and then no adjacent pair occurred more than once, leaving
+        a vocabulary of 9,390 entries against the 32,000 requested. A merge of a
+        pair that occurs once would add a vocabulary entry that shortens exactly
+        one word in the whole corpus — pure parameter cost with no compression
+        benefit, which is why the natural stopping rule is frequency >= 2.
+        Vocabulary size is therefore bounded by the corpus's pair diversity, not
+        by a hyperparameter: more vocabularies need more text, and a tokenizer
+        trained on 116k words has no use for 32k entries. The measured curve
+        agrees — the last 1,134 merges bought 1.4% fewer tokens.
+    - id: cp-heldout
+      question: >-
+        Two tokenizers of the same size over the same data: frequency-BPE and
+        unigram. On the training corpus unigram is 27% better in tokens per
+        word. How much of that survives on held-out text, and why?
+      answerKind: short_text
+      hint: >-
+        Unigram can have whole words in its inventory; BPE can only have them if
+        a chain of merges built them. What happens to a whole-word entry on a
+        document that contains it? What about one that does not?
+      solution: >-
+        Most of it survives but not all: measured at V around 1,200, unigram is
+        1.4823 tokens per word on held-out text against BPE's 2.0230 (-26.7%),
+        and at V around 2,100 it is 1.4897 against 1.7286 (-13.8%). Unigram
+        wins because it optimises the segmentation probability directly, by EM
+        over all segmentations, and because its inventory can contain whole
+        words; BPE approximates that objective greedily and its merges are
+        spent wherever frequency is highest. The advantage halves as the
+        vocabulary doubles, because the extra entries are progressively rarer
+        and the two inventories converge. The honest comparison holds out text
+        and matches vocabulary size; the dishonest one reports the training
+        corpus, where both tokenizers look better than they are.
+    - id: cp-fertility
+      question: >-
+        With the same tokenizer, English is 1.19 tokens per word and Hindi is
+        12.58. A product page claims a 128k-token context. How many Hindi words
+        does that actually hold, and which costs does the difference show up in?
+      answerKind: short_text
+      hint: >-
+        Words per context equals window divided by fertility. Then think about
+        which parts of the bill are per token rather than per document.
+      solution: >-
+        128,000 / 12.58 is about 10,200 Hindi words against about 107,000 English
+        words — a factor of 10.5. The difference shows up in everything priced
+        per token: attention at 2nd multiply-adds per token, KV cache at
+        2 L n_kv d_head n bytes, and therefore latency and cost; a Hindi
+        document occupies ten times the cache and takes ten times the compute of
+        the same content in English. It also shows up in effective context: the
+        model's 128k window is a 10k-word window for that user. The root cause
+        is not Hindi — it is a vocabulary with zero Devanagari entries, so the
+        tokenizer falls back to three bytes per character, and the measured
+        2.60 tokens per character is exactly that 3-byte encoding with almost no
+        merges applied.
+    - id: cp-crossover
+      question: >-
+        Your 12-layer, 768-wide model's tokenizer has 8,256 entries and you are
+        offered 16,000 more, trained on 900,000 words of extra text. Should you
+        take them? Give the inequality you would check and the number for your
+        model.
+      answerKind: short_text
+      hint: >-
+        An entry costs 2d parameters and is read on every token; a shorter
+        document pays back on every token. The crossover is where the relative
+        token reduction per entry equals 2d/P.
+      solution: >-
+        Take them only if the relative reduction in tokens per added entry
+        exceeds 2d/P, which for this model is 1536 / 97,615,872 = 1.57e-5 per
+        entry, or 1.57e-2 per 1,000 entries — approximately 1/(6Ld) =
+        1/(6 x 12 x 768) = 1.81e-5. In the measured curve, going from 6,000 to
+        8,256 entries gave 1.57e-2 per 1,000, exactly at the threshold, and the
+        next 1,134 entries gave 1.22e-2, below it: the total cost of a
+        100k-word document rose from 27.59 to 27.69 TFLOPs. So 16,000 more
+        entries would need to deliver more than 1.57% fewer tokens per 1,000
+        entries, sustained, which is roughly ten times the marginal gain
+        observed at this vocabulary size. The extra text helps the tokenizer
+        learn better merges but does not move the threshold, which depends only
+        on L and d.
+    - id: cp-arithmetic
+      question: >-
+        A model adds 4-digit numbers at 60% accuracy and 2-digit numbers at 98%.
+        Its tokenizer learns merges by frequency with no digit rule. Explain the
+        gap in terms of the tokenizer, and say what you would change.
+      answerKind: short_text
+      hint: >-
+        Tokenize "1234", "12345" and "31415" and look at where the boundaries
+        fall. Then ask what a column is.
+      solution: >-
+        With no digit rule the merge loop builds digit tokens wherever digits
+        repeat: measured, 225 of 0-999 are single tokens and 775 are two, only
+        245 of 0-9999 are single, and boundaries are irregular — "1234" is
+        "12" + "34", "12345" is "12" + "34" + "5", "31415" is "3" + "14" + "15",
+        "1000000" is "1" + "000000". Only 297 of 8,000 tokens are purely digits.
+        Column addition needs ones aligned with ones across both addends; the
+        tokenizer guarantees no such alignment, so the model must infer place
+        value from token identity, which is why accuracy collapses as the number
+        of digits grows. The fix is a pre-tokenisation rule that splits every
+        digit into its own token, applied identically at training and serving
+        time, plus training on the split representation; the cost is roughly
+        three times the tokens for numbers.
+    - id: cp-whitespace
+      question: >-
+        A chat model occasionally ends its answer with a stray space, and a
+        prompt template that trims trailing whitespace measurably lowers quality.
+        One tokenizer fact explains both. What is it?
+      answerKind: short_text
+      hint: >-
+        Tokenize "Hello" and "Hello ". Count the tokens, and ask which symbol the
+        extra one is and how often it appears in the vocabulary.
+      solution: >-
+        The space is a token of its own, and a leading space is part of the next
+        word's token: "Hello" is H + el + lo (three), "Hello " is four with the
+        trailing space as its own symbol, and " the" is a single token distinct
+        from "the". 60.59% of the used vocabulary is space-initial and carries
+        71.75% of token mass, so the model's distribution over "what comes next"
+        is conditioned on whether a space preceded. Trailing space before EOS is
+        a legitimate high-probability continuation, which is the "stray space";
+        trimming whitespace in the template removes the space token the model
+        expects and shifts every subsequent token identity, which is the quality
+        drop. Fix the output post-hoc (strip at the API boundary, after
+        generation) and never inside the prompt path.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A tokenizer is a compressor with two knobs that fight each other. A
+        bigger vocabulary means more distinct symbols, so a document needs fewer
+        of them — but every symbol costs an embedding row, and every row is a
+        parameter read on every token. Separately, the compressor runs once, on
+        a corpus, before the model exists; whatever it decides about boundaries
+        becomes a permanent fact about the model's input distribution.
+
+        The reason this matters beyond bookkeeping is that the boundaries are
+        arbitrary with respect to meaning. They are chosen by frequency (or by
+        likelihood), not by what makes arithmetic or spelling easy, so the model
+        inherits a segmentation that can split digits off from their place value
+        and letters off from their word.
+      blocks:
+        - kind: checklist
+          body: |
+            - The vocabulary is learned once, from a corpus, and then frozen
+            - Merges are chosen by frequency (BPE) or likelihood (WordPiece, unigram)
+            - The merge rank, not the final vocabulary, defines the segmentation
+            - Byte-level has no UNK and pays in sequence length
+            - Vocabulary size trades parameters per token against tokens per document
+            - Fertility converts a token window into words, and it is language-specific
+      checkpoint: >-
+        Before reading on: if two tokenizers have exactly the same set of 8,000
+        strings but learned them in a different order, do they segment the same
+        text identically? What does that tell you about what a "vocabulary" is?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        There are three separate questions and they use three different tools.
+        "What does the tokenizer do?" is answered by implementing the merge loop
+        and watching the token count — the count is a bookkeeping identity, so
+        any implementation you can check against it is either right or obviously
+        wrong. "What does the vocabulary cost?" is answered by counting
+        parameters and tokens per document and differentiating; the threshold
+        falls out as 1/(6Ld) and depends only on depth and width. "Why does the
+        model fail on this input?" is answered by tokenizing the input and
+        looking at where the boundaries land — not by reading the model code.
+
+        Choose the direction by the question: mechanics use the merge loop,
+        economics use the derivative, and failures use an actual tokenizer on an
+        actual string.
+      blocks:
+        - kind: checklist
+          body: |
+            - Mechanism: count pairs, merge, recount — verify with the token identity
+            - Alternative algorithms: change the merge *score*, keep the loop
+            - Cost: parameters as 12Ld^2 + 2Vd, tokens as W x fertility
+            - Crossover: -tau'/tau = 2d/P, approximately 1/(6Ld)
+            - Cross-lingual: measure tokens per character, not tokens per word
+            - Failures: print the segmentation of the exact input that failed
+      checkpoint: >-
+        Which of those three tools would you reach for to decide whether to
+        raise a model's vocabulary from 32k to 64k, and which to explain why the
+        same model mangles a date like "2024-10-28"?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The merge loop is four lines and the application rule is one; everything
+        else in a tokenizer is bookkeeping around them.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # training
+            seqs = {word: list(bytes(word)) for word in corpus}
+            for step in range(K):
+                pairs = count adjacent symbol pairs, weighted by word frequency
+                (a, b) = the most frequent pair, ties broken deterministically
+                if count((a, b)) < 2: break
+                for each word: replace non-overlapping (a, b) left to right with a+b
+                append (a, b) to the merge list        # rank = len(merges)
+
+            # inference — the merge list IS the algorithm
+            while True:
+                find the adjacent pair with the lowest merge rank
+                if none: break
+                replace that single occurrence
+            # NOT: longest match against the final vocabulary
+
+            # vocabulary economics
+            P(V) = 12*L*d*d + 2*V*d
+            C(V) = 2 * P(V) * W * tau(V)
+            optimum where  -tau'(V)/tau(V) == 2*d/P(V)  ~  1/(6*L*d)
+      checkpoint: >-
+        In the training pseudocode the merge is applied to every non-overlapping
+        occurrence at once, while inference replaces one occurrence per pass.
+        Why do both give the same segmentation, and what breaks if inference
+        replaces all occurrences of the best pair before looking again?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three relations do all the work: the token identity, the cost
+        derivative, and the units conversion.
+      blocks:
+        - kind: math
+          body: |
+            Token identity. A merge of a pair occurring $c_k$ times
+            non-overlapping removes exactly $c_k$ tokens:
+
+            $$T_K = T_0 - \sum_{k=1}^{K} c_k,$$
+
+            measured as $707{,}634 - 546{,}409 = 161{,}225$ over 9,134 merges.
+
+            Vocabulary crossover. With $P(V) = 12Ld^2 + 2Vd$ and $n = W\tau(V)$,
+
+            $$C(V) = 2P(V)W\tau(V), \qquad
+              -\frac{\tau'}{\tau} = \frac{2d}{P(V)} \approx \frac{1}{6Ld}.$$
+
+            At $L=12$, $d=768$: $1/(6 \cdot 12 \cdot 768) = 1.81\times10^{-5}$;
+            at $L=32$, $d=4096$: $1.27\times10^{-6}$. With the measured tail
+            $\tau \propto V^{-0.20}$ this gives $V^\star \approx 1.2\,Ld$.
+
+            Units. One token spans $w/\tau$ characters, so
+
+            $$\text{bits/char} = \frac{\mathcal{L}_{\text{nats/token}}}
+              {\ln 2 \cdot \text{chars/token}},$$
+
+            and 3.0 nats/token is 1.49 bits/char at 2.91 chars/token but 1.00
+            bits/char at 4.31.
+      checkpoint: >-
+        The threshold 1/(6Ld) contains no corpus term, while the measured
+        marginal gain is entirely a property of the corpus. Which of the two
+        would change if you swapped in a corpus in another language, and which
+        would not?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A byte-level BPE that trains, applies by rank, and reports the three
+        numbers that tell you whether it is right: tokens per word, characters
+        per token, and the merge identity.
+      blocks:
+        - kind: warning
+          body: >-
+            Three things break implementations, and none of them raise. Applying
+            merges by longest match instead of rank order gets 14.84% of word
+            types a different segmentation with a 0.54% difference in length.
+            Applying merges across pre-token boundaries produces tokens the
+            model never saw. And pairing weights with a tokenizer of the same
+            size but different ids makes every embedding lookup wrong while the
+            model still runs — cross-entropy goes to ln V, which looks like a
+            learning-rate problem, not a tokenizer problem.
+        - kind: code
+          language: python
+          body: |
+            import glob, re
+            from collections import Counter
+
+            PAT = re.compile(r"'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+")
+
+            def corpus(pattern="docs/**/*.md"):
+                return re.sub(r"```.*?```", " ",
+                              "\n\n".join(open(f).read() for f in sorted(glob.glob(pattern, recursive=True))),
+                              flags=re.S)
+
+            def train(counts, k):
+                seqs = {w: [bytes([b]) for b in w.encode()] for w in counts}
+                merges = []
+                for _ in range(k):
+                    pairs = Counter()
+                    for w, s in seqs.items():
+                        for a, b in zip(s, s[1:]):
+                            pairs[(a, b)] += counts[w]
+                    if not pairs:
+                        break
+                    (a, b), c = sorted(pairs.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1]))[0]
+                    if c < 2:
+                        break
+                    merges.append((a, b))
+                    for w, s in seqs.items():
+                        out, i = [], 0
+                        while i < len(s):
+                            if i < len(s) - 1 and s[i] == a and s[i + 1] == b:
+                                out.append(a + b); i += 2
+                            else:
+                                out.append(s[i]); i += 1
+                        seqs[w] = out
+                return merges
+
+            def encode(word, merges):
+                rank = {m: i for i, m in enumerate(merges)}
+                s = [bytes([b]) for b in word.encode()]
+                while len(s) > 1:
+                    best, at = None, None
+                    for i in range(len(s) - 1):
+                        r = rank.get((s[i], s[i + 1]))
+                        if r is not None and (best is None or r < best):
+                            best, at = r, i
+                    if best is None:
+                        break
+                    s = s[:at] + [s[at] + s[at + 1]] + s[at + 2:]
+                return s
+
+            text = corpus()
+            counts = Counter(PAT.findall(text))
+            merges = train(counts, 2000)
+            toks = sum(c * len(encode(w, merges)) for w, c in counts.items())
+            words = sum(c for t, c in counts.items() if any(ch.isalpha() for ch in t))
+            print("tokens/word %.4f  chars/token %.4f  vocab %d"
+                  % (toks / words, len(text) / toks, 256 + len(merges)))
+      checkpoint: >-
+        `encode` rebuilds the rank map on every call, which is a real cost at
+        serving time. Hoist it — and then explain why the rank map, not the
+        vocabulary set, is the object you must ship alongside the weights.
+
+  problems:
+    - id: p-bpe-train
+      title: "Train the merge loop"
+      difficulty: medium
+      prompt: >-
+        Implement `bpe_train(words, num_merges)` over a list of already
+        pre-tokenised strings. Start from single characters as the initial
+        symbols. At each step count every adjacent symbol pair, weighted by how
+        often its word occurs; choose the pair with the highest count, breaking
+        ties by the lexicographically smallest pair; stop early if the winning
+        count is below 2 or if no pairs remain. Merge all non-overlapping
+        occurrences of that pair, left to right, and append the pair to the merge
+        list. Return a dict with `merges` (the list of pairs, in order, as
+        two-element lists of strings), `vocab_size` (the number of distinct
+        characters in the input plus the number of merges learned) and `tokens`
+        (the total token count over all words after training, counting each
+        word as often as it occurs). Two equal-count pairs must always resolve
+        the same way regardless of input order.
+      starter: |
+        from collections import Counter
+
+        def bpe_train(words, num_merges):
+            # your implementation here
+            pass
+      language: python
+      entry: bpe_train
+      testCases:
+        - input: '[["low", "low", "lower", "lowest", "newer", "wider"], 0]'
+          expected: '{"merges": [], "vocab_size": 10, "tokens": 27}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[["low", "low", "lower", "lowest", "newer", "wider"], 5]'
+          expected: '{"merges": [["l", "o"], ["lo", "w"], ["e", "r"]], "vocab_size": 13, "tokens": 16}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[["low", "lower", "lowest"], 10]'
+          expected: '{"merges": [["l", "o"], ["lo", "w"], ["low", "e"]], "vocab_size": 10, "tokens": 6}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[["aa", "aa", "aa", "ab"], 3]'
+          expected: '{"merges": [["a", "a"]], "vocab_size": 3, "tokens": 5}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[["abc", "abc", "abd"], 2]'
+          expected: '{"merges": [["a", "b"], ["ab", "c"]], "vocab_size": 6, "tokens": 4}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        from collections import Counter
+
+        def bpe_train(words, num_merges):
+            counts = Counter(words)
+            seqs = {w: list(w) for w in counts}
+            merges = []
+            for _ in range(int(num_merges)):
+                pairs = Counter()
+                for w, s in seqs.items():
+                    f = counts[w]
+                    for a, b in zip(s, s[1:]):
+                        pairs[(a, b)] += f
+                if not pairs:
+                    break
+                cand = sorted(pairs.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1]))
+                (a, b), c = cand[0]
+                if c < 2:
+                    break
+                merges.append([a, b])
+                for w, s in seqs.items():
+                    out, i = [], 0
+                    while i < len(s):
+                        if i < len(s) - 1 and s[i] == a and s[i + 1] == b:
+                            out.append(a + b)
+                            i += 2
+                        else:
+                            out.append(s[i])
+                            i += 1
+                    seqs[w] = out
+            tokens = sum(counts[w] * len(s) for w, s in seqs.items())
+            alphabet = len({ch for w in counts for ch in w})
+            return {"merges": merges, "vocab_size": alphabet + len(merges), "tokens": tokens}
+      solutionExplanation: >-
+        The second case is the whole algorithm in miniature. With counts
+        {low: 2, lower: 1, lowest: 1, newer: 1, wider: 1} the pairs (l,o) and
+        (o,w) both occur 4 times; the tie-break takes (l,o) because "l" < "o".
+        That makes "lo" a symbol, and (lo,w) now occurs 4 times — the most
+        frequent pair in the corpus — so the second merge is (lo,w), which
+        demonstrates why BPE builds long units: each merge creates the pair the
+        next merge consumes. The third merge is (e,r) with count 3, and then
+        every remaining pair occurs once, so the loop stops after 3 merges even
+        though 5 were requested. `tokens` falls 27 to 16, and the accounting is
+        exact: 4 + 4 + 3 = 11 removed, 27 - 11 = 16. The fourth case is the one
+        that catches a merge loop which
+        forgets that "aa" appears twice inside "aa" only once as a
+        non-overlapping pair: three copies of "aa" merge to one symbol each, so
+        three 2-character words become three tokens and "ab" stays at two,
+        giving 5 rather than 4. The fifth case shows chain building in its
+        purest form — (a,b) then (ab,c) — and if your `vocab_size` counts
+        multi-character merged symbols you will be off by two.
+      complexity: "O(num_merges x corpus symbols) time, O(unique words) space"
+      tags: [bpe, merge-loop, tokenisation, frequency]
+
+    - id: p-fertility
+      title: "Apply a merge list and measure fertility"
+      difficulty: easy
+      prompt: >-
+        Implement `fertility(words, merges)` where `merges` is an ordered list of
+        two-element lists of strings (rank 0 first). Segment each word by
+        repeatedly applying the lowest-ranked merge that occurs anywhere in the
+        current symbol sequence, replacing one occurrence at a time, until no
+        applicable merge remains. Each word is segmented independently — merges
+        never cross a word boundary. Return a dict with `tokens` (total tokens
+        across all words in the list, counting duplicates), `tokens_per_word`
+        (tokens divided by the number of words) and `chars_per_token` (total
+        characters divided by total tokens), both as floats.
+      starter: |
+        def fertility(words, merges):
+            # your implementation here
+            pass
+      language: python
+      entry: fertility
+      testCases:
+        - input: '[["low", "lower", "lowest"], [["l", "o"], ["lo", "w"]]]'
+          expected: '{"tokens": 8, "tokens_per_word": 2.6666666666666665, "chars_per_token": 1.75}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[["token", "tokens", "tokenizer"], [["t", "o"], ["to", "k"], ["tok", "en"]]]'
+          expected: '{"tokens": 14, "tokens_per_word": 4.666666666666667, "chars_per_token": 1.4285714285714286}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[["hello", "hello"], []]'
+          expected: '{"tokens": 10, "tokens_per_word": 5.0, "chars_per_token": 1.0}'
+          mode: json
+          tolerance: 1e-9
+        - input: '[["abcde"], [["a", "b"], ["c", "d"], ["ab", "cd"]]]'
+          expected: '{"tokens": 2, "tokens_per_word": 2.0, "chars_per_token": 2.5}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def fertility(words, merges):
+            rank = {(m[0], m[1]): i for i, m in enumerate(merges)}
+
+            def encode(w):
+                s = list(w)
+                while len(s) > 1:
+                    best_r, at = None, None
+                    for i in range(len(s) - 1):
+                        r = rank.get((s[i], s[i + 1]))
+                        if r is not None and (best_r is None or r < best_r):
+                            best_r, at = r, i
+                    if best_r is None:
+                        break
+                    s = s[:at] + [s[at] + s[at + 1]] + s[at + 2:]
+                return s
+
+            ntok = sum(len(encode(w)) for w in words)
+            chars = sum(len(w) for w in words)
+            return {"tokens": ntok,
+                    "tokens_per_word": ntok / len(words),
+                    "chars_per_token": chars / ntok}
+      solutionExplanation: >-
+        The second case is the important one: merges 0 and 1 apply, merge 2
+        ("tok","en") never does, because after the first two merges "token" is
+        ["tok","e","n"] and "tok" is no longer adjacent to "en" as a single
+        symbol. That is not a bug — it is the rank-order rule, and it is why the
+        merge list and not the vocabulary is the specification. A longest-match
+        implementation would give "token" as one token and return 10 instead of
+        14. The fourth case shows a merge between two merged symbols: after
+        (a,b) and (c,d), "abcde" is ["ab","cd","e"] and the rank-2 merge joins
+        "ab" with "cd" to leave 2 tokens. If you implement merging by string
+        replacement on the word rather than on a symbol list, the rank-2 merge
+        will fail to find "abcd" inside "abcde" in the right position and you
+        will return 3. The third case pins the degenerate path: with no merges
+        the answer is character-level, 10 tokens for two copies of a 5-letter
+        word.
+      complexity: "O(|merges| x word length) per word with a scan per merge"
+      tags: [bpe, segmentation, fertility, rank-order]
+
+    - id: p-unigram
+      title: "Viterbi segmentation under a unigram model"
+      difficulty: hard
+      prompt: >-
+        Implement `unigram_segment(text, probs)` where `probs` maps a substring
+        to its probability in a unigram language model. Return the segmentation
+        of `text` with the highest total log-probability, as a list of strings
+        whose concatenation is `text`. Every character of `text` is guaranteed to
+        appear in `probs` as a one-character key, so a full segmentation always
+        exists. Break ties by fewer pieces first, then by the lexicographically
+        smallest list of pieces.
+      starter: |
+        import math
+
+        def unigram_segment(text, probs):
+            # your implementation here
+            pass
+      language: python
+      entry: unigram_segment
+      testCases:
+        - input: '["lowest", {"low": 0.3, "l": 0.05, "o": 0.05, "w": 0.05, "e": 0.05, "s": 0.05, "t": 0.05, "est": 0.2, "we": 0.1, "st": 0.1, "lo": 0.1, "west": 0.2}]'
+          expected: '["low", "est"]'
+          mode: json
+        - input: '["ab", {"a": 0.5, "b": 0.5, "ab": 0.4}]'
+          expected: '["ab"]'
+          mode: json
+        - input: '["abcd", {"a": 0.4, "b": 0.4, "c": 0.4, "d": 0.4, "ab": 0.3, "cd": 0.3, "abc": 0.25, "bcd": 0.25}]'
+          expected: '["a", "bcd"]'
+          mode: json
+        - input: '["aaa", {"a": 0.6, "aa": 0.5, "aaa": 0.2}]'
+          expected: '["a", "aa"]'
+          mode: json
+      solution: |
+        import math
+
+        def unigram_segment(text, probs):
+            n = len(text)
+            best = [None] * (n + 1)
+            best[0] = (0.0, 0, ())
+            for i in range(n):
+                if best[i] is None:
+                    continue
+                for j in range(i + 1, n + 1):
+                    piece = text[i:j]
+                    if piece not in probs:
+                        continue
+                    score = best[i][0] + math.log(probs[piece])
+                    cand = (score, best[i][1] + 1, best[i][2] + (piece,))
+                    if best[j] is None:
+                        best[j] = cand
+                        continue
+                    b0 = best[j]
+                    if score > b0[0] + 1e-12:
+                        best[j] = cand
+                    elif abs(score - b0[0]) <= 1e-12 and (cand[1], cand[2]) < (b0[1], b0[2]):
+                        best[j] = cand
+            return list(best[n][2])
+      solutionExplanation: >-
+        This is Viterbi over a lattice whose edges are the substrings present in
+        `probs`: `best[j]` holds the best way to reach position j, and each
+        transition multiplies by one more probability, so maximising a product
+        becomes summing logs. The third case is a real tie and it is deliberate:
+        "abc" + "d" scores 0.25 x 0.4 and "a" + "bcd" scores 0.4 x 0.25, the
+        same product, and the tie-break must pick the lexicographically smaller
+        piece list, ["a","bcd"]. A plain argmax over the final score picks
+        whichever the loop happened to write last, which is why the comparison
+        is written as "greater than plus epsilon, else tie-break". The fourth
+        case ties the same way between "a"+"aa" and "aa"+"a", and here the
+        three-token option "a"+"a"+"a" (0.216) is only slightly worse than
+        "aaa" (0.2) — a reminder that a unigram model can prefer three cheap
+        pieces to one expensive one, which is exactly the behaviour that makes
+        it robust on unseen words and occasionally worse on seen ones. Note the
+        unknown-substring handling: pieces absent from `probs` are skipped
+        rather than scored, and the guarantee that every character is a key
+        keeps the lattice connected.
+      complexity: "O(n^2) transitions, O(n) memory"
+      tags: [unigram, sentencepiece, viterbi, segmentation]
+
+  visualizers:
+    - id: vs-tokenizer
+      kind: tokenizer
+      title: "Merge count, vocabulary, and tokens per word on one screen"
+      description: >-
+        Step the merge loop and watch three quantities move at different rates:
+        the vocabulary grows by exactly one per merge, the token count falls by
+        the pair's count, and tokens per word falls from 6.12 to 1.39 while
+        characters per token rises from 1.00 to 4.37. Past 1,000 merges each
+        additional entry buys less than the last, and past 9,134 there is
+        nothing left to merge.
+      params:
+        corpus: "44 topic files, 115,695 words"
+        vocab_sizes: [256, 1256, 4256, 8256, 9390]
+        merges: [0, 1000, 4000, 8000, 9134]
+
+
+  try_it: >-
+    Tokenise the integers 0 to 999 with your tokenizer and count how many are a single token.
+    Then tokenise 31415 and check whether it is three tokens — that is the whole reason column
+    addition has no columns to work with.
+  interview_questions:
+    - question: 'Walk through one BPE merge and say exactly how many tokens it removes.'
+      level: mid
+      key_points:
+        - 'Start from bytes: 707,634 bytes over 115,695 words is 6.1164 tokens per word before any merge.'
+        - 'Each iteration counts adjacent symbol pairs weighted by word frequency, merges the most frequent, and appends one vocabulary entry.'
+        - 'A merge removes exactly as many tokens as the pair occurs in the corpus, so the saving is the pair count and not one per word.'
+        - 'The loop is greedy and irreversible, so a bad merge holds a vocabulary slot forever: 13.47% of the 9,134 learned tokens are never emitted as a final token.'
+    - question: 'Your model cannot add four-digit numbers. Is that a training problem or a tokenizer problem?'
+      level: senior
+      key_points:
+        - 'Digits are not tokens: of the integers 0 to 999, 225 are a single token and 775 are two, and of 0 to 9,999 only 245 are single.'
+        - 'The segmentations cross digit boundaries: 1234 is 12 plus 34, 12345 is 12 plus 34 plus 5, and 31415 is 3 plus 14 plus 15.'
+        - 'Column addition needs aligned columns, and the tokenizer provides no alignment to anything positional.'
+        - 'So the failure is a representational one that no amount of training data fixes, which is why digit-level tokenisation or a scratchpad changes the result.'
+      follow_up: 'What would you change in the tokenizer or the interface to make arithmetic learnable, and what does that cost elsewhere?'
+    - question: 'Why is fertility the number that decides whether a language is affordable?'
+      level: mid
+      key_points:
+        - 'Fertility is tokens per word: with an English-trained 8,000-merge tokenizer, English is 1.19 tokens per word at 4.55 characters per token and Hindi is 12.58 at 0.38.'
+        - 'A 128k-token window holds about 107,000 English words and roughly a tenth of that in Hindi.'
+        - 'Cost is per token at training and at inference, so the same document costs ten times more in the under-served script.'
+        - 'That is also why per-token losses across languages are not comparable: the denominator changes with the script.'
+  common_mistakes:
+    - 'Comparing per-token losses across tokenizers, where 3.00 nats at 4.31 characters per token is 1.00 bits per character and 2.02 at 2.91 is 1.49.'
+    - 'Assuming merges are reversible or prunable, when 13.47% of the learned vocabulary is never emitted as a final token.'
+    - 'Pairing weights with a same-size tokenizer that has different ids, which is silent corruption rather than an error.'
+  further_reading:
+    - label: "Sennrich, Haddow & Birch, Neural Machine Translation of Rare Words with Subword Units (ACL 2016)"
+    - label: "Kudo & Richardson, SentencePiece: A Simple and Language Independent Subword Tokenizer and Detokenizer for Neural Text Processing (EMNLP 2018)"

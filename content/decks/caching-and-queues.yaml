@@ -1,0 +1,135 @@
+id: caching-and-queues
+title: Caching and queues
+order: 42
+minutes: 9
+params:
+  - { id: hit, label: "cache hit rate (%)", min: 0, max: 100, step: 5, init: 80 }
+  - { id: slow, label: "slow path time (ms)", min: 100, max: 2000, step: 100, init: 800 }
+  - { id: fast, label: "cache lookup time (ms)", min: 1, max: 50, step: 1, init: 5 }
+derived:
+  - { id: avg, expr: "hit / 100 * fast + (1 - hit / 100) * slow" }
+  - { id: gain, expr: "slow / avg" }
+cards:
+  - kind: story
+    kicker: Start here
+    title: Do not do the same work twice
+    body:
+      - "Some answers are slow to produce, like a database report or a model call. If many people ask the same thing, repeating the work wastes time and money."
+      - "A **cache** remembers answers you already computed. A **queue** moves slow work out of the request, so the user is not left waiting."
+    callout: "Remember it, or do it later."
+
+  - kind: lab
+    kicker: See it first
+    title: Average time with a cache
+    intro: "A **hit** is a request answered from the cache. A miss takes the slow path. The average blends both. **Drag the hit rate.**"
+    view:
+      type: bars
+      max: 2000
+      items:
+        - { label: "no cache (ms)", value: slow, color: "#ef4444" }
+        - { label: "average with the cache (ms)", value: avg, color: "#1cd6ac" }
+    sliders: [hit, slow, fast]
+    outro: "At {hit} percent hits, the average request takes **{avg} ms**, about **{gain}** times faster than the {slow} ms slow path."
+
+  - kind: formula
+    kicker: Read the formula
+    title: Average latency
+    tex: "\\bar{t} = h\\,t_{\\text{fast}} + (1 - h)\\,t_{\\text{slow}}"
+    say: "A share h of requests take the fast path and the rest take the slow one. Weight each time by its share and add them."
+    verify:
+      - { expr: "avg", equals: 164, tol: 0.01 }
+      - { expr: "gain", equals: 4.88, tol: 0.01 }
+      - { expr: "0.5 * 5 + 0.5 * 800", equals: 402.5, tol: 0.01 }
+    symbols:
+      - { tex: "\\bar{t}", means: "the average time per request in milliseconds", value: avg }
+      - { tex: "h", means: "hit rate as a fraction, for example 0.8 for 80 percent", value: "hit / 100" }
+      - { tex: "t_{\\text{fast}}", means: "time to read from the cache", value: fast }
+      - { tex: "t_{\\text{slow}}", means: "time on a miss, doing the full work", value: slow }
+
+  - kind: code
+    kicker: Read it
+    title: A small cache with expiry
+    intro: "Store each answer with the time it was saved. If it is older than the limit, treat it as a miss and compute again."
+    lang: python
+    code: |
+      import time
+
+      cache = {}
+      TTL = 300  # seconds
+
+      def get_report(key):
+          hit = cache.get(key)
+          if hit and time.time() - hit["at"] < TTL:
+              return hit["value"]
+          value = build_report(key)          # the slow work
+          cache[key] = {"value": value, "at": time.time()}
+          return value
+    note: "In production, Redis plays this role so every server shares one cache."
+
+  - kind: code
+    kicker: Read it
+    title: A queue for slow jobs
+    intro: "The web request only **adds a job** and replies at once. A separate worker process does the slow part later."
+    lang: python
+    code: |
+      from redis import Redis
+      from rq import Queue
+
+      q = Queue(connection=Redis())
+
+      def start_export(user_id):
+          q.enqueue(build_export, user_id)    # returns immediately
+          return {"status": "queued"}
+    note: "Tell the user it is queued, then show the result when the worker finishes."
+
+  - kind: check
+    kicker: Check yourself
+    title: Pick the tool
+    question: "A user clicks a button that takes about 30 seconds to build a PDF. What should the request do?"
+    options:
+      - { text: "Queue the job and reply right away", correct: true, why: "The user is not blocked, and a worker can retry if it fails." }
+      - { text: "Cache the PDF and make the user wait", why: "A cache only helps on repeat requests. The first one is still slow." }
+      - { text: "Run it in the request so it is simple", why: "A 30 second request risks timeouts and ties up the server." }
+
+  - kind: check
+    kicker: Check yourself
+    title: Stale data
+    question: "A cached price is 10 minutes old and the real price just changed. What is the usual fix?"
+    options:
+      - { text: "Set an expiry, and clear the entry when the price changes", correct: true, why: "Expiry bounds how stale it gets, and clearing on change fixes it at once." }
+      - { text: "Never cache prices", why: "Caching is fine when you plan how to refresh it." }
+      - { text: "Make the cache bigger", why: "Size does not make old data fresh." }
+
+  - kind: practice
+    kicker: Your turn
+    title: "Least recently used"
+    intro: "Write `lru(capacity, keys)` that processes a list of keys through an LRU cache and returns how many were hits. Use a list or dict to track recency."
+    entry: lru
+    starter: |
+      def lru(capacity, keys):
+          pass
+    solution: |
+      def lru(capacity, keys):
+          cache, hits = [], 0
+          for k in keys:
+              if k in cache:
+                  hits += 1
+                  cache.remove(k)
+              elif len(cache) >= capacity:
+                  cache.pop(0)
+              cache.append(k)
+          return hits
+    tests:
+      - { input: "[2, [\"a\", \"b\", \"a\", \"c\", \"b\"]]", expected: "1" }
+      - { input: "[1, [\"a\", \"a\", \"a\"]]", expected: "2" }
+      - { input: "[3, []]", expected: "0" }
+    hint: "Move a key to the back on every use. Drop from the front when full."
+
+  - kind: mistakes
+    kicker: Watch out
+    title: Three easy slips
+    items:
+      - "**No expiry.** Stale answers live forever, and bugs hide behind them."
+      - "**Caching per-user data under a shared key.** One person can see another's results."
+      - "**Jobs that cannot be repeated.** Queues retry, so a job must be safe to run twice."
+    next: { label: "Next: cost and latency", href: /learn/cost-and-latency }

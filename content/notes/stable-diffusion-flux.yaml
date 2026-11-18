@@ -1,0 +1,396 @@
+id: stable-diffusion-flux
+title: "Stable Diffusion to FLUX: compress, straighten the path, then distil the steps away"
+summary: >-
+  Stable Diffusion made image generation cheap by moving diffusion into a
+  compressed latent space: an 8x VAE turns a 512-pixel image into a 64-pixel
+  latent, cutting the quantity the model has to denoise by 48x. FLUX then
+  changed two more things. It replaced the U-Net with a multimodal diffusion
+  transformer that keeps text and image tokens in separate weight streams, and
+  it replaced the curved diffusion trajectory with rectified flow, which is
+  straight enough to sample in a handful of Euler steps. The engineering story
+  is a chain of three compressions: space, trajectory, and steps.
+kind: case_study
+date: "2024-08-01"
+actors: [Stability AI, Black Forest Labs]
+key_facts:
+  - "Latent diffusion was published in December 2021 and shipped as Stable Diffusion in August 2022, with an 8x spatial VAE and a U-Net denoiser at 512x512."
+  - "The VAE turns a 512x512x3 image into a 64x64x4 latent, reducing the number of values the denoiser touches from 786,432 to 16,384, a 48x reduction."
+  - "SDXL in July 2023 scaled the U-Net roughly 3x, added a second text encoder and a refiner stage, and moved the native resolution to 1024x1024."
+  - "FLUX.1 launched on 1 August 2024 from Black Forest Labs: a 12B rectified-flow transformer with a multimodal diffusion transformer block that keeps separate weights for text and image tokens."
+  - "FLUX.1 [schnell] is Apache 2.0 and timestep-distilled to 1 to 4 steps; [dev] is guidance-distilled and non-commercial at around 50 steps; [pro] is API-only."
+  - "Rectified flow learns a straight-line velocity field between noise and data, which is why a 4-step Euler sampler can produce a usable image where a 50-step DDPM schedule was needed before."
+  - "Classifier-free guidance doubles the denoiser cost per step by running a conditional and an unconditional pass, which is why guidance distillation is worth as much as step distillation."
+timeline:
+  - when: Dec 2021
+    what: "Latent Diffusion Models published: diffuse in a compressed latent rather than in pixel space."
+  - when: Aug 2022
+    what: "Stable Diffusion released with open weights, and image generation becomes a commodity on consumer GPUs."
+  - when: Jul 2023
+    what: "SDXL: 3x larger U-Net, dual text encoders, a refiner, and 1024x1024 native resolution."
+  - when: Mar 2024
+    what: "SD3 introduces the MMDiT block and rectified flow at 8B parameters."
+  - when: 1 Aug 2024
+    what: "FLUX.1 released in three tiers: schnell at 1 to 4 steps under Apache 2.0, dev at 50 steps non-commercial, pro via API."
+  - when: 2025
+    what: "Step distillation to 1 to 4 steps becomes the default, and the sampler stops being the cost centre."
+decisions:
+  - choice: "Diffuse in a latent space rather than in pixels"
+    why: "Pixel diffusion at 512x512 has to model 786,432 values per image, and at 1024x1024 it is 3.1 million. An 8x VAE reduces that by 48x, so the denoiser sees 16,384 latents. Compute falls by roughly the same factor, which is the difference between a research demo and a product that runs on a consumer GPU."
+    cost: "The VAE is a lossy bottleneck. Fine text, small faces and high-frequency texture are damaged by compression, and no amount of denoising recovers them. The failure is visible as mush at small scale, not as an error."
+  - choice: "A diffusion transformer with separate modality weights instead of a U-Net with cross-attention"
+    why: "In a U-Net, text conditioning enters through cross-attention into a convolutional trunk, so the text can only modulate features the convolution already computed. In an MM-DiT, text tokens and image tokens are concatenated into one sequence and attention runs jointly, with separate projection weights per modality. The model can therefore align a word to a region directly."
+    cost: "Joint attention over text and image tokens is more expensive than cross-attention to a pooled embedding, and the transformer loses the locality prior that made U-Nets data-efficient."
+  - choice: "Rectified flow instead of a curved diffusion trajectory"
+    why: "Rectified flow trains a velocity field that points along a straight line from noise to data. A straight path can be integrated with a few Euler steps, where a curved variance-preserving path needs dozens. It is the same objective family with a different interpolation, and it buys an order of magnitude in step count."
+    cost: "Straight paths constrain the model's ability to represent multi-modal distributions, so diversity can suffer; and the theoretical guarantee only holds if the coupling between noise and data is optimal, which in practice it is not."
+  - choice: "Distil the steps and the guidance into the model"
+    why: "A 50-step sampler with classifier-free guidance is 100 denoiser passes per image, because guidance doubles each step. Distillation collapses that to 4 passes, a 25x reduction, which is what makes a per-image price of a fraction of a cent possible."
+    cost: "Distillation narrows diversity and softens fine detail. The 4-step model is measurably worse on unusual prompts and on text rendering, and the teacher is still needed to generate training data for the student."
+  - choice: "Release the fast model under a permissive licence and the quality model under a non-commercial one"
+    why: "Schnell at Apache 2.0 captures the developer ecosystem and the research use cases, while dev at a non-commercial licence keeps the commercial API as the only route for companies that need the best quality."
+    cost: "It splits the community: the model most people can use is not the model that produces the best images, and the gap is a persistent source of confusion in benchmarks."
+lessons:
+  - "Compression is the first lever. Moving diffusion into a latent space bought more than any sampler improvement that followed."
+  - "Straighten the path before you distil the steps. Rectified flow makes a 4-step sampler possible; distillation makes it good."
+  - "Guidance is a hidden 2x. Classifier-free guidance doubles every step, so guidance distillation is worth as much as step reduction."
+  - "The text encoder is not free at low step counts. At 4 steps, a 4.7B T5 pass is a meaningful fraction of the total compute, so cache the embedding."
+  - "The VAE sets the quality ceiling. Small text and faces fail because of compression, not because of the denoiser."
+mistakes:
+  - "Judging image models by step count alone. A 4-step model with poor guidance distillation is worse than a 20-step model with good CFG."
+  - "Assuming latent diffusion is lossless because the samples look sharp. The VAE loses high-frequency detail, and the loss shows up on text and faces first."
+  - "Forgetting that classifier-free guidance doubles the batch. Capacity planned on one forward pass per step is off by 2x."
+  - "Comparing FLUX schnell and dev as if they were the same model at different step counts. They are distilled differently and have different licence terms."
+problem_statement: >-
+  Diffusion models generate images by iteratively denoising a sample, which
+  works but is expensive twice over: the sample lives in pixel space, where a
+  megapixel image is three million values, and the trajectory from noise to data
+  is curved, so it needs dozens of steps. Stable Diffusion attacked the first
+  problem by compressing the image into a latent with an 8x VAE, cutting the
+  quantity the model touches by 48x. FLUX attacked the second by replacing the
+  curved diffusion path with a rectified flow, which is straight enough to
+  integrate in a few Euler steps, and by replacing the U-Net with a transformer
+  that lets text and image tokens attend to each other directly. The remaining
+  cost is the sampler: 50 steps times 2 for guidance is 100 forward passes per
+  image. The final compression is distillation, which collapses those passes to
+  4 and turns image generation into a commodity with a per-image price measured
+  in fractions of a cent.
+requirements:
+  functional:
+    - "Generate a 1024x1024 image from a text prompt with correct attribute binding, counting and legible short text."
+    - "Support image-to-image and inpainting from the same weights, with a mask that restricts where the model may change pixels."
+    - "Produce a usable image in 1 to 4 denoiser steps on a single GPU, so that a consumer product can price per image."
+    - "Preserve identity and composition across a batch when seeded, so the same prompt and seed give the same image."
+    - "Allow fine-tuning by third parties on a single 24 GB GPU via LoRA, without redistributing the base weights."
+  non_functional:
+    - "Generate a 1024x1024 image in under 2 seconds on one H100 at 4 steps, which sets the model size and the batch shape."
+    - "Keep the weights under 24 GB in BF16 so that a single 24 GB consumer card can run the distilled model at reduced resolution."
+    - "Keep the VAE decode from dominating latency; it is memory-bound and does not shrink with step distillation."
+    - "Hold prompt adherence under classifier-free guidance without doubling the batch, via guidance distillation."
+    - "Keep the licence auditable: a user must be able to tell from public terms whether commercial use is permitted."
+clarifying_questions:
+  - question: "Is the product latency-bound or quality-bound?"
+    why_it_matters: "A latency-bound product uses a distilled 4-step model and accepts narrower diversity; a quality-bound product uses 30 to 50 steps with full guidance and pays 25x more per image. The same weights serve both, but not the same economics."
+  - question: "What resolution does the customer actually need?"
+    why_it_matters: "Attention scales with the square of the token count, and the token count scales with the square of the resolution. Going from 1024 to 2048 is 4x the tokens and 16x the attention, which is why high-resolution generation is usually a second upscaling stage rather than a bigger denoiser."
+  - question: "Is text rendering part of the requirement?"
+    why_it_matters: "Legible text is the first casualty of VAE compression and of low step counts. If the product needs typography, the VAE resolution and the text encoder matter more than the denoiser size."
+  - question: "Does the customer need to fine-tune?"
+    why_it_matters: "LoRA fine-tuning needs the base weights resident during training, so a 12B model at BF16 is 24 GB before activations. That decides whether the model can be a platform or only an API."
+  - question: "Is commercial use required?"
+    why_it_matters: "The licence differs between the fast Apache model and the quality non-commercial model. A product that needs the best quality and commercial rights has to use the API, which changes the cost model entirely."
+capacity_estimation:
+  assumptions:
+    - "The baseline is SD 1.5-class: 512x512 output, 8x VAE, 64x64x4 latent, a U-Net with roughly 860M parameters and 16 attention layers at model dimension 320."
+    - "The modern baseline is FLUX.1-class: 1024x1024 output, 12B parameters, 8x VAE giving 128x128x16 latents, patchified at 2x2 to 4,096 image tokens."
+    - "An A100 has 312 TFLOPS BF16 peak and an H100 has 989 TFLOPS; effective throughput is taken at 30 to 50% of peak for these small, memory-bound workloads."
+    - "Classifier-free guidance runs a conditional and an unconditional pass, so the per-step cost doubles."
+    - "A 50-step sampler is the quality baseline and a 4-step distilled sampler is the production case."
+  arithmetic:
+    - label: "Latent size for a 512x512 image"
+      calculation: "512 x 512 x 3 = 786,432 pixel values; /8 x /8 = 64 x 64 spatial; x 4 channels = 16,384 latent values; 786,432 / 16,384 = 48"
+      conclusion: "The VAE reduces the quantity the denoiser models by 48x. That single ratio is why Stable Diffusion ran on a consumer GPU when pixel diffusion did not."
+    - label: "Latent size for a 1024x1024 image"
+      calculation: "1024 x 1024 x 3 = 3,145,728 pixel values; /8 x /8 = 128 x 128; x 16 channels = 262,144 latent values; patchified 2x2 gives 4,096 tokens"
+      conclusion: "A 4-megapixel-class image is 4,096 tokens, which is a small language-model sequence. That is the reason a diffusion transformer is tractable at all."
+    - label: "Attention FLOPs at 1024x1024"
+      calculation: "4 x S^2 x d = 4 x (4,096)^2 x 3,072 = 2.06e11 per attention layer; x 38 layers = 7.8e12 per step"
+      conclusion: "Attention is about 8e12 FLOPs per step, comparable to the parameter term at 12B. At 2048x2048 the token count quadruples and attention becomes 16x larger, which is why high resolution is a separate stage."
+    - label: "Parameter FLOPs per denoise step"
+      calculation: "2 x 12e9 params x 4,096 tokens = 9.8e13 FLOPs per step"
+      conclusion: "Roughly 1e14 FLOPs per step at 1024x1024. The parameter term dominates at this resolution, and attention only takes over beyond about 8,000 tokens."
+    - label: "Cost of a 50-step image with guidance"
+      calculation: "50 steps x 2 for CFG x 1e14 = 1e16 FLOPs; at an H100 with 4e14 effective that is 25 s"
+      conclusion: "A quality image is about 25 seconds of one H100, or roughly $0.017 at $2.50 per GPU-hour. At 100 million images a month that is $1.7M of pure denoiser compute."
+    - label: "Cost of a 4-step distilled image"
+      calculation: "4 steps x 1 pass (guidance distilled into the weights) x 1e14 FLOPs = 4e14 FLOPs; / 4e14 effective = 1 s per image"
+      conclusion: "One second per image, and guidance no longer doubles the batch. That 25x reduction is the entire consumer market for image generation."
+    - label: "Text encoder share at low step counts"
+      calculation: "T5-XXL at 4.7B parameters over 512 tokens: 2 x 4.7e9 x 512 = 4.8e12 FLOPs; against 1e14 per step that is 4.8% at 1 step and 0.1% at 50 steps"
+      conclusion: "At 4 steps the encoder is a few percent of the bill, which is why production stacks cache the prompt embedding and reuse it across a batch of variations."
+    - label: "VAE decode cost"
+      calculation: "128 x 128 x 16 = 262,144 latents decoded to 3.1e6 pixels; at roughly 5e3 FLOP per output pixel that is 1.6e10 FLOPs, negligible in FLOPs but memory-bound at about 40 ms"
+      conclusion: "Decode is under 5% of FLOPs and often 20% of wall clock, because it is a series of upsampling convolutions over a large volume with poor arithmetic intensity."
+    - label: "Training compute for one epoch"
+      calculation: "1e9 image-text pairs x 1e14 FLOPs = 1e23 FLOPs; 2,048 H100 x 9.89e14 x 0.4 = 8.1e17 FLOP/s; 1e23 / 8.1e17 = 1.2e5 s = 1.4 days"
+      conclusion: "One epoch is cheap; the cost is in the multiple epochs, the resolution ramp and the ablation grid, which is why image-model training budgets are dominated by experiments rather than by the final run."
+    - label: "LoRA fine-tuning footprint"
+      calculation: "12B params x 2 bytes = 24 GB of frozen weights; LoRA adapters at rank 16 add 12e9 x 0.001 x 2 bytes = 24 MB; activations at batch 1 and 1024x1024 add 6 to 8 GB"
+      conclusion: "Fine-tuning fits on a single 40 GB card, which is what makes the ecosystem work. Full fine-tuning would need the optimiser state and would not fit."
+architecture_summary: >-
+  The pipeline is four stages. A VAE encoder compresses the image 8x spatially
+  into a 16-channel latent. A text encoder, usually a large T5 plus a CLIP
+  model, produces a token sequence rather than a single pooled vector. The
+  denoiser is a transformer over the concatenated text and image tokens: the
+  image tokens are patchified 2x2 from the latent grid and projected to the
+  model dimension, the text tokens are projected through their own weights, and
+  attention runs jointly over the union with separate query, key and value
+  projections per modality. Conditioning on the diffusion timestep enters through
+  adaptive layer norm, which scales and shifts each block's activations as a
+  function of the step. The sampler integrates the learned velocity field from
+  noise to latent over 4 to 50 steps, optionally with classifier-free guidance
+  that runs the model twice and extrapolates away from the unconditional
+  prediction. Finally the VAE decoder expands the latent back to pixels. The
+  serving stack is dominated by three different bottlenecks: the denoiser is
+  compute-bound, the VAE decode is memory-bound, and the text encoder is a
+  fixed cost that is worth caching.
+deep_dives:
+  - topic: "Latent diffusion: the 8x VAE is the whole trick"
+    explanation: >-
+      Pixel-space diffusion is a beautiful idea and an impractical one. At
+      512x512 an image is 786,432 values, and a diffusion model has to predict a
+      noise or velocity for every one of them at every step. Latent diffusion
+      inserts a VAE in front: the encoder maps the image to a 64x64x4 latent,
+      the diffusion process runs entirely in that space, and the decoder maps the
+      result back. The quantity the model touches falls from 786,432 to 16,384,
+      a 48x reduction, and because attention is quadratic in token count the
+      saving in the attention layers is far larger. The 8x factor is a
+      compromise. At 4x the latent is four times larger and the denoiser is
+      correspondingly more expensive; at 16x the reconstruction loses so much
+      detail that the output looks like a painting of the prompt rather than a
+      photograph. Eight is where the reconstruction error is small enough that
+      the denoiser can compensate and the latent is small enough to be cheap.
+      The corollary is that the VAE is a hard ceiling: if the encoder destroyed
+      the information needed to render a small face or a word, no sampler will
+      invent it, and the failure is not an error but a soft blur that users
+      describe as the model being bad at text.
+    tradeoffs:
+      - option: "8x VAE, 16-channel latent"
+        pros: "48x fewer values than pixels; reconstruction good enough for most photographic content; cheap enough for consumer GPUs."
+        cons: "Small text and faces are damaged; the codebook-free continuous latent still loses high-frequency detail; the decoder is memory-bound."
+      - option: "4x VAE"
+        pros: "Much better reconstruction, especially for text and fine structure; the denoiser sees more of the original signal."
+        cons: "4x the latent values and roughly 16x the attention cost; a 1024x1024 image no longer fits a comfortable batch on one GPU."
+      - option: "16x VAE"
+        pros: "Very cheap denoising; a large image fits a small token budget."
+        cons: "Reconstruction is visibly lossy; detail is hallucinated by the decoder rather than preserved, which is unacceptable for editing and inpainting."
+  - topic: "Rectified flow: why straight paths sample in four steps"
+    explanation: >-
+      A diffusion model defines a path from noise to data and learns the score or
+      velocity along it. The classic variance-preserving path is curved: the
+      model's prediction at high noise has little to do with its prediction at
+      low noise, so an integrator has to take small steps to follow the curve.
+      Rectified flow changes the interpolation to a straight line, x_t = (1-t) x
+      noise + t x data, and trains the model to predict the constant velocity
+      x_data minus x_noise along that line. If the path really is straight, one
+      Euler step from noise would land on the data, and in practice a handful of
+      steps is enough. The catch is that the pairing between noise and data is
+      not known in advance; the model is trained on random pairs, so the learned
+      field is only approximately straight, and the residual curvature is what
+      the extra steps correct. There is a reflow procedure that re-pairs samples
+      using the model's own outputs to straighten the path further, which is
+      effectively a form of distillation. This is why rectified flow and
+      distillation are usually discussed together: the first makes a short
+      sampler possible, the second makes it accurate.
+    tradeoffs:
+      - option: "Rectified flow with 4 to 8 Euler steps"
+        pros: "An order of magnitude fewer function evaluations than a curved diffusion path; simple sampler with no scheduler tuning."
+        cons: "Residual curvature means quality is below a 50-step run; multi-modal distributions can collapse toward the mean path."
+      - option: "Variance-preserving diffusion with 50 DDIM steps"
+        pros: "Well understood, mature schedulers, strong diversity; the reference against which everything is measured."
+        cons: "50 forward passes per image; guidance doubles it to 100, which is unaffordable for a consumer product."
+      - option: "Consistency or adversarial distillation on top"
+        pros: "1 to 4 steps with quality close to the teacher; the production answer for a per-image price under a cent."
+        cons: "Narrows diversity, needs a teacher and a distillation run, and fails on prompts outside the distillation distribution."
+  - topic: "MM-DiT: one sequence, two sets of weights"
+    explanation: >-
+      The obvious way to condition a transformer on text is cross-attention, the
+      way a U-Net does it: image tokens attend to text tokens through separate
+      key and value projections. The MM-DiT block does something subtly
+      different. It concatenates the text tokens and the image tokens into one
+      sequence, runs a single attention operation over the union, and then
+      applies separate feed-forward and separate query-key-value projections for
+      each modality. The difference is that the text tokens are themselves
+      updated by the attention, so they can adapt to the image content instead
+      of remaining a fixed conditioning vector. That bidirectional flow is what
+      improves attribute binding: a word can move toward the region it describes
+      over successive layers. The cost is that attention runs over a longer
+      sequence, since the text tokens are part of it, and the block has roughly
+      twice the parameters of a single-stream design at the same width. The
+      practical benefit shows up on compositional prompts, where a single-stream
+      model tends to smear attributes across objects.
+    tradeoffs:
+      - option: "MM-DiT with separate modality weights"
+        pros: "Text tokens adapt to the image; better attribute binding and counting; one attention operation handles alignment."
+        cons: "Roughly twice the parameters per block at equal width; longer attention sequence; more memory."
+      - option: "Single-stream DiT with concatenated tokens"
+        pros: "Fewer parameters, cheaper per block, simpler to implement; used by SD3.5 and many open models."
+        cons: "Text and image tokens share projections, so the model cannot specialise them; attribute binding is measurably weaker."
+      - option: "U-Net with cross-attention"
+        pros: "Data-efficient, strong locality prior, well understood; the architecture that made Stable Diffusion cheap."
+        cons: "Text can only modulate features the convolutional trunk already computed; alignment is weaker and scales less well."
+  - topic: "Classifier-free guidance is a hidden 2x"
+    explanation: >-
+      Classifier-free guidance improves prompt adherence by running the model
+      twice per step: once with the text conditioning and once with an empty
+      prompt, then extrapolating away from the unconditional prediction by a
+      guidance scale. It is the single most effective quality knob in image
+      generation, and it doubles the cost of every step. A 50-step sampler with
+      guidance is therefore 100 forward passes, not 50, which is why capacity
+      planned on one pass per step is off by a factor of two. The fix is
+      guidance distillation: train the model to produce the guided output in a
+      single pass, typically by distilling the guided teacher into an
+      unguided student. The student loses the ability to vary the guidance scale
+      at inference, which is a real product limitation, because the scale is how
+      users trade prompt adherence against diversity. In practice a distilled
+      model exposes a fixed scale and users learn to prompt around it, which is a
+      worse experience that costs half as much.
+    tradeoffs:
+      - option: "Classifier-free guidance at inference"
+        pros: "Adjustable scale per request; strong prompt adherence; no extra training."
+        cons: "Doubles the denoiser cost; the scale is a tuning parameter users must learn; high scales oversaturate."
+      - option: "Guidance distillation into the weights"
+        pros: "Halves the cost per step; one pass per step; simpler API with no scale to tune."
+        cons: "Loses per-request control of the adherence-diversity trade; the distilled scale may be wrong for unusual prompts."
+      - option: "No guidance"
+        pros: "Cheapest possible sampler; one pass per step by construction."
+        cons: "Prompt adherence is visibly weaker; the model drifts toward the marginal distribution and ignores details."
+  - topic: "Distillation: turning 50 steps into 4"
+    explanation: >-
+      Step distillation trains a student to jump along the teacher's trajectory
+      rather than follow it one small step at a time. There are three common
+      flavours. Consistency distillation trains the model to map any point on the
+      trajectory to the endpoint, so one or two steps suffice. Adversarial
+      distillation adds a discriminator that judges whether a generated image
+      looks like a real one, which recovers the sharpness that trajectory
+      matching loses. Timestep distillation, used for FLUX schnell, trains the
+      student on a sparse set of timesteps so that the sampler only visits those.
+      All three trade diversity for speed. The student's outputs cluster around
+      the teacher's most likely modes, so unusual prompts produce generic
+      images, and text rendering degrades first because it depends on
+      high-frequency detail that averaging destroys. The economics are
+      overwhelming: a 25x reduction in forward passes is the difference between
+      $0.017 and $0.0007 per image, and at a hundred million images a month that
+      is the difference between a viable business and an unviable one.
+    tradeoffs:
+      - option: "4-step distilled student"
+        pros: "25x cheaper per image; interactive latency; good quality on common prompts."
+        cons: "Narrower diversity, weaker text rendering, fails on out-of-distribution prompts; needs the teacher to generate training data."
+      - option: "20-step guided teacher"
+        pros: "Full quality and diversity; the reference for evaluation."
+        cons: "Five times the cost of the student and still slower than interactive."
+      - option: "Two-tier service, student default and teacher on request"
+        pros: "Cheap by default, quality available for the prompts that need it; prices can differ per tier."
+        cons: "Two models to serve and to keep aligned; a user who gets a bad student image does not know the teacher would have done better."
+bottlenecks:
+  - failure: "VAE decode dominating tail latency"
+    symptom: "Denoising finishes in under a second and the request takes 1.5 seconds; GPU utilisation drops during decode and the profile shows upsampling convolutions waiting on memory."
+    mitigation: "Decode in tiles with overlap, run the decode on a separate pool from the denoiser, and pipeline decode of image N against denoising of image N+1."
+  - failure: "Classifier-free guidance doubling the batch"
+    symptom: "Throughput is exactly half of the FLOP-based forecast, and the batch size that fits memory is half what was planned."
+    mitigation: "Account for the 2x in every capacity model, batch the conditional and unconditional passes together so they share a kernel launch, and use guidance distillation where the scale does not need to be per-request."
+  - failure: "Text rendering failure"
+    symptom: "Short words come out as plausible-looking glyphs that are not the requested word; the failure is consistent and does not improve with more steps."
+    mitigation: "Higher-resolution VAE or a dedicated text-rendering stage, a stronger text encoder with token-level conditioning, and evaluation that scores OCR accuracy rather than CLIP similarity."
+  - failure: "Prompt embedding recomputation"
+    symptom: "At 4 steps the text encoder is a visible fraction of latency, and a batch of variations on one prompt pays for the same encoding repeatedly."
+    mitigation: "Cache the encoded prompt by hash, reuse it across a batch of seeds and variations, and treat the encoder as a separate service with its own batching."
+  - failure: "Resolution mismatch at inference"
+    symptom: "Images generated at a resolution the model did not train on show duplicated limbs or tiled artefacts, because the positional encoding and the attention pattern are out of distribution."
+    mitigation: "Train across a resolution range with bucketing, generate at a trained resolution and upscale with a separate model, and reject requests outside the supported bucket set."
+interview_questions:
+  - question: "Why is latent diffusion 48x cheaper than pixel diffusion at 512x512?"
+    level: mid
+    key_points:
+      - "A 512x512 RGB image is 786,432 values; an 8x VAE gives a 64x64x4 latent of 16,384 values."
+      - "The ratio is 48x, and attention cost falls by more because it is quadratic in token count."
+      - "The VAE is a lossy bottleneck, so the saving is paid for in high-frequency detail."
+      - "The 8x factor is a compromise between reconstruction quality and denoiser cost."
+    follow_up: "What would you change if the product needed legible text at small sizes?"
+  - question: "Explain rectified flow and why it samples in four steps."
+    level: senior
+    key_points:
+      - "It defines a straight-line interpolation between noise and data and trains the model to predict the constant velocity along it."
+      - "A straight path can be integrated with a few Euler steps; a curved variance-preserving path needs dozens."
+      - "The learned field is only approximately straight because the noise-data pairing is random, so residual curvature needs a few steps."
+      - "Reflow and distillation straighten it further by re-pairing samples using the model's own outputs."
+    follow_up: "What is the failure mode of a rectified-flow model on a highly multi-modal prompt distribution?"
+  - question: "What does MM-DiT buy over a U-Net with cross-attention?"
+    level: senior
+    key_points:
+      - "Text and image tokens share one attention operation with separate per-modality weights, so text tokens are updated by image content."
+      - "That bidirectional flow improves attribute binding and counting."
+      - "A U-Net's text can only modulate features the convolutional trunk already computed."
+      - "The cost is roughly twice the parameters per block and a longer attention sequence."
+    follow_up: "When would you choose a single-stream DiT instead, and what would you give up?"
+  - question: "Your capacity model is off by exactly 2x. What did you forget?"
+    level: mid
+    key_points:
+      - "Classifier-free guidance runs a conditional and an unconditional pass per step."
+      - "So a 50-step sampler is 100 forward passes, and the batch that fits memory is half the naive estimate."
+      - "The fix is to batch both passes together or to distil guidance into the weights."
+      - "Also check whether the VAE decode and the text encoder are in the measured path."
+    follow_up: "What do you lose by distilling guidance into the weights?"
+  - question: "Estimate the cost of a million 1024x1024 images at 4 steps and at 50 steps."
+    level: senior
+    key_points:
+      - "At 1024x1024 a 12B model with 4,096 tokens costs about 1e14 FLOPs per step."
+      - "Fifty steps with guidance is 1e16 FLOPs, about 25 seconds on an H100, or $0.017 at cost."
+      - "Four steps with distilled guidance is 4e14 FLOPs, about one second, or $0.0007."
+      - "A million images is therefore about $17,000 at 50 steps and about $700 at 4 steps, before VAE decode and redundancy."
+    follow_up: "Where does the VAE decode fit in that estimate, and why is it not proportional to the step count?"
+  - question: "Why does distillation hurt text rendering before it hurts anything else?"
+    level: staff
+    key_points:
+      - "Text depends on high-frequency detail that trajectory averaging destroys first."
+      - "The student clusters around the teacher's most likely modes, and glyph shapes are low-probability fine detail."
+      - "The VAE also damages small text, so the two effects compound."
+      - "The fix is a higher-resolution latent or a dedicated text stage, not more steps."
+    follow_up: "How would you evaluate text rendering in a way that catches this before launch?"
+  - question: "A customer wants 2048x2048 output. What happens to your cost model?"
+    level: staff
+    key_points:
+      - "Token count scales with the square of resolution, so 2048 is 4x the tokens of 1024."
+      - "Attention scales with the square of token count, so it grows 16x and stops being a minor term."
+      - "Memory for activations grows 4x, so batch size falls and throughput falls further."
+      - "The practical answer is to generate at 1024 and upscale with a second model, which is cheaper and often better."
+    follow_up: "What artefacts does the upscale stage introduce, and how would you detect them?"
+what_to_steal:
+  - "Compress before you model. Moving diffusion into a latent bought more than every sampler improvement that followed."
+  - "Straighten the trajectory before you distil. Rectified flow makes a short sampler possible; distillation makes it good."
+  - "Count guidance as a 2x in every capacity plan, or your forecasts will be exactly half right."
+  - "Cache the text embedding. At four steps the encoder is a measurable share of the bill."
+  - "Treat the VAE as a quality ceiling, not a preprocessing step. Its losses are the failures users report."
+  - "Ship two tiers. The distilled model is the business and the teacher is the quality reference."
+further_reading:
+  - label: "High-Resolution Image Synthesis with Latent Diffusion Models"
+    url: "https://arxiv.org/abs/2112.10752"
+  - label: "SDXL: Improving Latent Diffusion Models for High-Resolution Image Synthesis"
+    url: "https://arxiv.org/abs/2307.01952"
+  - label: "Scaling Rectified Flow Transformers for High-Resolution Image Synthesis (SD3)"
+    url: "https://arxiv.org/abs/2403.03206"
+  - label: "FLUX.1 announcement and model family"
+    url: "https://blackforestlabs.ai/announcing-black-forest-labs/"
+  - label: "Classifier-free diffusion guidance"
+    url: "https://arxiv.org/abs/2207.12598"
+  - label: "Latent Consistency Models"
+    url: "https://arxiv.org/abs/2310.04378"
+sources:
+  - label: "Latent Diffusion paper (arXiv 2112.10752)"
+    url: "https://arxiv.org/abs/2112.10752"
+  - label: "SD3 / rectified flow transformers (arXiv 2403.03206)"
+    url: "https://arxiv.org/abs/2403.03206"
+  - label: "Black Forest Labs — FLUX.1 announcement, 1 Aug 2024"
+    url: "https://blackforestlabs.ai/announcing-black-forest-labs/"
+  - label: "Classifier-free guidance (arXiv 2207.12598)"
+    url: "https://arxiv.org/abs/2207.12598"
+tags: [diffusion, latent-space, rectified-flow, dit, distillation, inference-cost]

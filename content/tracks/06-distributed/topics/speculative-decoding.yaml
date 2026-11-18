@@ -1,0 +1,1377 @@
+id: speculative-decoding
+slug: speculative-decoding
+title: "Speculative Decoding"
+summary: >-
+  A small draft model guesses the next few tokens and the target model checks
+  all of them in one forward pass, so a step that used to emit one token emits
+  three. This topic derives the acceptance rule that makes the output
+  distribution exactly the target's, measures it (TV 0.002 against 0.100 for the
+  naive residual), and then prices the whole thing: break-even is a cost ratio,
+  the ratio your implementation actually has is not the one your model does, and
+  measuring both is what tells you whether to ship.
+kind: lesson
+difficulty: hard
+position: 7
+estMinutes: 28
+prerequisites: [decoding-strategies, continuous-batching]
+phase: serving
+tags:
+  - speculative-decoding
+  - draft-model
+  - rejection-sampling
+  - acceptance-rate
+  - break-even
+  - serving
+  - latency
+  - lookahead
+  - medusa
+  - eagle
+  - sampling
+
+body:
+  big_idea: >-
+    A decode step is priced by the weights it reads, not the tokens it emits:
+    draft guesses ride along almost free — if acceptance samples the target's
+    distribution and drafting undercuts the pass it saves.
+  problem:
+    - "You need 100 tokens per second from a 70B at 40; a second GPU does not help, each step being one weight read, one token."
+    - "You wire up \"draft four, keep what the big model agrees with\" and outputs change in ways no benchmark catches."
+    - "You fix the distribution, measure 0.76 acceptance, and get 1.02x: the cost ratio you computed is not the cost ratio the stack pays."
+  analogy: >-
+    A tax partner and an associate. The associate drafts the whole letter; the
+    partner reads it in one sitting and either signs each paragraph or
+    rewrites from where it stops sounding like her. Her time is billed per
+    letter read and per paragraph rewritten, so correct guesses are nearly
+    free and wrong ones cost one rewrite.
+  concept_points:
+    - "**The step is a weight read, so extra positions are nearly free — that is the premise, and it is borrowed.** Measured on this harness: a 9 MB target costs **0.127 ms for one position and 0.188 ms for five, 1.48x not 5x**, because the extra rows ride the same weight read. The factor is 1.03 on an H100 that is genuinely bandwidth-bound and 1.4-1.6 on CPU."
+    - "**The acceptance rule is two lines and it is exact.** Draw $x$ from $q$, accept with probability $\\min(1, p(x)/q(x))$, and on rejection draw once from the residual $r(y) \\propto (p(y)-q(y))_+$. Measured acceptance is **0.7849**, the residual has non-zero mass on **26 of 256 tokens**, and over 4,000,000 draws the output's distance from $p$ is **0.0022, below the 0.0036 noise floor**."
+    - "**The naive residual is the classic bug, and it is worth 0.1 TV.** Resampling from $p$ itself on rejection gives $\\min(p,q) + (1-\\alpha)p$, whose distance from $p$ is **0.1001 analytically and 0.1002 measured — 46x the correct sampler's error** — and it does not shrink with samples, because it is a bias. The text stays fluent and quietly over-represents tokens the target already favoured."
+    - "**A speculative step emits $1 + \\alpha + \\alpha^2 + \\dots + \\alpha^\\gamma$ tokens, not $\\gamma$.** It always emits at least the correction or bonus token, plus one per draft token accepted before the first rejection. Measured: **1.760, 2.266, 2.703, 3.116 and 3.502 tokens per step at $\\gamma = 1, 2, 3, 4, 8$**, against a naive $\\gamma$ model that overstates the last by 128%."
+    - "**The speedup is $(1-\\alpha^{\\gamma+1})/((1-\\alpha)(v+\\gamma c))$, and it has an interior maximum.** With $c = 0.128$ measured and $v = 1$ it peaks at **$\\gamma = 4$ for $\\alpha = 0.7$ (1.83x), $\\gamma = 5$ for $\\alpha = 0.8$ (2.25x), $\\gamma = 9$ for $\\alpha = 0.9$ (3.03x)**. At $\\alpha = 0.76$ it is flat from 4 to 8, then falls: **$\\gamma = 20$ gives 1.17x, $\\gamma = 32$ gives 0.82x**."
+    - "**Your effective $c$ is not your model's $c$.** Inverting the formula, $c_{\\text{eff}} = (\\mathbb{E}[T]/S - v)/\\gamma$ gives **0.26 to 0.41** against the model's 0.128, because each draft position also pays a softmax over a 4,096-token vocabulary, a cumsum and a search: **0.065 ms of bookkeeping against 0.016 ms of arithmetic**. That predicts the measured 1.02x at $\\gamma = 4$."
+  definitions:
+    - term: "Speculative decoding (draft-then-verify, assisted generation)"
+      meaning: >-
+        A decoding loop in which a cheap draft model proposes $\gamma$ tokens,
+        the target model scores all $\gamma+1$ positions in one forward pass, and
+        an acceptance test decides how many proposals survive. It is exact: the
+        emitted sequence is distributed as if the target had sampled every token
+        itself.
+    - term: "Draft model"
+      meaning: >-
+        Any model cheap enough that $\gamma$ of its passes cost less than one
+        target pass: a distilled smaller sibling, a pruned or quantised copy, an
+        auxiliary head on the target (Medusa, EAGLE), or a lookup table over the
+        context. Its only job is to put probability mass where the target does.
+        Being wrong is allowed; being *differently* wrong is what costs.
+    - term: "Target model (verifier)"
+      meaning: >-
+        The model whose distribution you are contractually serving. It scores
+        $\gamma+1$ positions per step and never samples more than once, which is
+        where the whole saving comes from.
+    - term: "Lookahead $\\gamma$"
+      meaning: >-
+        The number of tokens the draft proposes per step. It is not a batch size
+        and it is not "more is better": expected tokens per step is
+        $1+\alpha+\dots+\alpha^{\gamma}$ while the step costs $v + \gamma c$, so
+        the optimum is where the marginal survival probability
+        $\alpha^{\gamma+1}$ meets the marginal cost $c$.
+    - term: "Acceptance probability"
+      meaning: >-
+        For a draft token $x$ drawn from $q$, the probability it survives is
+        $\min(1, p(x)/q(x))$. Tokens the target likes more than the draft are
+        always kept; tokens the draft overweights are kept in proportion.
+    - term: "Acceptance rate $\\alpha$"
+      meaning: >-
+        The unconditional probability that a draft token is accepted,
+        $\alpha = \sum_y \min(p(y), q(y))$ — equivalently one minus the total
+        variation distance. 0.7849 for the reference pair, and 0.7850 measured
+        empirically over 4,000,000 draws.
+    - term: "Residual distribution"
+      meaning: >-
+        $r(y) \propto (p(y)-q(y))_+$: the mass the target has and the draft does
+        not. It is the exact complement of what acceptance removed, which is why
+        sampling from it restores $p$ exactly rather than approximately. Non-zero
+        on 26 of 256 tokens for the reference pair.
+    - term: "Exact rejection sampling"
+      meaning: >-
+        The accept-or-resample scheme above, in the sense of von Neumann: it
+        turns samples from $q$ into samples from $p$ using only pointwise ratios,
+        with no normalising constant and no retry loop. Its output distribution
+        equals $p$ to float precision — 5.2e-18 measured.
+    - term: "Verification pass"
+      meaning: >-
+        One target forward over the $\gamma+1$ positions of a speculative step.
+        Its cost relative to a single-token pass is $v$: 1.03 on a
+        bandwidth-bound GPU, 1.48 on the CPU harness here. The technique rests on
+        $v$ being close to 1, and $v$ enters the break-even directly — at
+        $\gamma = 4$, raising $v$ from 1 to 1.48 cuts the tolerable cost ratio
+        from 0.53 to 0.41.
+    - term: "Bonus token"
+      meaning: >-
+        The token the target samples at position $\gamma+1$ when every draft
+        token was accepted. It is not a correction; it is the free token that
+        makes a fully-accepted step emit $\gamma+1$ rather than $\gamma$, and it
+        is why the numerator is $1-\alpha^{\gamma+1}$ rather than
+        $1-\alpha^{\gamma}$.
+    - term: "Cost ratio $c$"
+      meaning: >-
+        One draft pass divided by one target pass, measured on the *models*:
+        **0.128** here (0.0162 ms against 0.1268 ms). It is the left-hand side of
+        the break-even comparison, and the single number most often assumed
+        instead of measured.
+    - term: "Effective cost ratio $c_{\\text{eff}}$"
+      meaning: >-
+        The cost ratio your implementation actually has, recovered from the
+        speedup you actually got: $c_{\text{eff}} = (\mathbb{E}[T]/S - v)/\gamma$.
+        **0.26 to 0.41** on this harness against a model $c$ of 0.128, because
+        per-position bookkeeping is charged to the draft. It is the number that
+        decides deployment, and it is only ever obtained by measurement.
+    - term: "Break-even ratio"
+      meaning: >-
+        $c_{\text{break}}(\gamma) = (\mathbb{E}[T]-v)/\gamma$, the cost ratio at
+        which $S = 1$: **0.53 at $\gamma = 4$** with $v = 1$, 0.41 with the
+        measured $v = 1.48$. Below it speculation pays; above it, no acceptance
+        rate rescues the step.
+    - term: "Reach probability"
+      meaning: >-
+        The probability a draft position is evaluated at all: the product of the
+        acceptance rates of every position before it. Measured 1.000, 0.785,
+        0.613, 0.398 for the four positions of a $\gamma = 4$ step. Expected
+        tokens per step is $1 + \sum_k P(\text{reach } k)$, so reach, not
+        acceptance, is what makes long drafts unprofitable.
+    - term: "Tree drafting (Medusa, EAGLE, lookahead decoding)"
+      meaning: >-
+        Proposing several continuations per position and verifying them as a
+        tree with a custom attention mask, so one pass covers many candidate
+        sequences. It buys more shots at the positions where reach probability is
+        still high, instead of betting further out on a chain whose reach decays
+        geometrically.
+
+  diagrams:
+    - type: architecture
+      title: "Where the two models and the acceptance test sit"
+      nodes:
+        - { id: c, x: 0, y: 1, label: "Token stream", kind: client, detail: "The accepted prefix plus one correction token per step. Nothing downstream can tell that some tokens were proposed by a smaller model." }
+        - { id: d, x: 1, y: 0, label: "Draft model", kind: "model", detail: "Autoregressive and cheap: 0.6 MB of weights against the target's 9 MB, 0.016 ms per token of arithmetic. Runs gamma times per step on its own samples." }
+        - { id: t, x: 1, y: 2, label: "Target model", kind: "gpu", detail: "One forward over gamma+1 positions per step: 0.127 ms for one position, 0.188 ms for five. It never samples more than once per step, and that single draw is the correction or the bonus token." }
+        - { id: a, x: 2, y: 1, label: "Acceptance test", kind: worker, detail: "Draws one uniform per draft position, compares it with min(1, p/q) using the target's logits, and on the first rejection draws once from the residual. Two lines of code, exact by construction — and 0.065 ms of bookkeeping per position, which is why the effective cost ratio is three times the model's." }
+        - { id: k, x: 3, y: 1, label: "KV cache", kind: storage, detail: "The accepted prefix is appended once; rejected draft positions are never written. A gamma = 4 step appends 3.12 positions on average, not 4, so the cache grows at the rate tokens are emitted." }
+      edges:
+        - { from: c, to: a, label: "accepted tokens", style: bidirectional }
+        - { from: d, to: a, label: "gamma proposals + q(x)" }
+        - { from: t, to: a, label: "p(x) at gamma+1 positions" }
+        - { from: a, to: k, label: "append accepted prefix" }
+        - { from: a, to: d, label: "continue from accepted", style: async }
+      caption: "The target appears once per step and produces the probabilities for every candidate position. That single pass is the entire budget; the draft is only allowed to spend it on better guesses."
+
+    - type: pipeline
+      title: "One speculative step, end to end"
+      nodes:
+        - label: "Draft"
+          note: "gamma tokens from q, autoregressively"
+          detail: "Each draft token conditions on the previous draft token, not on the target's choice. 0.016 ms of arithmetic per token and about 0.065 ms of everything around it — the softmax over the vocabulary, the cumsum and the search."
+        - label: "Verify"
+          note: "one target pass over gamma+1 positions"
+          detail: "Reads the target's weights once and produces p at every candidate position, including the one after the last draft token. 0.188 ms for five positions against 0.127 ms for one."
+        - label: "Accept"
+          note: "walk left to right, stop at the first rejection"
+          detail: "min(1, p/q) per position. Every position before the first rejection is appended; the position at the rejection is replaced, and every draft token after it is discarded without being looked at again."
+        - label: "Correct or bonus"
+          note: "one draw: residual, or the extra position"
+          detail: "On rejection the draw comes from (p-q)+ normalised, which is the exact complement of what acceptance removed. If nothing was rejected, the same draw comes from p at position gamma+1 and is a free token."
+        - label: "Append"
+          note: "3.12 positions per step at gamma = 4"
+          detail: "The KV cache grows by the number of emitted tokens, not by gamma. Rejected positions cost the target pass but never a cache slot, which is why speculative decoding composes with paged allocation."
+      caption: "Four beats, one target forward. Everything that makes the technique safe lives in the third and fourth beats, everything that makes it fast lives in the second, and everything that makes it lose money lives in the first."
+
+    - type: plot
+      title: "Speedup against gamma, from the formula, at measured c = 0.128"
+      chart: line
+      xLabel: "gamma (draft tokens per step)"
+      yLabel: "speedup at v = 1"
+      series:
+        - name: "alpha = 0.5"
+          points:
+            - { x: 1, y: 1.330 }
+            - { x: 2, y: 1.393 }
+            - { x: 3, y: 1.355 }
+            - { x: 4, y: 1.281 }
+            - { x: 5, y: 1.200 }
+            - { x: 6, y: 1.122 }
+            - { x: 8, y: 0.986 }
+        - name: "alpha = 0.7"
+          points:
+            - { x: 1, y: 1.507 }
+            - { x: 2, y: 1.744 }
+            - { x: 3, y: 1.830 }
+            - { x: 4, y: 1.834 }
+            - { x: 5, y: 1.793 }
+            - { x: 6, y: 1.730 }
+            - { x: 8, y: 1.580 }
+        - name: "alpha = 0.9"
+          points:
+            - { x: 1, y: 1.684 }
+            - { x: 2, y: 2.158 }
+            - { x: 3, y: 2.485 }
+            - { x: 4, y: 2.708 }
+            - { x: 5, y: 2.857 }
+            - { x: 6, y: 2.951 }
+            - { x: 8, y: 3.027 }
+      caption: "Every curve turns over. The turnover is not a kernel artefact: it is the marginal draft token becoming less likely to survive than it is expensive to compute."
+
+    - type: compare
+      title: "Break-even at gamma = 4: which cost ratio you are comparing"
+      left_label: "Model ratio, c = 0.128 (measured on the passes)"
+      left_points:
+        - "Draft 0.0162 ms against target 0.1268 ms per pass"
+        - "Break-even at gamma = 4 is 0.529 with v = 1, 0.41 with v = 1.48"
+        - "The model ratio clears both by a factor of three"
+        - "Predicted speedup 2.06x at v = 1, 1.56x at v = 1.48"
+        - "This is the number the paper assumes"
+      right_label: "Effective ratio, c_eff = 0.40 (measured end to end)"
+      right_points:
+        - "Each draft position also costs 0.065 ms of bookkeeping"
+        - "Break-even at gamma = 4 with v = 1.48 is 0.41"
+        - "0.40 against 0.41 is a dead heat"
+        - "Measured speedup 1.01x at an acceptance rate of 0.758"
+        - "This is the number your users experience"
+
+    - type: sequence
+      title: "Reach, not acceptance, is what limits a four-token draft"
+      items:
+        - "Position 1: accepted 76.1% of the time; reached on 100% of steps"
+        - "Position 2: accepted 75.8%; reached on 78.5% — the first position was rejected in 22% of steps"
+        - "Position 3: accepted 68.0%; reached on 61.3%"
+        - "Position 4: accepted 71.5%; reached on 39.8%"
+        - "Expected tokens: 1 + 0.785 + 0.613 + 0.398 + 0.285 = 3.12 per step, which matches the replay exactly"
+        - "A sixteenth draft token would be reached on under 1% of steps and would still cost c on every one"
+      caption: "Acceptance is flat — 0.76, 0.76, 0.68, 0.72 — and it is still the wrong number to reason with. What decays is the product, and the product is why gamma has an optimum."
+
+  markdown: |
+    ## The step you are already paying for
+
+    *Continuous Batching* established the premise this topic spends. A decode
+    step reads every weight in the model once and emits one token per live
+    sequence, so the cost of a step is the weight read and the sequences in the
+    batch ride along for close to nothing.
+
+    Speculative decoding points the same premise at one sequence's future instead
+    of other sequences' present. If a cheap model proposes the next four tokens,
+    the target can score five positions in the forward pass it would have spent
+    on one — measured here at **0.188 ms against 0.127 ms, 1.48x**, and on a
+    bandwidth-bound accelerator about 1.03x — and then emit however many of those
+    proposals survive. The step still reads the weights once. It just stopped
+    producing one token.
+
+    ## The rule, and why it is exact
+
+    Let the target distribution at a position be $p$ and the draft's be $q$. Draw
+    the draft token $x \sim q$. Accept it with probability
+
+    $$P(\text{accept}) = \min\left(1, \frac{p(x)}{q(x)}\right),$$
+
+    and on rejection draw exactly once from the residual
+
+    $$r(y) = \frac{(p(y)-q(y))_+}{\sum_z (p(z)-q(z))_+}.$$
+
+    That is the whole algorithm, and its output distribution is $p$ — not an
+    approximation to it. Acceptance keeps $\min(p,q)$ of the mass; rejection
+    happens with probability $1-\alpha$ where
+
+    $$\alpha = \sum_y \min(p(y), q(y)) = 1 - \operatorname{TV}(p,q);$$
+
+    the residual carries exactly that much mass, so the correction restores $p$
+    identically. The measurement is that
+    over **4,000,000 draws the empirical distribution sits 0.0022 from $p$**,
+    against a **0.0036 noise floor** measured between two independent draws from
+    $p$ — and 5.2e-18 analytically.
+
+    This matters because the alternative is not "slightly worse". Resampling from
+    $p$ on rejection is the natural implementation and it produces
+    $\min(p,q) + (1-\alpha)p$: **TV 0.1001 from the target, 46x the correct
+    sampler's error**, permanently. Every rejected position over-represents the
+    tokens the target already liked, which biases toward high-probability
+    continuations — shorter, flatter, more repetitive text. No number of samples
+    fixes a bias.
+
+    The second requirement is that acceptance is *pointwise*, not greedy. If you
+    keep a draft token whenever the target's argmax agrees, you sample from a
+    distribution that equals $p$ only on the tokens where $p > q$; where the draft
+    overweights, the target's own preference is never expressed. The $p(x)/q(x)$
+    ratio is what turns "the target agrees" into "the target's probability is
+    preserved".
+
+    ## How many tokens a step actually emits
+
+    A step emits one token no matter what — the correction draw, or the bonus
+    token at position $\gamma+1$ if everything was accepted — plus one for every
+    draft token accepted before the first rejection:
+
+    $$\mathbb{E}[T] = 1 + \alpha + \alpha^2 + \dots + \alpha^{\gamma}
+      = \frac{1-\alpha^{\gamma+1}}{1-\alpha}.$$
+
+    The replay measures **1.760, 2.266, 2.703, 3.116 and 3.502** tokens per step
+    at $\gamma = 1, 2, 3, 4, 8$. The bonus token is why the numerator runs to
+    $\gamma$ and not $\gamma-1$: a perfect one-token draft yields two tokens.
+
+    The correction worth internalising is that this is a *reach* calculation, not
+    an acceptance one. Measured inside a single $\gamma = 4$ run, conditional
+    acceptance is flat — **0.761, 0.758, 0.680, 0.715** — while the probability of
+    reaching those positions is **1.000, 0.785, 0.613, 0.398**. The fourth draft
+    token is used on 40% of steps and paid for on all of them. That gap, not any
+    decay in accuracy, is what makes long drafts a bad buy.
+
+    ## The speedup, and the cost ratio that decides it
+
+    One step costs $\gamma c$ draft passes plus $v$ target-pass equivalents, where
+    $c$ is the draft-to-target cost ratio and $v$ is the verify pass relative to a
+    single token:
+
+    $$S(\gamma) = \frac{1-\alpha^{\gamma+1}}{(1-\alpha)(v+\gamma c)}.$$
+
+    Setting $S = 1$ turns this into a statement about cost, which is the form that
+    is actually useful:
+
+    $$c_{\text{break}}(\gamma) = \frac{\mathbb{E}[T]-v}{\gamma}.$$
+
+    At $v = 1$ and $\alpha \approx 0.76$ that is **0.760, 0.633, 0.568, 0.529,
+    0.393, 0.313** for $\gamma = 1, 2, 3, 4, 6, 8$. The line *tightens* as the
+    draft gets longer: four draft passes amortise the verify over 3.12 tokens, but
+    eight barely improve on that and double the draft bill.
+
+    | $\gamma$ | measured $\alpha$ | tokens/step | $c_{\text{break}}$ at $v=1$ | $S$ at $c=0.128$, $v=1$ | $S$ at $v=1.48$ | measured | $c_{\text{eff}}$ |
+    |---|---|---|---|---|---|---|---|
+    | 1 | 0.760 | 1.76 | 0.760 | 1.56x | 1.09x | 1.02x | 0.26 |
+    | 2 | 0.734 | 2.27 | 0.633 | 1.80x | 1.31x | 1.03x | 0.36 |
+    | 3 | 0.751 | 2.70 | 0.568 | 1.95x | 1.45x | 1.04x | 0.38 |
+    | 4 | 0.758 | 3.12 | 0.529 | 2.06x | 1.56x | 1.01x | 0.40 |
+    | 6 | 0.739 | 3.36 | 0.393 | 1.90x | 1.49x | 0.85x | 0.41 |
+    | 8 | 0.744 | 3.50 | 0.313 | 1.73x | 1.40x | 0.74x | 0.40 |
+
+    Read the last column first. The model's cost ratio is 0.128; the *effective*
+    ratio, recovered by inverting the formula against the measured speedup, is
+    0.26 to 0.41. At $\gamma = 4$ the break-even line with the measured
+    $v = 1.48$ is $(\mathbb{E}[T]-1.48)/\gamma = 0.41$, and $c_{\text{eff}} = 0.40$
+    sits exactly on it — hence 1.01x at an acceptance rate of 0.758. At
+    $\gamma = 8$ the line falls to 0.25 while $c_{\text{eff}}$ stays at 0.40, and
+    the measurement is 0.74x. Those two columns are one run: they move 15-20%
+    between runs on one CPU core, while $\alpha$, tokens/step and
+    $c_{\text{break}}$ do not.
+
+    The gap between 0.128 and 0.40 is not the draft model. It is everything else
+    charged to a draft position: a softmax over the 4,096-token vocabulary, a
+    cumsum, a search, and the Python around them — **0.065 ms against 0.016 ms of
+    arithmetic**. A fused implementation does not pay that; a naive one pays it
+    three times over. This is the number to measure before you promise anything,
+    and it is the one nobody measures, because the paper reports $c$ for the
+    models and the wall clock for the system.
+
+    With the bookkeeping gone, $c_{\text{eff}} = c = 0.128$ and the same
+    acceptance gives **2.06x at $\gamma = 4$ with $v = 1$**, or 1.56x with the
+    verify penalty intact. If no route gets you under the line — a cheaper draft,
+    fused kernels, a bigger target pass — then a smaller $\gamma$ will not save it:
+    the workload does not support speculative decoding, and a larger batch is the
+    better use of the GPU.
+
+    ## What a draft has to be
+
+    "Small and fast" is the wrong specification. At $\gamma = 4$: a draft with
+    $\alpha = 0.35$, $c = 0.03$ returns **1.37x** — clear of its 0.133 line, but
+    capped at 1.54x by its own acceptance; one with $\alpha = 0.75$, $c = 0.13$
+    returns **2.01x** against a line of 0.513; one with $\alpha = 0.90$,
+    $c = 0.40$ returns **1.58x** against a line of 0.774. All three clear, and the
+    middle one wins: it is the only one where neither acceptance nor cost binds.
+
+    ## What breaks
+
+    Four things, all measurable before deployment. Verification is not free: $v$
+    is 1.48 here and 1.03 on an H800, which at $\gamma = 4$ moves the tolerable
+    cost ratio from 0.53 to 0.41. Reach decays geometrically while acceptance
+    does not, so the honest $\gamma$ is usually 3 to 5. Bookkeeping per draft
+    position can triple your effective $c$ without touching a model weight. And
+    the line is unforgiving: at $\gamma = 4$, $c_{\text{eff}} = 0.40$ is on it,
+    and a draft from another model family routinely lands past it. Tree drafting
+    buys shots at high-reach positions; it does not fix a cost ratio.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A decode step is priced by the weights it reads rather than by the tokens it emits, so a cheap model's guesses can ride along in the same pass for almost nothing — provided the expensive model's acceptance test samples from its own distribution exactly, and provided the extra work per draft token costs less than the target pass it saves.
+
+    ### The analogy, in full
+
+    A tax partner and an associate. The associate drafts the whole letter; the partner reads all of it in one sitting and either signs each paragraph or rewrites it from the point where it stops sounding like her. Her time is billed per letter read and per paragraph rewritten, not per paragraph read, so the associate's correct guesses are nearly free and the wrong ones cost one rewrite. The mapping is exact. A paragraph is a draft token, the partner's sitting is one verification pass, "signs it" is acceptance with probability min(1, p/q), and "rewrites it" is a draw from the residual — the paragraphs the partner would have written that the associate did not. The letters that leave the office are distributed exactly as if the partner had written every one of them herself, which is the property the whole scheme exists to preserve. It breaks in four places, and the fourth is the one that kills deployments. The partner reads more slowly than she reads one paragraph — five paragraphs take 1.48x as long as one. The associate's fourth paragraph is only reached 39.8% of the time, so a fifth is a guess about a letter that mostly does not exist. And every paragraph the associate drafts has to be typed, filed and handed over: 0.065 ms of overhead per paragraph against 0.016 ms of thinking. If the filing costs more than the reading saves, the letter takes longer than if the partner had written it, at any acceptance rate.
+
+    ### Failure modes, in full
+
+    - You serve a 70B model at 40 tokens per second and the product wants 100. Buying a second GPU does not help, because each step emits exactly one token per sequence and the card is already saturating its memory bandwidth. The step is not compute-bound; it is a weight read that produces one token, and no amount of hardware makes that read shorter.
+    - You read that a small model can guess ahead and the big model can check the guesses, so you wire up "draft four, keep the ones the big model agrees with" and ship it. Outputs change. Not degrade in a way a benchmark catches — change, on prompts where the model used to be stable at temperature 0.4, in a way a reviewer notices.
+    - You fix the distribution, measure a healthy 0.76 acceptance rate, and get 1.02x. The draft is eight times cheaper than the target per pass, so the arithmetic promised 1.5x. Both numbers are right: the cost ratio you computed for the models is not the cost ratio your serving stack actually pays, because everything else in a step is charged to the draft.
+    - You quote the paper's 2.4x in a design review and your own A/B says 1.0x. The paper's target was a 70B on an H100 where verifying five positions costs 1.03 target passes and the kernels are fused; yours is a 7B on a stack where verification costs 1.48 and per-position bookkeeping costs four times the draft's arithmetic. The technique's premise is a property of your implementation, not a law of the method.
+    - Somebody proposes deleting the target model and serving the draft, since it is cheaper. It is also the model users rate lower, and the entire point of the acceptance rule is that you get the big model's distribution at the small model's speed — not the small model's distribution.
+
+    ### The mechanisms, in full
+
+    - **The step is a weight read, so extra positions are nearly free — that is the premise, and it is borrowed.** Continuous batching established that one decode step reads the whole model and emits one token per live sequence, which is why filling empty slots costs almost nothing. Measured on the harness in this topic: a 9 MB target costs **0.127 ms for one position and 0.188 ms for five — 1.48x, not 5x**, because the extra rows ride on the same weight read. Speculative decoding spends that free dimension on one sequence's future instead of on other sequences' present. The trap is assuming the factor is 1.0: it is 1.03 on an H100 whose decode step is genuinely bandwidth-bound and 1.4-1.6 on a CPU where the multi-row GEMM path gives up bandwidth, and the gap moves the break-even line by a third.
+    - **The acceptance rule is two lines and it is exact.** Draw the draft token $x$ from $q$, accept it with probability $\min(1, p(x)/q(x))$, and on rejection draw once from the residual $r(y) \propto (p(y)-q(y))_+$. With a draft that is the target at temperature 1.6 over a 256-token vocabulary, the measured acceptance rate is **0.7849**, and the residual has non-zero mass on **26 of 256 tokens** — the places the draft overweights and the target does not. The trap is treating the residual as a fallback that "roughly" corrects the bias: it is the exact complement of what acceptance removed, and skipping it is not a small error.
+    - **The output distribution is exactly the target's, not approximately.** Over 4,000,000 draws the measured total-variation distance from $p$ is **0.0022, below the 0.0036 sampling-noise floor** measured between two independent draws from $p$ itself, and the analytic output distribution differs from $p$ by **5.2e-18** — float noise on an identity. The sampler is exact for any pair $(p,q)$ where $q$ has mass everywhere $p$ does, with no correction term, no retry loop, and no tuning. The trap is believing exactness costs throughput: it costs one subtraction and one draw.
+    - **The naive residual is the classic bug and it is worth 0.1 TV.** Resampling from $p$ itself on rejection — the natural thing to write, because "the draft was wrong so use the target" — produces $\min(p,q) + (1-\alpha)p$, whose TV distance from $p$ is **0.1001 analytically and 0.1002 over 4,000,000 draws: 46x the correct sampler's error**, and it does not shrink with more samples because it is a bias, not noise. The result is still fluent text, still passes a vibe check, and quietly over-represents the tokens the target already favoured at every rejected position. The trap is that the bug is invisible in aggregate metrics and obvious in a TV measurement.
+    - **A speculative step emits $1 + \alpha + \alpha^2 + \dots + \alpha^\gamma$ tokens, not $\gamma$.** The step always emits at least one token — the correction draw, or the bonus token if every draft token was accepted — plus one for each draft token accepted before the first rejection, which happens with probability $\alpha^k$. Measured: **1.760, 2.266, 2.703, 3.116 and 3.502 tokens per step at $\gamma = 1, 2, 3, 4, 8$**, against a naive $\gamma$-token model that overstates the last one by 128%. The trap is estimating throughput from $\gamma$ instead of from the geometric sum, and it gets worse the more you draft.
+    - **Acceptance is flat across a draft; what decays is the chance of getting there.** Measured conditional acceptance at each position inside a $\gamma = 4$ run: **0.761, 0.758, 0.680, 0.715** — no systematic decay, because the draft is judged against the target's logits on the same prefix every time. But the probability of *reaching* position four is **1.000, 0.785, 0.613, 0.398**, so the fourth draft token is emitted on 40% of steps while costing $c$ on every one. The trap is reading the mean acceptance fraction $n_{\text{accepted}}/\gamma$ as the per-position rate: at $\gamma = 8$ that statistic is **0.31** while the per-position rate is **0.74**, and feeding 0.31 into the formula predicts 1.45 tokens per step against 3.50 measured — a 2.4x understatement that makes you abandon a working technique.
+    - **The speedup is $\dfrac{1-\alpha^{\gamma+1}}{(1-\alpha)(v+\gamma c)}$, and it has an interior maximum.** With $c = 0.128$ measured on the models (a 0.016 ms draft pass against a 0.127 ms target pass) and $v = 1$ assumed, the formula peaks at **$\gamma = 4$ for $\alpha = 0.7$ (1.83x), $\gamma = 5$ for $\alpha = 0.8$ (2.25x) and $\gamma = 9$ for $\alpha = 0.9$ (3.03x)**. At $\alpha = 0.76$ the curve is flat from $\gamma = 4$ to $8$ (2.06x, 1.88x) and then falls away: **$\gamma = 20$ gives 1.17x and $\gamma = 32$ gives 0.82x**, because 32 draft passes cost four target passes whether or not anybody accepts them. The trap is treating $\gamma$ as a "more is better" knob rather than as a price.
+    - **Break-even is a cost ratio, and the line tightens as $\gamma$ grows.** Setting $S = 1$ at $v = 1$ gives $c_{\text{break}}(\gamma) = (\mathbb{E}[T]-1)/\gamma$: **0.760, 0.633, 0.568, 0.529, 0.393, 0.313** for $\gamma = 1, 2, 3, 4, 6, 8$. Longer drafts amortise the verify pass over more tokens but multiply the draft cost, so a $\gamma = 8$ draft must be **2.4x cheaper** than a $\gamma = 1$ draft to break even at the same acceptance rate. The measured model ratio of 0.128 clears every one of those lines with room to spare. The trap is quoting a speedup without quoting the $c$ it assumed: the same $\alpha$ is a 2x win at $c = 0.05$ and a loss at $c = 0.6$.
+    - **Your effective $c$ is not your model's $c$, and inverting the formula recovers it.** From the measured speedup, $c_{\text{eff}} = (\mathbb{E}[T]/S - v)/\gamma$ gives **0.26, 0.36, 0.38, 0.40, 0.41, 0.40** at $\gamma = 1 \dots 8$ on one run (0.22 to 0.41 across runs, because the timing moves) — two to three times the model's 0.128, because each draft position also costs a softmax over the 4,096-token vocabulary, a cumsum and a search: **0.065 ms of bookkeeping against 0.016 ms of arithmetic**. Against the break-even line at $v = 1.48$ — 0.28, 0.39, 0.41, 0.41, 0.31, 0.25 — that predicts every measured point: wins at $\gamma = 1\text{-}3$ (1.02x, 1.03x, 1.04x), break-even at 4 (1.01x), losses at 6 and 8 (0.85x, 0.74x). The trap is measuring $c$ on the models and believing it describes the system.
+    - **Below the break-even line speculation is a slowdown at any acceptance rate; above it the ceiling is $1/((1-\alpha)v)$.** Measured at $\gamma = 4$: $c_{\text{eff}} = 0.40$ against a break-even of 0.41 — a 1.01x result with an acceptance rate of 0.758. Nothing about that is an acceptance problem; it is a cost problem, and the only fixes are a cheaper draft, a cheaper per-position path, or a bigger target pass. Once cost is out of the way the ceiling is set by agreement alone: **5.0x at $\alpha = 0.8$, 2.0x at $\alpha = 0.5$**, 1.35x at 0.26. The trap is optimising $\gamma$ and the kernel while the ceiling is a training problem and the floor is an implementation one.
+  derivations:
+    - title: "The acceptance rule reproduces the target distribution exactly"
+      latex: |
+        Let $q$ be the draft's distribution and $p$ the target's. A token $y$ can
+        be emitted in exactly two ways: it was drawn from $q$ and accepted, or a
+        draw was rejected and the correction produced $y$.
+
+        The first path contributes $q(y)\min(1, p(y)/q(y)) = \min(p(y), q(y))$.
+        The rejection probability is
+
+        $$1-\alpha = 1-\sum_z \min(p(z), q(z)) = \sum_z \bigl(p(z)-q(z)\bigr)_+ ,$$
+
+        because $p$ and $q$ both sum to one, so whatever mass $p$ has that $q$
+        does not is exactly the mass acceptance failed to cover. The correction
+        draw is normalised by that same quantity, so the second path contributes
+
+        $$(1-\alpha)\cdot\frac{(p(y)-q(y))_+}{1-\alpha} = (p(y)-q(y))_+ .$$
+
+        Adding the two paths,
+
+        $$P(\text{output}=y) = \min(p(y),q(y)) + (p(y)-q(y))_+
+          = p(y),$$
+
+        since $\min(a,b) + (a-b)_+ = a$ for any real $a,b$. The identity holds
+        pointwise, so it holds for the whole distribution. Measured on the
+        reference pair: maximum absolute deviation $5.2\times10^{-18}$,
+        empirical TV 0.0022 over $4\times10^{6}$ draws against a 0.0036 noise
+        floor.
+      prose: >-
+        Nothing here is asymptotic and nothing is approximate. The two paths
+        partition the outcome space, the masses add to $p$ exactly, and the only
+        error is float. That is why the technique is safe to ship on top of a
+        product whose outputs people have already evaluated — it is a sampler for
+        $p$, not a heuristic that resembles one. Note what the proof does *not*
+        require: nothing about $q$'s shape, nothing about $\alpha$, nothing about
+        how good the draft is. A bad draft costs speed and buys nothing else.
+
+    - title: "Expected tokens per step is a geometric sum, plus the bonus token"
+      latex: |
+        Number the draft positions $1..\gamma$. The step emits the correction
+        token unconditionally — either the residual draw at the first rejection,
+        or the target's own draw at position $\gamma+1$ — so
+
+        $$\mathbb{E}[T] = 1 + \sum_{k=1}^{\gamma} P(\text{the first } k \text{ drafts are all accepted}).$$
+
+        With per-position acceptance probabilities $\alpha_1,\dots,\alpha_\gamma$
+        the survival term is the product $\prod_{i\le k}\alpha_i$; call it the
+        reach probability of position $k+1$, $R_k$. If the rates are equal to a
+        common $\alpha$,
+
+        $$\mathbb{E}[T] = 1 + \alpha + \alpha^2 + \dots + \alpha^{\gamma}
+          = \frac{1-\alpha^{\gamma+1}}{1-\alpha}.$$
+
+        Two limits are worth memorising. At $\gamma = 1$,
+        $\mathbb{E}[T] = 1+\alpha$: a single draft token is worth having only if
+        it survives more often than never. As $\gamma\to\infty$,
+        $\mathbb{E}[T]\to 1/(1-\alpha)$ — 5.0 tokens per step at $\alpha = 0.8$.
+
+        The product form is the one to use on real data, because it needs no
+        assumption of constant $\alpha$. Measured at $\gamma = 4$:
+        $1 + 0.785 + 0.613 + 0.398 + 0.285 = 3.08$, against 3.116 replayed — the
+        two agree because acceptance happens to be flat here (0.761, 0.758,
+        0.680, 0.715). Where it decays with position, only the product is right.
+      prose: >-
+        The bonus token is the difference between a technique that pays and one
+        that does not at small gamma: a fully accepted one-token draft yields two
+        tokens, not one, so the marginal value of the first draft token is its
+        entire acceptance probability. It is also why the numerator in the
+        speedup formula runs to $\gamma$ rather than to $\gamma-1$ — one extra
+        term, and it is the one that makes $\gamma = 1$ worth deploying.
+
+    - title: "Break-even is a cost ratio, and it tightens with gamma"
+      latex: |
+        The speedup is tokens emitted over cost per token:
+
+        $$S(\gamma) = \frac{1-\alpha^{\gamma+1}}{(1-\alpha)(v+\gamma c)}.$$
+
+        Setting $S = 1$ and solving for the cost ratio gives the line the draft
+        has to clear:
+
+        $$v + \gamma c = \frac{1-\alpha^{\gamma+1}}{1-\alpha} = \mathbb{E}[T]
+          \quad\Longrightarrow\quad
+          c_{\text{break}}(\gamma) = \frac{\mathbb{E}[T]-v}{\gamma}.$$
+
+        At $v = 1$ and $\alpha = 0.76$: 0.760, 0.633, 0.568, 0.529, 0.393 and
+        0.313 at $\gamma = 1,2,3,4,6,8$. The sequence decreases, so **a longer
+        draft must be cheaper, not merely as cheap** — the verify pass is
+        amortised over a bounded number of tokens while the draft bill grows
+        linearly.
+
+        The same expression inverted audits an implementation. From a measured
+        speedup $S$,
+
+        $$c_{\text{eff}} = \frac{\mathbb{E}[T]/S - v}{\gamma},$$
+
+        which on one run of this harness gives 0.26, 0.36, 0.38, 0.40, 0.41,
+        0.40 against a model cost ratio of 0.128 — the spread across runs is
+        0.22 to 0.41, which is why the measurement, not the arithmetic, has to
+        be the thing you quote. At $\gamma = 4$ with $v = 1.48$ the line is
+        0.41 and $c_{\text{eff}}$ is 0.40: the predicted speedup is 1.0x, and the
+        measured speedup is 1.01x.
+
+        The gap between 0.128 and 0.40 is bookkeeping: 0.065 ms per draft
+        position against 0.016 ms of arithmetic. Fuse it away and
+        $c_{\text{eff}} = c$, so the same acceptance yields $S = 2.06$ at
+        $\gamma = 4$, $v = 1$.
+      prose: >-
+        This is the derivation that decides deployments, and it is one line. The
+        cost ratio in the paper is measured on two models in isolation; the cost
+        ratio your service pays includes the sampler, the copy into the cache
+        block table, the kernel launches and the language the loop is written in.
+        When the two differ by 3x — as they do here — the difference between a 2x
+        win and a 1.0x tie is not the algorithm, it is the plumbing, and no
+        amount of tuning $\gamma$ recovers it.
+
+  implementations:
+    - language: python
+      title: "The exact sampler, and the four numbers that decide whether it pays"
+      note: >-
+        Correct, and deliberately instrumented: it prints the cost ratio $c$, the
+        verify overhead $v$, the tokens per step, the break-even ratio and the
+        *effective* ratio recovered from the measured speedup. Those five numbers
+        are the deployment decision, and three of them are routinely guessed. The
+        draft is the target with its 512-direction logit matrix truncated to 32
+        directions — a stand-in for a distilled sibling: 8x cheaper per pass,
+        agreeing about three quarters of the time. Watch the last column: it says
+        the implementation pays 0.40 for a draft token whose arithmetic costs
+        0.128, and that is the whole reason the measured speedup is 1.0x while the
+        formula says 1.56x. Sampling is inverse-CDF with `searchsorted` rather
+        than `rng.choice(p=q)`, because the latter validates the whole
+        distribution and costs about 30 microseconds a call — a quarter of a draft
+        pass, which is enough to corrupt the comparison you are trying to make.
+      code: |
+        import numpy as np
+        import time
+
+        D, V, K, S = 512, 4096, 32, 12.0          # residual width, vocab, draft dims, logit scale
+        rng = np.random.default_rng(5)
+        sig = 1.0 / (1.0 + np.arange(D) / 60.0)   # decaying spectrum: the draft keeps the head
+        U = (rng.normal(0, 1 / np.sqrt(D), (D, D)) * sig[None, :]).astype(np.float32)
+        Vt = rng.normal(0, 1 / np.sqrt(V), (D, V)).astype(np.float32)
+        Ud, Vd = np.ascontiguousarray(U[:, :K]), np.ascontiguousarray(Vt[:K, :])
+        E = rng.normal(0, 0.6, (V, D)).astype(np.float32)
+
+
+        def logits(X, A, B):
+            return ((X @ A) @ B) * S
+
+
+        def softmax(Z):
+            Z = Z - Z.max(axis=1, keepdims=True)
+            e = np.exp(Z)
+            return e / e.sum(axis=1, keepdims=True)
+
+
+        def draw(cdf, u):
+            return int(np.searchsorted(cdf, u * cdf[-1]))
+
+
+        def target_only(n, seed):
+            r = np.random.default_rng(seed)
+            y, emitted = 3, 1
+            while emitted < n:
+                p = softmax(logits(E[y:y + 1], U, Vt))[0]
+                y = draw(np.cumsum(p), r.random())
+                emitted += 1
+            return emitted
+
+
+        def speculative(n, gamma, seed):
+            """Tokens emitted, steps taken, and per-position acceptance."""
+            r = np.random.default_rng(seed)
+            y, emitted, steps = 3, 0, 0
+            hit, seen = np.zeros(gamma), np.zeros(gamma)
+            while emitted < n:
+                steps += 1
+                draft, qs, last = [], [], y
+                for _ in range(gamma):                       # gamma cheap passes
+                    q = softmax(logits(E[last:last + 1], Ud, Vd))[0]
+                    t = draw(np.cumsum(q), r.random())
+                    draft.append(t); qs.append(q); last = t
+                P = softmax(logits(E[np.array([y] + draft)], U, Vt))   # ONE target pass
+                nacc = 0
+                for i in range(gamma):
+                    seen[i] += 1
+                    if r.random() < min(1.0, float(P[i][draft[i]] / qs[i][draft[i]])):
+                        hit[i] += 1
+                        nacc += 1
+                    else:
+                        w = np.clip(P[i] - qs[i], 0.0, None)
+                        draw(np.cumsum(w / w.sum()), r.random())       # exact residual
+                        break                                          # rest is discarded
+                emitted += nacc + 1                                    # + correction or bonus
+            return emitted, steps, hit / np.maximum(seen, 1)
+
+
+        def bench(fn, n=200):
+            fn(); fn()
+            t0 = time.perf_counter()
+            for _ in range(n):
+                fn()
+            return (time.perf_counter() - t0) / n * 1e3
+
+
+        SEEDS, N = (77, 78, 79), 320
+        t_t = bench(lambda: logits(E[3:4], U, Vt))
+        t_d = bench(lambda: logits(E[3:4], Ud, Vd))
+        v = bench(lambda: logits(E[:5], U, Vt)) / t_t
+        c = t_d / t_t
+        print("target %.4f ms/token  draft %.4f ms/token  c = draft/target = %.3f  v(5) = %.2f"
+              % (t_t, t_d, c, v))
+
+        base = []
+        for s in SEEDS:
+            t0 = time.perf_counter(); target_only(N, s); base.append(time.perf_counter() - t0)
+        base = float(np.mean(base))
+        print("plain decode %.4f ms/token" % (base * 1e3 / N))
+
+        for g in (1, 2, 3, 4, 6, 8):
+            dt, tps, acc = [], [], []
+            for s in SEEDS:
+                t0 = time.perf_counter()
+                e, st, per = speculative(N, g, s)
+                dt.append(time.perf_counter() - t0)
+                tps.append(e / st); acc.append(float(per.mean()))
+            a, et, sp = float(np.mean(acc)), float(np.mean(tps)), base / float(np.mean(dt))
+            formula = (1 - a ** (g + 1)) / ((1 - a) * (g * c + v))
+            c_break = (et - 1.0) / g            # the cost ratio at which S = 1, at v = 1
+            c_eff = (et / sp - v) / g           # the cost ratio your implementation actually has
+            print("gamma %2d  alpha %.3f  %.2f tok/step  c_break %.3f  formula %.2fx  "
+                  "measured %.2fx  c_eff %.3f" % (g, a, et, c_break, formula, sp, c_eff))
+
+        # One run, verbatim. alpha and tokens/step reproduce exactly; timings move
+        # 15-20% between runs, so c, v, measured and c_eff move with them — across
+        # runs c_eff at gamma = 4 lands between 0.37 and 0.40 and measured between
+        # 1.01x and 1.05x, while the 1.56x formula column does not move at all:
+        # target 0.1268 ms/token  draft 0.0162 ms/token  c = draft/target = 0.128  v(5) = 1.48
+        # plain decode 0.1657 ms/token
+        # gamma  1  alpha 0.760  1.76 tok/step  c_break 0.760  formula 1.10x  measured 1.02x  c_eff 0.255
+        # gamma  2  alpha 0.734  2.27 tok/step  c_break 0.633  formula 1.31x  measured 1.03x  c_eff 0.359
+        # gamma  3  alpha 0.751  2.70 tok/step  c_break 0.568  formula 1.47x  measured 1.04x  c_eff 0.377
+        # gamma  4  alpha 0.758  3.12 tok/step  c_break 0.529  formula 1.56x  measured 1.01x  c_eff 0.403
+        # gamma  6  alpha 0.739  3.36 tok/step  c_break 0.393  formula 1.50x  measured 0.85x  c_eff 0.413
+        # gamma  8  alpha 0.744  3.50 tok/step  c_break 0.313  formula 1.45x  measured 0.74x  c_eff 0.404
+
+    - language: python
+      title: "The residual everyone writes first, and what it costs"
+      note: >-
+        **Numerically WRONG, in the way this mistake is actually made.** One line
+        differs from the reference sampler: on rejection it draws from `p` itself
+        instead of from `(p - q)+` renormalised. That is the reading most people
+        take from "if the draft is rejected, sample from the target", and it is
+        wrong because it double-counts the mass the two distributions share. On
+        the reference pair it reports **TV 0.1002 from the target against the
+        correct sampler's 0.0022 — a 46x bias that never shrinks**, because it is
+        a bias, not variance: four million samples move it by less than 0.0001.
+        Nothing raises, the text is fluent, and the damage is that every rejected
+        position over-represents tokens the target already favoured, which reads
+        as shorter and more repetitive completions. Pairing this with a greedy
+        verify — keep the draft token when the target's argmax agrees — is the
+        other half of the bug: it samples from $p$ only where $p > q$.
+      code: |
+        import numpy as np
+
+        V, N = 256, 4_000_000
+        rng = np.random.default_rng(11)
+        z = rng.normal(0.0, 1.7, V)
+
+
+        def softmax(z, t):
+            a = np.exp(z / t - (z / t).max())
+            return a / a.sum()
+
+
+        p, q = softmax(z, 1.0), softmax(z, 1.6)        # draft = target at temperature 1.6
+        alpha = float(np.minimum(p, q).sum())
+
+
+        def sample(rule, r):
+            """One pass over the vocabulary; `r` is shared so the stream is reproducible."""
+            x = r.choice(V, size=N, p=q)
+            u = r.random(N)
+            ok = u < np.minimum(1.0, p[x] / q[x])
+            out = np.empty(N, dtype=np.int64)
+            out[ok] = x[ok]
+            k = int((~ok).sum())
+            if rule == "residual":                     # correct: (p-q)+ renormalised
+                w = np.clip(p - q, 0.0, None)
+                w = w / w.sum()
+            else:                                      # WRONG: draw from the target
+                w = p
+            out[~ok] = r.choice(V, size=k, p=w)
+            return out
+
+
+        def tv_to_p(x):
+            h = np.bincount(x, minlength=V).astype(float)
+            return 0.5 * np.abs(h / h.sum() - p).sum()
+
+
+        r = np.random.default_rng(2024)
+        correct = sample("residual", r)
+        naive = sample("naive", r)
+        a, b = r.choice(V, N, p=p), r.choice(V, N, p=p)     # two draws from p itself
+
+        print("alpha %.4f  TV(p,q) %.4f" % (alpha, 0.5 * np.abs(p - q).sum()))
+        print("correct residual  TV %.4f" % tv_to_p(correct))
+        print("naive residual    TV %.4f" % tv_to_p(naive))
+        print("naive analytic    TV %.4f"
+              % (0.5 * np.abs(np.minimum(p, q) + (1 - alpha) * p - p).sum()))
+        print("noise floor, two draws from p: %.4f"
+              % (0.5 * np.abs(np.bincount(a, minlength=V) / N
+                              - np.bincount(b, minlength=V) / N).sum()))
+
+        # alpha 0.7849  TV(p,q) 0.2151
+        # correct residual  TV 0.0022
+        # naive residual    TV 0.1002
+        # naive analytic    TV 0.1001
+        # noise floor, two draws from p: 0.0036
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        The draft model's distribution $q$ never appears in the output — only in
+        the acceptance ratio and in the residual. Why is that enough for the
+        output to be exactly $p$?
+      answerKind: short_text
+      hint: >-
+        Split the outcome by path: accepted draws and correction draws. What mass
+        does each path contribute at token $y$, and what is the rejection
+        probability in terms of $p$ and $q$?
+      solution: >-
+        Because the two paths partition the space and their masses add to $p$.
+        Acceptance contributes $q(y)\min(1,p(y)/q(y)) = \min(p(y),q(y))$. The
+        rejection probability is $1-\alpha = \sum_z(p(z)-q(z))_+$, and the
+        correction draw is normalised by exactly that, so it contributes
+        $(1-\alpha)\cdot(p(y)-q(y))_+/(1-\alpha) = (p(y)-q(y))_+$. Since
+        $\min(a,b)+(a-b)_+ = a$, the sum is $p(y)$ for every $y$. Nothing
+        downstream needs to know $q$'s shape; $q$ entered through the ratio and
+        the residual, and both cancelled.
+    - id: cp-2
+      question: >-
+        You keep a draft token whenever the target's top-1 token agrees with it,
+        and otherwise replace it with the target's top-1. The text looks fine.
+        What distribution are you sampling from, and how would you prove it is
+        wrong?
+      answerKind: short_text
+      hint: >-
+        Where $p > q$ the rule always keeps the draft token; where $q > p$ it
+        always replaces it. Write down the resulting probability of each token.
+      solution: >-
+        You are sampling from something like $\min(p,q)$ plus a point mass on the
+        target's argmax at each rejection — not from $p$. Where the draft
+        overweights a token ($q > p$), the rule never emits it, so the target's own
+        probability for that token is thrown away; where the draft underweights it,
+        the rule always keeps it, so the token is over-emitted. The proof is the
+        instrument from this topic: draw four million samples, histogram them,
+        compute $0.5\sum_y|\hat p(y)-p(y)|$. The correct sampler measures 0.0022
+        against a 0.0036 noise floor; resample-from-$p$ measures 0.1002
+        analytically and 0.1002 empirically. Greedy verify is worse still, because
+        it is deterministic where $p$ is not.
+    - id: cp-3
+      question: >-
+        Your draft costs 0.08 target passes per token and its acceptance rate is
+        0.55. Does it clear break-even at gamma = 4, and what is the best gamma?
+      answerKind: short_text
+      hint: >-
+        Break-even is a cost ratio: $c_{\text{break}} = (\mathbb{E}[T]-1)/\gamma$
+        at $v = 1$. Compute it at gamma = 4 and compare with 0.08.
+      solution: >-
+        It clears easily: $c_{\text{break}}(4) = (2.19-1)/4 = 0.30$, so 0.08 is
+        nearly four times under the line. The best gamma is 3, at 1.63x. With
+        $c = 0.08$ and $v = 1$: $\gamma=1$ gives 1.44; $\gamma=2$ gives 1.60;
+        $\gamma=3$ gives 1.63; $\gamma=4$ gives 1.60. The curve is flat to within
+        0.03x from gamma 2 to 4, because $\alpha = 0.55$ caps the ceiling at
+        $1/(1-\alpha) = 2.22$ — the binding constraint here is acceptance, not
+        cost, which is the opposite of the harness this topic measured.
+    - id: cp-4
+      question: >-
+        The replay shows 3.12 tokens per step at $\gamma = 4$ and 0.758
+        acceptance, and the model cost ratio is 0.128 — yet the measured speedup
+        is 1.01x. Which of the four numbers in the formula is lying?
+      answerKind: short_text
+      hint: >-
+        None of them. Invert the formula against the measured speedup and see what
+        cost ratio it implies; then compare that with the ratio you measured on
+        the models.
+      solution: >-
+        None of them; they describe different objects. Invert the formula:
+        $c_{\text{eff}} = (\mathbb{E}[T]/S - v)/\gamma = (3.12/1.01 - 1.48)/4 =
+        0.40$. The models cost 0.128, but the implementation pays 0.40, because
+        each draft position also carries a softmax over the 4,096-token
+        vocabulary, a cumsum, a search and the Python around them: 0.065 ms
+        against 0.016 ms of arithmetic. The break-even line at $v = 1.48$ and
+        $\gamma = 4$ is 0.41, so 0.40 against 0.41 is a dead heat, and 1.01x is
+        the correct answer to "what does this implementation do". The formula was
+        never wrong; it was answering "what would this algorithm do if a draft
+        token cost what its arithmetic costs".
+    - id: cp-5
+      question: >-
+        Acceptance is flat at about 0.76 across the four positions of a draft, and
+        the effective cost ratio sits exactly on the break-even line. Do you fix
+        acceptance, fix cost, or reduce gamma?
+      answerKind: short_text
+      hint: >-
+        Which term in $c_{\text{eff}} = (\mathbb{E}[T]/S - v)/\gamma$ does each
+        intervention move, and which one has the most headroom?
+      solution: >-
+        Fix cost, and reduce gamma only as a stopgap. Acceptance is already 0.76;
+        pushing it to 0.85 buys $\mathbb{E}[T]$ from 3.12 to 4.0, which moves the
+        measured ratio by about 25% and is a training project. Cost has a 3x gap:
+        $c_{\text{eff}}$ is 0.40 against a model $c$ of 0.128, so fusing the
+        per-position path — one kernel for logits, softmax and the draw — returns
+        the whole difference and takes the speedup from 1.0x to 1.56x at the same
+        acceptance. Reducing gamma to 1 or 2 is the correct immediate move because
+        the break-even line is loosest there (0.76 and 0.63 at $v = 1$), but it
+        caps you near 1.1x; it buys time, not throughput.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A decode step reads the entire model and produces one token. That is a
+        terrible ratio: the expensive part is the read, and the token is a
+        rounding error. If something cheap could guess the next few tokens, the
+        expensive model could score all of them during the read it was going to do
+        anyway, and keep the ones it agrees with.
+
+        The hard part is not the guessing, it is keeping the output honest. A
+        draft model has its own distribution, and "keep what the big model likes"
+        quietly changes the distribution the product was evaluated on. The fix has
+        to be a sampling correction so exact that a four-million-sample histogram
+        cannot tell the output from the target's own samples.
+      blocks:
+        - kind: checklist
+          body: |
+            - A step costs a weight read, not a token count
+            - Cheap model proposes, expensive model scores, one pass
+            - Acceptance must be probabilistic, not greedy
+            - Rejections need a correction draw from the right distribution
+            - Tokens per step is a geometric sum, not gamma
+            - A speedup claim is meaningless without a cost ratio
+      checkpoint: >-
+        Before going on: if the draft model is wrong 25% of the time, where
+        exactly does the 25% go? It cannot simply be discarded, or the output
+        would be missing the mass the draft overstated.
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Write the sampler first and prove it before you write the loop. The object
+        you need is a function of $(p, q, x, u)$ that returns a token whose
+        distribution is $p$ — and you can test it without any model at all, by
+        running it four million times on a fixed pair of distributions and
+        computing the total-variation distance to $p$.
+
+        Then the loop, then the economics. Four numbers, each measured: acceptance
+        $\alpha$, cost ratio $c$, verify overhead $v$, and the effective cost
+        ratio $c_{\text{eff}}$ recovered from the speedup you actually got. Every
+        wrong claim in this area comes from assuming one of the four.
+      blocks:
+        - kind: checklist
+          body: |
+            - Build the sampler and audit it with TV before timing anything
+            - Acceptance: min(1, p(x)/q(x)); rejection: (p-q)+ renormalised
+            - Use reach probabilities, not the mean acceptance fraction
+            - Measure c as one draft pass over one target pass, on the models
+            - Measure v as a gamma+1-position pass over a one-position pass
+            - Invert your own speedup to get c_eff; if it is not c, fix the path
+      checkpoint: >-
+        Two implementations differ by one line and one of them is wrong. What
+        single measurement separates them without looking at the text they
+        produce?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The sampler is four lines; the loop is the scheduler around it. Note that
+        the target is called once per step and the draft is called gamma times.
+      blocks:
+        - kind: pseudocode
+          body: |
+            accept_or_resample(p, q, x, u):
+                if u < min(1, p[x] / q[x]):     # draft token survives
+                    return x
+                w = max(p - q, 0)               # residual: mass p has and q does not
+                w = w / sum(w)
+                return inverse_cdf(w, u2)       # one draw, exact
+
+            step(prefix, gamma):
+                draft, qs = [], []
+                for i in 1..gamma:
+                    q = draft_model(prefix + draft)
+                    draft.append(sample(q)); qs.append(q)
+                P = target_model(prefix + draft)      # ONE pass, gamma+1 rows
+                for i in 1..gamma:
+                    if accept(P[i], qs[i], draft[i]):
+                        continue
+                    correction = resample(P[i], qs[i])
+                    return prefix + draft[:i] + [correction]
+                bonus = sample(P[gamma + 1])          # nothing was rejected
+                return prefix + draft + [bonus]
+
+            speedup(alpha, gamma, c, v):
+                tokens = (1 - alpha**(gamma+1)) / (1 - alpha)
+                return tokens / (v + gamma * c)
+
+            break_even(alpha, gamma, v):
+                return ((1 - alpha**(gamma+1)) / (1 - alpha) - v) / gamma
+      checkpoint: >-
+        In `step`, why does `P` need `gamma + 1` rows when only `gamma` draft
+        tokens exist — and what would break if you only scored `gamma` positions?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Four expressions: exactness, expected length, speedup, and the cost ratio
+        at which the speedup disappears.
+      blocks:
+        - kind: math
+          body: |
+            Exactness. Acceptance contributes $\min(p,q)$ because
+            $q\min(1,p/q) = \min(p,q)$. Rejection happens with probability
+            $1-\alpha = \sum_z (p-q)_+$, and the residual is normalised by that
+            same mass, so the correction contributes $(p-q)_+$. Then
+
+            $$P(\text{output}=y) = \min(p,q) + (p-q)_+ = p(y).$$
+
+            Measured: TV 0.0022 over $4\times10^6$ draws, noise floor 0.0036,
+            analytic deviation $5\times10^{-18}$. Resample-from-$p$ instead gives
+            $\min(p,q)+(1-\alpha)p$, TV 0.1001 — a permanent 46x bias.
+
+            Length. One guaranteed token plus one per accepted draft prefix:
+
+            $$\mathbb{E}[T] = 1+\alpha+\dots+\alpha^{\gamma}
+              = \frac{1-\alpha^{\gamma+1}}{1-\alpha},$$
+
+            measured at 1.760, 2.266, 2.703, 3.116, 3.502 for gamma 1, 2, 3, 4, 8.
+
+            Cost. The step costs $v + \gamma c$ target-pass equivalents, so
+
+            $$S = \frac{\mathbb{E}[T]}{v+\gamma c},
+              \qquad c_{\text{break}} = \frac{\mathbb{E}[T]-v}{\gamma}.$$
+
+            At $\alpha=0.76$, $v=1$: $c_{\text{break}}$ falls from 0.760 at
+            $\gamma=1$ to 0.313 at $\gamma=8$. At $v=1.48$, $\gamma=4$ the line is
+            0.41 — and the implementation's measured $c_{\text{eff}}$ is 0.40,
+            which is why the measured speedup is 1.01x rather than 1.56x.
+      checkpoint: >-
+        The break-even ratio falls as gamma grows, so a longer draft has to be
+        cheaper. Explain the mechanism in one sentence, then say what it implies
+        about which gamma a fixed-model draft should use.
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The sampler, the loop, and the four measurements that decide whether to
+        ship it. The failure modes are all in the measurement, not the algebra.
+      blocks:
+        - kind: warning
+          body: >-
+            Three numbers get faked without anyone lying. Quoting tokens per step
+            as throughput ignores $\gamma c$ in the denominator. Averaging
+            acceptance instead of multiplying reach overstates long drafts — the
+            mean rate stays at 0.74 while the reach of position eight collapses to
+            0.13. And quoting the cost ratio of the two models as the cost ratio
+            of the system understates it by 3x on this harness, which is the
+            difference between a 1.56x prediction and a 1.01x measurement.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def accept_or_resample(p, q, x, u, rng):
+                """One draw whose distribution is exactly p."""
+                ratio = p[x] / q[x] if q[x] > 0 else np.inf
+                if u < min(1.0, ratio):
+                    return int(x)
+                w = np.clip(p - q, 0.0, None)
+                total = w.sum()
+                if total <= 0.0:
+                    return int(x)
+                cdf = np.cumsum(w / total)
+                return int(np.searchsorted(cdf, rng.random() * cdf[-1]))
+
+
+            def speculative_step(target, draft_model, prefix, gamma, rng):
+                draft, qs = [], []
+                for _ in range(gamma):
+                    q = draft_model(prefix + draft)
+                    cdf = np.cumsum(q)
+                    t = int(np.searchsorted(cdf, rng.random() * cdf[-1]))
+                    draft.append(t)
+                    qs.append(q)
+                P = target(prefix + draft)                  # ONE pass, gamma+1 rows
+                for i in range(gamma):
+                    if rng.random() < min(1.0, P[i][draft[i]] / qs[i][draft[i]]):
+                        continue
+                    w = np.clip(P[i] - qs[i], 0.0, None)
+                    cdf = np.cumsum(w / w.sum())
+                    corr = int(np.searchsorted(cdf, rng.random() * cdf[-1]))
+                    return prefix + draft[:i] + [corr]
+                cdf = np.cumsum(P[gamma])
+                bonus = int(np.searchsorted(cdf, rng.random() * cdf[-1]))
+                return prefix + draft + [bonus]
+
+
+            def plan(alpha, c, v, max_gamma=32):
+                """Best gamma, its speedup, and the cost ratio that would tie."""
+                best = max(range(1, max_gamma + 1),
+                           key=lambda g: (1 - alpha ** (g + 1))
+                                         / ((1 - alpha) * (v + g * c)))
+                tokens = (1 - alpha ** (best + 1)) / (1 - alpha)
+                return {"gamma": best,
+                        "speedup": tokens / (v + best * c),
+                        "tokens_per_step": tokens,
+                        "c_break": (tokens - v) / best,
+                        "ceiling": 1.0 / ((1 - alpha) * v)}
+        - kind: checklist
+          body: |
+            - alpha = sum min(p,q): 0.785 for the temperature pair, 0.758 for the truncated draft
+            - Correct sampler TV 0.0022; naive residual TV 0.1002; noise floor 0.0036
+            - Tokens/step 1.760, 2.266, 2.703, 3.116, 3.502 at gamma 1, 2, 3, 4, 8
+            - Reach probabilities 1.000, 0.785, 0.613, 0.398 inside a gamma = 4 step
+            - c = 0.128 on the models, 0.40 effective; v = 1.48 here, 1.03 on an H800
+            - c_break at gamma=4 is 0.529 with v=1, 0.41 with v=1.48
+            - Measured 1.02x at gamma=1, 1.01x at gamma=4, 0.74x at gamma=8
+      checkpoint: >-
+        `plan` returns `c_break` next to the speedup. If your measured $c$ is
+        close to it, what are the three levers available, and which one does the
+        measurement say has the most headroom?
+
+  problems:
+    - id: p-accept-resample
+      title: "One exact draw from the acceptance rule"
+      difficulty: medium
+      prompt: >-
+        Implement `accept_or_resample(p, q, draft, u_accept, u_resample)`.
+
+        `p` and `q` are lists of equal length summing to 1 (the target and draft
+        distributions at one position). `draft` is the token index the draft
+        sampled. `u_accept` and `u_resample` are uniforms in [0, 1).
+
+        Accept the draft token when `u_accept < min(1, p[draft] / q[draft])`
+        (strictly less; treat `q[draft] == 0` as an infinite ratio) and return it.
+        Otherwise build `w = max(p[i] - q[i], 0)`, normalise it by its sum, and
+        return the smallest index `i` whose cumulative sum is strictly greater
+        than `u_resample`, falling back to the last index. If `w` sums to zero,
+        return `draft`.
+
+        Return an integer token index.
+      starter: |
+        def accept_or_resample(p, q, draft, u_accept, u_resample):
+            # your implementation here
+            pass
+      language: python
+      entry: accept_or_resample
+      testCases:
+        - input: '[[0.7, 0.3], [0.2, 0.8], 1, 0.5, 0.0]'
+          expected: '0'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.7, 0.3], [0.2, 0.8], 1, 0.2, 0.0]'
+          expected: '1'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.5, 0.5], [0.5, 0.5], 0, 0.99, 0.5]'
+          expected: '0'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.1, 0.2, 0.7], [0.6, 0.3, 0.1], 0, 0.5, 0.9]'
+          expected: '2'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.1, 0.2, 0.7], [0.6, 0.3, 0.1], 1, 0.5, 0.9]'
+          expected: '1'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.05, 0.35, 0.6], [0.5, 0.1, 0.4], 0, 0.99, 0.3]'
+          expected: '1'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.05, 0.35, 0.6], [0.5, 0.1, 0.4], 0, 0.99, 0.6]'
+          expected: '2'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.05, 0.35, 0.6], [0.5, 0.1, 0.4], 0, 0.05, 0.0]'
+          expected: '0'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.25, 0.25, 0.25, 0.25], [0.4, 0.3, 0.2, 0.1], 3, 0.1, 0.0]'
+          expected: '3'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.5, 0.5], [0.25, 0.75], 1, 0.9, 0.0]'
+          expected: '0'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+
+        def accept_or_resample(p, q, draft, u_accept, u_resample):
+            p = np.asarray(p, dtype=float)
+            q = np.asarray(q, dtype=float)
+            d = int(draft)
+            ratio = p[d] / q[d] if q[d] > 0.0 else float("inf")
+            if u_accept < min(1.0, float(ratio)):
+                return d
+            w = np.clip(p - q, 0.0, None)
+            total = w.sum()
+            if total <= 0.0:
+                return d
+            cdf = np.cumsum(w / total)
+            return min(int(np.searchsorted(cdf, u_resample, side="right")), len(w) - 1)
+      solutionExplanation: >-
+        The first two cases are the same position with two uniforms, and they are
+        the whole rule: $p(1)/q(1) = 0.3/0.8 = 0.375$, so a uniform of 0.5 rejects
+        and a uniform of 0.2 accepts. When it rejects, the residual $(0.5, 0)$
+        normalises to $(1, 0)$, so the only legal correction is token 0 — the
+        draft proposed the wrong token and the target's remaining mass points the
+        other way. The third case is $p = q$: the ratio is exactly 1, every
+        uniform is below it, and the residual path is never reached, which is why
+        the zero-sum branch exists as a guard rather than as a live path. The
+        fourth and fifth are a rejection and an acceptance at the same position
+        and they show the ratio working in both directions: token 0 is rejected
+        because the draft overweights it six to one, token 1 is accepted because
+        the target weights it two to three. The sixth and seventh test the
+        inverse CDF: the residual of $(0.05,0.35,0.6)$ against $(0.5,0.1,0.4)$ is
+        $(0, 0.25, 0.2)$, normalising to $(0, 0.556, 0.444)$, so a uniform of 0.3
+        lands on 1 and 0.6 lands on 2 — an implementation that forgets to
+        renormalise divides by the pre-clip sum and returns 2 for both. The eighth
+        is the case that catches an inverted test: the ratio is
+        $0.05/0.5 = 0.1$ and the uniform is 0.05, so it accepts narrowly, and a
+        solver who wrote `u > min(1, p/q)` rejects and then hands back the
+        residual's only non-zero entry, token 1, instead of 0. The ninth accepts a
+        token whose ratio is $0.25/0.1 = 2.5$, which catches a solver who
+        special-cases the final position instead of evaluating the ratio. The
+        tenth is the rejection that lands on the residual's only non-zero entry,
+        token 0, for a pair where the target and draft share token 1 exactly.
+      complexity: "O(V) time and O(V) space for the residual"
+      tags: [rejection-sampling, acceptance, speculative-decoding]
+
+    - id: p-gamma-plan
+      title: "Choose gamma, and find the cost ratio that ties"
+      difficulty: medium
+      prompt: >-
+        Implement `spec_plan(alpha, c, max_gamma)` returning a dict with exactly
+        the keys `best_gamma`, `expected_tokens`, `speedup` and `c_break`.
+
+        For a candidate lookahead `g` in `1..max_gamma`, expected tokens per step
+        is `(1 - alpha ** (g + 1)) / (1 - alpha)`, or `g + 1` when `alpha >= 1`.
+        The speedup at cost ratio `c` with `v = 1` is `expected_tokens / (g * c +
+        1)`. Return the `g` with the largest speedup, breaking ties toward the
+        smaller `g` (compare with a strict `>` against the best so far plus
+        1e-15), that `g`'s expected tokens and speedup, and
+        `c_break = (expected_tokens - 1) / g` — the cost ratio at which this
+        gamma would tie.
+      starter: |
+        def spec_plan(alpha, c, max_gamma):
+            # your implementation here
+            pass
+      language: python
+      entry: spec_plan
+      testCases:
+        - input: '[0.8, 0.1, 8]'
+          expected: '{"best_gamma": 6, "expected_tokens": 3.9514240000000003, "speedup": 2.46964, "c_break": 0.49190400000000006}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.5, 0.3, 6]'
+          expected: '{"best_gamma": 1, "expected_tokens": 1.5, "speedup": 1.1538461538461537, "c_break": 0.5}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.0, 0.1, 4]'
+          expected: '{"best_gamma": 1, "expected_tokens": 1.0, "speedup": 0.9090909090909091, "c_break": 0.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[1.0, 0.2, 3]'
+          expected: '{"best_gamma": 3, "expected_tokens": 4.0, "speedup": 2.5, "c_break": 1.0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.9, 0.5, 10]'
+          expected: '{"best_gamma": 3, "expected_tokens": 3.4390000000000005, "speedup": 1.3756000000000002, "c_break": 0.8130000000000002}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[0.76, 0.128, 8]'
+          expected: '{"best_gamma": 4, "expected_tokens": 3.1101977599999997, "speedup": 2.0570091005291005, "c_break": 0.5275494399999999}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def spec_plan(alpha, c, max_gamma):
+            best_g, best_e, best_s = 1, 0.0, -1.0
+            for g in range(1, int(max_gamma) + 1):
+                if alpha >= 1.0:
+                    e = float(g + 1)
+                else:
+                    e = (1.0 - alpha ** (g + 1)) / (1.0 - alpha)
+                s = e / (g * c + 1.0)
+                if s > best_s + 1e-15:
+                    best_g, best_e, best_s = g, e, s
+            return {"best_gamma": best_g, "expected_tokens": best_e,
+                    "speedup": best_s, "c_break": (best_e - 1.0) / best_g}
+      solutionExplanation: >-
+        The first case is the interior optimum the plot shows: at $\alpha=0.8$ and
+        $c=0.1$ the best is 6 at 2.47x, and $\gamma=8$ has fallen to 2.28x because
+        two extra draft passes cost 0.2 of a target pass and buy 0.09 of a token.
+        The second is the discouraging one: at $\alpha=0.5$ and $c=0.3$ the only
+        break-even gamma is 1, at 1.15x — the curve decreases monotonically
+        because each extra pass costs 0.3 and buys at most 0.5 of a token. The
+        third is the degenerate case that catches both a divide-by-zero and a
+        missing floor: at $\alpha=0$ the draft never contributes, tokens are 1 for
+        every gamma, `c_break` is 0, and the best is the smallest gamma — 0.909x,
+        a 9% tax, and the right answer is not to deploy it. The fourth exercises
+        the $\alpha=1$ branch where the closed form divides by zero, so tokens
+        fall back to $\gamma+1$, the best is the largest gamma available, and
+        `c_break` is exactly 1.0 — a perfect draft tolerates a cost ratio of one
+        and no worse. The fifth shows cost dominating: at $c=0.5$ even
+        $\alpha=0.9$ peaks at 1.38x, because three draft passes cost 1.5 target
+        passes. The sixth is this topic's own measurement: $\alpha=0.76$,
+        $c=0.128$ gives 4 at 2.06x with a tie-line of 0.53 — and the harness,
+        whose effective cost ratio is 0.40, measures 1.01x, because at $\gamma=4$
+        the line with $v=1.48$ is 0.41, not 0.53.
+      complexity: "O(max_gamma) time and O(1) space"
+      tags: [speculative-decoding, gamma, break-even, tuning]
+
+    - id: p-sampler-audit
+      title: "Audit a sampler against the target distribution"
+      difficulty: medium
+      prompt: >-
+        Implement `sampler_audit(p, q, counts)` returning a dict with exactly the
+        keys `tv`, `alpha`, `naive_tv` and `worst_index`.
+
+        `p` and `q` are lists summing to 1. `counts` are observed counts per token
+        from some sampler, so `obs = counts / sum(counts)`.
+
+        `tv` is `0.5 * sum(abs(obs[i] - p[i]))`. `alpha` is
+        `sum(min(p[i], q[i]))`. `naive_tv` is the total-variation distance from
+        `p` of what a naive sampler produces when it resamples from `p` itself on
+        rejection: `out = min(p, q) + (1 - alpha) * p`, so
+        `naive_tv = 0.5 * sum(abs(out[i] - p[i]))`. `worst_index` is the smallest
+        index maximising `abs(obs[i] - p[i])`.
+      starter: |
+        def sampler_audit(p, q, counts):
+            # your implementation here
+            pass
+      language: python
+      entry: sampler_audit
+      testCases:
+        - input: '[[0.5, 0.3, 0.2], [0.2, 0.3, 0.5], [5200, 2900, 1900]]'
+          expected: '{"tv": 0.020000000000000018, "alpha": 0.7, "naive_tv": 0.15, "worst_index": 0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.5, 0.3, 0.2], [0.2, 0.3, 0.5], [5000, 3000, 2000]]'
+          expected: '{"tv": 0.0, "alpha": 0.7, "naive_tv": 0.15, "worst_index": 0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.1, 0.2, 0.7], [0.6, 0.3, 0.1], [1200, 2500, 6300]]'
+          expected: '{"tv": 0.06999999999999997, "alpha": 0.4, "naive_tv": 0.17999999999999997, "worst_index": 2}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25], [250, 250, 250, 250]]'
+          expected: '{"tv": 0.0, "alpha": 1.0, "naive_tv": 0.0, "worst_index": 0}'
+          mode: json
+          tolerance: 1e-12
+        - input: '[[0.5, 0.5], [0.5, 0.5], [400, 600]]'
+          expected: '{"tv": 0.09999999999999998, "alpha": 1.0, "naive_tv": 0.0, "worst_index": 0}'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import numpy as np
+
+
+        def sampler_audit(p, q, counts):
+            p = np.asarray(p, dtype=float)
+            q = np.asarray(q, dtype=float)
+            cnt = np.asarray(counts, dtype=float)
+            obs = cnt / cnt.sum()
+            alpha = float(np.minimum(p, q).sum())
+            naive = np.minimum(p, q) + (1.0 - alpha) * p
+            return {
+                "tv": float(0.5 * np.abs(obs - p).sum()),
+                "alpha": alpha,
+                "naive_tv": float(0.5 * np.abs(naive - p).sum()),
+                "worst_index": int(np.argmax(np.abs(obs - p))),
+            }
+      solutionExplanation: >-
+        This is the instrument that separates a working sampler from a plausible
+        one, and the cases are chosen so that each failure mode shows up
+        separately. The first is a sampler that is nearly right: 200 samples in
+        10,000 land on the wrong token, TV is 0.02, and the naive rule's bias on
+        the same pair is 0.15 — seven times a sampling error that a longer run
+        would fix. The second is the same pair with exact counts, TV exactly 0,
+        and `naive_tv` still 0.15: the bias belongs to the rule, not to the
+        sample, which is the whole lesson of this topic in one row. The third is
+        the only case where `worst_index` is not 0, and it also shows the bias and
+        the overlap moving independently: only 0.4 of the mass is shared, so the
+        naive rule is off by 0.18, more than the first pair's 0.15 despite the
+        same formula, because the shared mass is smaller and the residual is
+        bigger. The fourth is the identity: when $p = q$, alpha is 1, the residual
+        is empty, the naive rule coincides with the correct one, and every number
+        is 0 — an implementation that divides by `1 - alpha` crashes here. The
+        fifth is the one that catches people who think exactness is only about
+        acceptance: $p = q$, so `alpha` is 1 and `naive_tv` is 0, yet the observed
+        counts are 400/600 against a uniform target and TV is 0.1 — a sampler can
+        have an unbiased rule and still be broken in its CDF.
+      complexity: "O(V) time and O(V) space"
+      tags: [total-variation, rejection-sampling, auditing, speculative-decoding]
+
+  try_it: >-
+    With an acceptance rate of 0.76 and a four-token draft, compute the expected tokens per step
+    from (1 − α^(γ+1))/(1 − α). You should get about 3.11, not 4. Then compute the break-even
+    cost ratio c = (E[T] − 1)/γ, about 0.53, and compare it with the 0.40 measured on a real
+    serving stack.
+  interview_questions:
+    - question: "Why is the acceptance rule min(1, p(x)/q(x)) rather than 'keep the token when the target agrees with the draft'?"
+      level: mid
+      key_points:
+        - "Keeping the argmax token changes the distribution: it collapses sampling onto the target's mode, which is not a draw from p at temperature."
+        - "The accept test plus a residual draw r(y) proportional to (p(y) − q(y))_+ is exact rejection sampling: measured TV distance 0.0022, below the 0.0036 sampling-noise floor, and an analytic difference of 5.2e−18."
+        - "The naive repair — resampling from p on rejection — gives TV distance 0.1001, which is 46× the correct sampler's error."
+        - "So the exactness lives in the residual, not in the accept test, and the accept test alone is not enough."
+      follow_up: "What must the residual be proportional to, and why does that expression make the mixture exactly p?"
+    - question: "You measure a healthy 0.76 acceptance rate and get 1.02×. Where did the arithmetic promise 1.5×?"
+      level: senior
+      key_points:
+        - "The speedup is (1 − α^(γ+1)) / ((1 − α)(v + γc)), not 1/(1 − α); v and c are both in the denominator because every draft token is paid for."
+        - "Break-even is a cost ratio: c_break(γ) = (E[T] − 1)/γ, which is 0.760 at γ = 1, 0.529 at 4 and 0.313 at 8."
+        - "Measured c_eff at γ = 4 was 0.40 against a 0.41 break-even, so the run was 1.01× — an acceptance rate of 0.758 with nothing wrong with acceptance."
+        - "The model's cost ratio of 0.128 is not the stack's: per-position bookkeeping and unfused verification inflate it two to three times."
+      follow_up: "How would you measure c_eff from a running system instead of assuming the model's ratio?"
+    - question: "Does acceptance decay across a four-token draft? What does decay instead?"
+      level: senior
+      key_points:
+        - "Measured conditional acceptance at positions 1 to 4 was 0.761, 0.758, 0.680 and 0.715 — no systematic decay, because each draft token is judged against the target's logits on the same prefix."
+        - "What decays is the probability of reaching position k, which is α^k, so the step emits 1 + α + α² + … tokens rather than γ."
+        - "At α = 0.76 and γ = 4 that is about 3.11 tokens per step, and at α = 0.5 it is under 2."
+        - "Because draft cost grows linearly in γ while the expected gain saturates, the speedup has an interior maximum — γ = 4 at α = 0.7 and γ = 5 at α = 0.8."
+      follow_up: "At α = 0.5, what γ is optimal, and why is it smaller than at α = 0.8?"
+  common_mistakes:
+    - "Keeping the token whenever the draft and target agree, which changes the output distribution while every benchmark still looks plausible."
+    - "Resampling from p on rejection instead of from the residual, which is 46× further from the target distribution — TV 0.1001 against 0.0022."
+    - "Quoting the paper's 2.4× without measuring your own cost ratio, when 0.40 against a 0.41 break-even is a 1.01× result."
+  further_reading:
+    - label: "Leviathan, Kalman, Matias, Fast Inference from Transformers via Speculative Decoding, ICML 2023"
+    - label: "Chen, Borgeaud, Irving, Lespiau, Sifre, Jumper, Accelerating Large Language Model Decoding with Speculative Sampling"

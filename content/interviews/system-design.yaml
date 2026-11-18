@@ -1,0 +1,4042 @@
+- id: iv-sd-url-shortener
+  kind: system_design
+  level: mid
+  title: "Design a URL shortener"
+  prompt: >-
+    Design a service that turns a long URL into a short code and redirects a
+    visitor who hits that code. Assume 100M new links a day and 10B redirects a
+    day.
+  reference_topics: [system-design-foundations, information-theory]
+  stages:
+    - id: clarify
+      question: >-
+        Before drawing anything, what do you need to pin down?
+      intent: >-
+        The read/write ratio is the whole shape of this system, so a candidate
+        who does not ask for it will design for the wrong side.
+      hint: >-
+        Ten billion reads against a hundred million writes is a 100:1 read-heavy
+        system, which means the redirect path is where every design decision
+        lands and the write path is allowed to be slow.
+      criteria:
+        - id: ratio
+          label: "derives the read/write ratio and the per-second rates"
+          weight: 2
+          patterns: ["read heavy|read to write|100 to 1|reads dominate", "qps|per second|requests per second"]
+        - id: aliases
+          label: "asks about custom aliases, expiry and deletion"
+          weight: 1
+          patterns: ["custom|vanity|chosen alias", "expiry|expire|ttl|delet"]
+        - id: abuse
+          label: "raises abuse: phishing, spam and who may create links"
+          weight: 1
+          patterns: ["abuse|spam|phish|malicious|blocklist"]
+    - id: core
+      question: >-
+        How is a short code generated, and what does the redirect path look like?
+      intent: >-
+        This separates a candidate who hashes the URL from one who understands
+        why a counter plus base62 is the standard answer.
+      hint: >-
+        A counter encoded in base62 gives 3.5 trillion seven-character codes with
+        no collision check at all; hashing the URL forces a uniqueness check on
+        every write and leaks that two long URLs are the same.
+      criteria:
+        - id: counter
+          label: "generates codes from a counter or sequence, not from hashing the URL"
+          weight: 2
+          patterns: ["counter|sequence|snowflake|increment|monotonic id"]
+        - id: base62
+          label: "encodes the id in base62 and does the capacity arithmetic"
+          weight: 2
+          patterns: ["base ?62|62 characters|62 symbols|alphabet of 62"]
+        - id: readpath
+          label: "redirect is a key-value lookup with a cache in front"
+          weight: 2
+          patterns: ["key value|kv store|redis|dynamo|cassandra", "cache|cdn|edge"]
+    - id: scale
+      question: >-
+        What breaks first at ten billion redirects a day, and how do you fix it?
+      intent: >-
+        The answer is hot keys and cache misses, not storage capacity — probing
+        for that is the point of the stage.
+      hint: >-
+        A single viral link is one key receiving millions of reads, which no
+        sharded store spreads. Edge caching plus request coalescing is what keeps
+        it off the origin.
+      criteria:
+        - id: hotkey
+          label: "identifies the hot key / viral link problem"
+          weight: 2
+          patterns: ["hot key|hotspot|viral|celebrity|single key"]
+        - id: miss
+          label: "describes the cache-miss path and request coalescing"
+          weight: 1
+          patterns: ["cache miss|miss path|singleflight|coalesc|thundering"]
+        - id: code301
+          label: "compares 301 and 302 for caching versus click analytics"
+          weight: 1
+          patterns: ["301|302|permanent redirect|temporary redirect"]
+- id: iv-sd-news-feed
+  kind: system_design
+  level: senior
+  title: "Design a home timeline at Twitter scale"
+  prompt: >-
+    Design the home timeline: a user opens the app and sees recent posts from
+    accounts they follow, within 200 ms, at 500M daily users.
+  reference_topics: [system-design-foundations, cs-tiktok-recommendation]
+  stages:
+    - id: clarify
+      question: "What do you need to know about the read and write paths before choosing a fanout?"
+      intent: >-
+        Fanout choice is the entire question, and it depends on follower
+        distribution, which the candidate must ask for.
+      hint: >-
+        Ask for the follower distribution first: a median user has a few hundred
+        followers and a celebrity has a hundred million, and no single fanout
+        strategy serves both.
+      criteria:
+        - id: dist
+          label: "asks about follower distribution and celebrity accounts"
+          weight: 2
+          patterns: ["follower|celebrity|high degree|distribution|skew"]
+        - id: latency
+          label: "confirms the 200 ms budget is p99 and read-dominated"
+          weight: 1
+          patterns: ["p99|percentile|tail", "read heavy|reads dominate|read path"]
+        - id: freshness
+          label: "asks how fresh the timeline must be, and whether ranking applies"
+          weight: 1
+          patterns: ["fresh|staleness|real time|ranking|ranked|chronological"]
+    - id: core
+      question: "Fanout on write, fanout on read, or both? Defend the choice."
+      intent: >-
+        Expect a hybrid: precompute for normal users, merge at read time for
+        celebrities.
+      hint: >-
+        The defensible answer is hybrid: materialise each post into follower
+        inboxes for normal accounts, and for high-degree accounts store the post
+        once and merge it into the reader's timeline at request time.
+      criteria:
+        - id: write
+          label: "fanout on write into per-user inboxes, with the cost stated"
+          weight: 2
+          patterns: ["fanout on write|write fanout|push|inbox|materiali"]
+        - id: read
+          label: "fanout on read, or a merge of celebrity posts at request time"
+          weight: 2
+          patterns: ["fanout on read|pull|merge at read|read time merge|on demand"]
+        - id: hybrid
+          label: "states the hybrid and the threshold that switches strategies"
+          weight: 2
+          patterns: ["hybrid|both|threshold|cut ?off|above .* followers|celebrity path"]
+    - id: scale
+      question: "What does the storage layer look like, and what fails during a celebrity post?"
+      intent: >-
+        Probes whether the candidate can size an inbox store and reason about
+        write amplification.
+      hint: >-
+        Inboxes are a wide-column store trimmed to a few thousand entries; the
+        failure mode is a hundred million fanout writes from one post, which is
+        exactly why the celebrity path exists.
+      criteria:
+        - id: store
+          label: "names a wide-column or KV store with per-user partitioning"
+          weight: 2
+          patterns: ["cassandra|hbase|wide column|rocksdb|dynamo|partition by user"]
+        - id: trim
+          label: "bounds inbox size and trims or backfills old entries"
+          weight: 1
+          patterns: ["trim|cap|bound|keep the newest|backfill"]
+        - id: spike
+          label: "describes queueing or shedding when a single post fans out massively"
+          weight: 1
+          patterns: ["queue|backpressure|shed|rate limit|spike"]
+- id: iv-sd-chat
+  kind: system_design
+  level: senior
+  title: "Design a messaging system like WhatsApp"
+  prompt: >-
+    Design one-to-one and group chat: message delivery, ordering, offline
+    delivery and read receipts, for 2B users.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What has to be true about delivery and ordering before you design anything?"
+      intent: >-
+        Chat is a per-conversation ordering problem, not a global one, and the
+        candidate should say so.
+      hint: >-
+        Ordering only needs to hold within a conversation, which lets each
+        conversation own a monotonic sequence and removes any need for a global
+        clock.
+      criteria:
+        - id: order
+          label: "scopes ordering to the conversation, not globally"
+          weight: 2
+          patterns: ["per conversation|within a conversation|conversation level|chat level"]
+        - id: delivery
+          label: "separates at-least-once delivery from deduplication"
+          weight: 2
+          patterns: ["at least once|dedup|idempot|message id"]
+        - id: offline
+          label: "asks about offline delivery and multi-device sync"
+          weight: 1
+          patterns: ["offline|store and forward|multi device|multiple devices"]
+    - id: core
+      question: "How does a message travel from sender to receiver? Name every hop."
+      intent: >-
+        Probes the connection layer: persistent sockets, a session registry, and
+        a message queue between them.
+      hint: >-
+        The sender writes to a message service, which persists and enqueues; a
+        session service knows which gateway holds the recipient's socket, and the
+        gateway pushes. Without that registry you cannot route to a socket.
+      criteria:
+        - id: socket
+          label: "persistent connection (WebSocket or MQTT) with a gateway tier"
+          weight: 2
+          patterns: ["websocket|mqtt|long poll|persistent connection|gateway"]
+        - id: registry
+          label: "a session registry maps user to the gateway holding the connection"
+          weight: 2
+          patterns: ["session registry|presence|which node|connection registry|routing table"]
+        - id: persist
+          label: "message is persisted before or independently of delivery"
+          weight: 1
+          patterns: ["persist|durable|write ahead|store first|database"]
+    - id: scale
+      question: "Group chat with 1,000 members, and a user with four devices. What changes?"
+      intent: >-
+        Fanout multiplies, and per-device cursors replace a single delivery
+        pointer.
+      hint: >-
+        Each device needs its own cursor into the conversation, otherwise a
+        message read on a phone is lost on a laptop. For groups, fanout is
+        bounded by membership, so a per-member inbox is affordable.
+      criteria:
+        - id: cursor
+          label: "per-device delivery cursor or sync state"
+          weight: 2
+          patterns: ["cursor|per device|sync state|offset per device"]
+        - id: fanout
+          label: "group fanout writes to member inboxes, bounded by group size"
+          weight: 2
+          patterns: ["fanout|member inbox|per member|group size"]
+        - id: receipts
+          label: "read receipts aggregated rather than one write per reader"
+          weight: 1
+          patterns: ["receipt|aggregate|batch|coalesce"]
+- id: iv-sd-notifications
+  kind: system_design
+  level: mid
+  title: "Design a multi-channel notification service"
+  prompt: >-
+    Design a service that sends push, email and SMS notifications triggered by
+    product events, at 50M notifications an hour, without spamming users.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What questions decide the shape of this system?"
+      intent: >-
+        The interesting constraints are preferences, deduplication and provider
+        limits, not throughput.
+      hint: >-
+        Ask about user preferences and quiet hours first — a notification system
+        that ignores them is a spam cannon, and the preference check belongs on
+        the hot path.
+      criteria:
+        - id: prefs
+          label: "asks about per-channel preferences and quiet hours"
+          weight: 2
+          patterns: ["preference|opt out|opt in|quiet hours|do not disturb"]
+        - id: priority
+          label: "asks which notifications are transactional versus promotional"
+          weight: 1
+          patterns: ["transactional|promotional|marketing|priority|critical"]
+        - id: dedupe
+          label: "asks about deduplication and idempotency of triggers"
+          weight: 1
+          patterns: ["dedup|idempot|duplicate|same event twice"]
+    - id: core
+      question: "Walk the pipeline from product event to delivered push."
+      intent: >-
+        Expect ingestion, preference and suppression, templating, per-channel
+        queues, provider adapters, and a delivery log.
+      hint: >-
+        The pipeline is ingest, fan out by channel, evaluate preferences and
+        suppression, render from a template, enqueue per channel, hand to a
+        provider, and record the result. Skipping the suppression step is the
+        usual gap.
+      criteria:
+        - id: pipeline
+          label: "event ingestion decoupled from sending via a queue"
+          weight: 2
+          patterns: ["queue|kafka|stream|async|decouple"]
+        - id: suppress
+          label: "explicit suppression and preference evaluation before send"
+          weight: 2
+          patterns: ["suppress|preference check|filter|eligib"]
+        - id: template
+          label: "templating and localisation rendered per channel"
+          weight: 1
+          patterns: ["template|render|localis|localiz|i18n"]
+    - id: scale
+      question: "A provider starts rate limiting you, and a retry storm starts. What do you do?"
+      intent: >-
+        Probes backpressure, provider failover and retry policy.
+      hint: >-
+        Retries must be jittered and capped, per-provider quotas enforced with a
+        token bucket, and a second provider configured for failover — otherwise
+        one 429 becomes an outage.
+      criteria:
+        - id: backoff
+          label: "exponential backoff with jitter and a retry cap"
+          weight: 2
+          patterns: ["exponential|backoff|jitter|retry cap|max retries"]
+        - id: quota
+          label: "per-provider rate limiting and quota tracking"
+          weight: 2
+          patterns: ["quota|token bucket|rate limit|per provider"]
+        - id: failover
+          label: "provider failover and a dead-letter path"
+          weight: 1
+          patterns: ["failover|secondary provider|dead letter|dlq"]
+- id: iv-sd-rate-limiter
+  kind: system_design
+  level: mid
+  title: "Design a distributed rate limiter"
+  prompt: >-
+    Design a rate limiter that enforces per-tenant quotas across a fleet of API
+    servers, at 500k requests per second.
+  reference_topics: [system-design-foundations, probability-distributions]
+  stages:
+    - id: clarify
+      question: "What does the limiter have to guarantee, and what happens when it is wrong?"
+      intent: >-
+        The candidate must choose between approximate and exact limiting and
+        state the cost of each.
+      hint: >-
+        Ask whether strict accuracy matters. A limiter that is a few percent
+        over quota is fine; a limiter that adds 20 ms to every request is not,
+        and that trade decides the algorithm.
+      criteria:
+        - id: accuracy
+          label: "asks how exact the limit must be and what over-admission costs"
+          weight: 2
+          patterns: ["accur|exact|approximate|over admit|slight over"]
+        - id: window
+          label: "asks the window and whether it is per second, minute or burst"
+          weight: 1
+          patterns: ["window|per second|per minute|burst"]
+        - id: scope
+          label: "asks whether limits are per tenant, per key, or per endpoint"
+          weight: 1
+          patterns: ["per tenant|per key|per user|per endpoint|dimension"]
+    - id: core
+      question: "Which algorithm, and where does its state live?"
+      intent: >-
+        Token bucket is the expected answer; the state placement is the deeper
+        half.
+      hint: >-
+        A token bucket in Redis with a Lua script makes the read-modify-write
+        atomic; a local bucket per node is faster but lets the fleet exceed the
+        quota by the node count.
+      criteria:
+        - id: bucket
+          label: "token bucket or leaky bucket, with refill semantics"
+          weight: 2
+          patterns: ["token bucket|leaky bucket|gcra|refill"]
+        - id: atomic
+          label: "atomic read-modify-write, e.g. a Lua script or CAS"
+          weight: 2
+          patterns: ["lua|atomic|compare and swap|cas|transaction"]
+        - id: local
+          label: "local buckets with periodic reconciliation, and the error it admits"
+          weight: 1
+          patterns: ["local|in process|per node|gossip|reconcil"]
+    - id: scale
+      question: "The limiter itself becomes a dependency. How do you keep it off the critical path?"
+      intent: >-
+        Fail-open versus fail-closed is the staff-level judgement call.
+      hint: >-
+        Decide fail-open or fail-closed per endpoint before the outage, cache
+        decisions locally for a short window, and shard counters by key so one
+        hot tenant cannot saturate the store.
+      criteria:
+        - id: failmode
+          label: "states fail-open or fail-closed per route, and why"
+          weight: 2
+          patterns: ["fail open|fail closed|degrade|default allow"]
+        - id: shard
+          label: "shards the counter store by key to avoid a hot shard"
+          weight: 1
+          patterns: ["shard|partition|hot shard|spread"]
+        - id: localcache
+          label: "caches decisions locally for a short TTL to shed reads"
+          weight: 1
+          patterns: ["local cache|short ttl|cache the decision|batch"]
+- id: iv-sd-web-crawler
+  kind: system_design
+  level: mid
+  title: "Design a distributed web crawler"
+  prompt: >-
+    Design a crawler that fetches and stores a billion pages a month, respects
+    robots and politeness, and revisits pages sensibly.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What are the politeness and freshness requirements?"
+      intent: >-
+        Crawling is a scheduling and politeness problem long before it is a
+        throughput problem.
+      hint: >-
+        Politeness is per-host: one connection at a time, honour crawl-delay and
+        robots, and never let global throughput override a per-host rule.
+      criteria:
+        - id: politeness
+          label: "per-host politeness, robots and crawl-delay"
+          weight: 2
+          patterns: ["robots|politeness|crawl delay|per host|rate per host"]
+        - id: freshness
+          label: "asks how often pages must be revisited"
+          weight: 1
+          patterns: ["revisit|refresh|freshness|recrawl|change frequency"]
+        - id: scope
+          label: "asks what content types and languages are in scope"
+          weight: 1
+          patterns: ["content type|language|scope|allowlist|domain list"]
+    - id: core
+      question: "Describe the frontier and the fetch loop."
+      intent: >-
+        The frontier is a priority queue partitioned by host; deduplication
+        happens before enqueue.
+      hint: >-
+        The frontier is a set of per-host queues plus a global priority queue, and
+        URLs are normalised and checked against a seen-set before they are ever
+        enqueued — otherwise the crawl loops.
+      criteria:
+        - id: frontier
+          label: "frontier partitioned by host with a global priority"
+          weight: 2
+          patterns: ["frontier|priority queue|per host queue|scheduler"]
+        - id: dedupe
+          label: "URL normalisation and a seen-set or bloom filter"
+          weight: 2
+          patterns: ["normalis|normaliz|canonical|bloom|seen set|dedup"]
+        - id: extract
+          label: "link extraction feeds back into the frontier"
+          weight: 1
+          patterns: ["extract|parse|links|href|outlinks"]
+    - id: scale
+      question: "Two workers fetch the same host at once and the site bans you. What went wrong?"
+      intent: >-
+        Probes the coordination between distributed workers and the host
+        partition.
+      hint: >-
+        Host ownership must be assigned to exactly one worker through a
+        consistent-hash or lease, with a lease timeout so a dead worker's hosts
+        are reclaimed.
+      criteria:
+        - id: lease
+          label: "host leases or consistent hashing assign each host to one worker"
+          weight: 2
+          patterns: ["lease|consistent hash|ownership|assign host|shard by host"]
+        - id: timeout
+          label: "lease expiry and reclamation for dead workers"
+          weight: 1
+          patterns: ["expire|timeout|reclaim|heartbeat|dead worker"]
+        - id: backoff
+          label: "per-host backoff on errors and a blocklist for repeat offenders"
+          weight: 1
+          patterns: ["backoff|429|403|blocklist|ban"]
+- id: iv-sd-typeahead
+  kind: system_design
+  level: senior
+  title: "Design search autocomplete"
+  prompt: >-
+    Design typeahead suggestions: as a user types, return the ten most likely
+    completions in under 50 ms, personalised to their history.
+  reference_topics: [system-design-foundations, information-theory]
+  stages:
+    - id: clarify
+      question: "What is being suggested, and how fresh must the suggestions be?"
+      intent: >-
+        The candidate must separate global popularity from personal history and
+        ask about the update cadence.
+      hint: >-
+        Ask whether suggestions come from global query logs, the user's own
+        history, or both, and how stale a trending query may be — that decides
+        whether you can precompute at all.
+      criteria:
+        - id: source
+          label: "separates global popularity from personal history"
+          weight: 2
+          patterns: ["global|popular|query log|personal|history"]
+        - id: freshness
+          label: "asks the update cadence for trending queries"
+          weight: 1
+          patterns: ["fresh|trending|real time|update cadence|stale"]
+        - id: latency
+          label: "confirms the 50 ms budget and that it is tail latency"
+          weight: 1
+          patterns: ["p99|tail|50 ms|budget|percentile"]
+    - id: core
+      question: "How do you serve completions for a prefix in 50 ms?"
+      intent: >-
+        Expect a trie or a prefix-indexed KV store, precomputed top-k per node,
+        and aggressive caching.
+      hint: >-
+        Store the top ten completions at each trie node so a lookup is one walk,
+        not a subtree scan; a KV store keyed by prefix does the same job without
+        the pointer chasing.
+      criteria:
+        - id: trie
+          label: "trie or prefix tree, with top-k precomputed per node"
+          weight: 2
+          patterns: ["trie|prefix tree|prefix index|radix"]
+        - id: kv
+          label: "alternative: KV lookup keyed by prefix"
+          weight: 1
+          patterns: ["key value|kv|redis|lookup table|hash map"]
+        - id: cache
+          label: "caches hot prefixes at the edge"
+          weight: 1
+          patterns: ["cache|cdn|edge|memo"]
+    - id: scale
+      question: "How is the index rebuilt as queries trend, without serving stale garbage?"
+      intent: >-
+        Probes the batch pipeline and the publish step: build a new index,
+        validate it, swap atomically.
+      hint: >-
+        Rebuild offline from logs, score by frequency and recency, then publish a
+        new index version and swap the pointer; in-place mutation of a live trie
+        is how you serve a half-updated index.
+      criteria:
+        - id: pipeline
+          label: "offline aggregation of query logs with a scoring function"
+          weight: 2
+          patterns: ["offline|batch|aggregate|mapreduce|spark|logs"]
+        - id: swap
+          label: "build-then-swap with versioned indexes"
+          weight: 2
+          patterns: ["swap|version|blue green|atomic publish|new index"]
+        - id: filter
+          label: "filters unsafe or abusive suggestions"
+          weight: 1
+          patterns: ["filter|blocklist|safe|abuse|profan"]
+- id: iv-sd-kv-store
+  kind: system_design
+  level: staff
+  title: "Design a distributed key-value store"
+  prompt: >-
+    Design a sharded, replicated key-value store for 100 TB with tunable
+    consistency, surviving the loss of a node without data loss.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What consistency and durability guarantees are you promising?"
+      intent: >-
+        The candidate must choose a point on the consistency spectrum rather than
+        claiming all of them.
+      hint: >-
+        Say which operations are linearizable and which are eventually
+        consistent. A store that promises everything promises nothing testable.
+      criteria:
+        - id: consistency
+          label: "names a specific consistency model, not just strong or weak"
+          weight: 2
+          patterns: ["linearis|lineariz|eventual|quorum|read your writes|causal"]
+        - id: durability
+          label: "states the durability target: replicas, fsync, or both"
+          weight: 2
+          patterns: ["durab|replica|fsync|write ahead|acknowledg"]
+        - id: access
+          label: "asks the access pattern: key size, value size, read/write mix"
+          weight: 1
+          patterns: ["value size|key size|read write|access pattern|workload"]
+    - id: core
+      question: "How is data partitioned and replicated?"
+      intent: >-
+        Expect consistent hashing or range partitioning plus a replication
+        protocol with a defined leader.
+      hint: >-
+        Partition by a hash ring or by key range, replicate to three nodes, and
+        name the leader for each shard. Consistent hashing alone does not say who
+        accepts the write.
+      criteria:
+        - id: partition
+          label: "hash or range partitioning with a stated rebalance strategy"
+          weight: 2
+          patterns: ["consistent hash|range partition|shard|virtual node|rebalance"]
+        - id: replication
+          label: "leader-based or quorum replication with a defined write path"
+          weight: 2
+          patterns: ["leader|primary|quorum|raft|paxos|replica set"]
+        - id: routing
+          label: "a metadata service or gossip layer maps key to shard"
+          weight: 1
+          patterns: ["metadata|routing|gossip|membership|cluster map"]
+    - id: scale
+      question: "A node dies mid-write, and then a rack loses power. What happens?"
+      intent: >-
+        Probes failure semantics, hinted handoff, and whether the candidate knows
+        the difference between node and rack failure domains.
+      hint: >-
+        A single node death is one replica short with hinted handoff; a rack loss
+        is a correlated failure, which is why replicas must be placed across
+        failure domains rather than across random nodes.
+      criteria:
+        - id: handoff
+          label: "hinted handoff or anti-entropy repair after a node returns"
+          weight: 2
+          patterns: ["hinted handoff|anti entropy|repair|merkle|read repair"]
+        - id: domains
+          label: "replica placement across racks or availability zones"
+          weight: 2
+          patterns: ["rack|zone|failure domain|topology aware|spread"]
+        - id: splitbrain
+          label: "addresses split brain or quorum loss on the minority side"
+          weight: 1
+          patterns: ["split brain|quorum|minority|fencing|epoch"]
+- id: iv-sd-object-storage
+  kind: system_design
+  level: senior
+  title: "Design object storage like S3"
+  prompt: >-
+    Design object storage: put and get blobs up to 5 TB, eleven nines of
+    durability, and strong read-after-write consistency for new objects.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What are the size distribution and access pattern of the objects?"
+      intent: >-
+        Object storage is two systems: metadata and bulk bytes, and the split is
+        driven by object size.
+      hint: >-
+        Ask for the object size distribution — small objects make metadata the
+        bottleneck and large objects make the data path the bottleneck, and the
+        design differs.
+      criteria:
+        - id: size
+          label: "asks the object size distribution and the tail"
+          weight: 2
+          patterns: ["object size|size distribution|small object|large object|median size"]
+        - id: pattern
+          label: "asks read/write ratio and whether access is sequential or random"
+          weight: 1
+          patterns: ["read write|sequential|random access|hot|cold"]
+        - id: durability
+          label: "translates eleven nines into a replication or erasure strategy"
+          weight: 1
+          patterns: ["erasure|replication factor|checksum|durability target"]
+    - id: core
+      question: "Separate the metadata path from the byte path and justify it."
+      intent: >-
+        Probes the core architectural split: a metadata service over a
+        distributed block or blob layer.
+      hint: >-
+        Metadata lives in a transactional store keyed by bucket and key;
+        bytes live in immutable chunks placed by a placement service. Mixing them
+        gives you a filesystem, which is the thing you were avoiding.
+      criteria:
+        - id: split
+          label: "separate metadata service and data plane"
+          weight: 2
+          patterns: ["metadata|namespace|separate|data plane|control plane"]
+        - id: chunks
+          label: "objects chunked into immutable blocks with content hashes"
+          weight: 2
+          patterns: ["chunk|block|immutable|content hash|checksum"]
+        - id: placement
+          label: "a placement service decides which disks hold which chunks"
+          weight: 1
+          patterns: ["placement|allocat|which node|cluster map|crush"]
+    - id: scale
+      question: "How do you hit eleven nines without eleven copies?"
+      intent: >-
+        Erasure coding is the expected answer, along with its repair cost.
+      hint: >-
+        Erasure coding at something like 12 plus 4 gives durability close to
+        many replicas at a fraction of the bytes, but repair traffic becomes the
+        operational problem.
+      criteria:
+        - id: erasure
+          label: "erasure coding with a stated scheme and overhead"
+          weight: 2
+          patterns: ["erasure|reed solomon|parity|12 plus 4|striping"]
+        - id: repair
+          label: "background repair and scrubbing to catch silent corruption"
+          weight: 2
+          patterns: ["scrub|repair|verify|silent corruption|bit rot"]
+        - id: consistency
+          label: "read-after-write consistency via a single metadata authority per key"
+          weight: 1
+          patterns: ["read after write|strong consistency|single writer|version"]
+- id: iv-sd-cdn
+  kind: system_design
+  level: staff
+  title: "Design a content delivery network"
+  prompt: >-
+    Design a CDN that serves static and video content from 200 edge locations,
+    with cache invalidation and origin protection.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What is cached, for how long, and who decides?"
+      intent: >-
+        Cacheability and TTL ownership determine whether the design is a proxy
+        or a platform.
+      hint: >-
+        Ask whether TTLs are set by the customer or by the CDN, and whether
+        content is public or authenticated — private content changes the cache
+        key entirely.
+      criteria:
+        - id: ttl
+          label: "asks who controls TTL and whether it can be purged"
+          weight: 2
+          patterns: ["ttl|max age|cache control|purge|invalidate"]
+        - id: private
+          label: "asks whether content is public or authenticated"
+          weight: 2
+          patterns: ["private|authenticated|signed url|token|personalised|personalized"]
+        - id: types
+          label: "asks about content types and whether video needs range requests"
+          weight: 1
+          patterns: ["range request|video|segment|hls|dash|static"]
+    - id: core
+      question: "How does a request reach the right edge, and how does the edge decide a miss?"
+      intent: >-
+        Expect anycast or DNS steering, a tiered cache, and a cache key that
+        includes the varying dimensions.
+      hint: >-
+        Anycast gets the packet to a nearby edge; a mid-tier shield cache absorbs
+        misses so 200 edges do not each hit the origin. The cache key must include
+        every header the origin varies on.
+      criteria:
+        - id: routing
+          label: "anycast or DNS-based steering to the nearest edge"
+          weight: 2
+          patterns: ["anycast|dns|geo|nearest|latency based"]
+        - id: tier
+          label: "tiered cache or shield between edge and origin"
+          weight: 2
+          patterns: ["tier|shield|mid tier|parent cache|origin shield"]
+        - id: key
+          label: "cache key includes the varying dimensions"
+          weight: 2
+          patterns: ["cache key|vary|header|query string|normalis"]
+    - id: scale
+      question: "A customer pushes a bad deploy and needs a global purge in ten seconds. How?"
+      intent: >-
+        Probes invalidation propagation and the cost of a purge versus a TTL.
+      hint: >-
+        Purge by tag rather than by URL, propagate through a control plane with a
+        versioned generation number the edges check, and accept that a global
+        purge is a fan-out problem with a long tail.
+      criteria:
+        - id: purge
+          label: "tag-based or surrogate-key purge rather than URL enumeration"
+          weight: 2
+          patterns: ["surrogate|tag based|purge by tag|wildcard purge"]
+        - id: propagate
+          label: "control-plane propagation with a version or generation check"
+          weight: 1
+          patterns: ["control plane|propagat|generation|version|push to edge"]
+        - id: tail
+          label: "acknowledges the long tail of edges and staleness window"
+          weight: 1
+          patterns: ["long tail|eventual|stale window|most edges|converge"]
+- id: iv-sd-payment-ledger
+  kind: system_design
+  level: staff
+  title: "Design a double-entry payment ledger"
+  prompt: >-
+    Design the ledger behind a payments product: every movement of money is
+    recorded, balances are always reconstructable, and no money is created or
+    destroyed.
+  reference_topics: [system-design-foundations, cs-fraud-detection]
+  stages:
+    - id: clarify
+      question: "What must be true of a ledger before you design its API?"
+      intent: >-
+        The invariant is the design: debits equal credits, append-only, and
+        balances derived.
+      hint: >-
+        State the invariant first: every transaction's debits equal its credits,
+        entries are append-only, and a balance is a projection you can rebuild.
+      criteria:
+        - id: invariant
+          label: "states debits equal credits and entries are immutable"
+          weight: 2
+          patterns: ["double entry|debits equal credits|balanced|immutable|append only"]
+        - id: derived
+          label: "balances are derived from entries, not stored as truth"
+          weight: 2
+          patterns: ["derive|projection|recompute|snapshot|balance from entries"]
+        - id: currency
+          label: "asks about multi-currency and rounding"
+          weight: 1
+          patterns: ["currency|fx|rounding|minor unit|cents|decimal"]
+    - id: core
+      question: "What is the write path for a single transfer?"
+      intent: >-
+        Probes atomicity, idempotency and the ordering of the two postings.
+      hint: >-
+        One transaction writes both postings atomically with an idempotency key
+        supplied by the caller; if the key is seen twice you return the original
+        result rather than posting again.
+      criteria:
+        - id: atomic
+          label: "both postings written in one atomic transaction"
+          weight: 2
+          patterns: ["atomic|single transaction|all or nothing|same transaction"]
+        - id: idempotency
+          label: "caller-supplied idempotency key with stored result"
+          weight: 3
+          patterns: ["idempotency key|idempotent|dedupe key|request id"]
+        - id: order
+          label: "a monotonic sequence or timestamp orders entries"
+          weight: 1
+          patterns: ["sequence|monotonic|ordering|timestamp|version"]
+    - id: scale
+      question: "How do you prove the ledger is correct at the end of the month?"
+      intent: >-
+        Reconciliation and invariants checked by a job, not by trust.
+      hint: >-
+        A reconciliation job recomputes every balance from entries and compares
+        against external statements; a persistent mismatch is a P0, because the
+        ledger is the source of truth for money.
+      criteria:
+        - id: reconcile
+          label: "periodic reconciliation against the derived balance"
+          weight: 2
+          patterns: ["reconcil|check|recompute|compare|sum of entries"]
+        - id: external
+          label: "reconciles against the payment provider's settlement file"
+          weight: 2
+          patterns: ["settlement|provider|bank|statement|clearing"]
+        - id: audit
+          label: "an audit trail that cannot be edited, only appended"
+          weight: 1
+          patterns: ["audit|immutable|append only|hash chain|tamper"]
+- id: iv-sd-ride-hailing
+  kind: system_design
+  level: staff
+  title: "Design ride-hailing dispatch"
+  prompt: >-
+    Design the system that matches riders to nearby drivers within thirty
+    seconds, at a million concurrent drivers across a hundred cities.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What does a match have to optimise, and how long may it take?"
+      intent: >-
+        The objective is a policy question — ETA, fairness, utilisation — and the
+        candidate must ask.
+      hint: >-
+        Ask whether you optimise rider wait, driver earnings, or fleet
+        utilisation. Those objectives produce different matches, and the
+        interviewer wants to hear that you know it.
+      criteria:
+        - id: objective
+          label: "asks what the match optimises and who it favours"
+          weight: 2
+          patterns: ["optimis|optimiz|objective|metric|fairness|utilisation|utilization"]
+        - id: deadline
+          label: "treats thirty seconds as a hard deadline with a fallback"
+          weight: 1
+          patterns: ["deadline|30 seconds|timeout|fallback|best effort"]
+        - id: geo
+          label: "asks about city partitioning and location update rate"
+          weight: 1
+          patterns: ["city|region|geo|location update|gps|heartbeat"]
+    - id: core
+      question: "How do you find nearby available drivers and pick one?"
+      intent: >-
+        Expect a geospatial index, a candidate set, and a scoring or assignment
+        step.
+      hint: >-
+        A grid or geohash index returns candidates in the cell and its
+        neighbours; then score by ETA, not straight-line distance, and exclude
+        drivers already assigned.
+      criteria:
+        - id: index
+          label: "geohash, S2, or grid index for candidate lookup"
+          weight: 2
+          patterns: ["geohash|s2|grid|quadtree|h3|spatial index"]
+        - id: eta
+          label: "scores by road ETA rather than Euclidean distance"
+          weight: 2
+          patterns: ["eta|travel time|route|road network|traffic"]
+        - id: lock
+          label: "a driver is reserved atomically so two riders cannot match it"
+          weight: 2
+          patterns: ["lock|reserve|atomic|lease|claim|dedup"]
+    - id: scale
+      question: "Two riders and one driver race for the same car. What is the guarantee?"
+      intent: >-
+        Probes the concurrency control on assignment and the compensating
+        action when a rider cancels.
+      hint: >-
+        Assignment must be a compare-and-set on the driver's state; the loser is
+        re-queued rather than failed. A timeout on the rider's acceptance must
+        release the reservation, or drivers leak.
+      criteria:
+        - id: cas
+          label: "compare-and-set or distributed lock on driver state"
+          weight: 2
+          patterns: ["compare and set|cas|optimistic|lock|conditional write"]
+        - id: release
+          label: "reservation expiry releases the driver on timeout or cancel"
+          weight: 2
+          patterns: ["expire|timeout|release|ttl|cancel"]
+        - id: requeue
+          label: "the losing rider is re-queued or offered the next candidate"
+          weight: 1
+          patterns: ["requeue|retry|next candidate|fallback"]
+- id: iv-sd-ticket-booking
+  kind: system_design
+  level: senior
+  title: "Design ticket booking with seat selection"
+  prompt: >-
+    Design a concert ticketing system: users pick specific seats, hold them
+    while they pay, and two users must never get the same seat.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "How long is a hold, and what happens to the seat when it expires?"
+      intent: >-
+        The hold lifecycle is the system; everything else is CRUD around it.
+      hint: >-
+        A hold must have a TTL, and expiry must return the seat to inventory
+        automatically. Without a TTL, abandoned carts silently remove seats from
+        sale.
+      criteria:
+        - id: ttl
+          label: "asks the hold duration and defines expiry behaviour"
+          weight: 2
+          patterns: ["hold|ttl|expire|reservation window|timer"]
+        - id: contention
+          label: "asks about the contention level for a popular show"
+          weight: 1
+          patterns: ["flash|contention|popular|sold out|rush|on sale"]
+        - id: fairness
+          label: "asks whether queueing or lottery is required for fairness"
+          weight: 1
+          patterns: ["fair|queue|lotto|lottery|waiting room|bot"]
+    - id: core
+      question: "How do you prevent double-selling a seat?"
+      intent: >-
+        Expect a conditional write on the seat row, or a lease, with the
+        transaction boundary stated.
+      hint: >-
+        The seat is a row with a version; the hold is an UPDATE with a WHERE on
+        the expected status. A read-then-write without a condition double-sells
+        under concurrency.
+      criteria:
+        - id: conditional
+          label: "conditional update or row lock on the seat"
+          weight: 3
+          patterns: ["conditional|where status|compare and set|row lock|select for update"]
+        - id: lease
+          label: "a hold token with an expiry that the payment step validates"
+          weight: 2
+          patterns: ["hold token|lease|reservation id|expiry|validate hold"]
+        - id: inventory
+          label: "inventory is the database, not a cache"
+          weight: 1
+          patterns: ["database|source of truth|transactional|acid"]
+- id: iv-sd-photo-sharing
+  kind: system_design
+  level: mid
+  title: "Design a photo sharing app"
+  prompt: >-
+    Design Instagram's core: upload a photo, follow people, and see a feed of
+    photos. 100M uploads a day, 1B feed reads a day.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What is the media pipeline, and what does the feed need to contain?"
+      intent: >-
+        Upload and feed are separate systems; conflating them is the common miss.
+      hint: >-
+        Split the answer at the start: a media pipeline that stores and
+        transcodes bytes, and a metadata plus feed system that serves small JSON.
+      criteria:
+        - id: split
+          label: "separates media storage from feed metadata"
+          weight: 2
+          patterns: ["separate|two systems|media|metadata|feed"]
+        - id: size
+          label: "asks the image size and how many renditions are needed"
+          weight: 1
+          patterns: ["resolution|rendition|thumbnail|size|variant"]
+        - id: readratio
+          label: "notes that reads vastly outnumber writes"
+          weight: 1
+          patterns: ["read heavy|reads outnumber|ratio|read to write"]
+    - id: core
+      question: "How does an upload become visible in a follower's feed?"
+      intent: >-
+        Expect object storage plus CDN for bytes, a metadata row, and a fanout to
+        follower feeds.
+      hint: >-
+        Bytes go to object storage and are served through a CDN; the post id is
+        appended to each follower's feed list, and the feed read is a single
+        range scan of that list plus a metadata lookup.
+      criteria:
+        - id: storage
+          label: "object storage for bytes and a CDN for delivery"
+          weight: 2
+          patterns: ["object storage|s3|blob|cdn|edge"]
+        - id: fanout
+          label: "post ids fanned out to follower feed lists"
+          weight: 2
+          patterns: ["fanout|feed list|inbox|push to follower|timeline"]
+        - id: hydration
+          label: "feed read hydrates ids with metadata in a batch"
+          weight: 1
+          patterns: ["hydrate|batch|multi get|lookup|join"]
+    - id: scale
+      question: "What happens when a user with 50M followers posts?"
+      intent: >-
+        Probes the celebrity problem and whether the candidate reuses the same
+        hybrid answer as a timeline.
+      hint: >-
+        Fanout to 50M inboxes is not affordable, so high-degree accounts are
+        merged at read time; the threshold is a product and cost decision, not a
+        technical constant.
+      criteria:
+        - id: celebrity
+          label: "hybrid fanout with a celebrity threshold"
+          weight: 2
+          patterns: ["celebrity|high degree|threshold|hybrid|merge at read"]
+        - id: async
+          label: "fanout runs asynchronously through a queue"
+          weight: 1
+          patterns: ["async|queue|worker|background"]
+        - id: degrade
+          label: "feed degrades gracefully when fanout lags"
+          weight: 1
+          patterns: ["lag|stale|degrade|eventual|catch up"]
+- id: iv-sd-file-sync
+  kind: system_design
+  level: senior
+  title: "Design file sync like Dropbox"
+  prompt: >-
+    Design a sync service: a file edited on one device appears on the others
+    within seconds, conflicts are resolved, and history is kept.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What is the unit of sync, and what does a conflict mean?"
+      intent: >-
+        Block-level versus file-level sync and the conflict policy are the
+        design.
+      hint: >-
+        Decide whether you sync whole files or content-defined chunks, and say
+        what happens when two devices edit the same file offline. Keeping both
+        and naming one a conflict copy is a policy, not a resolution.
+      criteria:
+        - id: unit
+          label: "asks or decides block-level versus file-level sync"
+          weight: 2
+          patterns: ["block|chunk|whole file|file level|delta"]
+        - id: conflict
+          label: "states a conflict policy explicitly"
+          weight: 2
+          patterns: ["conflict|last writer|merge|both copies|version vector"]
+        - id: history
+          label: "asks how much version history is retained"
+          weight: 1
+          patterns: ["history|version|retention|snapshot|restore"]
+    - id: core
+      question: "How does a change on one device reach the others, efficiently?"
+      intent: >-
+        Expect content-defined chunking, a manifest, and only-changed-chunk
+        upload.
+      hint: >-
+        Chunk with a rolling hash so an insertion does not shift every boundary,
+        hash the chunks, upload only the missing ones, then publish a new
+        manifest the other clients diff against.
+      criteria:
+        - id: chunk
+          label: "content-defined chunking with a rolling hash"
+          weight: 2
+          patterns: ["content defined|rolling hash|rabin|chunk|dedup"]
+        - id: manifest
+          label: "a manifest or tree maps file to chunk list"
+          weight: 2
+          patterns: ["manifest|tree|chunk list|metadata|index"]
+        - id: delta
+          label: "only missing chunks are uploaded"
+          weight: 2
+          patterns: ["only changed|missing chunk|delta|incremental|dedup"]
+    - id: scale
+      question: "Two devices edit the same file while offline. What does the user see?"
+      intent: >-
+        Probes causal ordering and the honesty of the conflict story.
+      hint: >-
+        Without a merge, the honest answer is to keep both: the later manifest
+        wins the name and the other becomes a conflict copy. Silent overwrite is
+        data loss.
+      criteria:
+        - id: vector
+          label: "version vectors or a causal graph detect concurrency"
+          weight: 2
+          patterns: ["version vector|vector clock|causal|lamport|revision"]
+        - id: copy
+          label: "conflict copy or explicit user resolution"
+          weight: 2
+          patterns: ["conflict copy|duplicate|ask the user|manual merge|both"]
+        - id: notify
+          label: "the user is notified rather than silently losing a version"
+          weight: 1
+          patterns: ["notify|surface|warn|history|restore"]
+- id: iv-sd-collab-editor
+  kind: system_design
+  level: staff
+  title: "Design a collaborative document editor"
+  prompt: >-
+    Design real-time collaborative editing: many cursors in one document,
+    sub-100 ms propagation, offline edits that merge on reconnect.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What consistency model does concurrent editing need?"
+      intent: >-
+        The candidate must name a CRDT or OT, and understand why plain
+        last-write-wins destroys text.
+      hint: >-
+        Concurrent character inserts need a merge that preserves intent, which
+        means operational transform or a CRDT. Last-write-wins on a document
+        loses characters.
+      criteria:
+        - id: model
+          label: "names operational transform or a CRDT"
+          weight: 3
+          patterns: ["operational transform|ot|crdt|yjs|automerge|merge algorithm"]
+        - id: concurrent
+          label: "explains what happens to two concurrent inserts"
+          weight: 2
+          patterns: ["concurrent|same position|interleav|conflict|order"]
+        - id: offline
+          label: "asks about offline editing and reconnect"
+          weight: 1
+          patterns: ["offline|reconnect|replay|queue of ops"]
+    - id: core
+      question: "How do edits travel between clients, and who is the authority?"
+      intent: >-
+        Expect a WebSocket fanout with a server that orders or transforms, and a
+        durable op log.
+      hint: >-
+        Clients send operations over a WebSocket; the server assigns a total
+        order or transforms against pending ops, then broadcasts and appends to a
+        log so a late joiner can rebuild.
+      criteria:
+        - id: socket
+          label: "WebSocket or similar bidirectional channel"
+          weight: 1
+          patterns: ["websocket|socket|bidirectional|persistent connection"]
+        - id: order
+          label: "the server sequences operations or transforms them"
+          weight: 2
+          patterns: ["sequence|total order|transform|server authorit|serialis"]
+        - id: log
+          label: "an append-only op log supports replay and late join"
+          weight: 2
+          patterns: ["op log|append|replay|snapshot|catch up"]
+    - id: scale
+      question: "A document has 500 concurrent editors and 10M characters. What degrades?"
+      intent: >-
+        Probes op-log growth, snapshotting, and per-document sharding.
+      hint: >-
+        The op log grows without bound, so you snapshot and truncate; the
+        document itself is a single-writer bottleneck, so shard by document and
+        cap the fanout per room.
+      criteria:
+        - id: snapshot
+          label: "periodic snapshots with log truncation"
+          weight: 2
+          patterns: ["snapshot|compact|truncate|checkpoint"]
+        - id: shard
+          label: "documents are sharded across servers by document id"
+          weight: 1
+          patterns: ["shard|partition by document|document id|room"]
+        - id: presence
+          label: "cursors and presence are ephemeral and not persisted"
+          weight: 1
+          patterns: ["presence|cursor|ephemeral|not persisted|throttle"]
+- id: iv-sd-video-streaming
+  kind: system_design
+  level: senior
+  title: "Design a video streaming platform"
+  prompt: >-
+    Design YouTube's playback path: upload a video, transcode it, and stream it
+    adaptively to millions of viewers.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What are the viewership and upload distributions?"
+      intent: >-
+        A long tail of views with a short head of viral videos is what makes the
+        CDN strategy work.
+      hint: >-
+        Ask about the view distribution: a tiny fraction of videos gets most
+        views, which is why the CDN can be sized for the head and the origin for
+        the tail.
+      criteria:
+        - id: dist
+          label: "asks the view distribution and identifies the long tail"
+          weight: 2
+          patterns: ["long tail|distribution|viral|popular|head"]
+        - id: formats
+          label: "asks about resolutions and device targets"
+          weight: 1
+          patterns: ["resolution|1080|4k|device|codec|bitrate"]
+        - id: latency
+          label: "distinguishes startup latency from steady-state buffering"
+          weight: 1
+          patterns: ["startup|time to first|buffer|rebuffer|latency"]
+    - id: core
+      question: "Walk the path from an uploaded file to a playing video."
+      intent: >-
+        Expect chunked upload, a transcode fan-out per rendition, segmentation,
+        and manifest-based playback.
+      hint: >-
+        The upload lands in object storage, a workflow fans out one transcode job
+        per rendition, outputs are segmented into short chunks with a manifest,
+        and playback is HTTP range requests against a CDN.
+      criteria:
+        - id: transcode
+          label: "per-rendition transcode jobs, parallelised"
+          weight: 2
+          patterns: ["transcode|rendition|per resolution|parallel|fan out"]
+        - id: segment
+          label: "segmentation and a manifest such as HLS or DASH"
+          weight: 2
+          patterns: ["hls|dash|segment|manifest|chunk"]
+        - id: cdn
+          label: "CDN delivery with range requests"
+          weight: 2
+          patterns: ["cdn|edge|range request|cache"]
+    - id: scale
+      question: "How does the player choose a bitrate, and what does your system do to help it?"
+      intent: >-
+        Probes adaptive bitrate: segment sizes, manifest metadata, and the
+        rebuffer tradeoff.
+      hint: >-
+        The player measures throughput and buffer occupancy and switches
+        renditions; your job is to publish accurate bitrate metadata, keep
+        segments short, and keep the CDN close.
+      criteria:
+        - id: abr
+          label: "adaptive bitrate switching driven by measured throughput and buffer"
+          weight: 2
+          patterns: ["adaptive|abr|bitrate ladder|switch|throughput"]
+        - id: segments
+          label: "segment length trades startup latency against switch agility"
+          weight: 1
+          patterns: ["segment length|short segment|startup|switch"]
+        - id: prewarm
+          label: "pre-warms or pushes popular content to the edge"
+          weight: 1
+          patterns: ["prewarm|pre fetch|push to edge|popularity"]
+- id: iv-sd-live-streaming
+  kind: system_design
+  level: senior
+  title: "Design live streaming with chat"
+  prompt: >-
+    Design a live streaming platform: a streamer pushes video, 100k viewers
+    watch with a few seconds of latency, and chat scrolls alongside.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What latency is acceptable, and does it differ for video and chat?"
+      intent: >-
+        Latency budget is the defining constraint, and chat has a different one
+        from video.
+      hint: >-
+        Ask for the latency target: interactive streaming wants two to five
+        seconds, which rules out the segment sizes you would use for video on
+        demand.
+      criteria:
+        - id: latency
+          label: "asks the glass-to-glass latency target"
+          weight: 2
+          patterns: ["latency|delay|seconds|glass to glass|real time"]
+        - id: scale
+          label: "asks the viewer count and its distribution per stream"
+          weight: 1
+          patterns: ["viewer|concurrent|audience|fanout"]
+        - id: chat
+          label: "separates chat from video delivery"
+          weight: 1
+          patterns: ["chat|separate|different path|comment"]
+    - id: core
+      question: "How does an ingested stream reach 100k viewers?"
+      intent: >-
+        Expect ingest, a transcoder, a packager, and a fanout tier that does not
+        multiply egress naively.
+      hint: >-
+        Ingest over RTMP or SRT, transcode to a small ladder, package into short
+        segments, then fan out through a tree or a CDN PoP so one origin stream
+        does not serve 100k sockets.
+      criteria:
+        - id: ingest
+          label: "ingest protocol such as RTMP or SRT"
+          weight: 1
+          patterns: ["rtmp|srt|webrtc|ingest|push"]
+        - id: package
+          label: "short segments or WebRTC for low latency"
+          weight: 2
+          patterns: ["segment|webrtc|ll hls|low latency|cmaf"]
+        - id: tree
+          label: "hierarchical fanout or CDN, not one origin to all viewers"
+          weight: 2
+          patterns: ["fanout|tree|cdn|relay|peer|pop"]
+    - id: scale
+      question: "Chat at 100k messages a minute in one room. How do you keep it usable?"
+      intent: >-
+        Probes fanout cost, sampling, and rate limiting per viewer.
+      hint: >-
+        You cannot deliver every message to every viewer. Rate-limit per user,
+        batch delivery, and for very large rooms show a sampled or aggregated
+        chat rather than the full firehose.
+      criteria:
+        - id: ratelimit
+          label: "per-user rate limits and moderation on the chat path"
+          weight: 2
+          patterns: ["rate limit|throttle|moderat|slow mode"]
+        - id: batch
+          label: "batches messages per delivery tick instead of per message"
+          weight: 2
+          patterns: ["batch|coalesce|tick|window|aggregate"]
+        - id: sample
+          label: "samples or truncates for very large rooms"
+          weight: 1
+          patterns: ["sample|truncate|top messages|slow mode|subset"]
+- id: iv-sd-ad-aggregation
+  kind: system_design
+  level: senior
+  title: "Design ad click aggregation"
+  prompt: >-
+    Design the pipeline that counts ad impressions and clicks for billing:
+    1M events a second, counts must be exact for invoices, and dashboards must
+    be near-real-time.
+  reference_topics: [system-design-foundations, time-series]
+  stages:
+    - id: clarify
+      question: "What must be exact, and what may be approximate?"
+      intent: >-
+        Billing exactness versus dashboard freshness is the lambda-versus-kappa
+        decision.
+      hint: >-
+        Invoices must be exact and reproducible; dashboards may be a few minutes
+        stale. Say which is which before choosing a streaming design.
+      criteria:
+        - id: exact
+          label: "separates billing-grade exactness from dashboard approximation"
+          weight: 3
+          patterns: ["exact|billing|invoice|approximate|dashboard"]
+        - id: delay
+          label: "asks the acceptable delay for dashboards"
+          weight: 1
+          patterns: ["delay|fresh|minutes|near real time|stale"]
+        - id: dedupe
+          label: "asks about duplicate events and late arrivals"
+          weight: 2
+          patterns: ["duplicate|dedup|late|out of order|idempot"]
+    - id: core
+      question: "Streaming, batch, or both? Justify the choice."
+      intent: >-
+        Expect a streaming layer for dashboards and a batch recomputation for the
+        invoice of record.
+      hint: >-
+        The defensible answer is both: streaming gives freshness, batch gives a
+        reproducible invoice from the immutable event log, and the two are
+        reconciled rather than trusted independently.
+      criteria:
+        - id: stream
+          label: "a streaming layer with windowed aggregation"
+          weight: 2
+          patterns: ["stream|kafka|flink|window|real time"]
+        - id: batch
+          label: "a batch layer that recomputes from the log"
+          weight: 2
+          patterns: ["batch|recompute|replay|hourly|daily job"]
+        - id: reconcile
+          label: "reconciliation between the two paths"
+          weight: 1
+          patterns: ["reconcil|compare|diff|audit"]
+    - id: scale
+      question: "Events arrive up to two hours late during a Kafka outage. What happens to your counts?"
+      intent: >-
+        Probes watermarks, allowed lateness, and whether the candidate would
+        silently drop data.
+      hint: >-
+        Late events must be accepted within a defined window and the aggregate
+        updated; beyond that they go to a reprocessing path, not the bin. Dropping
+        them quietly makes the invoice wrong.
+      criteria:
+        - id: watermark
+          label: "watermarks and an explicit allowed-lateness window"
+          weight: 2
+          patterns: ["watermark|allowed lateness|late window|grace period"]
+        - id: reprocess
+          label: "a reprocessing or backfill path for events beyond the window"
+          weight: 2
+          patterns: ["reprocess|backfill|replay|dead letter|side input"]
+        - id: idempotent
+          label: "idempotent aggregation keyed by event id"
+          weight: 1
+          patterns: ["idempot|event id|dedup|exactly once"]
+- id: iv-sd-unique-ids
+  kind: system_design
+  level: mid
+  title: "Design a unique ID generator"
+  prompt: >-
+    Design a service that issues unique 64-bit ids at 10M per second across
+    many data centres, roughly time-ordered.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What properties must the id have beyond uniqueness?"
+      intent: >-
+        Time ordering and monotonicity are separate requirements from uniqueness.
+      hint: >-
+        Ask whether ids must be sortable by creation time and whether strict
+        monotonicity per key is required — a snowflake is roughly ordered, not
+        strictly.
+      criteria:
+        - id: ordering
+          label: "asks whether ids must be time-sortable"
+          weight: 2
+          patterns: ["sortable|ordered|monotonic|time ordered|k sortable"]
+        - id: size
+          label: "asks the required width and whether ids are exposed to users"
+          weight: 1
+          patterns: ["64 bit|128 bit|width|guessable|exposed"]
+        - id: clock
+          label: "raises clock skew between machines"
+          weight: 2
+          patterns: ["clock|skew|drift|ntp|time synchron"]
+    - id: core
+      question: "Which scheme do you pick, and what is in the bit layout?"
+      intent: >-
+        Expect snowflake-style: timestamp, machine id, sequence, with the
+        arithmetic for bits per field.
+      hint: >-
+        A snowflake is a timestamp in milliseconds, a worker id, and a per worker
+        sequence. Do the bit arithmetic out loud: 41 bits of milliseconds is
+        about 69 years.
+      criteria:
+        - id: snowflake
+          label: "snowflake layout with timestamp, worker and sequence"
+          weight: 3
+          patterns: ["snowflake|timestamp|worker id|machine id|sequence"]
+        - id: bits
+          label: "allocates bits explicitly and does the arithmetic"
+          weight: 2
+          patterns: ["41 bit|10 bit|12 bit|bits for|wrap"]
+        - id: alternatives
+          label: "compares with UUID, a segment allocator, or a database sequence"
+          weight: 1
+          patterns: ["uuid|segment|leaf|database sequence|range allocat"]
+    - id: scale
+      question: "What happens when the clock jumps backwards on one worker?"
+      intent: >-
+        Probes the known failure mode and the standard refusal to issue ids.
+      hint: >-
+        A backwards clock can mint a duplicate. The safe behaviour is to wait for
+        the clock to catch up or to error rather than issue, and to keep the last
+        emitted timestamp per worker to detect it.
+      criteria:
+        - id: detect
+          label: "detects the rollback against the last issued timestamp"
+          weight: 2
+          patterns: ["last timestamp|rollback|backwards|drift|detect"]
+        - id: wait
+          label: "waits, errors, or borrows from the next millisecond instead of duplicating"
+          weight: 2
+          patterns: ["wait|sleep|refuse|error|reject|next millisecond"]
+        - id: workerid
+          label: "worker ids must be allocated uniquely, e.g. via ZooKeeper or leases"
+          weight: 1
+          patterns: ["worker id|lease|zookeeper|coordination|assignment"]
+- id: iv-sd-distributed-lock
+  kind: system_design
+  level: senior
+  title: "Design a distributed lock service"
+  prompt: >-
+    Design a lock service like Chubby: clients acquire a named lock, hold it
+    while they work, and the lock is released if the holder dies.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What does the lock actually guarantee, and what happens on a partition?"
+      intent: >-
+        A lock is a lease with a heartbeat; fencing is what makes it safe.
+      hint: >-
+        Ask whether a paused holder may still write after its lease expires. If
+        yes, the lock alone is unsafe and you need a fencing token checked by the
+        resource.
+      criteria:
+        - id: fence
+          label: "raises the paused-holder problem and fencing tokens"
+          weight: 3
+          patterns: ["fencing|token|stale holder|paused|lease expir|zombie"]
+        - id: partition
+          label: "asks what a partition means for lock availability"
+          weight: 2
+          patterns: ["partition|network split|quorum|availability|minority"]
+        - id: semantics
+          label: "asks whether the lock is exclusive or shared"
+          weight: 1
+          patterns: ["exclusive|shared|read write|mutual exclusion"]
+    - id: core
+      question: "How is a lock acquired and held?"
+      intent: >-
+        Expect consensus-backed lease with a session and a heartbeat, or a
+        Redis-style single-node lease with its caveat.
+      hint: >-
+        The lock is a key with a TTL plus a session heartbeat, written through a
+        consensus group so there is one owner. A single-node lease is simpler but
+        loses safety during failover unless you fence.
+      criteria:
+        - id: lease
+          label: "lease with TTL and a heartbeat that renews it"
+          weight: 2
+          patterns: ["lease|ttl|heartbeat|renew|session"]
+        - id: consensus
+          label: "consensus or a single authoritative store for the lock record"
+          weight: 2
+          patterns: ["raft|paxos|zookeeper|etcd|consensus|single node"]
+        - id: session
+          label: "session expiry releases locks when the client dies"
+          weight: 1
+          patterns: ["session|expire|disconnect|dead client|reap"]
+    - id: scale
+      question: "A client holds the lock and then stops responding for two minutes. Walk me through it."
+      intent: >-
+        Probes the timeline: lease expiry, a new holder, and the old holder
+        waking up.
+      hint: >-
+        The lease expires, a new client acquires it with a higher fencing token,
+        and when the old client wakes its write is rejected by the token check.
+        Without that check, two writers believe they hold the lock.
+      criteria:
+        - id: expiry
+          label: "lease expires and the lock is granted to another client"
+          weight: 2
+          patterns: ["expire|grant|another client|new owner|reacquire"]
+        - id: reject
+          label: "the stale holder's writes are rejected by a token version"
+          weight: 2
+          patterns: ["reject|fenc|token|version check|refuse write"]
+        - id: clock
+          label: "notes that lease correctness depends on bounded clock drift"
+          weight: 1
+          patterns: ["clock drift|bounded|skew|clock"]
+- id: iv-sd-job-scheduler
+  kind: system_design
+  level: senior
+  title: "Design a distributed cron and job scheduler"
+  prompt: >-
+    Design a scheduler that runs millions of recurring jobs, exactly once per
+    schedule, with retries and visibility into failures.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What does exactly once mean when a worker can crash mid-job?"
+      intent: >-
+        The candidate should distinguish at-least-once execution from exactly-once
+        effect.
+      hint: >-
+        Say plainly that execution is at least once and that exactly-once effect
+        comes from idempotent jobs or a dedupe key — claiming exactly-once
+        execution across a crash is a red flag.
+      criteria:
+        - id: semantics
+          label: "states at-least-once execution with idempotent effects"
+          weight: 3
+          patterns: ["at least once|idempot|exactly once effect|dedup"]
+        - id: duration
+          label: "asks about job duration and whether jobs can overlap"
+          weight: 1
+          patterns: ["duration|long running|overlap|concurren"]
+        - id: volume
+          label: "asks about the schedule distribution and burstiness"
+          weight: 1
+          patterns: ["schedule|burst|cron|per minute|volume"]
+    - id: core
+      question: "How does a job get from its schedule to a worker exactly once per tick?"
+      intent: >-
+        Expect a time-indexed store, a claim step with a lease, and a queue to
+        workers.
+      hint: >-
+        Materialise upcoming runs into a table keyed by fire time, claim a run
+        with a conditional update and a lease, then enqueue it. The claim is what
+        prevents two schedulers from firing the same tick.
+      criteria:
+        - id: materialise
+          label: "upcoming runs materialised, keyed by scheduled time"
+          weight: 2
+          patterns: ["materialis|materializ|upcoming|fire time|schedule table"]
+        - id: claim
+          label: "atomic claim with a lease before dispatch"
+          weight: 3
+          patterns: ["claim|lease|conditional update|lock|select for update"]
+        - id: queue
+          label: "dispatch through a queue to workers"
+          weight: 1
+          patterns: ["queue|worker|dispatch|enqueue"]
+    - id: scale
+      question: "The clock hits midnight and a million jobs fire at once. What do you do?"
+      intent: >-
+        Probes jitter, sharding, and backlog handling.
+      hint: >-
+        Spread the fire times with deterministic jitter, shard the scheduler by
+        job id, and let workers drain a backlog with priority for time-critical
+        jobs instead of assuming the queue absorbs the spike.
+      criteria:
+        - id: jitter
+          label: "deterministic jitter spreads the midnight spike"
+          weight: 2
+          patterns: ["jitter|spread|randomis|stagger|smooth"]
+        - id: shard
+          label: "schedulers sharded by job id so no single node owns a million"
+          weight: 2
+          patterns: ["shard|partition|multiple schedulers|by job id"]
+        - id: backlog
+          label: "backlog handling with priorities or shedding"
+          weight: 1
+          patterns: ["backlog|priority|shed|drain|lag"]
+- id: iv-sd-inverted-index
+  kind: system_design
+  level: staff
+  title: "Design a search engine index"
+  prompt: >-
+    Design full-text search over a billion documents: index new documents
+    within a minute, and return the top ten results in 100 ms.
+  reference_topics: [system-design-foundations, information-theory]
+  stages:
+    - id: clarify
+      question: "What query types must be supported, and how fresh must the index be?"
+      intent: >-
+        Query shape decides the index structure; freshness decides the segment
+        strategy.
+      hint: >-
+        Ask whether queries are keyword, phrase, or fuzzy, and whether a document
+        must be searchable on write. Those two answers decide between an inverted
+        index, a vector index, and a hybrid.
+      criteria:
+        - id: query
+          label: "asks the query types: keyword, phrase, fuzzy, semantic"
+          weight: 2
+          patterns: ["phrase|fuzzy|boolean|keyword|semantic|vector"]
+        - id: freshness
+          label: "asks the indexing delay requirement"
+          weight: 2
+          patterns: ["fresh|delay|near real time|searchable|minute"]
+        - id: relevance
+          label: "asks how relevance is judged"
+          weight: 1
+          patterns: ["relevance|ranking|bm25|tf idf|click"]
+    - id: core
+      question: "Describe the index structure and the write path."
+      intent: >-
+        Expect immutable segments, an inverted index per segment, a merge policy,
+        and deletion by tombstone.
+      hint: >-
+        Documents are buffered, flushed into immutable segments with their own
+        inverted index, and background merges combine them; deletes are
+        tombstones applied at merge time.
+      criteria:
+        - id: inverted
+          label: "inverted index mapping term to posting list"
+          weight: 2
+          patterns: ["inverted|posting list|term dictionary|forward index"]
+        - id: segment
+          label: "immutable segments with background merge"
+          weight: 2
+          patterns: ["segment|immutable|merge|compaction|flush"]
+        - id: delete
+          label: "deletes as tombstones or soft deletes"
+          weight: 1
+          patterns: ["tombstone|soft delete|deleted flag|merge away"]
+    - id: scale
+      question: "Sharding and replicas: how is a query executed across them?"
+      intent: >-
+        Probes scatter-gather, shard key choice, and the tail latency of the
+        slowest shard.
+      hint: >-
+        Queries scatter to every shard and merge top-k; the p99 is the slowest
+        shard, so you hedge requests or replicate to reduce the tail.
+      criteria:
+        - id: scatter
+          label: "scatter-gather with a merge of top-k results"
+          weight: 2
+          patterns: ["scatter|gather|merge|top k|fan out"]
+        - id: shardkey
+          label: "shard by document id or by term range, with the tradeoff stated"
+          weight: 2
+          patterns: ["shard by|partition|term range|document id|routing"]
+        - id: tail
+          label: "tail latency mitigated by replication or hedged requests"
+          weight: 1
+          patterns: ["tail|slowest|hedge|replica|p99"]
+- id: iv-sd-checkout
+  kind: system_design
+  level: senior
+  title: "Design an e-commerce checkout"
+  prompt: >-
+    Design checkout: cart, price calculation, payment, and order creation.
+    A payment must never be captured twice and an order must never exist
+    without a payment.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What are the failure modes you must not allow?"
+      intent: >-
+        The candidate should name double capture and orphan orders, then design
+        around them.
+      hint: >-
+        State the two invariants up front: at most one capture per order, and no
+        fulfilled order without a captured payment. Everything else is a
+        mechanism to keep them.
+      criteria:
+        - id: invariants
+          label: "names the double-capture and orphan-order failures"
+          weight: 3
+          patterns: ["double|twice|duplicate charge|orphan|without payment"]
+        - id: money
+          label: "asks about currency, tax and rounding"
+          weight: 1
+          patterns: ["currency|tax|rounding|price|discount"]
+        - id: timeout
+          label: "asks about the payment provider's timeout behaviour"
+          weight: 2
+          patterns: ["timeout|provider|unknown state|pending|async"]
+    - id: core
+      question: "Walk the state machine from cart to confirmed order."
+      intent: >-
+        Expect an explicit state machine with an idempotency key and a pending
+        state for ambiguous provider results.
+      hint: >-
+        The order moves through created, pending payment, paid, fulfilled. The
+        pending state exists because a provider timeout is not a failure — it is
+        an unknown you must resolve by polling or webhook.
+      criteria:
+        - id: state
+          label: "explicit order state machine with a pending payment state"
+          weight: 2
+          patterns: ["state machine|pending|created|paid|fulfilled|status"]
+        - id: idem
+          label: "idempotency key per checkout attempt"
+          weight: 3
+          patterns: ["idempotency|request id|dedupe|same key"]
+        - id: saga
+          label: "compensating actions or a saga for partial failure"
+          weight: 2
+          patterns: ["saga|compensat|rollback|refund|reverse"]
+    - id: scale
+      question: "The provider times out after charging the card. What does the system do?"
+      intent: >-
+        Probes reconciliation and the discipline not to retry a capture blindly.
+      hint: >-
+        Never retry a capture on timeout; query the provider by idempotency key
+        to learn the truth, and reconcile in a background job. A blind retry is
+        how customers get charged twice.
+      criteria:
+        - id: query
+          label: "queries the provider by idempotency key instead of retrying"
+          weight: 3
+          patterns: ["query|lookup|status check|poll|by key"]
+        - id: reconcile
+          label: "background reconciliation resolves unknown states"
+          weight: 2
+          patterns: ["reconcil|background|job|sweep|settle"]
+        - id: refund
+          label: "has a refund or void path when the order cannot complete"
+          weight: 1
+          patterns: ["refund|void|reverse|cancel"]
+- id: iv-sd-inventory-reservation
+  kind: system_design
+  level: staff
+  title: "Design inventory reservation at flash-sale load"
+  prompt: >-
+    Design inventory for a flash sale: 10k units, 2M users in the first
+    minute, and no overselling.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What does the business prefer: oversell or lost sales?"
+      intent: >-
+        The tradeoff is a product decision, and the candidate must ask before
+        choosing a mechanism.
+      hint: >-
+        Ask whether overselling is acceptable and whether a waiting room is
+        allowed. Those two answers decide between strict reservation and
+        optimistic overbooking.
+      criteria:
+        - id: policy
+          label: "asks whether oversell or lost sale is worse"
+          weight: 2
+          patterns: ["oversell|overbook|lost sale|stockout|acceptable"]
+        - id: waiting
+          label: "asks whether a virtual waiting room is acceptable"
+          weight: 1
+          patterns: ["waiting room|queue|lottery|admission"]
+        - id: duration
+          label: "asks how long a reservation is held before release"
+          weight: 1
+          patterns: ["hold|reservation|expire|ttl|timeout"]
+    - id: core
+      question: "Where does the count live, and how do you decrement it safely?"
+      intent: >-
+        Expect an atomic decrement in a fast store, with the database as the
+        eventual record.
+      hint: >-
+        A single atomic decrement on a counter shard is the only thing that
+        survives this load; a read-check-write against a database will oversell
+        under contention.
+      criteria:
+        - id: atomic
+          label: "atomic decrement or conditional update"
+          weight: 3
+          patterns: ["atomic|decrement|conditional|compare and set|incr"]
+        - id: shard
+          label: "counter sharded into buckets summed on read"
+          weight: 2
+          patterns: ["shard|bucket|partition|split counter|striped"]
+        - id: reserve
+          label: "reservation record separate from the stock count"
+          weight: 1
+          patterns: ["reservation|hold|pending order|claim"]
+    - id: scale
+      question: "2M users hit the same 10k units in one second. What protects the system?"
+      intent: >-
+        Probes admission control before the inventory layer, not just inside it.
+      hint: >-
+        Shed load before it reaches the counter: a token-bucket admission gate or
+        waiting room, with a per-user rate limit, so the inventory layer only ever
+        sees a rate it can serve.
+      criteria:
+        - id: admission
+          label: "admission control or waiting room in front of the inventory call"
+          weight: 2
+          patterns: ["admission|waiting room|token bucket|gate|shed"]
+        - id: peruser
+          label: "per-user limits to block scripts and duplicate attempts"
+          weight: 2
+          patterns: ["per user|rate limit|bot|script|captcha"]
+        - id: cache
+          label: "caches the read path so the display does not hammer inventory"
+          weight: 1
+          patterns: ["cache|read only|static|precomputed"]
+- id: iv-sd-presence
+  kind: system_design
+  level: junior
+  title: "Design an online presence service"
+  prompt: >-
+    Design the service behind the green dot: it tells a user which of their
+    friends are online, for 100M users.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "How accurate does the dot have to be, and how fresh?"
+      intent: >-
+        Presence is allowed to be wrong and stale; saying that unlocks a cheap
+        design.
+      hint: >-
+        A dot that is a few seconds stale is fine, and a false online is worse
+        than a false offline. That tolerance is what lets you use TTLs instead of
+        a durable record.
+      criteria:
+        - id: tolerance
+          label: "asks how stale the status may be"
+          weight: 2
+          patterns: ["stale|accurate|tolerance|seconds|delay"]
+        - id: direction
+          label: "asks whether a false online or false offline is worse"
+          weight: 1
+          patterns: ["false online|false offline|worse|fail"]
+        - id: scope
+          label: "asks whether presence is per friend or visible to all"
+          weight: 1
+          patterns: ["friend|contact|visibility|privacy|who can see"]
+    - id: core
+      question: "How is presence written and read?"
+      intent: >-
+        Expect a heartbeat writing a TTL key, and a fanout read over friends.
+      hint: >-
+        Each client heartbeats every few seconds to a key with a TTL; absence of
+        the key means offline, and a read fans out over the friend list, ideally
+        in one batch.
+      criteria:
+        - id: heartbeat
+          label: "heartbeat writes a key with a TTL"
+          weight: 3
+          patterns: ["heartbeat|ttl|expire|ping|refresh"]
+        - id: read
+          label: "reads are a batched multi-get over friends"
+          weight: 2
+          patterns: ["batch|multi get|pipeline|fan out|lookup"]
+        - id: store
+          label: "an in-memory store, not the primary database"
+          weight: 1
+          patterns: ["redis|memory|in memory|cache|kv"]
+    - id: scale
+      question: "100M clients heartbeating. How do you keep that off your main database?"
+      intent: >-
+        Probes write volume, sharding, and whether presence is persisted at all.
+      hint: >-
+        At a ten-second heartbeat this is ten million writes a second, so presence
+        never touches the primary database: it is sharded in memory, aggregated
+        per shard, and only transitions are published to subscribers.
+      criteria:
+        - id: volume
+          label: "does the heartbeat arithmetic and names the write volume"
+          weight: 2
+          patterns: ["per second|write volume|million|qps|arithmetic"]
+        - id: shard
+          label: "shards by user id across presence nodes"
+          weight: 2
+          patterns: ["shard|partition|consistent hash|by user"]
+        - id: publish
+          label: "publishes only state changes to subscribers"
+          weight: 1
+          patterns: ["publish|subscribe|change only|transition|pub sub"]
+- id: iv-sd-push-infra
+  kind: system_design
+  level: senior
+  title: "Design mobile push delivery"
+  prompt: >-
+    Design the service that delivers push notifications to iOS and Android
+    devices at 100k per second, with receipts and no duplicate buzzes.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What can you actually control, given APNs and FCM sit in the middle?"
+      intent: >-
+        The candidate must recognise that delivery is delegated and only
+        acceptance is guaranteed.
+      hint: >-
+        You cannot guarantee delivery: APNs and FCM accept a payload and decide
+        later. The design is about acceptance, retries, receipts, and payload
+        limits, not end-to-end delivery.
+      criteria:
+        - id: delegated
+          label: "acknowledges that APNs and FCM own final delivery"
+          weight: 2
+          patterns: ["apns|fcm|provider|delegat|third party"]
+        - id: payload
+          label: "asks the payload size limit and what is sent versus fetched"
+          weight: 1
+          patterns: ["payload|4kb|size limit|data only|silent"]
+        - id: dedupe
+          label: "asks how duplicate notifications are prevented"
+          weight: 1
+          patterns: ["dedup|duplicate|collapse|same id|idempot"]
+    - id: core
+      question: "Describe the path from an event to a device."
+      intent: >-
+        Expect topic fanout, device token lookup, per-provider batching, and a
+        delivery record.
+      hint: >-
+        An event maps to a topic, the topic fans out to device tokens, tokens are
+        grouped per provider and sent in batches, and the result is recorded so
+        you can retry only the failures.
+      criteria:
+        - id: token
+          label: "device token registry with invalidation on uninstall"
+          weight: 2
+          patterns: ["device token|token registry|uninstall|invalid token"]
+        - id: batch
+          label: "batches per provider connection instead of one call per message"
+          weight: 2
+          patterns: ["batch|connection|multiplex|pipeline|per provider"]
+        - id: record
+          label: "a delivery record supports retry and audit"
+          weight: 1
+          patterns: ["record|log|audit|status|receipt"]
+    - id: scale
+      question: "APNs starts returning 429 for one of your apps. What happens to the queue?"
+      intent: >-
+        Probes per-app isolation and backpressure, since one noisy app can
+        starve the rest.
+      hint: >-
+        A shared queue means one throttled app delays every other app. Partition
+        by app and provider, apply a per-partition token bucket, and keep retries
+        in a separate retry queue with backoff.
+      criteria:
+        - id: isolation
+          label: "per-app and per-provider queues so one app cannot starve others"
+          weight: 3
+          patterns: ["per app|isolat|partition|separate queue|tenant"]
+        - id: bucket
+          label: "a token bucket per provider matching the published quota"
+          weight: 2
+          patterns: ["token bucket|quota|rate limit|throttle"]
+        - id: retry
+          label: "retry queue with backoff and a dead-letter end state"
+          weight: 1
+          patterns: ["retry|backoff|dead letter|dlq|park"]
+- id: iv-sd-event-pipeline
+  kind: system_design
+  level: mid
+  title: "Design an event ingestion pipeline"
+  prompt: >-
+    Design the ingestion layer that collects product analytics events from web
+    and mobile clients, 5M events a second at peak.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What guarantees do downstream consumers need?"
+      intent: >-
+        Ordering, duplication and loss tolerance decide the transport.
+      hint: >-
+        Ask per consumer: a billing counter needs no loss, a funnel dashboard
+        tolerates duplicates, and neither needs global order. Per-key order is
+        usually enough.
+      criteria:
+        - id: guarantees
+          label: "asks loss, duplicate and ordering requirements per consumer"
+          weight: 3
+          patterns: ["loss|duplicate|ordering|guarantee|at least once"]
+        - id: schema
+          label: "asks whether the event schema is fixed or evolving"
+          weight: 1
+          patterns: ["schema|evolv|version|contract|json"]
+        - id: source
+          label: "asks about client-side batching and offline buffering"
+          weight: 1
+          patterns: ["client|batch|offline|buffer|sdk"]
+    - id: core
+      question: "How does an event get from a phone to a queryable table?"
+      intent: >-
+        Expect a collector, a durable log, stream processing, and a columnar
+        sink.
+      hint: >-
+        Client batches to a collector over HTTP, the collector validates and
+        appends to a partitioned log, stream processors enrich and aggregate, and
+        a columnar sink makes it queryable.
+      criteria:
+        - id: collector
+          label: "a thin stateless collector in front of the log"
+          weight: 2
+          patterns: ["collector|gateway|ingest|http|stateless"]
+        - id: log
+          label: "a partitioned durable log as the buffer"
+          weight: 2
+          patterns: ["kafka|log|queue|partition|durable"]
+        - id: sink
+          label: "columnar storage or a warehouse for queries"
+          weight: 1
+          patterns: ["columnar|parquet|warehouse|clickhouse|bigquery|s3"]
+    - id: scale
+      question: "Traffic doubles during a launch and consumers fall behind. Do you drop events?"
+      intent: >-
+        Probes the explicit decision between loss and lag, and per-tenant
+        fairness.
+      hint: >-
+        You decide before the incident: sampling for high-volume low-value events
+        with a stated rate, and never dropping the ones that feed billing. Consumers
+        lagging is a capacity problem, not a reason to silently discard.
+      criteria:
+        - id: policy
+          label: "states a sampling or shedding policy with a priority order"
+          weight: 3
+          patterns: ["sample|shed|drop|priority|critical"]
+        - id: lag
+          label: "monitors consumer lag and scales consumers"
+          weight: 2
+          patterns: ["lag|backlog|scale|consumer group|partition"]
+        - id: isolation
+          label: "isolates tenants or event classes so one cannot flood the rest"
+          weight: 1
+          patterns: ["tenant|isolat|quota|separate topic|fair"]
+- id: iv-sd-metrics-store
+  kind: system_design
+  level: staff
+  title: "Design a time-series metrics store"
+  prompt: >-
+    Design a metrics system that ingests 10M samples a second and answers
+    dashboard queries over a month of history in under a second.
+  reference_topics: [time-series, system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What is the shape of a sample and a query?"
+      intent: >-
+        Cardinality and query shape decide everything in a TSDB.
+      hint: >-
+        Ask for series cardinality and the query shape. Ten metrics with a
+        million label combinations each is a different system from ten million
+        metrics with one series.
+      criteria:
+        - id: cardinality
+          label: "asks about series cardinality, not just sample rate"
+          weight: 3
+          patterns: ["cardinality|series|label|dimension|distinct"]
+        - id: query
+          label: "asks the query shape: range, aggregation, and step"
+          weight: 2
+          patterns: ["range|aggregation|step|rollup|query shape"]
+        - id: retention
+          label: "asks the retention and resolution tradeoff"
+          weight: 1
+          patterns: ["retention|resolution|downsample|raw|month"]
+    - id: core
+      question: "How are samples stored so a month-wide query is fast?"
+      intent: >-
+        Expect time-blocked chunks per series, delta or Gorilla compression, and
+        label-based indexing.
+      hint: >-
+        Samples are appended to per-series chunks cut at fixed time boundaries,
+        compressed with delta-of-delta and XOR, and indexed by label so a query
+        touches only the series and time blocks it needs.
+      criteria:
+        - id: chunk
+          label: "time-blocked immutable chunks per series"
+          weight: 2
+          patterns: ["chunk|block|time window|per series|segment"]
+        - id: compress
+          label: "delta or XOR compression, with the ratio stated"
+          weight: 2
+          patterns: ["delta|gorilla|xor|compress|columnar"]
+        - id: index
+          label: "an inverted index over labels finds matching series"
+          weight: 2
+          patterns: ["inverted|label index|posting|series index|match"]
+    - id: scale
+      question: "One customer ships a million-cardinality label. What happens, and what do you do?"
+      intent: >-
+        Probes the classic TSDB failure: cardinality explosion.
+      hint: >-
+        Cardinality explosion blows the series index and the memory needed to
+        track active series. You bound it with per-tenant series limits, drop or
+        aggregate high-cardinality labels at ingest, and alert on series growth.
+      criteria:
+        - id: explosion
+          label: "identifies cardinality explosion as the failure"
+          weight: 2
+          patterns: ["cardinality explosion|too many series|high cardinality|blow up"]
+        - id: limit
+          label: "per-tenant series limits with rejection at ingest"
+          weight: 2
+          patterns: ["limit|quota|reject|per tenant|cap"]
+        - id: downsample
+          label: "downsampling or rollups keep month-long queries cheap"
+          weight: 1
+          patterns: ["downsample|rollup|aggregate|resolution"]
+- id: iv-sd-log-pipeline
+  kind: system_design
+  level: mid
+  title: "Design centralized log aggregation"
+  prompt: >-
+    Design the system that collects logs from 50k servers and lets an engineer
+    search the last seven days in seconds during an incident.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What does an engineer actually do with this system at 3 a.m.?"
+      intent: >-
+        The query pattern during an incident drives indexing and retention.
+      hint: >-
+        The dominant query is a keyword search filtered by service and time
+        window, not an analytical scan. That justifies an index per time block
+        and aggressive retention tiers.
+      criteria:
+        - id: query
+          label: "asks the actual query pattern during an incident"
+          weight: 2
+          patterns: ["search|query|keyword|filter|time window"]
+        - id: volume
+          label: "asks the log volume per host and per day"
+          weight: 2
+          patterns: ["volume|per day|gb|tb|rate|lines"]
+        - id: retention
+          label: "asks the retention window and the tiering policy"
+          weight: 1
+          patterns: ["retention|seven days|tier|archive|delete"]
+    - id: core
+      question: "Describe the path from a log line to a search result."
+      intent: >-
+        Expect an agent, a buffered transport, parsing, indexed storage, and a
+        query service.
+      hint: >-
+        An agent tails files and ships batches to a buffered log, a consumer
+        parses and enriches, writes time-partitioned indexes, and a query service
+        fans out across partitions for the requested window.
+      criteria:
+        - id: agent
+          label: "a per-host agent with batching and backpressure"
+          weight: 2
+          patterns: ["agent|collector|fluent|filebeat|tail|batch"]
+        - id: transport
+          label: "buffered transport so a slow indexer does not block hosts"
+          weight: 2
+          patterns: ["buffer|kafka|queue|backpressure|spool"]
+        - id: index
+          label: "time-partitioned indexes for the search window"
+          weight: 2
+          patterns: ["partition|time based index|shard|daily index"]
+    - id: scale
+      question: "An incident causes a hundredfold log spike. How does the system survive?"
+      intent: >-
+        Probes sampling, rate limits per host, and the difference between
+        dropping logs and dropping the service.
+      hint: >-
+        Per-host rate limits protect the pipeline, and a sampling policy that
+        keeps errors and drops debug lines is the right degradation. Dropping
+        everything equally destroys the investigation.
+      criteria:
+        - id: perhost
+          label: "per-host rate limits applied at the agent"
+          weight: 2
+          patterns: ["per host|rate limit|agent side|throttle|cap"]
+        - id: sample
+          label: "priority sampling that keeps errors over debug"
+          weight: 2
+          patterns: ["sample|priority|keep errors|drop debug|severity"]
+        - id: degrade
+          label: "search degrades by narrowing the window rather than failing"
+          weight: 1
+          patterns: ["narrow|degrade|partial|window|fail open"]
+- id: iv-sd-api-gateway
+  kind: system_design
+  level: senior
+  title: "Design an API gateway"
+  prompt: >-
+    Design the gateway in front of 200 internal services: authentication,
+    routing, rate limits, retries, and observability, at 1M requests a second.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What belongs in the gateway, and what must stay in the services?"
+      intent: >-
+        Scope control: the gateway is a policy layer, not a business logic layer.
+      hint: >-
+        The gateway owns cross-cutting policy — auth, quotas, routing, retries,
+        tracing. The moment business logic lands there, every team's deploy is
+        coupled to one binary.
+      criteria:
+        - id: scope
+          label: "separates cross-cutting policy from business logic"
+          weight: 3
+          patterns: ["cross cutting|policy|business logic|not in the gateway|scope"]
+        - id: auth
+          label: "asks how authentication and authorisation are handled"
+          weight: 2
+          patterns: ["auth|token|jwt|oauth|identity"]
+        - id: protocol
+          label: "asks about protocols: REST, gRPC, WebSocket"
+          weight: 1
+          patterns: ["grpc|rest|http|websocket|protocol"]
+    - id: core
+      question: "What is on the request path, in order?"
+      intent: >-
+        Expect a fixed, cheap pipeline, with per-request budgets and no blocking
+        calls to slow dependencies.
+      hint: >-
+        The order matters: terminate TLS, authenticate from a cached key, apply
+        quota, route, then proxy. Any step that calls a remote service on every
+        request becomes the gateway's latency floor.
+      criteria:
+        - id: order
+          label: "gives an explicit ordered pipeline"
+          weight: 2
+          patterns: ["order|first|then|pipeline|chain"]
+        - id: cache
+          label: "caches keys or policy so auth is not a remote call per request"
+          weight: 2
+          patterns: ["cache|local|jwks|key cache|ttl"]
+        - id: budget
+          label: "enforces a per-request timeout budget"
+          weight: 1
+          patterns: ["timeout|budget|deadline|circuit breaker"]
+    - id: scale
+      question: "One service starts responding in 30 seconds. What does the gateway do to everyone else?"
+      intent: >-
+        Probes bulkheads and circuit breaking: a slow dependency must not exhaust
+        the gateway's connections.
+      hint: >-
+        Without a per-route connection pool and a circuit breaker, one slow
+        service consumes every worker and takes the whole gateway down. Bulkheads
+        and timeouts are the answer.
+      criteria:
+        - id: bulkhead
+          label: "per-route connection pools or worker isolation"
+          weight: 2
+          patterns: ["pool|bulkhead|isolat|per route|worker"]
+        - id: breaker
+          label: "circuit breaking with a fast failure response"
+          weight: 2
+          patterns: ["circuit breaker|trip|fail fast|shed"]
+        - id: timeout
+          label: "timeouts shorter than the caller's budget"
+          weight: 1
+          patterns: ["timeout|deadline|budget|abort"]
+- id: iv-sd-service-discovery
+  kind: system_design
+  level: mid
+  title: "Design service discovery"
+  prompt: >-
+    Design service discovery for 5,000 service instances that scale up and
+    down constantly, across three regions.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "Who needs to know about an instance, and how fast?"
+      intent: >-
+        Discovery has two consumers with different needs: load balancers and
+        clients.
+      hint: >-
+        Ask whether clients resolve endpoints directly or always go through a
+        load balancer, and what the tolerable staleness is — those decide between
+        DNS, a client library, and a sidecar.
+      criteria:
+        - id: consumer
+          label: "asks whether clients resolve directly or through a balancer"
+          weight: 2
+          patterns: ["client side|load balancer|sidecar|proxy|dns"]
+        - id: staleness
+          label: "asks the tolerated staleness window"
+          weight: 2
+          patterns: ["stale|propagation|seconds|ttl|delay"]
+        - id: health
+          label: "asks how health is determined"
+          weight: 1
+          patterns: ["health check|readiness|liveness|probe"]
+    - id: core
+      question: "How does an instance register, and how does a client find it?"
+      intent: >-
+        Expect registration with a TTL or heartbeat, a registry of record, and
+        watch or poll for changes.
+      hint: >-
+        Instances register with a lease, heartbeats renew it, and clients watch
+        the registry for changes rather than polling DNS. A registry without a
+        lease keeps dead instances in rotation forever.
+      criteria:
+        - id: lease
+          label: "registration with a lease or heartbeat and expiry"
+          weight: 2
+          patterns: ["lease|heartbeat|register|expire|ttl"]
+        - id: registry
+          label: "a consistent registry of record"
+          weight: 2
+          patterns: ["registry|etcd|consul|zookeeper|control plane"]
+        - id: watch
+          label: "watch or long-poll pushes changes to clients"
+          weight: 2
+          patterns: ["watch|subscribe|push|stream|notify"]
+    - id: scale
+      question: "A region partitions from the others. Can it still resolve services?"
+      intent: >-
+        Probes the availability tradeoff: a global registry is a global outage
+        domain.
+      hint: >-
+        A client must be able to keep using its last known endpoint list, so
+        cache locally and serve stale on failure. A global consensus registry
+        that stops answering during a partition takes every service with it.
+      criteria:
+        - id: local
+          label: "clients cache the endpoint list locally"
+          weight: 2
+          patterns: ["cache|local|last known|in memory"]
+        - id: stale
+          label: "serves stale data when the registry is unreachable"
+          weight: 2
+          patterns: ["stale|fail static|keep serving|degrad"]
+        - id: regional
+          label: "regional registries that do not depend on cross-region consensus"
+          weight: 1
+          patterns: ["regional|per region|local registry|independent"]
+- id: iv-sd-config-service
+  kind: system_design
+  level: junior
+  title: "Design a dynamic configuration service"
+  prompt: >-
+    Design a service that stores configuration for 2,000 microservices and
+    pushes changes to them in under ten seconds, with rollback.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What kinds of configuration are there, and who may change them?"
+      intent: >-
+        Secrets, flags and tuning parameters have different safety requirements.
+      hint: >-
+        Separate secrets from ordinary config: secrets need encryption and an
+        audit trail, and a config change needs an approval path because a bad
+        value is an outage.
+      criteria:
+        - id: kinds
+          label: "separates secrets from ordinary configuration"
+          weight: 2
+          patterns: ["secret|credential|encrypt|sensitive|vault"]
+        - id: approval
+          label: "asks who can change config and whether review is required"
+          weight: 1
+          patterns: ["approval|review|permission|who can|audit"]
+        - id: urgency
+          label: "asks how fast a rollback must take effect"
+          weight: 1
+          patterns: ["rollback|revert|seconds|immediate|propagat"]
+    - id: core
+      question: "How does a change reach a running process?"
+      intent: >-
+        Expect versioned config with a watch or long-poll, and clients that apply
+        atomically.
+      hint: >-
+        Config is versioned and immutable per version; clients watch a version
+        pointer and fetch the full document when it changes, applying it
+        atomically so no request sees half a config.
+      criteria:
+        - id: version
+          label: "versioned, immutable config documents"
+          weight: 2
+          patterns: ["version|immutable|snapshot|revision"]
+        - id: watch
+          label: "watch or long-poll, not a fixed-interval poll"
+          weight: 2
+          patterns: ["watch|long poll|push|subscribe|stream"]
+        - id: atomic
+          label: "applied atomically without partial reads"
+          weight: 1
+          patterns: ["atomic|all at once|swap|pointer|no partial"]
+    - id: scale
+      question: "You push a bad config to 2,000 services. What now?"
+      intent: >-
+        Probes canary rollout and the blast radius of a global config push.
+      hint: >-
+        The answer is that this should have been a staged rollout: one service,
+        then a percentage, with automatic rollback on error rate. Global push is
+        the failure, not the recovery.
+      criteria:
+        - id: canary
+          label: "staged or canary rollout rather than a global push"
+          weight: 3
+          patterns: ["canary|staged|percentage|gradual|one service"]
+        - id: rollback
+          label: "one-command rollback to the previous version"
+          weight: 2
+          patterns: ["rollback|revert|previous version|undo"]
+        - id: guard
+          label: "automatic rollback triggered by a health signal"
+          weight: 1
+          patterns: ["automatic|health|error rate|guard|watchdog"]
+- id: iv-sd-feature-flags
+  kind: system_design
+  level: mid
+  title: "Design a feature flag service"
+  prompt: >-
+    Design feature flags used on the hot path of every request: 500k
+    evaluations a second, targeting rules, and instant kill switches.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What happens if the flag service is down?"
+      intent: >-
+        The flag service cannot be on the request path, so evaluation must be
+        local.
+      hint: >-
+        A flag service that is called per request is a single point of failure.
+        Flags are shipped to the SDK and evaluated locally, with the service only
+        distributing state.
+      criteria:
+        - id: local
+          label: "evaluation is local in the SDK, not a network call"
+          weight: 3
+          patterns: ["local|in process|sdk|no network|embedded"]
+        - id: fallback
+          label: "a defined default when the SDK has no data"
+          weight: 2
+          patterns: ["default|fallback|last known|cached|fail safe"]
+        - id: latency
+          label: "asks the per-evaluation latency budget"
+          weight: 1
+          patterns: ["microsecond|nanosecond|latency|budget|fast"]
+    - id: core
+      question: "How are targeting rules represented and served?"
+      intent: >-
+        Expect a bucketing hash over a stable identifier and a compiled rule set.
+      hint: >-
+        Percentage rollouts are a hash of flag key and user id, so a user lands
+        in the same bucket everywhere; rules compile into a decision tree
+        evaluated in order.
+      criteria:
+        - id: hash
+          label: "deterministic hashing of user id for percentage rollout"
+          weight: 2
+          patterns: ["hash|bucket|consistent|percentage|stable"]
+        - id: rules
+          label: "ordered targeting rules with segments"
+          weight: 2
+          patterns: ["rule|segment|target|attribute|condition"]
+        - id: compile
+          label: "rules compiled or indexed for fast evaluation"
+          weight: 1
+          patterns: ["compile|index|precompute|tree|cache"]
+    - id: scale
+      question: "A flag is stuck on for one percent of users and nobody knows why. How does your design help?"
+      intent: >-
+        Probes auditability and exposure: which rule matched, for this user.
+      hint: >-
+        Every evaluation should be explainable: the SDK exposes which rule
+        matched and why, and the service keeps an audit log of flag changes with
+        who and when.
+      criteria:
+        - id: explain
+          label: "explains which rule matched for a given user"
+          weight: 2
+          patterns: ["explain|why|which rule|reason|debug"]
+        - id: audit
+          label: "an audit log of changes with author and timestamp"
+          weight: 2
+          patterns: ["audit|history|who changed|log|version"]
+        - id: expire
+          label: "stale flags are cleaned up so they do not accumulate forever"
+          weight: 1
+          patterns: ["stale|cleanup|expire|remove|debt"]
+- id: iv-sd-leaderboard
+  kind: system_design
+  level: junior
+  title: "Design a real-time leaderboard"
+  prompt: >-
+    Design a leaderboard for a game: 50M players, scores update constantly,
+    and each player can see their own rank and the top hundred.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What queries must the leaderboard answer?"
+      intent: >-
+        Top-k and rank-of-user are different queries with different costs.
+      hint: >-
+        Ask whether you need global rank, percentile, or just a bucket, and
+        whether the leaderboard resets weekly. Exact rank for 50M players is much
+        more expensive than top-k plus a bucket.
+      criteria:
+        - id: queries
+          label: "separates top-k from rank-of-user"
+          weight: 3
+          patterns: ["top k|top hundred|rank of|own rank|position"]
+        - id: window
+          label: "asks whether the leaderboard is all-time or resets"
+          weight: 1
+          patterns: ["all time|weekly|reset|window|season"]
+        - id: realtime
+          label: "asks how real-time the ranking must be"
+          weight: 1
+          patterns: ["real time|fresh|delay|seconds|eventual"]
+    - id: core
+      question: "Which data structure gives you top-k and rank efficiently?"
+      intent: >-
+        Expect a sorted set with O(log n) insert and rank.
+      hint: >-
+        A sorted set keyed by score gives insert, top-k and rank in log time. A
+        database ORDER BY with an offset degrades linearly and will not hold this
+        write rate.
+      criteria:
+        - id: sortedset
+          label: "sorted set or skip list with score as the key"
+          weight: 3
+          patterns: ["sorted set|zset|skip list|balanced tree|red black"]
+        - id: logn
+          label: "states the logarithmic cost of insert and rank"
+          weight: 2
+          patterns: ["log n|logarithmic|o log|efficient"]
+        - id: page
+          label: "pages the top list rather than fetching everything"
+          weight: 1
+          patterns: ["page|paginate|range|limit|chunk"]
+    - id: scale
+      question: "50M players all update their score every minute. What is the bottleneck?"
+      intent: >-
+        Probes write amplification and sharding the sorted set.
+      hint: >-
+        The single sorted set becomes a write bottleneck and a hot key. Shard by
+        player id into buckets, keep a top-k per bucket, and merge the bucket tops
+        for the global view.
+      criteria:
+        - id: shard
+          label: "shards the sorted set by player or by score band"
+          weight: 2
+          patterns: ["shard|partition|bucket|score band|split"]
+        - id: merge
+          label: "merges per-shard top-k into a global list"
+          weight: 2
+          patterns: ["merge|combine|aggregate|global top"]
+        - id: batch
+          label: "batches score updates instead of one write per event"
+          weight: 1
+          patterns: ["batch|buffer|coalesce|flush|periodic"]
+- id: iv-sd-geo-search
+  kind: system_design
+  level: senior
+  title: "Design nearby search"
+  prompt: >-
+    Design Yelp's nearby search: given a location and a query, return the
+    closest matching businesses in under 100 ms.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What does nearby mean, and how are businesses ranked?"
+      intent: >-
+        Radius versus walking time, and distance versus rating, change the index.
+      hint: >-
+        Ask whether distance is straight-line or travel time, and whether ranking
+        is pure proximity or a blend with rating and popularity. A blend means
+        you cannot simply index by distance.
+      criteria:
+        - id: metric
+          label: "asks whether distance is straight-line or travel time"
+          weight: 2
+          patterns: ["straight line|euclidean|travel time|walking|drive time"]
+        - id: ranking
+          label: "asks how distance trades against rating and popularity"
+          weight: 2
+          patterns: ["rating|popularity|rank|blend|score"]
+        - id: density
+          label: "asks about density: city centres versus rural areas"
+          weight: 1
+          patterns: ["dense|rural|urban|density|sparse"]
+    - id: core
+      question: "How do you find candidates near a point?"
+      intent: >-
+        Expect a geospatial index: geohash, S2 cells, or a quadtree, with cell
+        neighbours included.
+      hint: >-
+        Index businesses into cells at a chosen precision, then query the cell
+        plus its neighbours. Querying only the containing cell misses businesses
+        just across the boundary.
+      criteria:
+        - id: index
+          label: "geohash, S2, quadtree or R-tree index"
+          weight: 3
+          patterns: ["geohash|s2|quadtree|r tree|h3|spatial index"]
+        - id: neighbours
+          label: "queries neighbouring cells, not just one cell"
+          weight: 2
+          patterns: ["neighbour|neighbor|adjacent|ring|bounding box"]
+        - id: filter
+          label: "filters candidates by the query, then ranks"
+          weight: 1
+          patterns: ["filter|match|category|keyword|then rank"]
+    - id: scale
+      question: "Downtown Manhattan has 10,000 businesses in one square kilometre. What breaks?"
+      intent: >-
+        Probes cell granularity and whether the candidate adapts precision by
+        density.
+      hint: >-
+        A fixed cell size concentrates a huge number of candidates in dense
+        areas, so cap the candidate set by distance-ordered expansion or use
+        adaptive cells and accept approximate results in dense regions.
+      criteria:
+        - id: density
+          label: "identifies candidate explosion in dense areas"
+          weight: 2
+          patterns: ["too many candidates|dense|explosion|10,000|large candidate"]
+        - id: adaptive
+          label: "adaptive cell size or ordered expansion by ring"
+          weight: 2
+          patterns: ["adaptive|variable precision|ring|expand|increase radius"]
+        - id: cap
+          label: "a bounded candidate set with a defined fallback"
+          weight: 1
+          patterns: ["cap|limit|top n|bounded|cut off"]
+- id: iv-sd-food-dispatch
+  kind: system_design
+  level: staff
+  title: "Design food delivery dispatch"
+  prompt: >-
+    Design dispatch for a food delivery marketplace: an order must be assigned
+    to a courier who can reach the restaurant and then the customer, without
+    cold food.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What are you optimising: delivery time, courier utilisation, or cost?"
+      intent: >-
+        The candidate must surface the multi-objective nature before designing.
+      hint: >-
+        These objectives conflict: minimising delivery time needs slack couriers,
+        maximising utilisation makes times longer. Ask which the business ranks
+        first.
+      criteria:
+        - id: objective
+          label: "names the conflicting objectives explicitly"
+          weight: 3
+          patterns: ["tradeoff|conflict|delivery time|utilisation|utilization|cost"]
+        - id: batching
+          label: "asks whether one courier may carry multiple orders"
+          weight: 2
+          patterns: ["batch|stack|multiple orders|multi order|route"]
+        - id: prep
+          label: "asks about restaurant prep time and its variance"
+          weight: 1
+          patterns: ["prep time|ready time|restaurant|cook|wait"]
+    - id: core
+      question: "How do you decide which courier gets which order?"
+      intent: >-
+        Expect a two-sided matching with an ETA model, not a greedy nearest
+        courier.
+      hint: >-
+        Greedy nearest-courier is locally optimal and globally poor: it strands
+        later orders. The answer is a batched assignment over a candidate set with
+        an ETA model for both legs.
+      criteria:
+        - id: eta
+          label: "an ETA model covering pickup and drop-off"
+          weight: 2
+          patterns: ["eta|travel time|pickup|drop off|route"]
+        - id: batch
+          label: "batched or periodic assignment rather than per-order greedy"
+          weight: 2
+          patterns: ["batch|periodic|window|global|assignment problem"]
+        - id: match
+          label: "a matching or optimisation step over candidates"
+          weight: 2
+          patterns: ["matching|hungarian|optimis|optimiz|min cost|score"]
+    - id: scale
+      question: "Rain doubles order volume and couriers go offline. What degrades first, and what do you do?"
+      intent: >-
+        Probes supply shock, quoting honest ETAs, and surge behaviour.
+      hint: >-
+        The honest failure is ETA inflation, and lying about it is worse than
+        admitting it. Surge pricing, throttling new orders, and widening the
+        courier search radius are the levers.
+      criteria:
+        - id: supply
+          label: "identifies the supply-demand imbalance rather than a code problem"
+          weight: 2
+          patterns: ["supply|demand|imbalance|couriers offline|capacity"]
+        - id: eta
+          label: "quotes honest ETAs instead of optimistic ones"
+          weight: 2
+          patterns: ["eta|honest|inflat|accurate|promise"]
+        - id: levers
+          label: "names concrete levers: surge, throttling, wider radius"
+          weight: 1
+          patterns: ["surge|throttle|radius|incentive|pause orders"]
+- id: iv-sd-hotel-booking
+  kind: system_design
+  level: senior
+  title: "Design hotel search and booking"
+  prompt: >-
+    Design hotel search and booking: search across 500k properties with live
+    availability and prices, then book without double-selling a room.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "Where does availability data come from, and how fresh is it?"
+      intent: >-
+        Hotels own their inventory in external systems, so the design is a cache
+        consistency problem.
+      hint: >-
+        Most inventory lives in partner systems you do not control, so search is
+        served from a cache and the booking is confirmed against the supplier.
+        Ask how stale the cache may be.
+      criteria:
+        - id: source
+          label: "asks whether inventory is owned or supplied by partners"
+          weight: 2
+          patterns: ["partner|supplier|external|third party|own inventory"]
+        - id: freshness
+          label: "asks the acceptable staleness of availability"
+          weight: 3
+          patterns: ["stale|fresh|sync|update|minutes"]
+        - id: consistency
+          label: "notes that search and booking have different consistency needs"
+          weight: 1
+          patterns: ["search|booking|different|eventual|confirm"]
+    - id: core
+      question: "Why is search not a database query? Describe the search path."
+      intent: >-
+        Expect a denormalised availability index built from feeds, with price and
+        availability precomputed.
+      hint: >-
+        Availability across a date range is a multidimensional join that no
+        transactional database answers in 100 ms, so you precompute an index of
+        property by date with price and remaining rooms.
+      criteria:
+        - id: index
+          label: "a denormalised search index keyed by city and date"
+          weight: 2
+          patterns: ["index|denormalis|denormaliz|precompute|search cluster"]
+        - id: feed
+          label: "ingest from partner feeds on a schedule"
+          weight: 2
+          patterns: ["feed|ingest|sync|poll|batch update"]
+        - id: rank
+          label: "ranking blends price, location and quality"
+          weight: 1
+          patterns: ["rank|score|relevance|price|quality"]
+    - id: scale
+      question: "Two users book the last room at once. Search said it was available. What happens?"
+      intent: >-
+        Probes the gap between cached search and authoritative booking, and how
+        the product handles it.
+      hint: >-
+        The booking path must confirm against the supplier and may still fail,
+        so the UX needs a hold or an honest failure with alternatives. Promising
+        a room based on cache is how you double-sell.
+      criteria:
+        - id: confirm
+          label: "booking revalidates against the authoritative supplier"
+          weight: 3
+          patterns: ["revalidat|confirm|authoritative|supplier call|final check"]
+        - id: hold
+          label: "a temporary hold or pending state during confirmation"
+          weight: 2
+          patterns: ["hold|pending|reserve|tentative|lock"]
+        - id: failure
+          label: "a defined UX for the lost race, with alternatives"
+          weight: 1
+          patterns: ["alternative|apolog|sold out|fallback|compensat"]
+- id: iv-sd-coupon-redemption
+  kind: system_design
+  level: mid
+  title: "Design coupon redemption"
+  prompt: >-
+    Design a coupon system: a code may be redeemed once, redemption must be
+    fast at checkout, and campaigns can have millions of codes.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What makes a redemption valid?"
+      intent: >-
+        The rules — per-user limits, expiry, minimum spend — are the system.
+      hint: >-
+        Ask for the rule set: once globally, once per user, expiry, minimum
+        spend, combinability. Each rule changes the storage key.
+      criteria:
+        - id: rules
+          label: "asks whether the limit is global, per user, or per campaign"
+          weight: 3
+          patterns: ["once|per user|global|limit|one per"]
+        - id: expiry
+          label: "asks about expiry and time zones"
+          weight: 1
+          patterns: ["expiry|expire|timezone|valid until|window"]
+        - id: stacking
+          label: "asks whether coupons combine with other promotions"
+          weight: 1
+          patterns: ["stack|combin|multiple|coupon plus|exclusive"]
+    - id: core
+      question: "How do you guarantee a code is used once under concurrency?"
+      intent: >-
+        Expect a conditional write on the code record, keyed to the reservation.
+      hint: >-
+        Redemption is a conditional update from unused to used with the order id
+        recorded, so two concurrent checkouts cannot both succeed. A read-then-write
+        will double-redeem.
+      criteria:
+        - id: conditional
+          label: "conditional or atomic state transition on the code"
+          weight: 3
+          patterns: ["conditional|atomic|compare and set|transaction|unique constraint"]
+        - id: order
+          label: "the redemption is tied to an order id for audit and reversal"
+          weight: 2
+          patterns: ["order id|tie to|record|audit|reference"]
+        - id: fast
+          label: "validation served from a fast store with a database of record"
+          weight: 1
+          patterns: ["cache|redis|fast|read|lookup"]
+    - id: scale
+      question: "A campaign has 10M codes and a bot tries every one. What do you do?"
+      intent: >-
+        Probes enumeration defence and per-user throttling.
+      hint: >-
+        Codes must be long and random enough that enumeration is infeasible, and
+        attempts must be rate limited per account and per IP. Short human-readable
+        codes are guessable by construction.
+      criteria:
+        - id: entropy
+          label: "codes have enough entropy to resist guessing"
+          weight: 2
+          patterns: ["entropy|random|length|unguessable|brute force"]
+        - id: ratelimit
+          label: "per-account and per-IP attempt limits"
+          weight: 2
+          patterns: ["rate limit|throttle|attempt|per ip|per account"]
+        - id: detect
+          label: "detects enumeration patterns and blocks them"
+          weight: 1
+          patterns: ["detect|pattern|block|fraud|anomal"]
+- id: iv-sd-tenant-isolation
+  kind: system_design
+  level: staff
+  title: "Design multi-tenant isolation for a SaaS"
+  prompt: >-
+    Design the data and compute isolation model for a B2B SaaS with 10,000
+    tenants, including a few who demand dedicated infrastructure.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What does each tenant actually require: compliance, performance, or both?"
+      intent: >-
+        Isolation is a spectrum and the requirement, not the technology, chooses
+        the point.
+      hint: >-
+        Ask whether the requirement is contractual (data residency, dedicated
+        keys) or performance (no noisy neighbour). Those lead to different
+        answers, and most tenants need neither.
+      criteria:
+        - id: requirement
+          label: "asks whether isolation is a compliance or performance requirement"
+          weight: 3
+          patterns: ["compliance|contract|residency|performance|noisy neighbour|noisy neighbor"]
+        - id: tiers
+          label: "asks whether all tenants need the same tier"
+          weight: 2
+          patterns: ["tier|premium|all tenants|segment|same"]
+        - id: cost
+          label: "raises the cost of per-tenant infrastructure"
+          weight: 1
+          patterns: ["cost|expensive|overhead|utilisation|utilization"]
+    - id: core
+      question: "Which isolation model do you choose, and what is the default?"
+      intent: >-
+        Expect pooled by default with a silo option for large tenants.
+      hint: >-
+        Pool everything by default with a tenant id on every row and enforced at
+        the data layer, and give the few demanding tenants a dedicated schema or
+        cluster. One model for everyone either wastes money or fails the contract.
+      criteria:
+        - id: pooled
+          label: "pooled multi-tenancy with a tenant key enforced everywhere"
+          weight: 2
+          patterns: ["pool|shared|tenant id|row level|schema per"]
+        - id: silo
+          label: "a dedicated silo tier for large or regulated tenants"
+          weight: 2
+          patterns: ["dedicated|silo|separate cluster|single tenant|isolated"]
+        - id: enforce
+          label: "the tenant filter is enforced centrally, not by each query author"
+          weight: 2
+          patterns: ["enforce|middleware|policy|row level security|guard"]
+    - id: scale
+      question: "One tenant's batch job saturates the shared database. How do you stop that?"
+      intent: >-
+        Probes noisy-neighbour control and per-tenant quotas.
+      hint: >-
+        Isolation without quotas does not protect anyone. Per-tenant connection
+        and query limits plus a separate queue for batch work keep one tenant from
+        consuming the shared pool.
+      criteria:
+        - id: quota
+          label: "per-tenant connection, query and rate limits"
+          weight: 2
+          patterns: ["quota|limit|connection pool|rate|per tenant"]
+        - id: separate
+          label: "batch or heavy work routed to a separate pool or replica"
+          weight: 2
+          patterns: ["separate pool|replica|queue|offload|batch tier"]
+        - id: detect
+          label: "per-tenant metrics so the offender is visible"
+          weight: 1
+          patterns: ["metrics|monitor|per tenant|dashboard|attribut"]
+- id: iv-sd-webhooks
+  kind: system_design
+  level: senior
+  title: "Design outbound webhook delivery"
+  prompt: >-
+    Design webhooks: when an event happens, POST it to each subscribed
+    customer endpoint, with retries, ordering guarantees, and signature
+    verification.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What does a customer expect when their endpoint is down for an hour?"
+      intent: >-
+        Retry policy and the delivery guarantee must be stated, not implied.
+      hint: >-
+        The guarantee is at-least-once with retries over hours, which means
+        customers must deduplicate by event id. Say that explicitly.
+      criteria:
+        - id: guarantee
+          label: "states at-least-once delivery and the need for consumer dedupe"
+          weight: 3
+          patterns: ["at least once|duplicate|dedup|event id|idempot"]
+        - id: retries
+          label: "asks the retry window and backoff policy"
+          weight: 2
+          patterns: ["retry|backoff|window|hours|attempt"]
+        - id: disable
+          label: "asks when to disable a failing endpoint"
+          weight: 1
+          patterns: ["disable|suspend|pause|auto disable|circuit"]
+    - id: core
+      question: "How is a delivery attempted and recorded?"
+      intent: >-
+        Expect per-endpoint queues, signed payloads, timeouts, and a delivery log.
+      hint: >-
+        Each endpoint gets its own queue so one slow customer does not block
+        others, each request is signed with a timestamped HMAC, and every attempt
+        is recorded for replay.
+      criteria:
+        - id: perqueue
+          label: "per-endpoint queue or partition for isolation"
+          weight: 3
+          patterns: ["per endpoint|separate queue|partition|isolat|per customer"]
+        - id: signature
+          label: "HMAC signature with a timestamp to prevent replay"
+          weight: 2
+          patterns: ["hmac|signature|sign|secret|timestamp"]
+        - id: timeout
+          label: "a short timeout so a hung endpoint does not hold a worker"
+          weight: 1
+          patterns: ["timeout|short|abort|deadline"]
+    - id: scale
+      question: "A customer's endpoint takes 30 seconds per request. What happens to their queue?"
+      intent: >-
+        Probes backpressure per endpoint and the operational consequence of
+        unbounded retries.
+      hint: >-
+        Their queue grows without bound, so you cap the queue, drop oldest or
+        pause the endpoint, and alert the customer. Unbounded retries turn their
+        problem into your storage bill.
+      criteria:
+        - id: cap
+          label: "bounded queue or rate per endpoint"
+          weight: 2
+          patterns: ["cap|bound|limit|max|rate"]
+        - id: pause
+          label: "pause or disable the endpoint after repeated failures"
+          weight: 2
+          patterns: ["pause|disable|circuit|suspend|back off"]
+        - id: surface
+          label: "surfaces delivery health to the customer"
+          weight: 1
+          patterns: ["dashboard|alert|notify|visibility|health"]
+- id: iv-sd-resumable-upload
+  kind: system_design
+  level: mid
+  title: "Design resumable large file upload"
+  prompt: >-
+    Design upload for multi-gigabyte files over flaky mobile networks: resume
+    after a drop, and do not corrupt the file.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What is the failure you are designing for?"
+      intent: >-
+        Partial upload and duplicate bytes are the two failure modes; the
+        candidate should name them.
+      hint: >-
+        A dropped connection mid-file must leave the server able to say exactly
+        which bytes it has, so the client resumes rather than restarting.
+      criteria:
+        - id: resume
+          label: "resume from a known offset rather than restarting"
+          weight: 3
+          patterns: ["resume|offset|restart|continue|from where"]
+        - id: integrity
+          label: "asks how integrity is verified, e.g. per-chunk hashes"
+          weight: 2
+          patterns: ["checksum|hash|integrity|corrupt|verify"]
+        - id: size
+          label: "asks the maximum file size and concurrent uploads"
+          weight: 1
+          patterns: ["size|gigabyte|maximum|concurrent|parallel"]
+    - id: core
+      question: "Describe the protocol between client and server."
+      intent: >-
+        Expect an initiate call returning an upload id, chunked PUTs with offsets,
+        and a complete call that assembles.
+      hint: >-
+        Initiate returns an upload id and the chunk size; each chunk is uploaded
+        with its index and hash; complete verifies all chunks present and
+        assembles into the final object.
+      criteria:
+        - id: init
+          label: "an initiate step that returns an upload id"
+          weight: 2
+          patterns: ["upload id|initiate|session|create upload"]
+        - id: chunks
+          label: "chunks uploaded with an index or byte range"
+          weight: 3
+          patterns: ["chunk|part|range|offset|index"]
+        - id: complete
+          label: "a complete step that verifies and assembles"
+          weight: 2
+          patterns: ["complete|assemble|finalis|finaliz|commit"]
+    - id: scale
+      question: "The client loses network after 90 percent. What does it send on reconnect?"
+      intent: >-
+        Probes the status endpoint and whether the client must re-send anything.
+      hint: >-
+        One status call returns the received chunk list, and the client uploads
+        only the missing chunks. Re-uploading from zero is the failure this design
+        exists to prevent.
+      criteria:
+        - id: status
+          label: "a status call lists received chunks or the offset"
+          weight: 3
+          patterns: ["status|list|which chunks|offset|received"]
+        - id: missing
+          label: "only missing chunks are retransmitted"
+          weight: 2
+          patterns: ["only missing|remaining|resume|not all|differential"]
+        - id: cleanup
+          label: "incomplete uploads expire and are cleaned up"
+          weight: 1
+          patterns: ["expire|cleanup|garbage|ttl|abandon"]
+- id: iv-sd-image-service
+  kind: system_design
+  level: mid
+  title: "Design an image transformation service"
+  prompt: >-
+    Design a service that resizes and reformats images on demand via URL
+    parameters, serving 200k requests a second.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "Which transformations are allowed, and can anyone request any size?"
+      intent: >-
+        An open transformation space is a denial-of-service vector.
+      hint: >-
+        Ask whether sizes are arbitrary or from a fixed set. Arbitrary sizes make
+        the cache useless and let one user generate infinite variants.
+      criteria:
+        - id: variants
+          label: "asks whether sizes and formats come from a fixed set"
+          weight: 3
+          patterns: ["fixed set|arbitrary|allowed|whitelist|preset"]
+        - id: source
+          label: "asks where originals live and how large they are"
+          weight: 1
+          patterns: ["original|source|origin|size|storage"]
+        - id: auth
+          label: "asks whether signed URLs are required"
+          weight: 1
+          patterns: ["signed|auth|token|private|hotlink"]
+    - id: core
+      question: "Walk a request from URL to bytes."
+      intent: >-
+        Expect a CDN hit, then a transform worker reading the original from
+        object storage, writing the derivative back, and caching it.
+      hint: >-
+        The CDN absorbs repeats; on a miss a worker fetches the original, applies
+        the transform, writes the derivative to storage, and serves it with a long
+        TTL. Transforming on every request without storing is the mistake.
+      criteria:
+        - id: cdn
+          label: "CDN cache in front with a long TTL"
+          weight: 2
+          patterns: ["cdn|edge|cache|ttl"]
+        - id: worker
+          label: "transform worker reads the original and writes a derivative"
+          weight: 2
+          patterns: ["worker|transform|resize|encode|derivative"]
+        - id: store
+          label: "derivatives are persisted, not regenerated each time"
+          weight: 2
+          patterns: ["store|persist|write back|object storage|s3"]
+    - id: scale
+      question: "Someone requests 10,000 distinct sizes of one image. What stops that?"
+      intent: >-
+        Probes variant explosion and the cost model.
+      hint: >-
+        A bounded variant set or a signed allowlist is the only real defence;
+        caching 10,000 derivatives costs more than the customer pays, and the
+        transform fleet becomes the amplifier.
+      criteria:
+        - id: allowlist
+          label: "rejects sizes outside an allowlist or preset set"
+          weight: 3
+          patterns: ["allowlist|whitelist|preset|reject|bounded"]
+        - id: quota
+          label: "per-tenant transform quotas or cost limits"
+          weight: 2
+          patterns: ["quota|rate limit|cost|per tenant|budget"]
+        - id: detect
+          label: "detects the pattern and blocks or slows the source"
+          weight: 1
+          patterns: ["detect|block|anomal|alert|throttle"]
+- id: iv-sd-session-auth
+  kind: system_design
+  level: senior
+  title: "Design session management"
+  prompt: >-
+    Design authentication sessions for a web product: login, stay logged in,
+    log out everywhere, and revoke a stolen session immediately.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What must revocation do, and how fast?"
+      intent: >-
+        Immediate revocation is what rules out a pure stateless JWT.
+      hint: >-
+        A stateless token cannot be revoked before it expires. Ask how fast
+        revocation must take effect; if the answer is immediately, you need
+        server-side state or a very short token lifetime with refresh.
+      criteria:
+        - id: revocation
+          label: "asks how quickly a session must be revocable"
+          weight: 3
+          patterns: ["revoke|revocation|immediate|seconds|stolen"]
+        - id: lifetime
+          label: "asks the session lifetime and idle timeout"
+          weight: 2
+          patterns: ["lifetime|expiry|idle|timeout|remember me"]
+        - id: devices
+          label: "asks about multiple devices and log out everywhere"
+          weight: 1
+          patterns: ["device|everywhere|all sessions|multi device"]
+    - id: core
+      question: "Cookie session or JWT? Defend it."
+      intent: >-
+        Expect an opaque session id with server-side state, or a short-lived JWT
+        plus a revocable refresh token.
+      hint: >-
+        An opaque session id in an HttpOnly cookie with server-side state gives
+        immediate revocation and is the simplest honest answer; a JWT needs a
+        short TTL plus a refresh token to get the same property.
+      criteria:
+        - id: opaque
+          label: "opaque session id with server-side state"
+          weight: 2
+          patterns: ["opaque|session id|server side|session store"]
+        - id: jwt
+          label: "if JWT, short expiry plus a revocable refresh token"
+          weight: 2
+          patterns: ["jwt|short lived|refresh token|access token"]
+        - id: cookie
+          label: "HttpOnly, Secure, SameSite cookie handling"
+          weight: 1
+          patterns: ["httponly|secure|samesite|cookie flag"]
+    - id: scale
+      question: "A session token leaks. Walk me through the revocation."
+      intent: >-
+        Probes the store, the propagation of the revocation to every node, and
+        the residual risk window.
+      hint: >-
+        Delete the session from the shared store and every node sees it on the
+        next lookup; with a cached JWT there is a window equal to the TTL, which
+        is why the TTL is minutes, not hours.
+      criteria:
+        - id: store
+          label: "a shared session store that all nodes consult"
+          weight: 2
+          patterns: ["redis|shared|store|lookup|central"]
+        - id: window
+          label: "states the residual window and bounds the TTL"
+          weight: 2
+          patterns: ["window|ttl|minutes|residual|until expiry"]
+        - id: rotate
+          label: "rotates the token on privilege change or login"
+          weight: 1
+          patterns: ["rotate|reissue|new token|regenerate|refresh"]
+- id: iv-sd-oauth-idp
+  kind: system_design
+  level: staff
+  title: "Design an OAuth identity provider"
+  prompt: >-
+    Design an OIDC identity provider used by 5,000 client applications and 50M
+    users, including social login and enterprise SSO.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "Which flows must it support, and who are the clients?"
+      intent: >-
+        The candidate must distinguish confidential web clients from public
+        mobile and SPA clients.
+      hint: >-
+        Public clients cannot keep a secret, so they need authorisation code with
+        PKCE. Asking this before designing the token endpoint is the whole point.
+      criteria:
+        - id: flows
+          label: "distinguishes authorisation code, PKCE and client credentials"
+          weight: 3
+          patterns: ["authorisation code|authorization code|pkce|client credentials|implicit"]
+        - id: clients
+          label: "asks whether clients are public or confidential"
+          weight: 2
+          patterns: ["public client|confidential|spa|mobile|server side"]
+        - id: federation
+          label: "asks about social and enterprise identity federation"
+          weight: 1
+          patterns: ["federation|saml|social|google|okta|sso"]
+    - id: core
+      question: "What is in a token, and how do clients verify it?"
+      intent: >-
+        Expect signed JWTs with a published key set, short access tokens, and
+        rotating refresh tokens.
+      hint: >-
+        Access tokens are short-lived signed JWTs verified locally against a
+        published JWKS; refresh tokens are opaque, stored hashed, and rotated on
+        use so a stolen refresh token is detectable.
+      criteria:
+        - id: jwks
+          label: "signed tokens verified against a published key set"
+          weight: 2
+          patterns: ["jwks|public key|signature|verify|rs256"]
+        - id: refresh
+          label: "opaque refresh tokens stored hashed and rotated"
+          weight: 2
+          patterns: ["refresh|opaque|hashed|rotat|one time"]
+        - id: claims
+          label: "minimal claims, with scopes and audience"
+          weight: 1
+          patterns: ["claim|scope|audience|exp|issuer"]
+    - id: scale
+      question: "Key rotation, and a client that caches keys for a day. What breaks?"
+      intent: >-
+        Probes the JWKS cache and the overlap window during rotation.
+      hint: >-
+        Publish new keys alongside old ones and keep the old public key available
+        until every token signed with it has expired; clients must refresh JWKS on
+        an unknown key id rather than failing.
+      criteria:
+        - id: overlap
+          label: "publishes old and new keys with an overlap window"
+          weight: 3
+          patterns: ["overlap|both keys|grace|keep old|transition"]
+        - id: kid
+          label: "clients refresh the key set when they see an unknown key id"
+          weight: 2
+          patterns: ["kid|key id|refresh|unknown key|refetch"]
+        - id: revoke
+          label: "a revocation or introspection path for the exceptions"
+          weight: 1
+          patterns: ["revoke|introspect|denylist|blocklist"]
+- id: iv-sd-permissions
+  kind: system_design
+  level: staff
+  title: "Design a permissions system"
+  prompt: >-
+    Design authorisation for a document product: sharing with users and
+    groups, nested folders, inheritance, and an answer in under 10 ms.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What is the model: roles, attributes, or relationships?"
+      intent: >-
+        The candidate should choose an authorisation model explicitly rather than
+        hardcoding checks.
+      hint: >-
+        Nested inheritance with sharing is a relationship problem, so ReBAC or a
+        graph of relations fits better than flat RBAC. Say which model you are
+        using before designing storage.
+      criteria:
+        - id: model
+          label: "names a model: RBAC, ABAC or ReBAC"
+          weight: 3
+          patterns: ["rbac|abac|rebac|relationship|role based|attribute"]
+        - id: inheritance
+          label: "asks how permissions inherit through folders"
+          weight: 2
+          patterns: ["inherit|nested|folder|parent|propagat"]
+        - id: latency
+          label: "confirms the check latency budget and its frequency"
+          weight: 1
+          patterns: ["10 ms|latency|per request|budget|fast"]
+    - id: core
+      question: "How is a permission check evaluated?"
+      intent: >-
+        Expect a graph traversal or a materialised relation tuple set, with
+        caching.
+      hint: >-
+        A check walks the relation graph from the document up through parent
+        folders to the subject; the expensive part is the walk, so you materialise
+        or cache the expanded set.
+      criteria:
+        - id: graph
+          label: "graph traversal over relations or tuples"
+          weight: 3
+          patterns: ["graph|tuple|relation|traversal|walk"]
+        - id: cache
+          label: "caches expanded permissions per subject and object"
+          weight: 2
+          patterns: ["cache|materialis|materializ|precompute|memo"]
+        - id: deny
+          label: "default deny, with explicit grants"
+          weight: 1
+          patterns: ["default deny|deny by default|explicit|least privilege"]
+    - id: scale
+      question: "A folder is shared with a group of 50k people. What happens to the check?"
+      intent: >-
+        Probes fan-out on group membership and the write cost of invalidation.
+      hint: >-
+        Expanding a 50k-member group at check time is infeasible, so you
+        materialise membership and accept a propagation delay, with a version
+        number to invalidate caches.
+      criteria:
+        - id: expand
+          label: "identifies group expansion as the cost"
+          weight: 2
+          patterns: ["expand|50k|large group|fan out|membership"]
+        - id: materialise
+          label: "materialises membership rather than walking it per check"
+          weight: 2
+          patterns: ["materialis|materializ|flatten|precompute|index"]
+        - id: invalidate
+          label: "a version or invalidation signal after a permission change"
+          weight: 1
+          patterns: ["invalidat|version|propagat|eventual|stale"]
+- id: iv-sd-comments
+  kind: system_design
+  level: junior
+  title: "Design a comments system"
+  prompt: >-
+    Design threaded comments on articles: post, reply, paginate, moderate, and
+    handle a post that gets 100k comments.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "How deep may threads go, and how are they ordered?"
+      intent: >-
+        Depth and ordering decide the read query, which is the hard part.
+      hint: >-
+        Ask the maximum depth and the sort order. Unbounded depth makes a single
+        query impossible; top-level by time with replies collapsed is a different
+        index from full threading.
+      criteria:
+        - id: depth
+          label: "asks the maximum nesting depth"
+          weight: 2
+          patterns: ["depth|nest|level|reply to|thread"]
+        - id: order
+          label: "asks the sort order: newest, top, or oldest first"
+          weight: 2
+          patterns: ["sort|newest|top|oldest|rank|order"]
+        - id: count
+          label: "asks about the comment volume per post"
+          weight: 1
+          patterns: ["volume|100k|per post|count|many"]
+    - id: core
+      question: "How is a thread stored and fetched?"
+      intent: >-
+        Expect a parent id plus a materialised path or a two-query pattern.
+      hint: >-
+        Store parent id and a path or depth, fetch top-level comments page by
+        page, then fetch the replies for that page in one query. Per-comment
+        recursion is the N plus one disaster.
+      criteria:
+        - id: parent
+          label: "parent id plus a path or depth column"
+          weight: 2
+          patterns: ["parent id|parent|path|depth|ancestor"]
+        - id: page
+          label: "paginates top-level comments first, then replies"
+          weight: 2
+          patterns: ["paginate|page|top level|then replies|two queries"]
+        - id: index
+          label: "an index on post id and created time"
+          weight: 1
+          patterns: ["index|composite|post id|created"]
+    - id: scale
+      question: "A post gets 100k comments in an hour. What degrades, and how do you fix it?"
+      intent: >-
+        Probes count queries, cache, and moderation load.
+      hint: >-
+        Counting and sorting over 100k rows per page view is the cost, so keep a
+        denormalised count and cache the first page; moderation needs a queue, not
+        synchronous review.
+      criteria:
+        - id: count
+          label: "denormalised comment counts rather than COUNT per view"
+          weight: 2
+          patterns: ["count|denormalis|denormaliz|counter|cache"]
+        - id: cache
+          label: "caches the first page or hot thread"
+          weight: 2
+          patterns: ["cache|hot|first page|redis|cdn"]
+        - id: moderation
+          label: "asynchronous moderation queue"
+          weight: 1
+          patterns: ["moderation|queue|async|review|flag"]
+- id: iv-sd-trending
+  kind: system_design
+  level: senior
+  title: "Design trending topics"
+  prompt: >-
+    Design a trending topics feature: surface what is spiking now, refreshed
+    every minute, resistant to manipulation.
+  reference_topics: [system-design-foundations, time-series]
+  stages:
+    - id: clarify
+      question: "What makes something trend: volume or acceleration?"
+      intent: >-
+        Volume alone surfaces the permanently popular; the interesting signal is
+        the derivative.
+      hint: >-
+        Raw volume returns the same topics every day. Trending is a rate of change
+        relative to a baseline, so ask what window and what comparison the product
+        wants.
+      criteria:
+        - id: signal
+          label: "distinguishes volume from acceleration or deviation"
+          weight: 3
+          patterns: ["acceleration|rate of change|spike|deviation|baseline|velocity"]
+        - id: window
+          label: "asks the window and refresh cadence"
+          weight: 2
+          patterns: ["window|minute|hour|refresh|cadence"]
+        - id: manipulation
+          label: "raises manipulation and bot amplification"
+          weight: 1
+          patterns: ["manipulat|bot|spam|amplif|gaming|coordinated"]
+    - id: core
+      question: "How do you compute counts per topic over a sliding window?"
+      intent: >-
+        Expect streaming aggregation with per-topic counters in bucketed windows.
+      hint: >-
+        Keep per-minute buckets per topic and sum the last N buckets on read;
+        a single rolling counter cannot answer a sliding window or compute a
+        baseline.
+      criteria:
+        - id: bucket
+          label: "per-minute buckets summed over a sliding window"
+          weight: 3
+          patterns: ["bucket|per minute|sliding|window|sum"]
+        - id: stream
+          label: "streaming aggregation with a bounded state"
+          weight: 2
+          patterns: ["stream|flink|kafka|aggregate|state"]
+        - id: score
+          label: "a scoring function combining velocity and uniqueness"
+          weight: 1
+          patterns: ["score|rank|weight|formula|normalis"]
+    - id: scale
+      question: "A coordinated campaign inflates one hashtag. How does your design resist it?"
+      intent: >-
+        Probes unique-author weighting and anomaly detection.
+      hint: >-
+        Weight by unique authors, not posts, and discount accounts that are new,
+        clustered, or posting identical text. Volume from one cluster is not a
+        trend.
+      criteria:
+        - id: unique
+          label: "counts unique authors rather than raw posts"
+          weight: 3
+          patterns: ["unique author|distinct user|per user|dedup by user"]
+        - id: cluster
+          label: "detects clusters of new or coordinated accounts"
+          weight: 2
+          patterns: ["cluster|coordinat|new account|sybil|graph"]
+        - id: review
+          label: "a human or policy layer before promotion"
+          weight: 1
+          patterns: ["review|curat|editorial|policy|manual"]
+- id: iv-sd-etl-orchestration
+  kind: system_design
+  level: senior
+  title: "Design a data pipeline orchestrator"
+  prompt: >-
+    Design the scheduler that runs 20,000 interdependent ETL jobs a day, with
+    backfills, retries and lineage.
+  reference_topics: [system-design-foundations, time-series]
+  stages:
+    - id: clarify
+      question: "What does a job depend on, and what does a missed SLA cost?"
+      intent: >-
+        Dependencies are on data partitions, not just on time, and the SLA decides
+        priority.
+      hint: >-
+        Ask whether a job depends on a schedule or on a partition being complete.
+        Data-aware dependencies are what prevent a job from reading yesterday's
+        partial table.
+      criteria:
+        - id: depends
+          label: "asks whether dependencies are time-based or data-based"
+          weight: 3
+          patterns: ["data aware|partition|dependency|upstream|sensor"]
+        - id: sla
+          label: "asks the SLA and what happens when it is missed"
+          weight: 2
+          patterns: ["sla|deadline|priority|alert|missed"]
+        - id: backfill
+          label: "asks about backfills and historical reruns"
+          weight: 1
+          patterns: ["backfill|rerun|historical|replay"]
+    - id: core
+      question: "How is the DAG represented and advanced?"
+      intent: >-
+        Expect a DAG of tasks with per-task state, and a scheduler that only
+        enqueues tasks whose dependencies succeeded.
+      hint: >-
+        Each task has a state per interval — scheduled, running, succeeded,
+        failed — and the scheduler walks the DAG, enqueuing only ready tasks. The
+        interval is part of the key, or backfills collide with live runs.
+      criteria:
+        - id: dag
+          label: "a DAG with per-task, per-interval state"
+          weight: 3
+          patterns: ["dag|directed|graph|state|interval"]
+        - id: ready
+          label: "only ready tasks are enqueued"
+          weight: 2
+          patterns: ["ready|dependency satisfied|upstream|topological"]
+        - id: idempotent
+          label: "tasks are idempotent or partitioned so retries are safe"
+          weight: 2
+          patterns: ["idempot|partition overwrite|retry safe|atomic"]
+    - id: scale
+      question: "A source table arrives three hours late. What does the orchestrator do?"
+      intent: >-
+        Probes sensors, downstream blocking, and the choice between waiting and
+        failing.
+      hint: >-
+        A sensor waits with a timeout and marks downstream tasks as blocked, not
+        failed, so a late arrival does not trigger a cascade of pointless retries.
+      criteria:
+        - id: sensor
+          label: "a sensor or check that waits for the data"
+          weight: 3
+          patterns: ["sensor|check|wait|poll|arrival"]
+        - id: block
+          label: "downstream is blocked or skipped rather than failed repeatedly"
+          weight: 2
+          patterns: ["block|skip|hold|upstream failed|not retry"]
+        - id: alert
+          label: "an alert on the SLA breach, not just on the failure"
+          weight: 1
+          patterns: ["alert|sla|notify|page|escalat"]
+- id: iv-sd-backup-dr
+  kind: system_design
+  level: staff
+  title: "Design backup and disaster recovery"
+  prompt: >-
+    Design backup and recovery for a system with 50 TB of transactional data:
+    define the RPO and RTO, and prove the restore actually works.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What RPO and RTO are you designing to, and what counts as a disaster?"
+      intent: >-
+        Without numbers, the design is a wish. The candidate must pin both.
+      hint: >-
+        RPO is how much data you may lose and RTO is how long recovery may take;
+        they price the whole design, so get them before choosing a mechanism.
+      criteria:
+        - id: rpo
+          label: "asks or states an RPO in time, not in vague terms"
+          weight: 3
+          patterns: ["rpo|recovery point|how much data|minutes of data|data loss"]
+        - id: rto
+          label: "asks or states an RTO"
+          weight: 3
+          patterns: ["rto|recovery time|how long|hours|minutes to recover"]
+        - id: scope
+          label: "defines what a disaster is: region loss, corruption, deletion"
+          weight: 1
+          patterns: ["region|corruption|deletion|ransomware|disaster"]
+    - id: core
+      question: "Full, incremental, or continuous? Justify the choice against the RPO."
+      intent: >-
+        Expect continuous log shipping or WAL archiving for a tight RPO, plus
+        periodic full backups.
+      hint: >-
+        Nightly full backups give a 24-hour RPO. If the number is minutes, you
+        need continuous WAL or binlog shipping, and the full backup is only a
+        baseline to replay onto.
+      criteria:
+        - id: continuous
+          label: "continuous log or WAL shipping for a tight RPO"
+          weight: 3
+          patterns: ["wal|binlog|log shipping|continuous|point in time"]
+        - id: full
+          label: "periodic full backups as a baseline"
+          weight: 2
+          patterns: ["full backup|snapshot|baseline|weekly|daily"]
+        - id: offsite
+          label: "backups stored off-site or in another region, and immutable"
+          weight: 2
+          patterns: ["offsite|off site|another region|immutable|object lock"]
+    - id: scale
+      question: "How do you know the restore works? Nobody has tested it in a year."
+      intent: >-
+        Probes restore drills and the honest admission that an untested backup is
+        not a backup.
+      hint: >-
+        A restore drill on a schedule, into a separate environment, with the
+        measured time compared against the RTO. An untested backup is a hypothesis.
+      criteria:
+        - id: drill
+          label: "scheduled restore drills, not just backup success alerts"
+          weight: 3
+          patterns: ["drill|test restore|game day|rehearsal|exercise"]
+        - id: measure
+          label: "measures the actual restore time against the RTO"
+          weight: 2
+          patterns: ["measure|time it|rto|elapsed|report"]
+        - id: verify
+          label: "verifies data integrity after restore, e.g. checksums or row counts"
+          weight: 1
+          patterns: ["checksum|count|integrity|verify|consistency"]
+- id: iv-sd-multi-region
+  kind: system_design
+  level: principal
+  title: "Design multi-region active-active"
+  prompt: >-
+    Design an active-active deployment across three regions for a product with
+    user-generated content, with no downtime when a region fails.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What must be strongly consistent, and what may be eventual?"
+      intent: >-
+        The principal-level move is to refuse blanket active-active and partition
+        the data by consistency requirement.
+      hint: >-
+        Almost nothing needs cross-region strong consistency. Split the data into
+        a strongly consistent core with a home region and an eventually consistent
+        periphery that replicates, and say which is which.
+      criteria:
+        - id: partition
+          label: "splits data by consistency requirement rather than declaring all active-active"
+          weight: 3
+          patterns: ["split|classif|core|periphery|not everything|consistency requirement"]
+        - id: conflict
+          label: "names the conflict resolution for concurrent writes"
+          weight: 2
+          patterns: ["conflict|last writer|merge|crdt|version|vector"]
+        - id: failover
+          label: "asks what failure is being survived: region, zone, or link"
+          weight: 2
+          patterns: ["region|zone|link|failure|survive"]
+    - id: core
+      question: "How are writes routed, and what happens to the home region on failure?"
+      intent: >-
+        Expect home-region writes with a promotion procedure, or a consensus group
+        with a defined quorum.
+      hint: >-
+        Writes go to a home region per shard; on failure you promote a replica,
+        which costs a bounded unavailability window. Pretending both regions accept
+        writes for the same key is where the data loss comes from.
+      criteria:
+        - id: home
+          label: "a home or leader region per shard for writes"
+          weight: 3
+          patterns: ["home region|leader|primary|owner|home shard"]
+        - id: promote
+          label: "a promotion or failover procedure with a bounded window"
+          weight: 2
+          patterns: ["promote|failover|election|takeover|window"]
+        - id: quorum
+          label: "quorum or consensus so two regions cannot both claim leadership"
+          weight: 1
+          patterns: ["quorum|consensus|raft|majority|fenc"]
+    - id: scale
+      question: "A region is cut off but still serving. What do users in it see?"
+      intent: >-
+        Probes the partition behaviour and whether the candidate chooses
+        availability or consistency explicitly.
+      hint: >-
+        The isolated region cannot reach quorum, so it must stop accepting writes
+        and serve reads, possibly stale. Continuing to accept writes creates a
+        split brain you have to reconcile by hand.
+      criteria:
+        - id: minority
+          label: "the minority region stops accepting writes"
+          weight: 3
+          patterns: ["stop|reject|read only|minority|no quorum"]
+        - id: stale
+          label: "reads are served, possibly stale, with a bound"
+          weight: 2
+          patterns: ["stale|read only|serve reads|bounded"]
+        - id: reconcile
+          label: "a reconciliation plan for anything written during the split"
+          weight: 1
+          patterns: ["reconcil|merge|replay|conflict|repair"]
+- id: iv-sd-resharding
+  kind: system_design
+  level: principal
+  title: "Reshard a live database"
+  prompt: >-
+    You have a sharded database with 500 shards and one hot shard. Walk me
+    through resharding it with no downtime.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "Why is the shard hot, and can the key change?"
+      intent: >-
+        Resharding is the last resort; the principal candidate should first ask
+        whether the key or the data model can change.
+      hint: >-
+        Ask whether the hot shard is a key-distribution problem or a genuine
+        single-tenant hotspot. If one tenant is the load, splitting shards does
+        not help — you need to split that tenant.
+      criteria:
+        - id: cause
+          label: "distinguishes skew from a single hot tenant"
+          weight: 3
+          patterns: ["skew|hot tenant|single tenant|distribution|one key"]
+        - id: key
+          label: "asks whether the shard key can change"
+          weight: 2
+          patterns: ["shard key|change the key|rekey|composite key"]
+        - id: downtime
+          label: "confirms the zero-downtime requirement and its cost"
+          weight: 1
+          patterns: ["no downtime|zero downtime|online|maintenance window"]
+    - id: core
+      question: "Describe the migration mechanics from old layout to new."
+      intent: >-
+        Expect dual writes or logical replication, backfill, shadow reads, then a
+        cutover.
+      hint: >-
+        The pattern is: enable dual writes, backfill history in the background,
+        compare reads between old and new, then flip the read path and finally the
+        write path. Skipping the shadow read is how you discover corruption after
+        cutover.
+      criteria:
+        - id: dualwrite
+          label: "dual writes or change data capture during the transition"
+          weight: 3
+          patterns: ["dual write|double write|cdc|capture|replication"]
+        - id: backfill
+          label: "background backfill with throttling"
+          weight: 2
+          patterns: ["backfill|copy|throttle|batch|migrate"]
+        - id: shadow
+          label: "shadow reads or comparison before cutover"
+          weight: 2
+          patterns: ["shadow|compare|verify|dual read|diff"]
+    - id: scale
+      question: "Halfway through, the backfill starts affecting production latency. What do you do?"
+      intent: >-
+        Probes throttling, reversibility, and the discipline to pause.
+      hint: >-
+        Throttle the backfill against the primary's own latency signal, and keep
+        the old path writable so you can abort. A migration without a reverse path
+        is a one-way door.
+      criteria:
+        - id: throttle
+          label: "throttles the backfill based on production latency"
+          weight: 3
+          patterns: ["throttle|rate limit|slow down|adaptive|back off"]
+        - id: abort
+          label: "the migration can be aborted and the old path is still valid"
+          weight: 2
+          patterns: ["abort|rollback|reverse|revert|old path"]
+        - id: observe
+          label: "monitors replication lag and error rate during the move"
+          weight: 1
+          patterns: ["lag|monitor|error rate|metric|alert"]
+- id: iv-sd-cache-stampede
+  kind: system_design
+  level: senior
+  title: "Diagnose and fix a cache stampede"
+  prompt: >-
+    Your cache expires a popular key every five minutes and the database spikes
+    to 100 percent CPU at each expiry. Walk me through the diagnosis and fix.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What is the access pattern around the expiry, and what is the rebuild cost?"
+      intent: >-
+        The candidate should quantify the thundering herd before choosing a fix.
+      hint: >-
+        One key with 10k requests a second and a two-second rebuild means every
+        request during the gap misses. That multiplication is the number to
+        establish first.
+      criteria:
+        - id: quantify
+          label: "quantifies requests per second against rebuild time"
+          weight: 3
+          patterns: ["per second|qps|rebuild|how many|multipl"]
+        - id: pattern
+          label: "identifies that all requests miss at the same instant"
+          weight: 2
+          patterns: ["same time|simultaneous|all miss|thundering|herd"]
+        - id: cost
+          label: "asks the cost of rebuilding the value"
+          weight: 1
+          patterns: ["rebuild|cost|expensive|query time|latency"]
+    - id: core
+      question: "Name the fixes and pick one."
+      intent: >-
+        Expect request coalescing, stale-while-revalidate, and jittered expiry.
+      hint: >-
+        A single-flight lock means one request rebuilds while the rest wait or are
+        served stale; jittered TTLs stop the whole keyspace expiring together.
+        Both together is the standard answer.
+      criteria:
+        - id: singleflight
+          label: "request coalescing or a single-flight lock per key"
+          weight: 3
+          patterns: ["singleflight|coalesc|lock|one request|mutex"]
+        - id: stale
+          label: "stale-while-revalidate serves the old value during rebuild"
+          weight: 2
+          patterns: ["stale while|serve stale|background refresh|refresh ahead"]
+        - id: jitter
+          label: "jittered or staggered expiry"
+          weight: 2
+          patterns: ["jitter|stagger|randomis|randomiz|spread ttl"]
+    - id: scale
+      question: "The key is hot across 50 cache nodes. Does single flight still work?"
+      intent: >-
+        Probes per-node coalescing and the need for a shared lock or a dedicated
+        hot-key path.
+      hint: >-
+        Single flight is per node, so 50 nodes still send 50 rebuilds. For a
+        globally hot key you need a shared lock, or to replicate the key to every
+        node and refresh it out of band.
+      criteria:
+        - id: pernode
+          label: "recognises coalescing is per node and multiplies across the fleet"
+          weight: 3
+          patterns: ["per node|each node|50|multipl|not global"]
+        - id: shared
+          label: "a shared lock or a dedicated refresh worker"
+          weight: 2
+          patterns: ["shared lock|distributed lock|refresh worker|central"]
+        - id: replicate
+          label: "replicates hot keys to every node or pins them"
+          weight: 1
+          patterns: ["replicate|pin|broadcast|local copy|hot key"]
+- id: iv-sd-idempotency
+  kind: system_design
+  level: senior
+  title: "Design an idempotency layer for a public API"
+  prompt: >-
+    Design idempotency keys for a payments API so a client retry never creates
+    a second charge, including when the first request is still in flight.
+  reference_topics: [system-design-foundations]
+  stages:
+    - id: clarify
+      question: "What does the client send, and how long is the key valid?"
+      intent: >-
+        Key scope and retention are the contract; without them the layer is
+        undefined.
+      hint: >-
+        The key is client-generated per logical operation, scoped to the account,
+        and retained long enough to cover the client's retry window — usually 24
+        hours, not forever.
+      criteria:
+        - id: key
+          label: "client-generated key scoped per account and operation"
+          weight: 3
+          patterns: ["client generated|client side|per account|scope|request id"]
+        - id: retention
+          label: "asks the retention window for keys"
+          weight: 2
+          patterns: ["retention|ttl|24 hours|expire|how long"]
+        - id: reuse
+          label: "asks what happens if the same key is reused with a different body"
+          weight: 2
+          patterns: ["same key|different body|mismatch|conflict|reuse"]
+    - id: core
+      question: "Walk the state machine for a request with a key."
+      intent: >-
+        Expect a record with states in-progress, completed and failed, and a
+        stored response.
+      hint: >-
+        Insert the key with a state of in progress before doing any work. If the
+        insert conflicts, the request is a retry: return the stored response or
+        wait. Without the pre-insert, two concurrent requests both proceed.
+      criteria:
+        - id: insert
+          label: "claims the key before performing the effect"
+          weight: 3
+          patterns: ["insert|claim|reserve|before|atomic"]
+        - id: states
+          label: "in-progress, completed and failed states"
+          weight: 2
+          patterns: ["in progress|pending|completed|failed|state"]
+        - id: stored
+          label: "the original response is stored and replayed"
+          weight: 2
+          patterns: ["store the response|replay|cached response|same response"]
+    - id: scale
+      question: "A retry arrives while the first request is still running. What do you return?"
+      intent: >-
+        Probes the concurrent case: 409, a wait, or a lock.
+      hint: >-
+        You cannot return a result that does not exist, so the honest answers are
+        a 409 conflict telling the client to retry later, or a short bounded wait
+        on the in-progress record. Returning success early is a lie.
+      criteria:
+        - id: conflict
+          label: "returns a conflict or in-progress status rather than a fake success"
+          weight: 3
+          patterns: ["409|conflict|in progress|retry later|not ready"]
+        - id: wait
+          label: "or waits on the in-progress record with a timeout"
+          weight: 2
+          patterns: ["wait|poll|block|timeout|subscribe"]
+        - id: expiry
+          label: "in-progress records expire so a crashed request does not block forever"
+          weight: 1
+          patterns: ["expire|ttl|stale|takeover|reclaim"]
+- id: iv-sd-billing-metering
+  kind: system_design
+  level: staff
+  title: "Design usage metering and billing"
+  prompt: >-
+    Design metering for an API product: count every request per customer,
+    price it monthly, and never bill the wrong amount.
+  reference_topics: [system-design-foundations, time-series]
+  stages:
+    - id: clarify
+      question: "What is billable, and how exact must the count be?"
+      intent: >-
+        Billable events must be defined before the pipeline, and exactness drives
+        the architecture.
+      hint: >-
+        Ask which requests are billable — errors, retries, batch calls — and
+        whether the invoice must be exact to the request or may be an
+        approximation. A dispute is a product problem, so exactness matters.
+      criteria:
+        - id: billable
+          label: "asks which events are billable, including errors and retries"
+          weight: 3
+          patterns: ["billable|which requests|errors|retries|exclude"]
+        - id: exact
+          label: "asks the exactness required for invoicing"
+          weight: 2
+          patterns: ["exact|dispute|audit|accurate|rounding"]
+        - id: granularity
+          label: "asks the pricing granularity: per request, per unit, tiered"
+          weight: 1
+          patterns: ["per request|tier|unit|granularity|pricing"]
+    - id: core
+      question: "How does a request become a line item?"
+      intent: >-
+        Expect an immutable usage event, idempotent aggregation per customer and
+        period, and a separate pricing step.
+      hint: >-
+        Emit an immutable usage event with a unique id, aggregate idempotently per
+        customer and billing period, and price separately. Mixing pricing into the
+        counting path means a price change requires re-counting.
+      criteria:
+        - id: event
+          label: "immutable usage events with unique ids"
+          weight: 3
+          patterns: ["event|immutable|unique id|record each"]
+        - id: aggregate
+          label: "idempotent aggregation per customer and period"
+          weight: 3
+          patterns: ["aggregate|idempot|dedup|per customer|period"]
+        - id: price
+          label: "pricing is a separate step over the aggregate"
+          weight: 2
+          patterns: ["price|pricing|rate card|separate|invoice"]
+    - id: scale
+      question: "A customer disputes their bill. How do you prove the number?"
+      intent: >-
+        Probes auditability: the raw events must be replayable.
+      hint: >-
+        You replay the immutable events for that period through the same
+        aggregation and pricing code, and show the customer the itemised events.
+        If you cannot replay, you cannot defend the invoice.
+      criteria:
+        - id: replay
+          label: "replays raw events to reconstruct the invoice"
+          weight: 3
+          patterns: ["replay|recompute|reconstruct|raw events|reprocess"]
+        - id: itemise
+          label: "itemised evidence the customer can inspect"
+          weight: 2
+          patterns: ["itemis|itemiz|breakdown|per request|detail"]
+        - id: immutability
+          label: "events are retained and immutable for the dispute window"
+          weight: 1
+          patterns: ["retain|immutable|retention|archive|audit"]

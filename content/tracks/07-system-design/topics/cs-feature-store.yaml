@@ -1,0 +1,718 @@
+id: cs-feature-store
+slug: cs-feature-store
+title: "Case Study: Online and Offline Feature Store"
+summary: >-
+  Build the layer that makes training and serving agree: 480 GB of online
+  features, 350 TB of point-in-time snapshots, and one join that decides whether
+  your offline AUC is a measurement or a fiction.
+kind: lesson
+difficulty: expert
+position: 9
+estMinutes: 21
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [feature-store, train-serve-skew, point-in-time, redis, freshness, backfill]
+
+body:
+  big_idea: >-
+    A feature store is a correctness system with a latency budget, not a
+    database with an API: the vector served must equal the one computed for
+    that entity at that timestamp.
+  problem:
+    - "Offline AUC is 0.91 and production behaves like 0.78: the join used latest values, computed after the label, so training saw the future."
+    - "You store 300 features as individual Redis hash fields, budget 480 GB, and need 3.4 TB — a 7x overhead from bookkeeping, not data."
+    - "A 60 s window with a 5 s watermark is 65 s stale, while the batch feature beside it refreshes hourly; model treats both alike."
+  analogy: >-
+    A hospital charts every patient continuously and keeps an archive of every
+    past chart. A doctor reads the live chart; a researcher reads the chart as
+    it stood on the day of treatment. Read the live chart — with the diagnosis
+    added afterwards — and every retrospective study finds the outcome was
+    predictable all along.
+  concept_points:
+    - "**Size the online store in bytes, then multiply by encoding overhead.** 200M users x 300 features x 8 bytes = **480 GB** of payload. As one serialised blob per entity that is ~500 GB with keys; as 300 individual hash fields it is **3.36 TB**, because per-field bookkeeping costs more than the 8-byte value."
+    - "**Point-in-time correctness is the product.** A training row must join feature values as of the label's timestamp, not the entity's latest value. A 30-day count read 7 days late is inflated by 7/30 of its rate — for a user averaging 2 orders per 30 days that is **+23%** on every row, and the model learns a feature that does not exist at serving time."
+    - "**Freshness is per feature, not per store.** Batch features at 24 h, micro-batch at 15 min, streaming at a 60 s window plus a 5 s watermark (**65 s worst case**), request-time at 0. Assigning one freshness number to the whole store either overpays for stale features or lies about fresh ones."
+    - "**Latency budget is 20 ms p99 and mostly not the database.** 2 ms network, 9 ms serve, 4 ms deserialise, 5 ms slack. Deserialisation is a real cost at 300 features per request and is the stage that grows when someone adds a nested structure to the schema."
+    - "**Backfill cost is the price of reproducibility.** 480 GB per daily snapshot x 730 days = **350 TB**, or **1.05 PB** with three replicas, which at 23 USD per TB-month is **~24,200 USD/month** for history alone. Most teams need the event log plus the ability to recompute, not daily snapshots of everything."
+    - "**Train/serve skew is a definition problem before it is a bug.** The same feature name can mean \\\"events in the last 30 days\\\" offline and \\\"events since last login\\\" online; both are correct code, and the model is trained on one and served the other. Shared definitions, one transformation, two execution engines is the only structural fix."
+  definitions:
+    - { term: "Feature", meaning: "A named, typed value for an entity at a time. The unit of both training data and serving input." }
+    - { term: "Entity", meaning: "The key a feature is attached to: user, item, session, merchant." }
+    - { term: "Online store", meaning: "Low-latency KV store holding the latest value per entity; serves the model at request time." }
+    - { term: "Offline store", meaning: "Columnar, partitioned history used to build training sets with as-of joins." }
+    - { term: "Point-in-time join", meaning: "Joining each label to feature values as of the label timestamp, never later." }
+    - { term: "Train/serve skew", meaning: "Divergence between offline and online feature computation, from definitions, windows, or data sources." }
+    - { term: "Freshness", meaning: "How old a served feature value may be. A per-feature contract, not a store-wide setting." }
+    - { term: "Backfill", meaning: "Recomputing historical feature values, usually after a definition change." }
+    - { term: "Watermark", meaning: "The lateness bound a streaming job waits for before closing a window; sets worst-case staleness." }
+    - { term: "PSI", meaning: "Population stability index: a binned divergence measure between training and serving distributions." }
+    - { term: "Feature view", meaning: "A named transformation plus its entity, schema, and freshness contract; the unit of ownership." }
+
+  diagrams:
+    - type: architecture
+      title: "One definition, two execution engines"
+      nodes:
+        - { id: ev, x: 0, y: 1, label: "Event stream", kind: "queue", detail: "Clickstream and transactions with event-time timestamps. The only source of truth for behavioural features." }
+        - { id: sp, x: 1, y: 0, label: "Stream job", kind: "worker", detail: "60 s windows, 5 s watermark: 65 s worst-case staleness. Writes to the online store and to the offline log." }
+        - { id: bp, x: 1, y: 2, label: "Batch job", kind: "worker", detail: "Same definitions, event-time semantics, run hourly or daily. The path that must agree with the stream job." }
+        - { id: on, x: 2, y: 0, label: "Online store", kind: "cache", detail: "500 GB as one blob per entity; 9 ms serve at 50,000 rps. Blob-per-entity is 7x smaller than field-per-feature." }
+        - { id: off, x: 2, y: 2, label: "Offline store", kind: "storage", detail: "Partitioned by event date, clustered by entity. 350 TB for two years of daily snapshots; keep the raw log instead where possible." }
+        - { id: tr, x: 3, y: 2, label: "Training set", kind: "database", detail: "As-of join at the label timestamp. 500M rows x 300 features x 8 B = 1.2 TB per build." }
+        - { id: sv, x: 3, y: 0, label: "Model server", kind: "model", detail: "Reads the online store with a 20 ms p99 budget; logs a 1% sample for skew monitoring." }
+      edges:
+        - { from: ev, to: sp, label: "realtime" }
+        - { from: ev, to: bp, label: "event-time", style: "async" }
+        - { from: sp, to: on, label: "upsert" }
+        - { from: bp, to: off, label: "partition" }
+        - { from: off, to: tr, label: "as-of join" }
+        - { from: on, to: sv, label: "vector" }
+        - { from: sv, to: tr, label: "1% sample", style: "async" }
+    - type: plot
+      title: "Storage cost of feature history, per replica"
+      chart: "line"
+      xLabel: "days of daily snapshots retained"
+      yLabel: "TB (480 GB per snapshot)"
+      series:
+        - name: "TB"
+          points:
+            - { x: 30, y: 14.4 }
+            - { x: 90, y: 43.2 }
+            - { x: 180, y: 86.4 }
+            - { x: 365, y: 175.2 }
+            - { x: 730, y: 350.4 }
+    - type: compare
+      title: "Two encodings for 300 features x 200M entities"
+      left_label: "One blob per entity"
+      left_points:
+        - "2.4 KB payload + 100 B key per entity"
+        - "~500 GB total, 9 ms serve"
+        - "Single GET, atomic upsert, simple rebalancing"
+        - "Cannot update one feature without rewriting the blob"
+      right_label: "300 hash fields per entity"
+      right_points:
+        - "8 B value + ~48 B bookkeeping per field"
+        - "~3.36 TB total, 6.7x the payload"
+        - "Field-level updates and partial reads"
+        - "p99 grows with field count and eviction pressure"
+
+  problem_statement: >-
+    Design a feature platform serving a ranking model and a fraud model from the
+    same entities: 200 million users, roughly 300 features each, 50,000 feature
+    requests per second at peak, a 20 ms p99 serving budget, and a training
+    pipeline that must be reproducible to the timestamp. Features arrive from
+    batch, micro-batch, and streaming sources, and the platform must be able to
+    answer "what did this entity's vector look like at time T" for any T in the
+    last two years.
+
+  requirements:
+    functional:
+      - "Register features with an owner, schema, entity, and freshness contract."
+      - "Serve the latest value per entity in under 20 ms p99, including deserialisation."
+      - "Build training sets with point-in-time correct joins at the label timestamp."
+      - "Backfill any feature from the raw event log after a definition change."
+      - "Log a sampled copy of served vectors for skew and drift monitoring."
+    non_functional:
+      - "Online store p99 under 20 ms at 50,000 rps; p50 under 6 ms."
+      - "Streaming features no more than 65 s stale at p99; batch features no more than 24 h."
+      - "Training sets reproducible bit-for-bit from a stated snapshot time."
+      - "Online store recoverable to within 10 minutes from a node loss, with no full-cluster rebuild."
+
+  clarifying_questions:
+    - question: "How many features per entity, and how many entities are hot at once?"
+      why_it_matters: "300 features x 8 bytes is 2.4 KB per entity, which decides blob versus field encoding and therefore a 7x memory difference; hot-entity concentration decides whether one key can saturate a shard."
+    - question: "What does 'point in time' mean for labels that arrive late?"
+      why_it_matters: "If a label lands 30 days after the event, the feature snapshot must be taken at event time, not label time; getting this backwards silently inflates offline metrics by the amount the feature moved in between."
+    - question: "Which features may be up to a day stale, and which must be seconds?"
+      why_it_matters: "Freshness is the main cost driver: streaming every feature costs a stream processor per feature view, while batching most of them and streaming a handful can cut the platform bill by an order of magnitude."
+    - question: "Is a definition change expected, and how often?"
+      why_it_matters: "Backfill capability is cheap to design in and expensive to retrofit; a store with only materialised tables cannot answer a new question without re-ingesting from source systems that may have expired."
+    - question: "Who owns a feature when it is wrong in production?"
+      why_it_matters: "Feature views need an owner and an SLO, or the platform becomes a shared dumping ground where every model team blames the data and nobody fixes the definition."
+
+  capacity_estimation:
+    assumptions:
+      - "200M entities, 300 features per entity, 8 bytes per feature value."
+      - "Peak 50,000 requests/s, each requesting one entity's full feature vector."
+      - "Daily snapshots retained for 730 days, three replicas in object storage at 23 USD per TB-month."
+      - "20 ms p99 budget: network 2 ms, serve 9 ms, deserialise 4 ms, slack 5 ms."
+      - "Streaming windows of 60 s with a 5 s watermark; batch refresh 24 h; micro-batch 15 min."
+    arithmetic:
+      - label: "Online payload"
+        calculation: "200e6 entities x 300 features x 8 B = 4.8e11 B = 480 GB"
+        conclusion: "480 GB of logical payload. That is the number people quote, and it is not the number they pay for."
+      - label: "Online store memory, blob versus hash"
+        calculation: "Blob: 200e6 x (300 x 8 + 100) B = 5.0e11 B = 500 GB. Hash: 200e6 x 300 x (8 + 48) B = 3.36e12 B = 3.36 TB"
+        conclusion: "3.36 TB versus 500 GB — a 6.7x difference created entirely by per-field hash bookkeeping. Encoding is a capacity decision."
+      - label: "Serving bandwidth"
+        calculation: "50,000 rps x 2,400 B = 1.2e8 B/s = 120 MB/s"
+        conclusion: "120 MB/s of payload at peak. The online store is latency-bound, not bandwidth-bound; the network is not the constraint, the tail of the GET is."
+      - label: "History storage"
+        calculation: "480 GB/snapshot x 730 days = 350.4 TB; x 3 replicas = 1.05 PB; x 23 USD/TB-month = 24,178 USD/month"
+        conclusion: "~24,200 USD/month for two years of daily snapshots. A raw event log plus recompute is typically a fraction of this and answers more questions."
+      - label: "Training set size"
+        calculation: "500e6 labelled rows x 300 features x 8 B = 1.2e12 B = 1.2 TB per build"
+        conclusion: "1.2 TB per training set, so ten builds a month is 12 TB of transient output — small next to the history, which is why snapshot retention dominates the bill."
+      - label: "Skew-monitoring sample"
+        calculation: "50,000 rps x 1% = 500 requests/s; x 300 features = 150,000 values/s; x 86,400 = 1.3e10 values/day"
+        conclusion: "1.3e10 values a day at 8 bytes is ~104 GB/day of sample. Sample the sample: 0.1% is enough for distribution comparison and 10x cheaper."
+      - label: "Leakage from a late as-of join"
+        calculation: "Feature = orders in last 30 days at 2 orders/30 days; joining 7 days late adds 2 x 7/30 = 0.467 orders"
+        conclusion: "+23% on the feature value for every training row. The model learns a shifted distribution and the offline metric is optimistic by exactly the amount the feature moved."
+
+  architecture_summary: >-
+    Feature definitions live in a registry as versioned feature views: entity,
+    schema, transformation, owner, and freshness contract. Two engines execute the
+    same definition — a streaming job for features whose value decays in seconds,
+    and a batch job for the rest — writing to an online KV store and to a
+    partitioned offline table keyed by event date and clustered by entity. Serving
+    is one blob read per entity behind a local cache, with a hard deadline and a
+    documented default per feature. Training builds read the offline table with an
+    as-of join at the label timestamp, so a row can never see a value computed
+    after its label. A 1% sample of served vectors lands in a monitoring table and
+    is compared against the training distribution daily.
+
+  deep_dives:
+    - topic: "Online store encoding and memory"
+      explanation: >-
+        The choice is between one serialised blob per entity and one field per
+        feature. A blob is 500 GB, returns in one round trip, and upserts
+        atomically; a hash is 3.36 TB because every field carries bookkeeping far
+        larger than its 8-byte value, but it supports partial updates and partial
+        reads. For a model that reads all 300 features on every request, the blob
+        is strictly better. The exception is a feature updated by a different
+        pipeline at a different cadence — mixing a 1-second counter into a
+        daily-refreshed blob forces the whole blob to be rewritten on every
+        counter update, which turns a read-optimised store into a write-heavy one.
+      tradeoffs:
+        - option: "Blob per entity"
+          pros: "6.7x smaller, one GET, atomic upsert, trivial to replicate and rebalance."
+          cons: "Any single-feature update rewrites 2.4 KB; concurrent writers need a merge or a lock."
+        - option: "Hash with field-per-feature"
+          pros: "Field-level updates and reads; natural fit for features with different cadences."
+          cons: "3.36 TB of memory for 480 GB of data; p99 rises with field count and fragmentation."
+        - option: "Hybrid: hot blob plus a small side hash for fast-moving counters"
+          pros: "Keeps the bulk read at one GET while letting counters update independently."
+          cons: "Two reads and a merge at serving time, plus a consistency question when the two disagree."
+
+    - topic: "Point-in-time correctness"
+      explanation: >-
+        The as-of join is the whole product. For each label at time T, the join
+        must take the most recent feature value with timestamp <= T, never the
+        entity's current value. Implementations get this wrong in three ways:
+        joining on the snapshot date instead of the event time, using the latest
+        partition rather than the partition containing T, and allowing a feature
+        computed from a window that extends past T. The check that catches all
+        three is a reconstruction test: take a production request, replay it
+        offline at its timestamp, and compare vectors byte for byte.
+      tradeoffs:
+        - option: "Daily snapshots with an as-of join on snapshot date"
+          pros: "Simple, cheap to query, and easy to explain; the join is a range lookup on one partition column."
+          cons: "Granularity is a day, so an event at 23:59 sees features from 00:00 — up to 24 h of look-back error, and 350 TB of history to store."
+        - option: "Event log plus recompute on demand"
+          pros: "Exact at any timestamp; storage is the log, not the snapshots; new features can be derived retroactively."
+          cons: "Every training build pays compute, and a definition change means recomputing billions of events."
+        - option: "Change-data-capture stream of feature updates"
+          pros: "Exact and incrementally maintainable; the history is the update stream rather than periodic copies."
+          cons: "Requires the online store to emit a durable, ordered changelog; replay cost grows with update rate, not entity count."
+
+    - topic: "Freshness tiers and streaming semantics"
+      explanation: >-
+        Freshness is bought per feature. A 24-hour batch feature costs a warehouse
+        query; a 15-minute micro-batch costs a scheduled job; a 60-second
+        streaming feature costs a stateful stream processor with checkpointing and
+        a watermark. The watermark is the honest part of the contract: it converts
+        "real time" into "65 s worst case", which is the number the model owner
+        needs. Late events are the second-order problem — a 5 s watermark means an
+        event arriving at 6 s is dropped or handled by a side output, and either
+        choice changes the feature's definition between offline and online.
+      tradeoffs:
+        - option: "Stream everything"
+          pros: "One code path, maximal freshness, no batch/stream divergence to reconcile."
+          cons: "A stateful job per feature view, checkpoint storage, and reprocessing costs; most features do not need it."
+        - option: "Batch plus micro-batch, streaming only for counters"
+          pros: "Cheap and simple; the features that need seconds get seconds and the rest do not pay for it."
+          cons: "Three execution paths to keep consistent, and the seam between them is where skew appears."
+        - option: "Lambda architecture with a batch recompute over the stream"
+          pros: "Corrects late and dropped events; the batch layer is the authority and the stream is a fast approximation."
+          cons: "Two implementations of every definition, which is exactly the divergence the store exists to prevent."
+
+    - topic: "Backfill and definition change"
+      explanation: >-
+        A definition change is the normal case, not the exception: someone
+        discovers that "active days" should exclude refunds, and now 300 billion
+        events must be re-aggregated. The cost is proportional to events, not
+        entities: 200M users x 30 events/month x 24 months is 1.4e11 events, and at
+        a realistic 5e5 events/s per worker-hour that is days of cluster time.
+        Designing for it means keeping the raw log, versioning the definition, and
+        writing the new feature to a new column so old training sets stay
+        reproducible.
+      tradeoffs:
+        - option: "Recompute from the raw event log"
+          pros: "Exact, and can produce any new feature without source-system cooperation."
+          cons: "Expensive and slow; requires the log to be complete and retained, which is itself a storage decision."
+        - option: "Snapshot-and-patch: recompute only the delta"
+          pros: "Cheap for additive changes; can run incrementally over recent partitions."
+          cons: "Only works when the change is expressible as a delta; a semantic change (excluding refunds) is not."
+        - option: "Dual-write old and new definitions for a period"
+          pros: "No backfill at all; the new definition accumulates history while both are served."
+          cons: "You wait the full history horizon before the new feature is trainable, which is often unacceptable for a launch."
+
+  bottlenecks:
+    - failure: "Offline and online definitions drift apart"
+      symptom: "Offline AUC 0.91 against production precision 0.78; the sampled online vectors show a 30-day count with a median 40% lower than the training distribution, and PSI crosses 0.25 on three features."
+      mitigation: "One transformation, two engines: generate online and offline code from the same definition, and gate any feature change on a reconstruction test that replays production requests offline and compares vectors. Alert on PSI per feature, not per model."
+    - failure: "A single hot entity saturates one shard"
+      symptom: "p99 spikes to 200 ms for a small fraction of requests while mean latency is flat; one shard shows a request rate thousands of times its peers, usually a bot or a very active merchant."
+      mitigation: "Add a local request cache in front of the store with a short TTL, replicate hot keys, and apply per-entity rate limits at the serving layer. Shard by a hash of the entity, never by entity range."
+    - failure: "A backfill storm starves the warehouse and the training pipeline"
+      symptom: "Nightly training builds miss their SLA during a backfill; warehouse queue times go from minutes to hours and the on-call rotation starts paging on the same job twice."
+      mitigation: "Run backfills on a separate compute pool with a hard concurrency cap, write to a versioned column so nothing in production reads partial results, and schedule them against the training calendar rather than ad hoc."
+
+  what_to_steal:
+    - "Quote memory after encoding: 480 GB of payload is 500 GB as blobs and 3.36 TB as hash fields — a 6.7x decision disguised as a schema choice."
+    - "Make point-in-time joins a test, not a convention: replay a production request offline at its timestamp and diff the vector."
+    - "Set freshness per feature view, and convert 'real time' into a watermark number (65 s) that the model owner can reason about."
+    - "Price history before committing to it: 480 GB daily for two years is 350 TB and ~24,200 USD/month, which is usually better spent on a raw log and recompute."
+
+  markdown: |
+    ## Two numbers, one of which people forget
+
+    The payload is easy:
+
+    $$200\times10^{6}\ \text{entities} \times 300\ \text{features} \times 8\ \text{B}
+    = 4.8\times10^{11}\ \text{B} = 480\ \text{GB}.$$
+
+    The memory is not. Stored as one blob per entity, with a key and a small
+    header: $200\times10^{6} \times 2{,}500\ \text{B} = 500\ \text{GB}$. Stored as
+    300 hash fields per entity, each field carrying roughly 48 bytes of
+    hash-table bookkeeping around its 8-byte value:
+
+    $$200\times10^{6} \times 300 \times 56\ \text{B} = 3.36\ \text{TB}.$$
+
+    A **6.7x** difference produced by a schema decision, not by a capacity
+    requirement. This is the single most common way a feature store's first
+    invoice surprises its team.
+
+    | Encoding | Per entity | 200M entities | Update granularity |
+    |---|---|---|---|
+    | Blob | 2.5 KB | 500 GB | Whole vector |
+    | Hash, 300 fields | 16.8 KB | 3.36 TB | Single feature |
+    | Hybrid | ~2.6 KB | ~520 GB | Hot counters only |
+
+    ## Point-in-time, and the size of the lie
+
+    A training row must see the world as it was at the label's timestamp. Join
+    against the entity's latest values instead and every feature silently contains
+    the future.
+
+    Take a "orders in the last 30 days" feature, a user averaging 2 orders per 30
+    days, and a join executed 7 days after the label:
+
+    $$2 \times \frac{7}{30} = 0.467\ \text{extra orders} = +23\%.$$
+
+    Every training row is 23% high, the model learns a distribution that does not
+    exist at serving time, and the offline AUC is optimistic by however much that
+    feature predicts the label. Nothing errors. The pipeline is green.
+
+    The test that catches it is a **reconstruction replay**: take a production
+    request, rebuild its vector offline at the request timestamp, and diff. If the
+    diff is non-empty, one of the two paths is wrong — and you find out before
+    shipping rather than after.
+
+    ## Freshness is a per-feature contract
+
+    | Tier | Cadence | Worst-case staleness | Cost |
+    |---|---|---|---|
+    | Batch | 24 h | 24 h | A warehouse query |
+    | Micro-batch | 15 min | 15 min | A scheduled job |
+    | Streaming | 60 s window + 5 s watermark | **65 s** | A stateful job with checkpoints |
+    | Request-time | Per request | 0 | Inside the latency budget |
+
+    "Real time" is not a number. A 60-second window with a 5-second watermark is
+    a 65-second worst case, and that is the figure the model owner needs in order
+    to decide whether the feature is worth a stateful job at all. Most features
+    are not: the median feature's predictive value does not decay in seconds, and
+    paying for a stream processor per feature view is how a platform bill triples
+    without a model improving.
+
+    ## The 20 ms serving budget
+
+    | Stage | p99 |
+    |---|---|
+    | Network | 2 ms |
+    | Store GET | 9 ms |
+    | Deserialise 300 features | 4 ms |
+    | Slack | 5 ms |
+    | **Total** | **20 ms** |
+
+    Deserialisation is 4 ms and grows with schema complexity — a nested map added
+    by one team becomes everyone's tail. Flat schemas with fixed-width types are
+    not a style preference at 300 features per request.
+
+    ## History is the expensive part
+
+    Daily snapshots for two years:
+
+    $$480\ \text{GB} \times 730 = 350.4\ \text{TB}
+    \quad\Longrightarrow\quad 1.05\ \text{PB with three replicas},$$
+
+    which at 23 USD per TB-month is **~24,200 USD/month** for reproducibility
+    alone. A raw event log plus recompute is usually a fraction of that and can
+    answer questions the snapshots cannot — but only if the log was retained,
+    which is a decision made years before anyone asks.
+
+    ## Detecting skew before the model does
+
+    Skew has three signatures, and they are cheap to monitor if you decide to
+    before the incident.
+
+    **Distribution divergence per feature.** Sample served vectors at 0.1% and
+    compare against the training window with PSI. At 50,000 rps, 0.1% is 50
+    requests/s and 15,000 feature values/s — 10 GB/day, which is affordable.
+    Alert at PSI 0.1 and page at 0.25; a single feature crossing 0.25 explains more
+    production regressions than any model change.
+
+    **Reconstruction divergence.** Replay a thousand production requests a day
+    through the offline path at their request timestamps and diff the vectors.
+    Three hundred features times a thousand requests is 300,000 comparisons,
+    which runs in minutes. Any non-empty diff is a definition bug, not a
+    distribution shift, and the distinction matters: one is fixed by a code
+    change, the other by a retrain.
+
+    **Freshness against the contract.** For each feature view, measure the p99 of
+    (serve time - event time) and compare it with the contract. A streaming view
+    that promises 65 s and delivers 400 s has a stalled consumer, not a slow
+    database, and the only way to notice is to measure the lag rather than the
+    throughput.
+
+    ## The backfill no one budgets for
+
+    A definition change is the normal case. Excluding refunds from "active days"
+    means re-aggregating every event in the history: 200M users x 30 events/month
+    x 24 months is **1.4e11 events**. At a realistic 5e5 events/s per worker-hour
+    that is 78 worker-hours of raw throughput, and several days of wall time once
+    shuffle, skew, and retries are counted.
+
+    Two design decisions make it survivable. Version the definition and write the
+    new feature to a new column, so old training sets stay reproducible while the
+    new one is built. And run the backfill on a separate compute pool with a hard
+    concurrency cap, because a backfill that starves the nightly training job
+    turns one team's improvement into every team's incident.
+
+    ## Where the analogy breaks
+
+    The live chart and the archive are written by different systems. The stream
+    job and the batch job implement the same definition with different engines,
+    different window boundaries, and different late-event handling — and the seam
+    between them is exactly where train/serve skew is born. A single definition
+    with two generated implementations is the structural fix; documentation is
+    not.
+
+    And the archive is not free. Keeping every patient's chart daily for two years
+    is hundreds of terabytes, and the honest design question is not "can we" but
+    "which questions will we need to ask again".
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A feature store is **a correctness system with a latency budget**, not a database with a nice API. Its job is to guarantee that the vector a model sees in production is the vector that was computed for that entity at that timestamp in training — and the two ways it fails are silent: a join that sees the future inflates offline metrics, and a serving path that computes a window differently degrades production while every dashboard stays green.
+
+    ### The analogy, in full
+
+    A hospital charts every patient continuously and also keeps a bound archive of every past chart. A doctor treating you today reads the live chart; a researcher studying outcomes reads the archived chart as it stood on the day of treatment, not the version updated six months later. If the researcher reads the live chart — with the diagnosis added afterwards — every retrospective study finds that the outcome was predictable all along. That is leakage, and it is not a subtle statistical sin: it is reading tomorrow's notes to predict today. Two ways the analogy breaks. First, the charts are written by different people with different tools: the live chart by a stream processor and the archive by a batch job, so the same field can mean slightly different things in each. Second, the archive is not free — keeping a daily copy of every patient's chart for two years is hundreds of terabytes, and someone has to decide whether the reproducibility is worth the storage.
+
+    ### Failure modes, in full
+
+    - Your offline AUC is 0.91 and production behaves like 0.78. Nothing is broken in the usual sense: the offline join used the entity's latest feature values, which were computed after the label, so the model was trained on information from the future.
+    - You store 300 features per user as individual Redis hash fields, cost out 480 GB of payload, and the cluster needs 3.4 TB — a 7x overhead you did not budget because you counted bytes of data and not bytes of hash-table entries.
+    - You backfill two years of daily snapshots to make training reproducible: 480 GB a day is 350 TB before replication, and the S3 bill arrives monthly as a line item nobody forecast.
+    - A feature's streaming window closes at 60 s with a 5 s watermark, so its worst-case staleness is 65 s; the batch feature next to it refreshes hourly, and the model treats both as equally fresh.
+    - You cannot answer 'what did this user's vector look like at 14:03 last Tuesday', so a production incident takes four days to diagnose because the only way to reproduce it is to redeploy last week's model against today's features.
+
+    ### The mechanisms, in full
+
+    - **Size the online store in bytes, then multiply by encoding overhead.** 200M users x 300 features x 8 bytes = **480 GB** of payload. As one serialised blob per entity that is ~500 GB with keys; as 300 individual hash fields it is **3.36 TB**, because per-field bookkeeping costs more than the 8-byte value.
+    - **Point-in-time correctness is the product.** A training row must join feature values as of the label's timestamp, not the entity's latest value. A 30-day count read 7 days late is inflated by 7/30 of its rate — for a user averaging 2 orders per 30 days that is **+23%** on every training row, and the model learns a feature that does not exist at serving time.
+    - **Freshness is per feature, not per store.** Batch features at 24 h, micro-batch at 15 min, streaming at a 60 s window plus a 5 s watermark (**65 s worst case**), request-time at 0. Assigning one freshness number to the whole store either overpays for stale features or lies about fresh ones.
+    - **A blob is faster and a hash is more flexible, and the memory difference is 7x.** One GET of a 2.4 KB blob costs 9 ms of serve time and 500 GB; 300 field reads cost more round trips and 3.36 TB. Blobs win unless you need partial updates on a subset of features.
+    - **Latency budget is 20 ms p99 and mostly not the database.** 2 ms network, 9 ms serve, 4 ms deserialise, 5 ms slack. Deserialisation is a real cost at 300 features per request and is the stage that grows when someone adds a nested structure to the schema.
+    - **Backfill cost is the price of reproducibility.** 480 GB per daily snapshot x 730 days = **350 TB**, or **1.05 PB** with three replicas, which at 23 USD per TB-month is **~24,200 USD/month** for history alone. Most teams do not need daily snapshots of everything; they need the event log plus the ability to recompute.
+    - **Train/serve skew is a definition problem before it is a bug.** The same feature name can mean "events in the last 30 days" offline and "events since last login" online; both are correct code and the model is trained on one and served the other. Shared definitions, one transformation, two execution engines is the only structural fix.
+    - **Monitoring needs its own sample.** Log 1% of online feature vectors — at 50,000 rps that is 500 requests/s and **150,000 feature values/s** — and compare distributions against the offline training set with PSI or KS. Without a sample you can only compare aggregates, which hides the skew that matters.
+    - **The offline store is a table format decision with a decade of consequences.** Partition by event date, cluster by entity, and keep the raw event log so any feature can be recomputed. A store that only keeps materialised feature tables cannot answer a new question without a backfill from the source system, which may no longer exist.
+  derivations:
+    - title: "Online memory with encoding overhead"
+      latex: |
+        For $E$ entities and $F$ features of $b$ bytes, payload is $EFb$, but
+        stored memory is $E\left(F(b+o) + k\right)$ with per-field overhead $o$
+        and key overhead $k$. The ratio to payload is
+        $$\frac{F(b+o)+k}{Fb}.$$
+        At $b=8$, $o=48$: $56/8 = 7$ before the key term, which measured against
+        a blob layout lands at **6.7x** once the blob's own key is included.
+      prose: >-
+        The overhead dominates because the value is small. At 64-byte values the
+        ratio falls to about 1.75, which is why wide embeddings and long strings are
+        cheap to store per field while counters are not.
+    - title: "Leakage from a late as-of join"
+      latex: |
+        If a feature counts events over a window $W$ at rate $r$, joining $\delta$
+        after the label adds $r\delta$ events, so the inflation is
+        $$\epsilon = \frac{r\delta}{rW} = \frac{\delta}{W}.$$
+        At $\delta = 7$ days and $W = 30$ days: $\epsilon = 0.233$.
+      prose: >-
+        23%. Note the ratio is independent of the rate: it depends only on how
+        late the join is relative to the window. A 1-day window joined 1 day late
+        is 100% inflated, which is why short-window features are the ones that
+        leak most catastrophically.
+    - title: "History storage and its monthly cost"
+      latex: |
+        With snapshot size $S$, retention $D$ days and $R$ replicas, storage is
+        $SDR$ and the monthly cost is
+        $$C = 0.001\, S D R\, p,$$
+        where $p$ is USD per TB-month and $S$ is in GB. At $S=480$, $D=730$,
+        $R=3$, $p=23$:
+        $$C = 0.001 \times 480 \times 730 \times 3 \times 23 = 24{,}178.$$
+      prose: >-
+        The 0.001 converts GB to TB. The lesson is that retention and replication
+        are the two multiplicative levers, and neither is a technical default —
+        both are budgets someone has to own.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        It is a correctness system. The online store is a latency problem; the
+        offline store is a reproducibility problem; the join between them is where
+        models quietly stop working. Size memory after encoding, not before.
+      blocks:
+        - kind: checklist
+          body: |
+            - 480 GB payload, 500 GB as blobs, 3.36 TB as hash fields
+            - As-of join at the label timestamp, never the latest value
+            - Freshness per feature: 65 s streaming, 15 min micro-batch, 24 h batch
+            - 20 ms p99: 2 network, 9 store, 4 deserialise, 5 slack
+            - 350 TB for two years of daily snapshots
+      checkpoint: >-
+        A 30-day count joined 7 days late is inflated by what fraction, and does
+        the answer depend on the event rate?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Write the feature contract first: entity, definition, window, freshness,
+        owner. Then choose encodings and stores. Most skew comes from a contract
+        that was never written down, not from a database that misbehaved.
+      blocks:
+        - kind: checklist
+          body: |
+            - Register the feature with a window and a watermark
+            - Choose blob versus hash by update granularity
+            - Build the as-of join and test it by replay
+            - Decide retention before the first snapshot is written
+            - Monitor PSI per feature on a real sample
+      checkpoint: >-
+        Which of those five steps would you skip under deadline pressure, and what
+        does skipping it cost six months later?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The join and the serve path.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # training
+            for label in labels:                  # label.ts is event time
+                vec = offline.as_of(entity=label.eid,
+                                    ts=label.ts,
+                                    features=view.features)
+                yield (vec, label.y)
+
+            # serving
+            def vector(eid):
+                blob = cache.get(eid) or online.get(eid)   # one GET
+                if blob is None: return defaults()          # documented per feature
+                return decode(blob)                         # 4 ms, keep it flat
+      checkpoint: >-
+        What goes wrong if the offline join uses label.ingested_at instead of
+        label.ts?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Encoding overhead, leakage fraction, history cost.
+      blocks:
+        - kind: math
+          body: |
+            **Memory ratio.** $\frac{F(b+o)+k}{Fb}$; at $b=8$, $o=48$, the
+            field term alone is 7x before the key.
+
+            **Leakage.** $\epsilon = \delta/W$; 7/30 = 23%.
+
+            **History.** $C = 0.001\,SDRp$ = 24,178 USD/month at 480 GB, 730
+            days, 3 replicas, 23 USD/TB.
+      checkpoint: >-
+        What is the leakage for a 1-day window joined 1 day late, and what does
+        that imply about which features to snapshot most carefully?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The platform shape plus the two tests that keep it honest.
+      blocks:
+        - kind: warning
+          body: >-
+            The failure mode is silence. Nothing errors when the join sees the
+            future or when the stream and batch windows differ by a boundary
+            condition; the model simply performs worse and everyone blames the
+            model.
+        - kind: code
+          language: python
+          body: |
+            def online_bytes(entities=200e6, features=300, value_b=8,
+                             field_overhead_b=48, key_b=100, layout="blob"):
+                if layout == "blob":
+                    return entities * (features * value_b + key_b)
+                return entities * features * (value_b + field_overhead_b)
+
+            def history_tb(snapshot_gb=480, days=730, replicas=3):
+                return snapshot_gb * days * replicas / 1000
+
+            def leakage(delta_days, window_days):
+                return delta_days / window_days
+      checkpoint: >-
+        The team wants 600 features instead of 300. Which number doubles first —
+        payload, memory, or the 20 ms budget?
+  try_it: >-
+    Compute the online store twice: 200M x 300 x 8 bytes is 480 GB of payload,
+    which is 500 GB as one blob per entity and 3.36 TB as 300 hash fields, because
+    each 8-byte value carries about 48 bytes of bookkeeping. Then compute the
+    leakage on a 30-day count joined 7 days late — 7/30 = 23% — and decide which
+    of the two numbers you would have got wrong first.
+  interview_questions:
+    - question: "What does point-in-time correctness mean, and how do you test it?"
+      level: senior
+      key_points:
+        - "Each training row must join feature values as of the label's event timestamp, never the entity's latest value."
+        - "A 30-day count joined 7 days late is inflated by 7/30 = 23%, and the inflation depends on the delay relative to the window, not on the event rate."
+        - "The failure is silent: offline metrics improve while production degrades, because the feature does not exist in that form at serving time."
+        - "Test by reconstruction replay — rebuild a production request's vector offline at its timestamp and diff it byte for byte."
+      follow_up: "Where do late-arriving labels fit into that scheme, and what timestamp do you join on?"
+    - question: "480 GB of features and the cluster needs 3.4 TB. Why?"
+      level: senior
+      key_points:
+        - "Per-field encoding carries bookkeeping far larger than the value: roughly 48 bytes around an 8-byte counter."
+        - "300 fields per entity x 200M entities x 56 bytes is 3.36 TB, a 6.7x ratio over the 480 GB payload."
+        - "One blob per entity is about 500 GB with keys, one GET, and atomic upserts — strictly better when the model reads all features."
+        - "A hybrid keeps the bulk in a blob and puts fast-moving counters in a small side hash, at the cost of a merge at serving time."
+      follow_up: "When would you deliberately pay the 6.7x and use field-per-feature?"
+    - question: "How fresh should features be, and what does that cost?"
+      level: staff
+      key_points:
+        - "Freshness is per feature view: batch 24 h at the cost of a warehouse query, micro-batch 15 min, streaming 65 s worst case with a stateful job."
+        - "A 60 s window with a 5 s watermark is a 65 s worst case, and that is the number the model owner needs, not 'real time'."
+        - "Streaming every feature multiplies platform cost by an order of magnitude for features whose value does not decay in seconds."
+        - "The trade is measured, not assumed: compare offline AUC with a stale version of the feature against the fresh one."
+      follow_up: "How would you prove a feature's value actually decays in seconds rather than days?"
+    - question: "You need to keep two years of history for reproducibility. What does it cost, and is there a better way?"
+      level: staff
+      key_points:
+        - "480 GB per daily snapshot x 730 days is 350 TB, or 1.05 PB with three replicas, about 24,200 USD/month at 23 USD per TB-month."
+        - "Retention and replication are the two multiplicative levers, and both are budget decisions rather than technical defaults."
+        - "A raw event log plus recompute is typically far smaller and answers questions materialised snapshots cannot."
+        - "Recompute cost scales with events, not entities — 200M users x 30 events/month x 24 months is 1.4e11 events, which is days of cluster time per backfill."
+      follow_up: "What would you keep if you could only keep one: the log or the snapshots?"
+  common_mistakes:
+    - "Sizing the online store from payload bytes: 480 GB becomes 3.36 TB with per-field encoding, a 6.7x surprise on the first invoice."
+    - "Joining training labels to the entity's latest feature values, which inflates a 30-day count by 23% and makes offline AUC a fiction."
+    - "Assigning one freshness number to the whole store, then either overpaying for streaming features that do not need it or lying about the ones that do."
+    - "Writing daily snapshots before deciding retention, then discovering two years of history costs 350 TB."
+  further_reading:
+    - label: "Hermannson, Kafka, Michelangelo: Uber's Machine Learning Platform, 2017"
+    - label: "Aksakalli, Feature Stores for ML: A Survey, 2023"
+    - label: "Polyzotis, Roy, Whang, Zinkevich, Data Management Challenges in Production Machine Learning, SIGMOD 2017"
+  implementations:
+    - language: python
+      title: "A point-in-time join, and what reading latest costs"
+      note: >-
+        The join is an as-of merge via searchsorted, which is what a feature store does when it is correct. A label at day 29 sees 2,900 events; the serving path reads day 36 and reports 3,600, a 24% inflation that becomes leakage in training. The byte counts compare one blob per entity with per-field bookkeeping, the 500 GB versus 3.36 TB trade in the case study.
+      code: |
+        import numpy as np
+
+        USERS, FEATURES, BYTES = 200_000_000, 300, 8
+
+
+        def online_bytes(users=USERS, feats=FEATURES, b=BYTES):
+            payload = users * feats * b
+            blob = payload * 1.04                      # one serialised row per entity
+            hashed = payload + users * feats * 48      # per-field bookkeeping
+            return payload, blob, hashed
+
+
+        def point_in_time_join(event_times, event_values, label_times):
+            """As-of join: latest event at or before each label timestamp."""
+            order = np.argsort(event_times, kind="stable")
+            t, v = event_times[order], event_values[order]
+            idx = np.searchsorted(t, label_times, side="right") - 1
+            return np.where(idx >= 0, v[np.clip(idx, 0, len(v) - 1)], 0.0)
+
+
+        def main():
+            payload, blob, hashed = online_bytes()
+            print(f"online payload: {payload/1e9:.0f} GB; blob {blob/1e9:.0f} GB; "
+                  f"hash fields {hashed/1e12:.2f} TB")
+
+            # A 30-day event count, snapshotted daily. Labels land at day 29, 34, 39.
+            days = np.arange(48.0)
+            counts = days * 100.0
+            label_t = np.array([29.0, 34.0, 39.0])
+            asof = point_in_time_join(days, counts, label_t)
+            # The serving path reads the CURRENT value: seven days fresher than the label.
+            latest = counts[(label_t + 7).astype(int)]
+            inflation = (latest - asof) / asof
+            print(f"as-of counts: {asof.tolist()}; latest-value join: {latest.tolist()}")
+            print(f"inflation from reading latest: {[round(x, 3) for x in inflation.tolist()]}")
+
+            assert payload == 480e9
+            assert abs(blob / 1e9 - 499.2) < 1
+            assert hashed > 3e12
+            assert np.all(asof == counts[label_t.astype(int)])
+            assert 0.23 < inflation[0] < 0.25
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-feature-store-asof
+      title: "As-of join by hand"
+      difficulty: easy
+      prompt: >-
+        Given sorted event `times` and `values`, return the value of the latest event at or
+        before `t`, or 0.0 if no event has happened yet. This is the join that makes a training
+        row point-in-time correct.
+      language: python
+      entry: asof_value
+      testCases:
+        - input: '{"times": [0, 1, 2], "values": [10, 20, 30], "t": 1.5}'
+          expected: "20"
+          tolerance: 1e-6
+        - input: '{"times": [0, 1, 2], "values": [10, 20, 30], "t": -1}'
+          expected: "0.0"
+          tolerance: 1e-6
+        - input: '{"times": [0, 1, 2], "values": [10, 20, 30], "t": 2}'
+          expected: "30"
+          tolerance: 1e-6
+      solution: |
+        def asof_value(times, values, t):
+            best = 0.0
+            for ts, v in zip(times, values):
+                if ts <= t:
+                    best = v
+            return best
+      solutionExplanation: >-
+        Scanning for the largest timestamp at or before t is the as-of semantics. Reading the
+        last value unconditionally is what inflates a feature by the gap between label and
+        snapshot.
+      tags: [feature-store, correctness]

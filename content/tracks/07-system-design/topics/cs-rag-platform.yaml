@@ -1,0 +1,688 @@
+id: cs-rag-platform
+slug: cs-rag-platform
+title: "Case Study: A Million-Document Enterprise RAG Platform"
+summary: >-
+  Design retrieval over a million documents where the index is 31 GB, the
+  reranker is 9 GPUs, the LLM is 60, and the freshness pipeline has to absorb
+  358,000 chunk updates a day without ever rebuilding from scratch.
+kind: case_study
+difficulty: expert
+position: 12
+estMinutes: 21
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [rag, retrieval, hybrid-search, reranking, ann, caching, freshness, capacity]
+
+body:
+  big_idea: >-
+    A RAG platform is four budgets confused for one: index memory (31 GB per
+    million documents), retrieval recall (which no latency number measures),
+    reranking compute (9 GPUs at 300 QPS) and answer latency (292 ms).
+  problem:
+    - "You embed a million documents into 17.9 million chunks in float32, and the 73 GB of vectors does not fit the 64 GB node provisioned."
+    - "Dense retrieval misses an exact part number, BM25 misses the paraphrase, and the hybrid costs a second index plus fusion weights nobody budgets."
+    - "You add a cross-encoder and it becomes the bottleneck: 50 pairs at 0.6 ms is 30 ms per query, 9 GPUs at 300 QPS."
+  analogy: >-
+    A research library with three desks. The first writes your question in the
+    library's own shorthand — the query encoder; if it differs from the one
+    the books were catalogued in, nothing is found and nothing errors. The
+    second finds candidates by phrase and by meaning and takes the union. The
+    third reads the fifty candidates and ranks them: slow, expensive, and the
+    only reason the answer is good.
+  concept_points:
+    - "**Chunk count, not document count, is the capacity unit.** A million documents at 8,000 tokens each is $8\\times10^{9}$ tokens; with 512-token chunks and 64-token overlap the stride is 448, so $8\\times10^{9}/448 = 17.9$ million chunks. Every memory, compute and freshness number downstream is per chunk."
+    - "**Vector memory is dimension times bytes times chunks, and the bytes are a quality decision.** 17.9M chunks at 1,024 dimensions is 73.3 GB in fp32, 36.7 GB in fp16, 18.3 GB in int8. The HNSW graph adds $M = 32$ neighbours at 4 bytes, 2.29 GB, so int8 plus graph is **20.6 GB** — fits a 64 GB node with room for the OS and working set."
+    - "**BM25 is not a legacy tax, it is 10.7 GB of exact-match recall.** At 150 unique terms per chunk and 4 bytes per posting, 17.9M chunks produce $2.7\\times10^{9}$ postings, 10.7 GB compressed. It is the only component that reliably finds a part number, an error code or a person's name, and it costs one extra index to maintain."
+    - "**Recall is not measurable from latency, and must be measured against brute force.** HNSW with $M = 32$ and $ef = 64$ visits roughly 1,500 nodes per query; whether that recovers the true top 10 is answered by exhaustive search on a 10,000-query sample. A target of 0.95 recall@10 is a test you run, not a property you assume from documentation."
+    - "**The reranker is the compute bottleneck, and its cost is linear in candidates.** A 22M-parameter cross-encoder over a 512-token pair costs $2 \\times 22\\times10^{6} \\times 512 = 2.25\\times10^{10}$ FLOPs, which at 30% of a 125 TFLOPS accelerator is 0.6 ms per pair: 50 candidates is 30 ms per query, and at 300 QPS that is **9 GPUs**."
+    - "**The LLM dominates the latency budget and the GPU bill.** An 8B model with a 5,000-token prompt costs $2 \\times 8\\times10^{9} \\times 5{,}000 = 8\\times10^{13}$ FLOPs of prefill; at 40% MFU on one H100 that is **202 ms**, and at 300 QPS it is **60 GPUs** — six times the reranker's bill for the part users call \\\"the answer\\\"."
+  definitions:
+    - { term: "Chunk", meaning: "The retrieval unit: a 512-token window with overlap, embedded and indexed independently of the document it came from." }
+    - { term: "Stride", meaning: "Chunk length minus overlap. A 512-token chunk with 64-token overlap advances 448 tokens, and stride sets the chunk count." }
+    - { term: "HNSW", meaning: "Hierarchical navigable small world graph: a multi-layer proximity graph searched greedily. Memory is vectors plus M neighbours per node." }
+    - { term: "ef (search breadth)", meaning: "The size of the candidate list during HNSW search. Larger ef means better recall and more distance computations per query." }
+    - { term: "BM25", meaning: "A lexical ranking function over an inverted index, scoring by term frequency, inverse document frequency and document length normalisation." }
+    - { term: "Hybrid retrieval", meaning: "Running lexical and dense retrieval in parallel and fusing the ranked lists, so exact-match and paraphrase queries are both served." }
+    - { term: "Reciprocal rank fusion", meaning: "Combining ranked lists by summing 1/(k + rank) per document. Needs no score calibration, which is why it is the default fusion." }
+    - { term: "Cross-encoder", meaning: "A model that scores a query-document pair jointly, so it can model interaction. Accurate and expensive: one forward pass per candidate, never precomputable." }
+    - { term: "Recall@k", meaning: "The fraction of queries whose true top-k results appear in the retrieved top-k. Measured against exhaustive search on a sample, never inferred from latency." }
+    - { term: "Semantic cache", meaning: "A cache keyed by embedding similarity rather than exact string, so paraphrases hit. Its risk is serving a stale answer to a query that looks identical." }
+    - { term: "Tombstone", meaning: "A deletion marker in an append-only index. Queries must filter it, and the space is only reclaimed by a merge, which is the source of silent index bloat." }
+    - { term: "Index lag", meaning: "The time between a source document changing and a query being able to retrieve the new version. A product SLO, not an operational detail." }
+
+  diagrams:
+    - type: architecture
+      title: "Two indexes, one reranker, one generator"
+      nodes:
+        - { id: q, x: 0, y: 1, label: "Query", kind: client, detail: "300 QPS peak, median 9 tokens. Short queries are exactly where dense retrieval is weakest and lexical retrieval is strongest, which is why both exist." }
+        - { id: bm25, x: 1, y: 0, label: "BM25 index", kind: database, detail: "10.7 GB of postings over 17.9M chunks. Finds part numbers, error codes and names that embeddings blur away. Takes the raw query, not the vector." }
+        - { id: enc, x: 1, y: 2, label: "Query encoder", kind: model, detail: "Must be the same model and the same version as the one that embedded the corpus. A version skew is silent: vectors are still produced, they are just in a different space." }
+        - { id: ann, x: 2, y: 2, label: "HNSW index", kind: database, detail: "20.6 GB: 18.3 GB of int8 vectors plus 2.29 GB of graph. 1,500 distance computations per query at ef=64." }
+        - { id: fuse, x: 2, y: 1, label: "Fuse + rerank", kind: gpu, detail: "Reciprocal rank fusion over the two lists, then a cross-encoder over the top 50. 0.6 ms per pair, 30 ms per query, 9 GPUs at peak." }
+        - { id: llm, x: 3, y: 1, label: "Generator (8B)", kind: model, detail: "5,000-token prompt, 202 ms of prefill, 400 output tokens. 60 GPUs at 300 QPS — the largest line item in the design." }
+      edges:
+        - { from: q, to: bm25, label: "terms" }
+        - { from: q, to: enc, label: "text" }
+        - { from: enc, to: ann, label: "vector" }
+        - { from: bm25, to: fuse, label: "top 100" }
+        - { from: ann, to: fuse, label: "top 100" }
+        - { from: fuse, to: llm, label: "top 8 chunks" }
+
+    - type: compare
+      title: "Dense-only versus hybrid plus cross-encoder"
+      left_label: "Dense only, no rerank"
+      left_points:
+        - "One index, 20.6 GB, one encoder to keep in sync, and a 22 ms retrieval path"
+        - "Misses exact identifiers: a part number and its near-neighbours are close in embedding space, so the wrong one is confidently returned"
+        - "Cheap at 300 QPS: no rerank GPUs at all"
+        - "Quality ceiling is set by the bi-encoder's single-vector bottleneck"
+      right_label: "Hybrid plus cross-encoder rerank"
+      right_points:
+        - "Two indexes, 31.3 GB, and two encoders to version together"
+        - "Exact-match recall from BM25 covers the identifiers embeddings blur"
+        - "45 ms of rerank latency and 9 GPUs at peak, for a large precision gain on the top 8 that reach the LLM"
+        - "The reranker can be upgraded independently of the index, which is the operational argument for it"
+
+    - type: pipeline
+      title: "The 292 ms answer budget"
+      nodes:
+        - label: "Encode query"
+          note: "8 ms"
+          detail: "One 9-token forward pass through a 110M-parameter encoder. Trivial compute, but it is a hard dependency: no vector, no dense retrieval."
+        - label: "Retrieve (parallel)"
+          note: "12 ms"
+          detail: "BM25 and HNSW run concurrently, so the cost is the slower one, not the sum. This is the only place where parallelism is free."
+        - label: "Fuse + rerank"
+          note: "45 ms"
+          detail: "RRF is O(k log k) and free; the cross-encoder is 50 forwards of 512 tokens at 0.6 ms each. Batching 50 pairs together is what makes it 30 ms instead of 50 sequential calls."
+        - label: "Assemble prompt"
+          note: "5 ms"
+          detail: "Top 8 chunks, deduplicated by document, ordered by score, with citation metadata. Tokenisation of 5,000 tokens happens here and is not free."
+        - label: "Generate first token"
+          note: "202 ms"
+          detail: "8e13 FLOPs of prefill at 40% MFU on one H100. This is 69% of the total and the only term that a bigger GPU actually improves."
+        - label: "Network + stream"
+          note: "20 ms"
+          detail: "TLS, gateway, SSE setup. Twenty milliseconds is small until you remember it is charged once per query and 8.6 million times a day."
+
+  markdown: |
+    ## Everything scales with chunks
+
+    A million documents is not a number you can design against. Convert it
+    first:
+
+    $$N_{\text{chunks}} = \frac{N_{\text{docs}} \cdot T_{\text{doc}}}{L_{\text{chunk}} - L_{\text{overlap}}}
+    = \frac{10^{6} \times 8{,}000}{512 - 64} = 1.79\times10^{7}.$$
+
+    Seventeen point nine million chunks. The overlap costs 14% redundancy
+    ($64/448$), which is the price of not cutting a sentence in half at every
+    boundary — and it is a real 14% on every memory and compute line that
+    follows.
+
+    | component | arithmetic | size |
+    |---|---|---|
+    | vectors, fp32 | 17.9M x 1,024 x 4 B | 73.3 GB |
+    | vectors, fp16 | 17.9M x 1,024 x 2 B | 36.7 GB |
+    | vectors, int8 | 17.9M x 1,024 x 1 B | 18.3 GB |
+    | HNSW graph, M=32 | 17.9M x 32 x 4 B | 2.29 GB |
+    | BM25 postings | 17.9M x 150 x 4 B | 10.7 GB |
+    | total, int8 + hybrid | | 31.3 GB |
+
+    Thirty-one gigabytes per replica, so a 64 GB node holds one replica with
+    headroom, and high availability costs a second node. Float32 is not a
+    tuning parameter here — it is a 73 GB index that does not fit the machine.
+
+    ## Why hybrid, in one query
+
+    Consider the query "error E-4471 on the X200 pump". A bi-encoder maps the
+    whole string to one vector, and "E-4471" contributes a fraction of that
+    vector; the top 10 will contain documents about pumps, errors, and the X200,
+    and possibly not the one page that mentions E-4471. BM25 scores that token
+    exactly, and it wins outright.
+
+    Consider "how do I stop the pump from overheating". BM25 needs the words
+    "stop", "pump", "overheating" to co-occur; the document says "thermal
+    shutdown prevents damage". BM25 scores zero, the dense retriever scores it
+    first.
+
+    Running both and fusing with reciprocal rank fusion,
+
+    $$\text{score}(d) = \sum_{r \in \{\text{bm25},\text{dense}\}} \frac{1}{60 + \text{rank}_r(d)},$$
+
+    needs no score calibration — which is the point, because BM25 scores and
+    cosine similarities are not on the same scale and never will be. The union
+    costs one extra index, 10.7 GB and one more system to keep consistent.
+
+    ## The reranker is where quality is bought and latency is spent
+
+    A cross-encoder sees query and document together, so it can model
+    interaction that a single dot product cannot. It also cannot be
+    precomputed: one forward pass per candidate per query.
+
+    $$F_{\text{rerank}} = 2 \cdot N_{\text{params}} \cdot L_{\text{pair}} = 2 \times 22\times10^{6} \times 512 = 2.25\times10^{10}.$$
+
+    At 30% of a 125 TFLOPS accelerator (37.5 TFLOPS) that is 0.6 ms per pair.
+    Reranking 50 candidates is 30 ms of compute; with batching overhead, 45 ms.
+    At 300 QPS:
+
+    $$300 \times 50 \times 2.25\times10^{10} = 3.4\times10^{14}\ \text{FLOP/s}
+    \Rightarrow \frac{3.4\times10^{14}}{3.75\times10^{13}} = 9\ \text{GPUs}.$$
+
+    Nine GPUs to rescore. Now ask what they buy: they do not change recall at
+    all — the candidates already came from the two indexes — they change
+    *precision in the top 8*, which is the only thing the LLM ever sees. Cutting
+    from 50 candidates to 25 halves the bill and the latency and usually costs
+    little, because rank 40 rarely enters the prompt. That is the trade to make
+    explicitly rather than by default.
+
+    ## The generator is 69% of the latency and 85% of the bill
+
+    $$F_{\text{prefill}} = 2 \cdot 8\times10^{9} \cdot 5{,}000 = 8\times10^{13}.$$
+
+    At 40% MFU on one H100 — 396 TFLOPS — that is **202 ms**, before a single
+    output token. Add 8 ms of encoding, 12 ms of retrieval, 45 ms of rerank and
+    20 ms of network and the p50 is 292 ms; the p99 is 850 ms, and almost all of
+    that spread is queueing in front of the generator rather than anything in
+    retrieval.
+
+    Sixty GPUs at 300 QPS is the largest line item, and it is the one a semantic
+    cache attacks most directly: a 35% hit rate removes 105 QPS from the
+    generator (21 GPUs), the reranker (3 GPUs) and the index at the same time.
+
+    ## Freshness is a pipeline, not a rebuild
+
+    Two percent daily churn:
+
+    $$N_{\text{updates}} = 0.02 \times 10^{6} \times \frac{8{,}000}{448}
+    = 3.58\times10^{5}\ \text{chunks/day} = 4.14\ \text{chunks/s}.$$
+
+    One embedding GPU at 600 chunks/s serves that at 0.7% utilisation. The
+    compute is free; the hard parts are deletion and atomicity. A document
+    update is a delete of 17.9 old chunks and an insert of 17.9 new ones, and a
+    query that lands between the two must see one version or the other, never
+    both. That means a per-document version in the index and a filter at query
+    time, which costs bytes in every payload and a filter in every search.
+
+    A full rebuild is 17.9M chunks at 600 chunks/s = 29,800 s = **8.3 hours on
+    one GPU**. Nobody can take an eight-hour outage for a re-embed, which is why
+    versioned upserts and alias cutovers are the only workable pattern.
+
+    ## Filters are part of retrieval, not a post-processing step
+
+    A tenant filter that matches 0.1% of the corpus cannot be applied after the
+    ANN scan: the top 100 chunks may contain none of that tenant's documents, so
+    the query returns three results instead of eight while the aggregate recall
+    metric still reads 0.95. The filter has to live inside the traversal — a
+    filtered graph walk that only admits permitted nodes, or a partition by
+    tenant so the scan never sees the rest.
+
+    The cost is real and it is counter-intuitive. A filtered graph search visits
+    more nodes to fill the same k, so latency rises most for the tenants with the
+    least data. The smallest customer gets the slowest query, because the index
+    has to walk past everything that is not theirs.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    A RAG platform is **four budgets that are usually confused for one**: index memory (31 GB for a million documents), retrieval recall (which no latency number measures), reranking compute (9 GPUs at 300 QPS), and answer latency (292 ms p50 with 200 ms of it inside the LLM) — and the design decisions that matter are the ones that trade one budget for another.
+
+    ### The analogy, in full
+
+    A research library with three desks. The first desk takes your question and writes it on a card in the library's own shorthand — that is the query encoder, and if it uses a different shorthand from the one the books were catalogued in, nothing is found and nothing errors. The second desk finds candidate books: one clerk searches by exact phrase in the card catalogue, another by meaning, and you take the union — that is hybrid retrieval, and its cost is that you now have two clerks to keep in sync. The third desk is a subject expert who reads the fifty candidates properly and ranks them. She is slow, expensive, and the only reason the answer is good — which is exactly why she is the thing you must budget for rather than the thing you add last. Where the analogy breaks: books do not change while you are reading them, and these do. Two percent of the corpus changes daily, so the catalogue is always slightly wrong, and the only defence is an update pipeline with a measured lag rather than a nightly rebuild.
+
+    ### Failure modes, in full
+
+    - You embed a million documents into 17.9 million chunks, put them in a vector index in float32, and the 73 GB of vectors does not fit the 64 GB node you provisioned — so you quantise to int8 and discover recall moved without any benchmark telling you.
+    - Dense retrieval alone misses the query that contains an exact part number. BM25 alone misses the paraphrase. The hybrid that fixes both costs a second index and a fusion step, and the fusion weights are the part nobody budgets for.
+    - You add a cross-encoder reranker because it improves quality, and it becomes the latency bottleneck: 50 candidate pairs at 0.6 ms each is 30 ms of pure compute per query, and at 300 QPS that is 9 GPUs doing nothing but rescoring.
+    - A bulk re-index of 2% of the corpus arrives and search quality drops for six hours, because the new documents are in the index but the old ones were never deleted — tombstones accumulate until recall is measured against a corpus that no longer exists.
+    - An interviewer asks for the latency budget and gets a single number. The design is not the number; it is knowing that 200 of the 292 ms is the LLM, 45 is the reranker, and 22 is retrieval — and which of those you can cut without losing the answer.
+
+    ### The mechanisms, in full
+
+    - **Chunk count, not document count, is the capacity unit.** A million documents at 8,000 tokens each is $8\times10^{9}$ tokens; with 512-token chunks and 64-token overlap the stride is 448, so $8\times10^{9}/448 = 17.9$ million chunks. Every memory, compute and freshness number downstream is per chunk, and the document count is a distraction.
+    - **Vector memory is dimension times bytes times chunks, and the bytes are a quality decision.** 17.9M chunks at 1,024 dimensions is 73.3 GB in fp32, 36.7 GB in fp16, and 18.3 GB in int8. The index must also hold the HNSW graph: $M = 32$ neighbours at 4 bytes each is 128 bytes per chunk, 2.29 GB. int8 plus graph is **20.6 GB**, which fits a 64 GB node with room for the OS and the query-time working set.
+    - **BM25 is not a legacy tax, it is 10.7 GB of exact-match recall.** At 150 unique terms per chunk and 4 bytes per posting, 17.9M chunks produce $2.7\times10^{9}$ postings, 10.7 GB compressed. It is the only component that reliably finds a part number, an error code or a person's name, and it costs one extra index to maintain.
+    - **Recall is not measurable from latency, and must be measured against brute force.** HNSW with $M = 32$ and $ef = 64$ visits roughly 1,500 nodes per query; whether that recovers the true top 10 is an empirical question answered by running exhaustive search on a 10,000-query sample. A target of 0.95 recall@10 is a test you run, not a property you assume from the library's documentation.
+    - **The reranker is the compute bottleneck, and its cost is linear in candidates.** A 22M-parameter cross-encoder scoring a 512-token pair costs $2 \times 22\times10^{6} \times 512 = 2.25\times10^{10}$ FLOPs. At 30% of a 125 TFLOPS accelerator that is 0.6 ms per pair, so 50 candidates is 30 ms per query; at 300 QPS that is $3.4\times10^{14}$ FLOPs/s, or **9 GPUs**.
+    - **The LLM dominates the latency budget and the GPU bill.** An 8B model with a 5,000-token prompt costs $2 \times 8\times10^{9} \times 5{,}000 = 8\times10^{13}$ FLOPs of prefill; at 40% MFU on one H100 (396 TFLOPS) that is **202 ms**. At 300 QPS it is 60 GPUs, which is six times the reranker's bill for a component the user perceives as "the answer".
+    - **Caching is a retrieval decision, not an infrastructure one.** A semantic cache at a 35% hit rate removes 105 of 300 QPS from the LLM, the reranker and the index at once — 21 LLM GPUs and 3 rerank GPUs — but a cache that ignores document freshness serves yesterday's answer with today's confidence. Every entry needs an invalidation key tied to the chunk version.
+    - **Freshness is a throughput problem with a lag SLO.** Two percent of a million documents changing daily is 20,000 documents, 358,000 chunks, or **4.14 chunks/s**. One embedding GPU at 600 chunks/s handles that at 0.7% utilisation — so the hard part is not compute, it is deletion, versioning and the guarantee that a query cannot see a half-updated document.
+    - **A full rebuild is not an option and the arithmetic proves it.** Embedding all 17.9M chunks at 600 chunks/s is 29,800 s — **8.3 hours on one GPU** — and the same work is minutes of downtime if it must be atomic. That is why every serious system upserts into a versioned index and cuts over by alias, rather than rebuilding.
+  problem_statement: >-
+    Design a RAG platform over one million enterprise documents (8,000 tokens
+    each) serving 300 queries per second at peak, with p99 answer latency under
+    1 second, retrievable index lag under 5 minutes, and citation-grade answers
+    that must not be stale. Choose the chunking, the retrieval stack, the
+    reranking budget and the cache hierarchy, and show the memory and compute
+    arithmetic for each.
+
+  requirements:
+    functional:
+      - "Answer natural-language questions with citations to specific chunks of specific document versions"
+      - "Support exact-identifier queries (part numbers, error codes, names) as well as paraphrases"
+      - "Index document updates and deletions within 5 minutes, with no query ever seeing a partially updated document"
+      - "Enforce per-tenant document access control at retrieval time, not after generation"
+      - "Expose retrieval provenance (which chunks, which scores, which index version) for every answer"
+    non_functional:
+      - "p99 end-to-end latency <= 1,000 ms to first token, p50 <= 350 ms"
+      - "recall@10 >= 0.95 against exhaustive search on a sampled query set"
+      - "Index lag p99 <= 5 minutes from document write to retrievability"
+      - "Zero cross-tenant document leakage, verified by an adversarial test suite"
+      - "Cost per 1,000 queries under 0.75 USD at the stated traffic mix"
+
+  clarifying_questions:
+    - question: "Is the corpus mostly prose, or does it contain tables, code and scanned pages?"
+      why_it_matters: "Tables and scans need layout-aware extraction before chunking, which changes chunk counts by 2-3x and can dominate quality. Chunking a table at 512 tokens destroys the answer before retrieval ever runs."
+    - question: "What is the freshness requirement per document class, not on average?"
+      why_it_matters: "A policy document updated quarterly and a ticket updated hourly cannot share an index lag SLO. Per-class SLOs decide whether you need a streaming path or a batch one, which is a different architecture."
+    - question: "How many tenants, and is isolation a hard requirement?"
+      why_it_matters: "Tenant filters at query time cost recall if the filter is post-hoc and cost memory if it is a separate index per tenant. This decision changes the sharding strategy more than any modelling choice."
+    - question: "Is a wrong answer worse than no answer?"
+      why_it_matters: "If so, the system needs an abstain path driven by reranker score thresholds and citation coverage, and that threshold is a product decision with a measurable cost in unanswered queries."
+    - question: "What is the query distribution — head queries repeated, or a long tail?"
+      why_it_matters: "A semantic cache only pays if the head is fat. At a 35% hit rate it saves 21 generator GPUs; at 5% it saves three and adds an invalidation bug surface for nothing."
+
+  capacity_estimation:
+    assumptions:
+      - "Corpus: 1,000,000 documents, 12 pages each, 500 words per page, about 8,000 tokens per document"
+      - "Chunking: 512 tokens with 64-token overlap, stride 448 tokens; embedding dimension 1,024"
+      - "Traffic: 300 QPS peak, 100 QPS average, 9-token queries, top-50 reranked, top-8 chunks in a 5,000-token prompt, 400-token answers"
+      - "Hardware: index nodes with 64 GB RAM; rerank accelerators at 125 TFLOPS peak, 30% MFU; H100 at 989 TFLOPS peak, 40% MFU for prefill"
+      - "Cost: 2.50 USD per GPU-hour, 0.12 USD per CPU-node-hour for index nodes"
+
+    arithmetic:
+      - label: "Corpus tokens and chunk count"
+        calculation: "1e6 documents x 8,000 tokens = 8e9 tokens. Stride = 512 - 64 = 448 tokens. 8e9 / 448 = 1.79e7 chunks (17.9 million). Overlap redundancy = 64/448 = 14.3%."
+        conclusion: "17.9M chunks is the unit every later number uses; the 14% overlap is a deliberate cost paid for not splitting sentences at boundaries."
+
+      - label: "Vector and graph memory"
+        calculation: "Vectors: 17.9e6 x 1,024 dims. fp32 = 4 bytes -> 73.3 GB; fp16 = 2 bytes -> 36.7 GB; int8 = 1 byte -> 18.3 GB. HNSW links at M=32: 17.9e6 x 32 x 4 bytes = 2.29 GB. int8 total = 18.3 + 2.29 = 20.6 GB."
+        conclusion: "float32 is a 73.3 GB index that does not fit a 64 GB node; int8 plus graph is 20.6 GB and fits with 43 GB spare for the query working set."
+
+      - label: "BM25 index size"
+        calculation: "Average 150 unique terms per 512-token chunk -> 17.9e6 x 150 = 2.69e9 postings. At 4 bytes per compressed posting: 2.69e9 x 4 = 10.7 GB."
+        conclusion: "10.7 GB buys exact-match recall that dense retrieval cannot provide, so the hybrid index is 31.3 GB per replica rather than 20.6 GB."
+
+      - label: "Replica count and node sizing"
+        calculation: "Per replica: 20.6 GB vectors + 10.7 GB postings = 31.3 GB. Two replicas: 2 x 31.3 GB = 62.6 GB across two 64 GB nodes; each node holds one full replica and serves 150 QPS at peak (2 nodes x 150 = 300 QPS). Node utilisation = 31.3 / 64 = 49%."
+        conclusion: "Two index nodes, each at 49% memory utilisation, giving both availability and headroom for a merge operation without eviction."
+
+      - label: "Reranker compute and GPU count"
+        calculation: "FLOPs per pair = 2 x 22e6 params x 512 tokens = 2.25e10. At 30% MFU of 125 TFLOPS = 3.75e13 FLOPS -> 0.6 ms per pair. 50 pairs = 30 ms per query, 45 ms with batching overhead. At 300 QPS: 300 x 50 x 2.25e10 = 3.4e14 FLOPs/s; 3.4e14 / 3.75e13 = 9 GPUs."
+        conclusion: "Nine rerank GPUs at peak. Halving candidates to 25 halves both the 45 ms and the 4.5-GPU average bill."
+
+      - label: "Generator prefill and GPU count"
+        calculation: "Prefill FLOPs per query = 2 x 8e9 params x 5,000 prompt tokens = 8e13. At 40% MFU on an H100 (0.4 x 989e12 = 3.96e14 FLOPS): 8e13 / 3.96e14 = 202 ms. At 300 QPS: 300 x 8e13 = 2.4e16 FLOPs/s; 2.4e16 / 3.96e14 = 60 GPUs."
+        conclusion: "60 GPUs for generation against 9 for reranking and 2 index nodes: the generator is 85% of the compute bill and 69% of the latency."
+
+      - label: "Semantic cache value"
+        calculation: "At a 35% hit rate, 0.35 x 300 = 105 QPS never reaches the stack. Generator saving = 105/300 x 60 = 21 GPUs; rerank saving = 105/300 x 9 = 3.2 GPUs; index saving = 105/300 x 2 nodes = 0.7 nodes."
+        conclusion: "24 GPUs saved is roughly 1,460 USD/day at 2.50 USD per GPU-hour, which is why cache hit rate is a first-class metric with an owner."
+
+      - label: "Freshness throughput and lag"
+        calculation: "Daily churn 2% of 1e6 documents = 20,000 documents; chunks per document = 8,000/448 = 17.9; updates = 20,000 x 17.9 = 3.58e5 chunks/day = 4.14 chunks/s. Embedding throughput at 600 chunks/s per GPU means utilisation = 4.14/600 = 0.7%."
+        conclusion: "One embedding GPU absorbs the entire daily churn at under 1% utilisation. The freshness problem is versioning and deletion, not compute."
+
+      - label: "Full rebuild cost"
+        calculation: "17.9e6 chunks / 600 chunks per second = 29,800 s = 8.3 hours on one GPU; on 8 GPUs, 1.0 hour. Query-visible downtime is zero only if the rebuild writes to a new index and cuts over by alias."
+        conclusion: "A rebuild is affordable in compute and unaffordable in downtime, so the index must support versioned upsert and alias cutover rather than replacement."
+
+      - label: "Cost per thousand queries"
+        calculation: "72 GPUs (60 generator + 9 rerank + 2 embed + 1 spare) x 2.50 USD/hour = 180 USD/hour = 4,320 USD/day. At 100 QPS average: 100 x 86,400 = 8.64e6 queries/day. 4,320 / 8,640 = 0.50 USD per 1,000 queries."
+        conclusion: "0.50 USD per 1,000 queries at average load; the cost is provisioned for a 3x peak, so utilisation is again the lever that moves it."
+
+  architecture_summary: >-
+    A query encoder feeds two indexes in parallel — a 10.7 GB BM25 index for
+    exact match and a 20.6 GB HNSW index of int8 vectors for meaning — whose
+    top-100 lists are fused by reciprocal rank and reranked by a cross-encoder
+    over the top 50. The top 8 chunks become a 5,000-token prompt for an 8B
+    generator. Index updates are versioned upserts with alias cutover, and a
+    semantic cache with freshness-aware keys absorbs the head of the query
+    distribution.
+
+  deep_dives:
+    - topic: "Chunking strategy"
+      explanation: >-
+        Chunk size is a three-way trade between retrieval precision (small chunks
+        match narrowly), answer completeness (large chunks carry the context the
+        LLM needs) and index cost (chunks scale inversely with stride). 512 with
+        64 overlap is a defensible default for prose; it is wrong for tables and
+        for code, which need structure-aware splitting.
+      tradeoffs:
+        - option: "Fixed 512-token windows with 64-token overlap"
+          pros: "Uniform cost, predictable chunk count (17.9M here), simple to reason about, and works well for narrative prose."
+          cons: "Splits tables, code blocks and numbered procedures mid-structure; 14% redundancy; a 256-token answer may need two chunks that were never retrieved together."
+        - option: "Structure-aware splitting by heading and table"
+          pros: "Keeps tables and procedures intact, which is where enterprise answers usually live; retrieval precision improves exactly where naive chunking fails."
+          cons: "Chunk sizes become non-uniform (200 to 4,000 tokens), which breaks batching assumptions, and the chunk count becomes unpredictable — 1.4x to 2.5x the fixed strategy."
+        - option: "Parent-child: index small, return large"
+          pros: "Precision of 128-token child chunks with the context of a 1,024-token parent, at the cost of one indirection at assemble time."
+          cons: "Doubles the number of indexed units and adds a join, so memory and latency both rise; parent fetches can blow the prompt budget if several children share a parent."
+
+    - topic: "Reranking depth and model class"
+      explanation: >-
+        The reranker converts retrieval recall into prompt precision. Its cost is
+        linear in candidates and its benefit is concentrated in the head of the
+        list, so the right depth is the point where the marginal candidate stops
+        entering the top 8. That point is measurable, and it is usually between
+        25 and 50.
+      tradeoffs:
+        - option: "Cross-encoder over the top 50"
+          pros: "Joint query-document modelling gives the best precision per candidate; 0.6 ms per pair makes 50 candidates 30 ms, which fits a 292 ms budget."
+          cons: "9 GPUs at peak, one forward pass per candidate, and no ability to precompute — the cost is paid on every query forever."
+        - option: "ColBERT-style late interaction over the top 200"
+          pros: "Token-level interaction at retrieval time with precomputed document token embeddings, so a deeper candidate list is affordable."
+          cons: "Storage explodes: 512 tokens x 128 dims x 2 bytes per chunk is 131 KB per chunk, 2.3 TB over 17.9M chunks, which is a different infrastructure problem entirely."
+        - option: "No reranker, better first-stage retrieval"
+          pros: "Removes 45 ms and 9 GPUs; a stronger bi-encoder or hybrid fusion can carry most of the quality."
+          cons: "Caps precision at what a single vector can express, and gives up the ability to swap a model without re-embedding the corpus."
+
+    - topic: "Cache hierarchy"
+      explanation: >-
+        Three caches with different keys and different risks: exact-match on the
+        normalised query, semantic on the query embedding, and prefix/KV cache on
+        the assembled prompt. Each has a hit-rate curve and a staleness surface,
+        and mixing them without per-entry version keys is how a platform serves
+        confidently wrong answers after an update.
+      tradeoffs:
+        - option: "Exact-match cache only"
+          pros: "Trivially correct invalidation — key on query text plus index version — and no false hits ever."
+          cons: "Hit rate on natural-language traffic is low, typically single digits, so the 21-GPU saving does not materialise."
+        - option: "Semantic cache with a similarity threshold"
+          pros: "Catches paraphrases and repeated intent, which is where the 35% hit rate comes from; the threshold tunes the precision/recall of the cache itself."
+          cons: "Near-duplicate queries with different answers (different tenant, different product version) get the wrong cached answer; needs tenant and version in the key and an audit trail."
+        - option: "Prefix/KV cache on the assembled prompt"
+          pros: "Saves the 202 ms prefill when the top chunks are unchanged, which is common for repeated questions over a static document."
+          cons: "Only helps when the prompt prefix is byte-identical, so chunk ordering must be deterministic, and the KV blocks are memory that competes with the generator's own concurrency."
+
+    - topic: "Index freshness architecture"
+      explanation: >-
+        Freshness has three parts: detecting a change, re-embedding it, and making
+        it visible atomically. The first is a CDC problem, the second is 0.7% of
+        one GPU, and the third is the one that produces user-visible bugs — a
+        query that sees new chunks and old chunks for the same document answers
+        from a document that never existed.
+      tradeoffs:
+        - option: "Nightly full rebuild into a new index, alias cutover"
+          pros: "Atomic by construction, simple to reason about, and every query sees exactly one consistent corpus version."
+          cons: "Index lag is up to 24 hours, which fails any 5-minute SLO; the rebuild is 8.3 GPU-hours and doubles index memory during the cutover window."
+        - option: "Streaming upsert with per-document version and query-time filter"
+          pros: "Index lag of seconds, no rebuild, and correctness preserved by filtering to the max visible version per document."
+          cons: "Tombstones accumulate until a merge, every query pays a filter, and a bug in version assignment silently returns two versions of one document."
+        - option: "Hybrid: streaming for hot document classes, batch for cold"
+          pros: "Pays the streaming complexity only where the SLO demands it, and keeps the cheap batch path for the 90% of documents that change quarterly."
+          cons: "Two ingestion paths and two consistency models, so every retrieval bug now has two possible causes."
+
+  bottlenecks:
+    - failure: "Embedding-model version skew between index and query"
+      symptom: "Recall drops sharply with no error and no latency change; retrieval returns plausible but wrong chunks; a new model deploy correlates with the drop but the index was never re-embedded."
+      mitigation: "Version the embedding model in the index metadata, refuse to serve a query encoder whose version does not match the target index, and run a nightly recall probe against a fixed labelled query set."
+    - failure: "Reranker queueing at peak"
+      symptom: "p99 latency rises from 292 ms to over 1 s while average GPU utilisation sits at 65%; retrieval time is flat, so the queue is in front of the reranker, not inside it."
+      mitigation: "Bound the rerank queue and degrade to fusion order under load rather than waiting; batch pairs across queries to raise GPU efficiency; autoscale on queue depth rather than utilisation."
+    - failure: "Tombstone accumulation after bulk deletes"
+      symptom: "Index memory grows after a deletion wave; search latency creeps up because dead nodes are still traversed; recall measured against the live corpus diverges from recall measured against the index."
+      mitigation: "Track live-to-tombstone ratio as a first-class metric, trigger a merge at 20% tombstones, and make deletion a versioned upsert rather than a physical removal so queries never see a torn document."
+    - failure: "Semantic cache serving stale answers"
+      symptom: "Users report confidently wrong answers that were correct last week; the answer text matches a cached entry whose source document has since been superseded; cache hit rate looks healthy."
+      mitigation: "Key cache entries on query embedding plus index version plus tenant, invalidate by document version on write, and sample-audit cached answers against a live retrieval at a low rate."
+
+  what_to_steal:
+    - "Convert documents to chunks before sizing anything: chunk count is the capacity unit, and stride (length minus overlap) is what turns a corpus into an index."
+    - "Quote vector memory at three precisions side by side. fp32, fp16 and int8 are 73.3, 36.7 and 18.3 GB here, and that single table decides whether the design fits one node or three."
+    - "Budget the reranker in FLOPs per pair times candidates times QPS. 2 x params x tokens is all it takes to get from 'we should rerank' to 'nine GPUs'."
+    - "Make the generator's prefill the headline latency number. At 202 of 292 ms it is where the user's waiting actually lives, and it is the only term a faster GPU improves."
+    - "Treat freshness as throughput plus atomicity, not as a rebuild schedule: 4.14 chunks/s is nothing, and the entire difficulty is versioning and deletion."
+
+  try_it: >-
+    Recompute the index for 256-token chunks with 32-token overlap: stride 224
+    doubles the chunk count to 35.7M, which doubles vector memory to 36.6 GB in
+    int8 and pushes the hybrid index past 47 GB — still one node, but no longer
+    with headroom for a merge. Then work out what the reranker bill becomes if
+    you keep top-50 candidates at the doubled chunk count, and why the answer is
+    unchanged.
+
+  interview_questions:
+    - question: "Size a RAG index for a million documents. Where do you start?"
+      level: staff
+      key_points:
+        - "Convert to tokens first: 1e6 docs x 8,000 tokens = 8e9 tokens, and with 512/64 chunking that is 8e9/448 = 17.9M chunks."
+        - "Vector memory is chunks x dimensions x bytes: 73.3 GB fp32, 36.7 GB fp16, 18.3 GB int8, plus 2.29 GB of HNSW links at M=32."
+        - "BM25 adds 10.7 GB of postings, so the hybrid replica is 31.3 GB and fits a 64 GB node with room for the query working set."
+        - "The design decision is the precision, not the node: fp32 does not fit, int8 does, and the recall cost must be measured rather than assumed."
+      follow_up: "The corpus doubles and the context window doubles. Which of your numbers moves by 2x and which by 4x?"
+
+    - question: "Why does a hybrid retriever beat a better dense model for enterprise search?"
+      level: senior
+      key_points:
+        - "A bi-encoder compresses the whole query into one vector, so a rare exact token like a part number contributes a small fraction of the signal and gets blurred into its neighbours."
+        - "BM25 scores that token exactly, which is why identifier, error-code and name queries are lexical wins regardless of embedding quality."
+        - "Conversely, paraphrases that share no vocabulary score zero under BM25 and are exactly where dense retrieval wins."
+        - "Reciprocal rank fusion combines them without score calibration, at the cost of a second 10.7 GB index and a second consistency problem."
+      follow_up: "How would you decide the fusion constant, and what would you measure to know it is wrong?"
+
+    - question: "The reranker adds 45 ms and 9 GPUs. Defend it or remove it."
+      level: staff
+      key_points:
+        - "It does not improve recall at all — candidates already came from the indexes — it improves precision in the top 8, which is the only content the generator sees."
+        - "Cost is 2 x 22e6 x 512 = 2.25e10 FLOPs per pair, 0.6 ms at 30% MFU, so 50 candidates is 30 ms and 9 GPUs at 300 QPS."
+        - "The depth is the tunable: rank 40 rarely enters the top 8, so cutting to 25 candidates halves both latency and bill with little quality loss."
+        - "Defend it by measuring answer accuracy with and without on a labelled set; if the delta is small, the honest move is to remove it and spend the GPUs on the generator."
+      follow_up: "What would make you switch from a cross-encoder to late interaction, and what does that cost in storage?"
+
+    - question: "A document is updated. Walk me through everything that has to happen before a query can see it — and what must never happen."
+      level: senior
+      key_points:
+        - "CDC fires, the document is re-extracted and re-chunked into 17.9 chunks, each embedded at about 1.7 ms, and upserted with a new version number."
+        - "The old chunks are tombstoned, not deleted, so an in-flight query that resolved them still gets a consistent answer."
+        - "Queries filter to the maximum visible version per document, so a query never sees new and old chunks of the same document together."
+        - "Cache entries keyed on the old version must be invalidated at the same moment, or the correct index is bypassed by a stale answer."
+      follow_up: "Your index lag SLO is 5 minutes and the embedding GPU is at 0.7% utilisation. What is actually limiting freshness?"
+
+  common_mistakes:
+    - "Sizing the index in float32 and discovering a 73.3 GB index does not fit a 64 GB node, then quantising without measuring the recall loss against exhaustive search."
+    - "Reranking 200 candidates because 'more is better', turning a 45 ms budget into 180 ms and a 9-GPU bill into 36, when rank 40 almost never reaches the prompt."
+    - "Deleting chunks physically on document update, so a query that spans the delete and the insert sees a document that never existed."
+    - "Caching on query text alone, so a paraphrase hits an answer generated from a document version that has since been superseded."
+    - "Reporting retrieval latency as the RAG latency. Retrieval is 22 ms of a 292 ms budget; the generator's 202 ms prefill is what the user experiences."
+
+  further_reading:
+    - label: "Karpukhin, Oguz, Min, Lewis, Wu, Edunov, Chen, Yih, Dense Passage Retrieval for Open-Domain Question Answering (EMNLP 2020)"
+    - label: "Malkov, Yashunin, Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs (TPAMI 2018)"
+    - label: "Cormack, Clarke, Buettcher, Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods (SIGIR 2009)"
+    - label: "Khattab, Zaharia, ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT (SIGIR 2020)"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Three numbers decide this design: how many chunks the corpus becomes,
+        how many bytes each chunk costs in each index, and how many FLOPs one
+        reranked candidate costs. Everything else is addition.
+      blocks:
+        - kind: checklist
+          body: |
+            - Chunks = tokens / stride
+            - Vectors = chunks x dims x bytes
+            - Graph = chunks x M x 4 bytes
+            - Postings = chunks x unique terms x 4 bytes
+            - Rerank = 2 x params x tokens per candidate
+      checkpoint: >-
+        Which of those five grows if you halve the chunk size, and which one stays
+        the same?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Size the index first because it is binary: it fits a node or it does not.
+        Then size the reranker because it is linear in candidates and is the only
+        quality knob with a per-query cost. The generator is last and largest, and
+        the only thing that makes it smaller is not calling it.
+      blocks:
+        - kind: warning
+          body: >-
+            Do not start with the LLM. Starting there produces a design where
+            retrieval is an afterthought, and the failure mode is confident answers
+            from the wrong three chunks — which no amount of generation quality
+            fixes.
+      checkpoint: >-
+        If retrieval returns the wrong eight chunks, does a better generator help?
+        What does that imply about where to spend the next engineering month?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Chunk, index, retrieve twice, fuse, rerank, generate.
+      blocks:
+        - kind: pseudocode
+          body: |
+            chunks = tokens / (L - overlap)
+            vec_bytes = chunks * dims * b
+            graph = chunks * M * 4
+            postings = chunks * terms * 4
+            for q in queries:
+                dense = ann(enc(q), k=100, ef=64)
+                lex   = bm25(q, k=100)
+                cand  = rrf(dense, lex)[:50]
+                ranked= cross_encoder(q, cand)     # 0.6 ms per pair
+                answer= llm(ranked[:8])            # 202 ms prefill
+      checkpoint: >-
+        Which line would you instrument first to distinguish a retrieval bug from
+        a generation bug?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Chunk count, index bytes, and rerank cost.
+      blocks:
+        - kind: math
+          body: |
+            **Chunks.**
+            $$N_c = \frac{N_d T_d}{L - L_o}$$
+
+            **Index bytes.**
+            $$M = N_c\,(d\,b_v + M_g\,4) + N_c\,T_u\,4$$
+
+            **Rerank FLOPs per query.**
+            $$F = 2\,N_p\,L_{\text{pair}}\,k$$
+      checkpoint: >-
+        Plug in 1e6 documents, 8,000 tokens, 512/64 chunking, 1,024 dims and 1 byte
+        per value. Do you get 17.9M chunks and 20.6 GB?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The 31 GB hybrid index with a 9-GPU reranker and a 60-GPU generator.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            docs, tok_per_doc = 1e6, 8000
+            L, ov, dims, M = 512, 64, 1024, 32
+            chunks = docs * tok_per_doc / (L - ov)
+            vec    = chunks * dims * 1          # int8
+            graph  = chunks * M * 4
+            bm25   = chunks * 150 * 4
+            rerank = 2 * 22e6 * 512
+            gpus   = 300 * 50 * rerank / (125e12 * 0.30)
+            gen    = 300 * 2 * 8e9 * 5000 / (989e12 * 0.40)
+            print(round(chunks/1e6,1), round((vec+graph)/1e9,1),
+                  round(bm25/1e9,1), round(gpus,1), round(gen))
+      checkpoint: >-
+        The generator count assumes 5,000 prompt tokens. What happens to it if
+        you cut the top-8 chunks to top-4, and what does that do to answer quality?
+  implementations:
+    - language: python
+      title: "Chunk arithmetic, hybrid RRF, and reranker cost"
+      note: >-
+        The chunk count is tokens divided by stride, not by chunk size: 512-token chunks with 64 overlap give 17.86M chunks, and the span function proves every token is covered. Reciprocal rank fusion of BM25 and dense rankings reaches recall@5 of 1.0 where the individual retrievers get 0.6 and 0.4. The reranker estimate assumes 22M parameters, a 512-token pair, and 30% of a 125 TFLOP/s GPU.
+      code: |
+        import numpy as np
+
+        TOKENS, CHUNK, OVERLAP = 8e9, 512, 64
+        DIM, CROSS_ENCODER_PARAMS = 1_024, 22e6
+
+
+        def chunk_count(tokens=TOKENS, chunk=CHUNK, overlap=OVERLAP):
+            """Stride is chunk minus overlap, so the count is tokens / stride."""
+            return int(np.ceil(tokens / (chunk - overlap)))
+
+
+        def chunk_spans(n_tokens, chunk=CHUNK, overlap=OVERLAP):
+            stride = chunk - overlap
+            return [(s, min(s + chunk, n_tokens))
+                    for s in range(0, max(n_tokens - overlap, 1), stride)]
+
+
+        def rrf(rankings, k=60):
+            """Reciprocal rank fusion: score(d) = sum 1 / (k + rank)."""
+            scores = {}
+            for ranking in rankings:
+                for rank, doc in enumerate(ranking, start=1):
+                    scores[doc] = scores.get(doc, 0.0) + 1.0 / (k + rank)
+            return sorted(scores, key=lambda d: -scores[d])
+
+
+        def main():
+            n = chunk_count()
+            spans = chunk_spans(10_000)
+            covered = np.zeros(10_000, bool)
+            for a, b in spans:
+                covered[a:b] = True
+            print(f"chunks for 8e9 tokens: {n:,}; all tokens covered: {covered.all()}")
+            print(f"int8 vectors: {n*DIM/1e9:.1f} GB; HNSW links: {n*32*4/1e9:.1f} GB")
+
+            flops = 2 * CROSS_ENCODER_PARAMS * 512
+            print(f"rerank: {flops/1e12:.2f} TFLOP/pair -> "
+                  f"{flops/(0.30*125e12)*1e3:.2f} ms/pair; "
+                  f"{300*50*flops/(0.30*125e12):.0f} GPUs at 300 QPS x 50 pairs")
+
+            # Hybrid retrieval: BM25 misses a paraphrase, dense misses an exact ID.
+            truth = {0, 1, 2, 3, 4}
+            bm25 = [0, 1, 2, 9, 8, 3, 4]
+            dense = [3, 4, 5, 6, 7, 0, 1, 2]
+            fused = rrf([bm25, dense])[:5]
+            print(f"recall@5 bm25={len(truth & set(bm25[:5]))/5:.1f} "
+                  f"dense={len(truth & set(dense[:5]))/5:.1f} "
+                  f"fused={len(truth & set(fused))/5:.1f}")
+
+            assert n == 17_857_143
+            assert len(spans) == 23 and covered.all()
+            assert len(truth & set(fused)) == 5
+            assert len(truth & set(bm25[:5])) < 5
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-rag-chunk-count
+      title: "Chunk count is tokens over stride"
+      difficulty: easy
+      prompt: >-
+        Return the number of chunks for `tokens` with `chunk`-token windows and `overlap` tokens
+        of overlap. The stride is chunk minus overlap, so the last partial chunk counts.
+      language: python
+      entry: chunk_count
+      testCases:
+        - input: '{}'
+          expected: "17857143"
+          tolerance: 1e-6
+        - input: '{"tokens": 10000}'
+          expected: "23"
+          tolerance: 1e-6
+      solution: |
+        import math
+
+        def chunk_count(tokens=8e9, chunk=512, overlap=64):
+            return math.ceil(tokens / (chunk - overlap))
+      solutionExplanation: >-
+        8e9 / 448 = 17.86M, not 15.6M. Dividing by 512 ignores the overlap and understates
+        vector memory by 15%.
+      tags: [rag, capacity]

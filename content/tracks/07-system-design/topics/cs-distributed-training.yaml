@@ -1,0 +1,655 @@
+id: cs-distributed-training
+slug: cs-distributed-training
+title: "Case Study: Training a 70B Model on 512 GPUs"
+summary: >-
+  Split a 70B model across 512 H100s with tensor, pipeline and data parallelism,
+  then account for every second of the step: 7.4 s of maths, 2.7 s of NVLink
+  all-reduce, 1.3 s of inter-node gradient traffic, and an MFU of 38%.
+kind: case_study
+difficulty: expert
+position: 11
+estMinutes: 21
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [distributed-training, 3d-parallelism, zero, mfu, checkpointing, straggler, capacity]
+
+body:
+  big_idea: >-
+    Distributed training is a memory problem that pays a communication tax:
+    70B parameters need 1.12 TB of state before one activation, so the layout
+    is chosen by what fits.
+  problem:
+    - "You put 70B on 8×H100 with plain data parallelism and it OOMs: 16 bytes per parameter is 1.12 TB, 7% of it per GPU."
+    - "You shard aggressively and train at 22% MFU: two thirds of the cluster's FLOPs go into all-reduce and pipeline bubbles, not the model."
+    - "Step time is stable at 8.7 s, then drifts to 9.6 s: one GPU is throttled and every rank waits at every all-reduce."
+  analogy: >-
+    A car factory where no station can hold the whole car: station 1 builds
+    the chassis, station 2 mounts the engine, and the car moves down the line
+    — pipeline parallelism, paid for in the empty line while the first car
+    fills it. Within a station four workers assemble one sub-assembly
+    together, passing parts constantly — tensor parallelism, paid for in the
+    passing.
+  concept_points:
+    - "**Model state, not parameters, sets the memory floor.** Parameters in bf16 are 2 bytes, an fp32 master copy is 4, Adam's two moments are 8, gradients are 2 — 16 bytes per parameter, so 70e9 x 16 = **1.12 TB**. Against 80 GB per GPU that is **14 GPUs** before any activation exists. Everyone quotes the 140 GB weight figure and then wonders why the job needs ten times that."
+    - "**The 3D layout at 512 GPUs is TP=8 × PP=4 × DP=16.** TP stays inside a node because that is where NVLink is; PP crosses nodes because it only communicates activations at stage boundaries; DP spans the rest. Each PP stage holds 17.5e9 parameters = 280 GB of state, and ZeRO-3 over 16 ranks leaves **17.5 GB per GPU** with 62 GB for activations."
+    - "**Compute per step is $6ND$, and $D$ is the whole cluster's token count.** $6 \\times 70\\times10^{9} \\times 4\\times10^{6} = 1.68\\times10^{18}$ FLOPs. At 512 H100s x 989 TFLOPS = 506 PFLOPS peak and 45% kernel efficiency that is **7.37 s**. The factor 6 is one forward (2) plus one backward (4) per parameter per token."
+    - "**TP communication is two all-reduces of the full activation per layer.** At microbatch 2 x 4,096 tokens and hidden 8,192 in bf16, one activation is 134 MB; ring all-reduce moves $2(P-1)/P = 1.75$ messages per GPU, so 80 layers x 2 x 134 MB x 1.75 = **37.5 GB per microbatch per GPU** — 1.2 TB per step at 32 microbatches, 2.7 s at 450 GB/s unoverlapped."
+    - "**Pipeline bubbles are a ratio you can compute before you build.** $(P-1)/(M+P-1)$ with $P = 4$ stages and $M = 32$ microbatches is $3/35 = 8.6\\%$. With $M = 8$ it is 30%, which is the real reason small-batch runs never reach good MFU: the bubble, not the kernels."
+    - "**MFU is an output, not a target.** $1.68\\times10^{18}$ FLOPs divided by (506 PFLOPS x 8.7 s) is **38%**. Quoting 45% kernel efficiency as MFU hides the 1.3 s of DP traffic — 65.6 GB per GPU against a 50 GB/s NIC — the 2.7 s of TP traffic and the 8.6% bubble."
+  definitions:
+    - { term: "Model state", meaning: "Everything the optimizer needs to resume: bf16 parameters, fp32 master weights, Adam's first and second moments, and gradients. 16 bytes per parameter for mixed-precision Adam." }
+    - { term: "Tensor parallelism (TP)", meaning: "Splitting individual weight matrices across GPUs, so each holds a shard of every layer. Requires an all-reduce per layer, so it stays inside one NVLink domain." }
+    - { term: "Pipeline parallelism (PP)", meaning: "Assigning whole layers to stages, so a GPU holds a contiguous block of the model. Communicates only activations at stage boundaries, which makes it viable across nodes." }
+    - { term: "ZeRO / FSDP", meaning: "Sharding optimizer state, gradients and parameters across data-parallel ranks, trading all-gather bandwidth for memory." }
+    - { term: "Microbatch", meaning: "The slice of the global batch that flows through the pipeline at once. More microbatches shrink the bubble and cost activation memory." }
+    - { term: "Pipeline bubble", meaning: "Idle time while the pipeline fills and drains, (P-1)/(M+P-1) of a step for P stages and M microbatches." }
+    - { term: "MFU", meaning: "Model FLOPs utilisation: 6ND divided by peak FLOPs times step time. A whole-system number that includes communication and bubbles." }
+    - { term: "Activation checkpointing", meaning: "Storing only layer inputs and recomputing the rest during backward, trading about 33% more compute for a 4-5x cut in activation memory." }
+    - { term: "All-reduce", meaning: "Summing a tensor across ranks and returning the result to all of them. Ring cost per GPU is 2(P-1)/P messages." }
+    - { term: "Straggler", meaning: "A rank that is slower than the others, usually thermally throttled or on a degraded link. Every collective waits for it, so its slowdown becomes everyone's." }
+    - { term: "Async checkpointing", meaning: "Snapshotting to local NVMe and copying to object storage in the background, so the training step does not block on 1.12 TB of writes." }
+    - { term: "Global batch size", meaning: "Tokens per optimizer step across the whole cluster. At 4M tokens it sets both the step time and the sample efficiency of the run." }
+
+  diagrams:
+    - type: architecture
+      title: "TP inside the node, PP across nodes, DP across the cluster"
+      nodes:
+        - { id: dp, x: 0, y: 1, label: "DP group (16)", kind: load_balancer, detail: "Sixteen replicas of the same 4-stage pipeline. ZeRO-3 shards each stage's 280 GB of state across the group, so each GPU holds 17.5 GB." }
+        - { id: node, x: 1, y: 0, label: "Node 0: TP=8", kind: gpu, detail: "One pipeline stage inside one NVLink domain. 8 x H100 at 3.35 TB/s each; the all-reduce per layer is 134 MB and must never leave the node." }
+        - { id: node2, x: 1, y: 2, label: "Node 1: TP=8", kind: gpu, detail: "The next pipeline stage. It receives 134 MB of activations per microbatch from the node above and sends back 134 MB of gradients on the way out." }
+        - { id: nic, x: 2, y: 0, label: "400 Gb/s per GPU", kind: external, detail: "50 GB/s per GPU, 400 GB/s per node. The DP all-gather of 35 GB of parameters is 1.31 s per step and is the reason fabric bandwidth shows up directly in MFU." }
+        - { id: ckpt, x: 2, y: 2, label: "Checkpoint store", kind: storage, detail: "1.12 TB per save. At 20 GB/s that is 56 s; async staged through local NVMe so the optimizer step does not wait." }
+      edges:
+        - { from: dp, to: node, label: "replica" }
+        - { from: node, to: node2, label: "activations", style: "async" }
+        - { from: node, to: nic, label: "gradients" }
+        - { from: node2, to: ckpt, label: "shards", style: "async" }
+
+    - type: compare
+      title: "Two ways to fit 1.12 TB into 512 GPUs"
+      left_label: "TP=8 x PP=4 x DP=16, ZeRO-3"
+      left_points:
+        - "17.5 GB of state per GPU for a 17.5B-parameter stage, leaving 62 GB for activations"
+        - "TP all-reduce stays on NVLink at 37.5 GB per microbatch per GPU"
+        - "Pipeline bubble 8.6% at 32 microbatches"
+        - "DP traffic 65.6 GB per GPU per step, 1.31 s on 400G fabric"
+      right_label: "TP=8 x PP=1 x DP=64, ZeRO-3"
+      right_points:
+        - "No pipeline bubble at all, which is worth 8.6% immediately"
+        - "70e9 parameters per stage means a full all-gather of 140 GB per step per GPU group"
+        - "DP traffic becomes 2 x 140 x 63/64 = 276 GB per GPU per step, 5.5 s at 50 GB/s"
+        - "The bubble you removed is smaller than the communication you added"
+
+    - type: pipeline
+      title: "Where the 8.7 s step goes"
+      nodes:
+        - label: "Forward + backward"
+          note: "7.37 s at 45% kernel efficiency"
+          detail: "6 x 70e9 x 4e6 = 1.68e18 FLOPs over 506 PFLOPS peak. This is the only term that produces model progress."
+        - label: "TP all-reduce"
+          note: "2.7 s unoverlapped"
+          detail: "1.2 TB per GPU per step of activation exchange across NVLink. Overlapped with the next layer's compute in a good implementation, which is why the measured step is 8.7 s and not 10.1 s."
+        - label: "Pipeline bubble"
+          note: "8.6%, about 0.75 s"
+          detail: "3 idle stage-slots out of 35 with PP=4 and 32 microbatches. Cut it with more microbatches or an interleaved schedule, never by shrinking the global batch."
+        - label: "DP all-gather + reduce-scatter"
+          note: "1.31 s"
+          detail: "65.6 GB per GPU over 400G fabric. This is the term that improves when you buy 800G, and the one that worsens when you add DP ranks."
+        - label: "Optimizer step + checkpoint amortisation"
+          note: "0.15 s + 0.4 s"
+          detail: "Adam on 17.5 GB of local shards, plus the amortised cost of a 56 s checkpoint every 207 steps."
+
+  markdown: |
+    ## The layout is chosen by subtraction
+
+    Start with what must be resident. In mixed-precision Adam:
+
+    $$M_{\text{state}} = N\,(2_{\text{bf16}} + 4_{\text{fp32}} + 4_{m} + 4_{v} + 2_{g})
+    = 16N.$$
+
+    For $N = 70\times10^9$ that is **1.12 TB**. One H100 holds 80 GB, so the
+    floor is 14 GPUs; with activations, workspace and fragmentation the practical
+    floor is 32. Everything above 32 is about speed, not fit.
+
+    At 512 GPUs the layout is TP=8 × PP=4 × DP=16. Each pipeline stage holds
+    $70/4 = 17.5$B parameters — 280 GB of state — and ZeRO-3 across 16
+    data-parallel ranks divides that to **17.5 GB per GPU**.
+
+    | axis | what it divides | what it costs | where it lives |
+    |---|---|---|---|
+    | TP=8 | every weight matrix | 2 all-reduces per layer | NVLink, 450 GB/s |
+    | PP=4 | whole layers | a bubble, $(P-1)/(M+P-1)$ | InfiniBand, activations only |
+    | DP=16 + ZeRO-3 | optimizer state, grads, params | all-gather + reduce-scatter | InfiniBand, 65.6 GB/GPU/step |
+    | recompute | activations | +33% FLOPs | nowhere, it is free of network |
+
+    ## The step, term by term
+
+    Compute is the easy one:
+
+    $$F_{\text{step}} = 6ND = 6 \times 70\times10^{9} \times 4\times10^{6}
+    = 1.68\times10^{18}.$$
+
+    At $512 \times 989$ TFLOPS $= 506$ PFLOPS peak and 45% of it, the arithmetic
+    takes **7.37 s**. That 45% is a kernel-level assumption: fused attention,
+    good GEMM tiles, no memory stalls. It is not MFU.
+
+    TP communication is the term people forget. Per layer there are two
+    all-reduces of the activation:
+
+    $$V_{\text{TP}} = 2 \cdot L \cdot 2 \cdot \frac{P-1}{P} \cdot b\,s\,h\,b_w.$$
+
+    With $b\,s = 8{,}192$ tokens, $h = 8{,}192$, $b_w = 2$ bytes and
+    $P = 8$: one activation is 134 MB, ring cost is 1.75 messages, so 80 layers
+    of 2 all-reduces is **37.5 GB per GPU per microbatch**. Thirty-two
+    microbatches later that is 1.2 TB and 2.7 s at 450 GB/s. In practice it
+    overlaps with the following layer's GEMMs, which is the difference between a
+    10.1 s step and an 8.7 s one.
+
+    DP communication is simpler:
+
+    $$V_{\text{DP}} = 2 \cdot \frac{P_{\text{dp}}-1}{P_{\text{dp}}} \cdot N_{\text{stage}} b_w
+    = 2 \times \frac{15}{16} \times 35\text{ GB} = 65.6\text{ GB},$$
+
+    which at 50 GB/s per GPU is **1.31 s** — 15% of the step, and the single
+    number that justifies 800G fabric.
+
+    ## MFU, honestly
+
+    $$\text{MFU} = \frac{6ND}{F_{\text{peak}} \cdot t_{\text{step}}}
+    = \frac{1.68\times10^{18}}{506\times10^{12} \times 8.7} = 38\%.$$
+
+    38% is a good number for 512 GPUs on a 70B model. The decomposition matters
+    more than the number: 45% kernels × 91.4% (bubble) × 85% (DP traffic) ≈ 35%,
+    and the residual is optimizer and checkpoint overhead. Each factor names a
+    different fix.
+
+    ## Time and money
+
+    At 4M tokens per 8.7 s step the cluster produces 460,000 tokens/s, so 2T
+    tokens takes
+
+    $$\frac{2\times10^{12}}{4.6\times10^{5}} = 4.3\times10^{6}\text{ s} = 50\text{ days}.$$
+
+    Five hundred and twelve GPUs for 1,200 hours is 614,400 GPU-hours; at 2.50 USD
+    per GPU-hour that is **1.54 million USD**. On A100s at 312 TFLOPS the same run
+    is 3.2× slower and takes 160 days, which is the entire reason H100 supply was
+    a strategic problem rather than a procurement detail.
+
+    ## Failure is the steady state
+
+    At 512 GPUs and a 50,000-hour MTBF per GPU, the cluster loses a GPU every
+    98 hours and a node (64 nodes, 2,000-hour MTBF) every 31 hours. Over 50 days
+    that is about 39 node-level failures.
+
+    With a 30-minute checkpoint interval, each failure costs at most 30 minutes of
+    work plus 3 minutes of restore. Thirty-nine failures × 33 minutes is 21 hours,
+    or 1.8% of the run — 28,000 USD. Halve the interval and you halve the loss but
+    double the checkpoint overhead from 3.1% to 6.2%. The optimum is where the
+    two curves cross, and it is a calculation, not a policy.
+
+    Silent stragglers are worse than failures because nothing restarts. A GPU
+    running 5% slow costs 5% of the entire cluster for as long as it goes
+    unnoticed, and it produces no error, no restart and no log line. Per-rank step
+    timing with a p99/p50 ratio is the only detector that works.
+
+    ## What changes at ten times the size
+
+    Five thousand GPUs is not a bigger version of this job, it is a different
+    one. The DP all-gather grows with the model, but the failure rate grows with
+    the node count: 640 nodes at a 2,000-hour MTBF is a failure every three
+    hours, so the checkpoint interval has to fall to minutes and async
+    checkpointing stops being an optimisation and becomes the only way to make
+    progress at all.
+
+    The bubble behaves the other way. More GPUs means more data-parallel
+    replicas, which means a larger global batch to keep each replica's microbatch
+    size fixed — and a larger global batch is more microbatches, so the bubble
+    shrinks while the communication grows. At 5,120 GPUs with PP=8 and 128
+    microbatches the bubble is $7/135 = 5.2\%$, but the DP reduce-scatter is
+    eight times the volume, and the fabric becomes the binding constraint before
+    the arithmetic does.
+
+    That is the general shape of scaling: the compute term is fixed by the model
+    and the token budget, and every other term grows with the cluster. A job that
+    takes 50 days on 512 GPUs does not take five days on 5,120, because the terms
+    that are 15% of the step at 512 GPUs are 60% of it at 5,120.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Distributed training is a **memory problem that pays a communication tax**: 70B parameters need 1.12 TB of model state before a single activation is stored, so the parallelism layout is chosen by what fits, and the step time is then compute plus the bytes that layout forces across NVLink and InfiniBand — which is why the achievable MFU is 38%, not 90%.
+
+    ### The analogy, in full
+
+    A car factory where no single station can hold the whole car. Station 1 builds the chassis, station 2 mounts the engine, and the car moves down the line one station at a time — that is pipeline parallelism, and its cost is the empty line while the first car fills it. Within a station, four workers assemble one sub-assembly together, passing parts back and forth constantly — that is tensor parallelism, and its cost is the passing: every layer needs two exchanges of the full activation. And the same factory exists eight times over, each building a different car from the same blueprints, synchronising their notes at the end of every shift — that is data parallelism, and its cost is the meeting. The analogy breaks in two places. The line never empties: with 32 microbatches in flight the bubble is 8.6%, not the 50% a two-station line would suggest. And the workers cannot specialise — every station holds a different quarter of the weights, so a station that falls behind does not slow the line, it stops it, which is why one throttled GPU costs the entire cluster its throughput.
+
+    ### Failure modes, in full
+
+    - You put a 70B model on 8×H100 with plain data parallelism and it OOMs before step one: 70e9 parameters at 16 bytes each for weights, master copy, Adam moments and gradients is 1.12 TB, and one 80 GB GPU holds 7% of it.
+    - You shard aggressively and training runs at 22% MFU. The GPUs are busy, the loss is falling, and two thirds of the cluster's FLOPs are going into all-reduce and pipeline bubbles rather than into the model.
+    - Your step time is stable at 8.7 s for six hours and then drifts to 9.6 s with no code change. One GPU is thermally throttled, every other rank is waiting on it at every all-reduce, and nothing in the logs says so.
+    - A node dies at hour 40 of a 50-day run. The last checkpoint is 40 minutes old, restore is 3 minutes, and the arithmetic on checkpoint interval is the difference between losing 0.1% and losing 2% of a 1.5 million dollar run.
+    - An interviewer asks how many GPUs a 70B model needs. The honest answer has three parts — 14 to fit the optimizer state, 32 to fit it with room for activations, and 512 to finish in a quarter — and only the third one is the answer they want.
+
+    ### The mechanisms, in full
+
+    - **Model state, not parameters, sets the memory floor.** Parameters in bf16 are 2 bytes, a fp32 master copy is 4, Adam's two moments are 8, and gradients are 2 — 16 bytes per parameter, so 70e9 × 16 = **1.12 TB**. Against 80 GB per GPU that is 14 GPUs before any activation exists. Everyone quotes the 140 GB weight figure and then wonders why the job needs ten times that.
+    - **Every parallelism axis buys memory with a different currency.** Tensor parallelism divides weights and optimizer state but pays an all-reduce per layer inside NVLink. Pipeline parallelism divides them across nodes and pays a bubble. Data parallelism with ZeRO-3 divides them across the whole cluster and pays an all-gather and a reduce-scatter per step. The layout is a choice of which tax you can afford, and at 512 GPUs you pay all three.
+    - **The 3D layout at 512 GPUs is TP=8 × PP=4 × DP=16.** TP stays inside a node because that is where NVLink is; PP crosses nodes because it only communicates activations at stage boundaries; DP spans the rest. Each PP stage holds 70e9/4 = 17.5e9 parameters = 280 GB of state, and ZeRO-3 across 16 data-parallel ranks leaves **17.5 GB per GPU** — comfortably inside 80 GB with 62 GB for activations.
+    - **Compute per step is $6ND$, and $D$ is the whole cluster's token count.** $6 \times 70\times10^{9} \times 4\times10^{6} = 1.68\times10^{18}$ FLOPs. At 512 H100s × 989 TFLOPS = 506 PFLOPS peak and 45% kernel efficiency (2.28e17 FLOPS), that is $1.68\times10^{18} / 2.28\times10^{17} = 7.37$ s. The factor 6 is one forward (2) plus one backward (4) per parameter per token; anything you measure that is far from it means the FLOPs went somewhere other than the model.
+    - **TP communication is two all-reduces of the full activation per layer.** At microbatch 2 × 4,096 tokens and hidden 8,192 in bf16, one activation is $2 \times 4{,}096 \times 8{,}192 \times 2 = 134$ MB. Ring all-reduce moves $2(P-1)/P = 1.75$ messages per GPU, so 80 layers × 2 all-reduces × 134 MB × 1.75 = **37.5 GB per microbatch per GPU** — 1.2 TB per step at 32 microbatches, and 2.7 s at 450 GB/s if it does not overlap.
+    - **Pipeline bubbles are a ratio you can compute before you build.** $(P-1)/(M + P - 1)$ with $P = 4$ stages and $M = 32$ microbatches is $3/35 = 8.6\%$. With $M = 8$ it is 30%, which is the real reason small-batch runs never reach good MFU: the bubble, not the kernels.
+    - **Activation memory is what recomputation buys back.** With full activation checkpointing you store only the input to each layer: 134 MB × 2 tensors per layer, sharded across TP=8, is 33.5 MB per GPU per layer, times 80 layers = **2.7 GB per microbatch**. Without checkpointing a realistic ten tensors per layer is 13.4 GB per microbatch, which caps you at four in flight.
+    - **Data-parallel gradient traffic is bandwidth, not latency.** ZeRO-3 all-gathers the stage's 35 GB of bf16 parameters and reduce-scatters 35 GB of gradients, so each GPU moves $2 \times 35 \times 15/16 = 65.6$ GB per step. A 400 Gb/s NIC is 50 GB/s, so **1.31 s per step** — 15% of an 8.7 s step, and the number that decides whether you need 400G or 800G fabric.
+    - **MFU is an output, not a target.** $1.68\times10^{18}$ FLOPs divided by (506 PFLOPS × 8.7 s) is **38%**. Quoting 45% kernel efficiency as MFU hides the 1.3 s of DP traffic, the 2.7 s of TP traffic and the 8.6% bubble; the honest decomposition is the only thing that tells you which one to attack.
+    - **Checkpoints are a bandwidth problem with a risk premium.** A full checkpoint is 1.12 TB; at 20 GB/s of object-store write that is **56 s**. Every 30 minutes (207 steps) that is 3.1% of wall clock if synchronous, and it bounds your loss on failure to 30 minutes of a 50-day run. Async sharded checkpointing moves most of it off the critical path at the cost of a consistent snapshot problem you now have to solve.
+  problem_statement: >-
+    Plan a 70B-parameter training run on H100s: choose the parallelism layout,
+    size the cluster, compute the per-step communication volume, state the
+    achievable MFU and the wall-clock time for 2 trillion tokens, and say how you
+    survive 39 node failures without losing more than 2% of the run.
+
+  requirements:
+    functional:
+      - "Train from scratch on 2 trillion tokens with a 4M-token global batch and a deterministic, resumable data pipeline"
+      - "Checkpoint full model state (parameters, optimizer moments, data-loader position, RNG state) and resume bit-exactly"
+      - "Detect and isolate a failed or degraded node without restarting the whole job when the topology allows"
+      - "Expose per-rank step time, all-reduce wait time and tokens/s so a straggler is visible within minutes"
+      - "Support elastic changes in world size at checkpoint boundaries"
+    non_functional:
+      - "Step time variance p99/p50 under 1.05 in steady state"
+      - "Checkpoint overhead under 4% of wall clock"
+      - "Loss of work per failure at most one checkpoint interval"
+      - "MFU at or above 35% on 512 GPUs, measured as 6ND over peak times wall clock"
+
+  clarifying_questions:
+    - question: "Is the 2T-token budget fixed, or is it a deadline?"
+      why_it_matters: "A fixed token budget makes MFU the objective and cluster size a free variable; a deadline makes cluster size the constraint and sample efficiency the lever. They lead to different parallelism layouts and different batch sizes."
+    - question: "How much GPU memory can we assume, and is FP8 training on the table?"
+      why_it_matters: "FP8 halves both the weight traffic and the all-gather volume, which is worth roughly 1.4x on the communication terms. It also changes the numerical recipe, so it is a first-meeting decision rather than an optimisation."
+    - question: "What is the interconnect — NVLink inside nodes only, or NVLink domains across nodes?"
+      why_it_matters: "TP=8 assumes a single 8-GPU NVLink domain. A GB200 NVL72 changes the layout completely: TP=72 becomes possible, and the pipeline bubble and DP traffic both collapse."
+    - question: "How much failure do we expect, and what is the cost of restarting?"
+      why_it_matters: "Checkpoint interval is a trade between 56 s of write bandwidth and the expected work lost per failure. At 39 failures per run the difference between 15 and 60 minute intervals is roughly 2% of a 1.5M USD budget."
+    - question: "Is the model architecture fixed, or can we choose attention variants?"
+      why_it_matters: "GQA or MLA cuts the KV cache and the activation size, which cuts the 134 MB per-microbatch all-reduce directly. Architecture and systems are not separable decisions at this scale."
+
+  capacity_estimation:
+    assumptions:
+      - "Model: 70e9 parameters, 80 layers, hidden 8,192, sequence length 4,096, bf16 compute with fp32 master weights and Adam"
+      - "Hardware: H100 SXM5 at 80 GB, 989 TFLOPS BF16 dense, 3.35 TB/s HBM, NVLink at 450 GB/s per direction inside a node, 400 Gb/s (50 GB/s) InfiniBand per GPU"
+      - "Layout: TP=8 inside a node, PP=4 across nodes, DP=16, ZeRO-3 inside the DP group; 512 GPUs total (64 nodes)"
+      - "Batch: 4M tokens global per optimizer step, 32 microbatches of 8,192 tokens, 45% kernel efficiency before communication"
+      - "Cost: 2.50 USD per GPU-hour; checkpoint store sustains 20 GB/s"
+
+    arithmetic:
+      - label: "Model state and the fit floor"
+        calculation: "16 bytes per parameter (2 bf16 weights + 4 fp32 master + 4 Adam m + 4 Adam v + 2 gradients) x 70e9 = 1.12e12 bytes = 1.12 TB. Divided by 80 GB per GPU = 14 GPUs to hold state alone."
+        conclusion: "Fourteen GPUs is the absolute floor and it leaves zero room for activations. The practical floor is 32 GPUs; 512 is a throughput decision, not a fit decision."
+
+      - label: "Model state per GPU at the chosen layout"
+        calculation: "Each PP stage holds 70e9 / 4 = 17.5e9 parameters; state per stage = 17.5e9 x 16 bytes = 280 GB. ZeRO-3 shards it across DP=16: 280 / 16 = 17.5 GB per GPU. Headroom = 80 - 17.5 = 62.5 GB for activations and workspace."
+        conclusion: "17.5 GB of the 80 GB is model state, so 62.5 GB per GPU is available for activations — enough for 32 microbatches of checkpointed activations at 2.7 GB each."
+
+      - label: "Activation memory per microbatch"
+        calculation: "One activation tensor for 2 sequences x 4,096 tokens x 8,192 hidden x 2 bytes = 134 MB. With full checkpointing, 2 stored tensors per layer sharded across TP=8: 80 layers x 2 x 134 MB / 8 = 2.68 GB per microbatch."
+        conclusion: "2.7 GB per microbatch with recomputation versus 13.4 GB without, which is what makes a deep pipeline fit: a PP=4 schedule holds 4 microbatches in flight at 10.7 GB, and even 8 in flight is only 21.5 GB against 62.5 GB available."
+
+      - label: "Compute time per step"
+        calculation: "6 x 70e9 parameters x 4e6 tokens = 1.68e18 FLOPs. Peak = 512 GPUs x 989e12 = 5.06e17 FLOPS (506 PFLOPS). At 45% kernel efficiency: 1.68e18 / 2.28e17 = 7.37 s."
+        conclusion: "7.37 s of pure arithmetic per step. Anything above this is communication, bubble or optimizer overhead, and each of those has a different fix."
+
+      - label: "Tensor-parallel communication per step"
+        calculation: "One activation = 2 seq x 4,096 tokens x 8,192 hidden x 2 bytes = 134 MB. Ring all-reduce per GPU at P=8 costs 2 x 7/8 = 1.75 messages. 80 layers x 2 all-reduces x 134 MB x 1.75 = 37.5 GB per GPU per microbatch. x 32 microbatches = 1.2 TB per step; at 450 GB/s = 2.67 s."
+        conclusion: "1.2 TB per GPU per step of NVLink traffic. Overlapped it costs about 1.3 s of the step; unoverlapped it is 2.7 s, which is why comm-compute overlap is a first-order optimisation and not a micro-optimisation."
+
+      - label: "Data-parallel communication per step"
+        calculation: "Per stage, bf16 parameters = 17.5e9 x 2 bytes = 35 GB. All-gather plus reduce-scatter per GPU = 2 x 35 GB x (16-1)/16 = 65.6 GB. At 50 GB/s per GPU (400 Gb/s NIC) = 1.31 s."
+        conclusion: "1.31 s per step, 15% of wall clock. Doubling fabric bandwidth to 800 Gb/s recovers 0.65 s per step, which over 50 days is about 3.7 days of the run."
+
+      - label: "MFU from the measured step"
+        calculation: "Step = 7.37 s compute + 1.31 s DP + 0.75 s bubble + 0.15 s optimizer + 0.4 s checkpoint amortisation = 9.98 s unoverlapped, or 8.7 s with TP overlap. MFU = 1.68e18 / (5.06e17 x 8.7) = 0.382."
+        conclusion: "38% MFU. The gap from 45% is the bubble and the DP traffic, both of which only shrink if you change the layout or the fabric — not by tuning kernels."
+
+      - label: "Wall clock and cost for 2T tokens"
+        calculation: "Tokens/s = 4e6 / 8.7 s = 4.60e5. 2e12 / 4.60e5 = 4.35e6 s = 50.3 days = 1,208 h. GPU-hours = 512 x 1,208 = 618,500. Cost = 618,500 x 2.50 USD = 1.55e6 USD."
+        conclusion: "50 days and 1.55M USD. A 10% MFU improvement is 154,000 USD and five days, which is why the step decomposition is worth an afternoon before the run starts."
+
+      - label: "Checkpoint overhead and failure exposure"
+        calculation: "Checkpoint = 1.12 TB / 20 GB/s = 56 s. At one every 30 min (207 steps x 8.7 s = 1,801 s) that is 56/1,801 = 3.1% of wall clock. Node MTBF 2,000 h over 64 nodes = one failure every 31.25 h; over 1,208 h that is 38.7 failures; each costs 30 min of lost work + 3 min restore."
+        conclusion: "3.1% checkpoint overhead buys a 30-minute worst-case replay, and 39 failures cost about 21 hours (1.8% of the run). Shortening the interval to 15 min halves replay loss and doubles the overhead — the optimum is near where they meet."
+
+  architecture_summary: >-
+    A 512-GPU job laid out as TP=8 inside each node, PP=4 across nodes and DP=16
+    for the rest, with ZeRO-3 sharding optimizer state, gradients and parameters
+    within each data-parallel group. Compute is 7.4 s of the 8.7 s step; the
+    remaining 1.3 s is DP traffic on 400G fabric and the rest is bubble and
+    optimizer. Checkpoints go to local NVMe asynchronously and drain to object
+    storage at 20 GB/s.
+
+  deep_dives:
+    - topic: "Choosing the parallelism layout"
+      explanation: >-
+        The layout is forced by two facts: TP must stay inside an NVLink domain or
+        its per-layer all-reduce dominates, and PP must have enough microbatches or
+        its bubble dominates. Everything else is arithmetic. At 512 GPUs the
+        natural answer is TP=8 (one node) × PP=4 (four nodes) × DP=16, because that
+        puts 17.5 GB of state on each GPU and leaves 62 GB for activations.
+      tradeoffs:
+        - option: "TP=8, PP=4, DP=16 with ZeRO-3"
+          pros: "TP all-reduce stays on NVLink at 450 GB/s; 8.6% bubble at 32 microbatches; 17.5 GB of state per GPU leaves ample activation room."
+          cons: "Pipeline stages create a bubble and couple stage balance; a straggler in any stage stalls the whole pipeline; 1.2 TB per step of NVLink traffic."
+        - option: "TP=8, PP=1, DP=64 with ZeRO-3"
+          pros: "No pipeline bubble and no stage-balance problem, simpler to debug and to checkpoint."
+          cons: "Each DP all-gather is the full 140 GB of parameters, so per-GPU traffic becomes 276 GB per step — 5.5 s at 50 GB/s, far more than the 0.75 s bubble it removed."
+        - option: "TP=8, PP=16, DP=4"
+          pros: "Smallest per-GPU state (4.4 GB), so activations can be large and microbatches few; useful when the model is much bigger than 70B."
+          cons: "Bubble becomes (15)/(M+15): at 32 microbatches that is 32%, and stage imbalance is brutal because early stages hold embeddings and late stages hold the head."
+
+    - topic: "MFU accounting and what actually improves it"
+      explanation: >-
+        MFU is a ratio with three multiplicative factors: kernel efficiency, step
+        utilisation (1 minus bubble), and communication overhead. Improving it
+        means knowing which factor you are attacking. Kernel work moves 45% to 50%;
+        layout work moves the 91.4% and 85% terms; and no amount of kernel tuning
+        fixes a 1.3 s DP all-gather.
+      tradeoffs:
+        - option: "Increase global batch to raise MFU"
+          pros: "More microbatches shrink the bubble and amortise the optimizer step; at 8M tokens the bubble falls from 8.6% to 4.3%."
+          cons: "Sample efficiency falls — beyond the critical batch size each token teaches less — so a 20% MFU gain can cost 30% more tokens to reach the same loss."
+        - option: "Full activation checkpointing"
+          pros: "Cuts activation memory 5x, which allows 32 microbatches and a small bubble on hardware that would otherwise cap at 8."
+          cons: "Costs about 33% extra forward compute, so kernel efficiency drops and the MFU gain is smaller than the memory win suggests."
+        - option: "FP8 training"
+          pros: "Halves weight and activation bytes, which halves both the 134 MB all-reduce and the 65.6 GB DP traffic — a direct win on the two communication terms."
+          cons: "Requires per-tensor scaling and a numerical recipe that survives; a bad scale costs a full restart at 1.5M USD, so it is a risk decision as much as a performance one."
+
+    - topic: "Checkpointing strategy"
+      explanation: >-
+        A checkpoint is 1.12 TB, so the only question is whether the write happens
+        on the critical path. Synchronous writes block every rank for 56 s;
+        asynchronous writes stage to local NVMe in seconds and drain in the
+        background, at the cost of snapshot consistency — you must define what
+        "the state at step N" means when the drain is still running.
+      tradeoffs:
+        - option: "Synchronous full checkpoint every 30 minutes"
+          pros: "Simple, consistent, and restore is a single read of one prefix; no coordination problem and no orphaned shards."
+          cons: "3.1% of wall clock, and every rank stalls simultaneously, so the fabric sees a 1.12 TB burst that queues behind training traffic."
+        - option: "Async sharded checkpoint to local NVMe, drained in background"
+          pros: "Near-zero critical-path cost, so the interval can drop to 10 minutes and worst-case replay loss falls to 3x less."
+          cons: "Needs a manifest and garbage collection for partially written checkpoints, and a node failure during drain leaves an inconsistent set that must be detected rather than assumed."
+        - option: "No optimizer state, weights only"
+          pros: "140 GB instead of 1.12 TB, so writes are 8x cheaper and restores are fast."
+          cons: "Cannot resume training — Adam moments are lost and the loss spikes on restart. Only acceptable for inference export, never mid-run."
+
+    - topic: "Stragglers and failure recovery"
+      explanation: >-
+        At 512 GPUs the cluster loses a node every 31 hours, and a collective makes
+        every rank as slow as the slowest one. Recovery has two modes: restart the
+        job from the last checkpoint (simple, loses work) or shrink the world and
+        continue (elastic, keeps work, complicates everything). The detector
+        matters more than the policy: a straggler produces no error at all.
+      tradeoffs:
+        - option: "Restart from last checkpoint on any failure"
+          pros: "No elastic logic, deterministic replay, and the topology is unchanged so performance returns to its known value."
+          cons: "Loses up to one interval of work and 3 minutes of restore; at 39 failures that is 21 hours of a 1,208-hour run."
+        - option: "Elastic: drop the failed node and continue at 504 GPUs"
+          pros: "Keeps all completed work; the loss is a 1.6% throughput dip rather than a 30-minute replay."
+          cons: "Requires resharding optimizer state, rebalancing pipeline stages, and a data loader that can be repartitioned — a large amount of machinery to avoid 21 hours."
+        - option: "Hot spare nodes and proactive drain"
+          pros: "Replaces a failing node before the collective stalls; works well with per-rank telemetry that catches thermal drift early."
+          cons: "Costs 2-4% of cluster spend permanently, and a spare is only useful if the scheduler can join it without a restart."
+
+  bottlenecks:
+    - failure: "Silent straggler on one rank"
+      symptom: "Step time drifts up 5-15% with no error and no restart; per-rank all-reduce wait time grows on every other rank; one GPU shows lower clocks or higher memory temperature."
+      mitigation: "Log per-rank step time and all-reduce wait every step, alert on p99/p50 above 1.05, and drain the node on a sustained skew. Never average away the tail — the maximum is the step time."
+    - failure: "Data-parallel all-gather saturating the fabric"
+      symptom: "Step time scales worse than linearly with DP size; MFU falls as you add nodes; NIC counters sit at line rate during the all-gather window."
+      mitigation: "Hierarchical all-gather (intra-node first, then inter-node), rail-optimised topology so each GPU talks to the same rail index, and larger microbatches to overlap the gather with compute."
+    - failure: "Checkpoint write burst blocking the optimizer"
+      symptom: "A 56 s step every 207 steps, correlated with object-store write throughput; training stalls while the fabric drains 1.12 TB."
+      mitigation: "Async sharded checkpointing staged through local NVMe with a manifest, plus throttling the background drain so it cannot starve the DP all-gather."
+    - failure: "Pipeline stage imbalance"
+      symptom: "Bubble larger than (P-1)/(M+P-1) predicts; some stages idle while one is always busy; microbatch count cannot be raised because activation memory is full."
+      mitigation: "Balance layers per stage by measured per-layer time rather than by count, put the embedding and head on the same stage, and use an interleaved 1F1B schedule so each GPU owns several non-contiguous chunks."
+
+  what_to_steal:
+    - "Quote 16 bytes per parameter for mixed-precision Adam, not 2 bytes per parameter for weights. The 8x gap is why 'it fits on one GPU' is always wrong."
+    - "Compute the pipeline bubble as (P-1)/(M+P-1) before choosing P. At PP=4 you need 32 microbatches for an 8.6% bubble; at PP=16 the same count gives 32%."
+    - "Separate kernel efficiency from MFU. 45% kernels and 38% MFU is a healthy 3D-parallel run; quoting 45% as MFU hides the communication you paid for."
+    - "Size fabric from the gradient volume: 2 x N_stage x bytes x (DP-1)/DP per GPU per step. That single expression decides 400G versus 800G."
+    - "Turn checkpoint interval into an expected-cost calculation: write time, failure rate, and the dollar value of an hour of cluster time. It is a number, not a policy."
+
+  try_it: >-
+    Recompute the step for PP=8 instead of PP=4 at the same 512 GPUs and the same
+    4M-token batch. The bubble becomes 7/(M+7); find the microbatch count that
+    holds it under 10%, then check whether the activations still fit in 62 GB per
+    GPU. Then halve the sequence length to 2,048 and see which term shrinks —
+    the answer is not the one most people guess.
+
+  interview_questions:
+    - question: "How many GPUs does a 70B model need, and why is the answer not 14?"
+      level: staff
+      key_points:
+        - "Model state is 16 bytes per parameter — bf16 weights, fp32 master, two Adam moments, gradients — so 70e9 x 16 = 1.12 TB, and 1.12 TB / 80 GB = 14 GPUs just to hold it."
+        - "Fourteen leaves zero bytes for activations, so the practical floor is 32 GPUs; below that you cannot run a microbatch even with full recomputation."
+        - "Above the floor, cluster size is a throughput decision: 512 GPUs at 38% MFU finishes 2T tokens in 50 days for 1.55M USD."
+        - "The right answer states all three numbers and which constraint each one comes from."
+      follow_up: "If the budget only allows 256 GPUs, what do you change first — batch size, sequence length, or the token budget?"
+
+    - question: "Your MFU is 38% on 512 GPUs. Walk me through where the other 62% went."
+      level: staff
+      key_points:
+        - "7.37 s of the 8.7 s step is arithmetic at 45% kernel efficiency, so 55% of peak is already lost to kernels before any distribution cost."
+        - "1.31 s is the DP all-gather and reduce-scatter: 65.6 GB per GPU per step over 50 GB/s fabric."
+        - "About 0.75 s is pipeline bubble, 3 idle stage-slots out of 35 with PP=4 and 32 microbatches."
+        - "The rest is optimizer and checkpoint amortisation; the fix for each term is different, which is why the decomposition matters more than the number."
+      follow_up: "Which of those terms would improve most from 800G fabric, and which would not move at all?"
+
+    - question: "Why does tensor parallelism have to stay inside one node?"
+      level: senior
+      key_points:
+        - "TP needs two all-reduces of the full activation per layer, so its volume scales with layers times batch times hidden — 37.5 GB per microbatch per GPU at this size."
+        - "Inside NVLink that is 450 GB/s; across InfiniBand at 50 GB/s it is 9x slower and would add 24 s per step instead of 2.7 s."
+        - "Pipeline parallelism is the axis that crosses nodes because it communicates only at stage boundaries, so its volume is one activation per microbatch rather than one per layer."
+        - "That is why the standard layout is TP inside a node, PP across nodes, DP across the cluster — the topology dictates the axis, not preference."
+      follow_up: "What does a 72-GPU NVLink domain change about that layout?"
+
+    - question: "A node dies 40 hours into a 50-day run. What does it cost, and how would you have reduced it?"
+      level: senior
+      key_points:
+        - "Cost is the work since the last checkpoint plus restore: at a 30-minute interval, at most 30 minutes of 512 GPUs plus 3 minutes to load 1.12 TB at 20 GB/s."
+        - "Across the run, 64 nodes at a 2,000-hour MTBF means about 39 failures, or 21 hours — 1.8% of the run and roughly 28,000 USD."
+        - "Halving the interval halves the replay loss but doubles the 3.1% checkpoint overhead; async sharded checkpointing is what lets you have both."
+        - "A silent straggler is more expensive than a crash: 5% slow for six hours is 5% of the cluster for six hours, with no restart to alert you."
+      follow_up: "How would you detect a straggler within five minutes rather than six hours?"
+
+  common_mistakes:
+    - "Sizing memory from parameter bytes (140 GB) instead of model state (1.12 TB), then discovering at step one that a 'one-node model' needs sixteen nodes of optimizer state."
+    - "Adding pipeline stages to fit memory without recomputing the bubble: PP=16 with 32 microbatches is a 32% bubble, which costs more than the memory it saves."
+    - "Reporting 45% kernel efficiency as MFU. It excludes the 1.3 s of DP traffic and the 8.6% bubble, and it makes the run look 18% better than it is."
+    - "Putting tensor parallelism across nodes because the model 'needs more GPUs', turning a 2.7 s NVLink all-reduce into a 24 s InfiniBand one."
+    - "Averaging step time across ranks. The step is as slow as the slowest rank, so the mean hides exactly the straggler you are looking for."
+
+  further_reading:
+    - label: "Rajbhandari, Rasley, Ruwase, He, ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (SC 2020)"
+    - label: "Shoeybi, Patwary, Puri, LeGresley, Casper, Catanzaro, Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism (2019)"
+    - label: "Narayanan, Harlap, Phanishayee, Seshadri, Devanur, Ganger, Gibbons, Zaharia, PipeDream: Generalized Pipeline Parallelism for DNN Training (SOSP 2019)"
+    - label: "Chowdhery et al., PaLM: Scaling Language Modeling with Pathways (2022), section on training efficiency and MFU"
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Three things must fit: the optimizer state, the activations of a
+        microbatch, and the communication the layout forces. The first sets the
+        minimum GPU count, the second sets the microbatch size, and the third
+        sets the step time.
+      blocks:
+        - kind: checklist
+          body: |
+            - State: 16 bytes per parameter
+            - Activations: batch x sequence x hidden x bytes, per stored tensor
+            - TP: two all-reduces per layer, NVLink only
+            - PP: bubble (P-1)/(M+P-1)
+            - DP: 2 x params x (DP-1)/DP per GPU
+      checkpoint: >-
+        Which of those five numbers changes if you double the sequence length, and
+        which one does not?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Choose the layout by topology, not by taste: TP where the NVLink is, PP
+        where the model must be split across nodes, DP for everything left over.
+        Then compute the step as compute plus communication and see whether the
+        result is within 20% of the compute-only time. If not, change an axis.
+      blocks:
+        - kind: warning
+          body: >-
+            The most common wrong turn is sharding harder to fit memory. Every
+            extra shard adds a collective; fitting at 30% MFU is worse than
+            fitting at 38% on fewer GPUs with a bigger batch.
+      checkpoint: >-
+        If you had to remove one axis entirely to simplify operations, which one
+        costs the least throughput and why?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Allocate memory, then account for time.
+      blocks:
+        - kind: pseudocode
+          body: |
+            state = 16 * N                       # bytes
+            gpus_min = ceil(state / 80e9)
+            per_gpu = state / (PP * DP)          # ZeRO-3 inside DP
+            act_per_mb = L * tensors_per_layer * b*s*h*2 / TP
+            bubble = (PP - 1) / (M + PP - 1)
+            t_compute = 6*N*D / (gpus * peak * eff)
+            t_tp = L * 2 * 1.75 * b*s*h*2 / bw_nvlink * M
+            t_dp = 2 * (N/PP)*2 * (DP-1)/DP / bw_nic
+            mfu = 6*N*D / (gpus*peak*(t_compute+t_tp+t_dp))
+      checkpoint: >-
+        Which line is most sensitive to a wrong assumption, and how would you
+        measure that assumption on a 32-GPU pilot?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The three volume formulas and the MFU ratio.
+      blocks:
+        - kind: math
+          body: |
+            **Pipeline bubble.**
+            $$\text{bubble} = \frac{P-1}{M+P-1}$$
+
+            **All-reduce volume per GPU (ring).**
+            $$V = 2\,\frac{P-1}{P}\,M_{\text{bytes}}$$
+
+            **MFU.**
+            $$\text{MFU} = \frac{6ND}{F_{\text{peak}}\,t_{\text{step}}}$$
+      checkpoint: >-
+        With P=4 and M=32, is the bubble 8.6%? What does M=8 give, and what does
+        that tell you about small-batch runs?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The 512-GPU layout with the step decomposition.
+      blocks:
+        - kind: code
+          language: python
+          body: |
+            N, L, h, s = 70e9, 80, 8192, 4096
+            gpus, peak, nvlink, nic = 512, 989e12, 450e9, 50e9
+            TP, PP, DP, M, mb_tokens = 8, 4, 16, 32, 8192
+            state = 16 * N
+            per_gpu = state / (PP * DP)
+            act = 2 * mb_tokens * h * 2 / TP * L
+            t_cmp = 6*N*4e6 / (gpus*peak*0.45)
+            t_tp  = L*2*1.75*(mb_tokens*h*2) / nvlink * M
+            t_dp  = 2*(N/PP)*2*(DP-1)/DP / nic
+            print(round(state/1e12,2), round(per_gpu/1e9,1),
+                  round(act/1e9,1), round(t_cmp,2), round(t_tp,2), round(t_dp,2))
+      checkpoint: >-
+        The printed activation figure assumes full checkpointing. What does it
+        become without it, and how many microbatches then fit in 62 GB?
+  implementations:
+    - language: python
+      title: "3D parallelism: state per GPU, step time, and pipeline bubble"
+      note: >-
+        Uses the case study's 16 bytes per parameter to show why 70B needs 1.12 TB of state and 35 GB per GPU at TP=8 x PP=4. The 6ND compute term gives 7.37 s at 45% kernel efficiency; the bubble is (P-1)/(M+P-1). The 38.1% MFU divides by the measured 8.7 s step, so communication is charged to the model rather than hidden.
+      code: |
+        PARAMS, GPUS = 70e9, 512
+        BYTES_PER_PARAM = 16          # bf16 weight 2 + fp32 master 4 + 2 moments 8 + grad 2
+        H100_TFLOPS, EFFICIENCY = 989e12, 0.45
+        TP, PP, DP, MICROBATCHES = 8, 4, 16, 32
+        TOKENS, MEASURED_STEP = 4e6, 8.7
+
+
+        def state_per_gpu(params=PARAMS, tp=TP, pp=PP):
+            """Model state is sharded by TP and PP, replicated by DP."""
+            return params * BYTES_PER_PARAM / (tp * pp)
+
+
+        def step_seconds(tokens=TOKENS, gpus=GPUS, efficiency=EFFICIENCY):
+            flops = 6 * PARAMS * tokens
+            return flops / (gpus * H100_TFLOPS * efficiency), flops
+
+
+        def bubble(pp=PP, m=MICROBATCHES):
+            """Fraction of a step the pipeline spends filling and draining."""
+            return (pp - 1) / (m + pp - 1)
+
+
+        def main():
+            per_gpu = state_per_gpu()
+            print(f"model state: {PARAMS*BYTES_PER_PARAM/1e12:.2f} TB; "
+                  f"per GPU: {per_gpu/1e9:.1f} GB")
+            secs, flops = step_seconds()
+            print(f"compute per step: {flops:.2e} FLOP; at {EFFICIENCY:.0%} kernel "
+                  f"efficiency: {secs:.2f} s")
+            print(f"pipeline bubble: {bubble():.1%} at PP={PP}, M={MICROBATCHES}")
+
+            mfu = flops / (GPUS * H100_TFLOPS * MEASURED_STEP)
+            print(f"measured MFU over the {MEASURED_STEP:.1f} s step: {mfu:.1%}")
+
+            assert abs(per_gpu - 35e9) < 1e6
+            assert abs(secs - 7.37) < 0.02
+            assert abs(bubble() - 3 / 35) < 1e-12
+            assert 0.37 < mfu < 0.39
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-dist-training-state
+      title: "State per GPU under TP and PP"
+      difficulty: easy
+      prompt: >-
+        Model state is 16 bytes per parameter, sharded by tensor parallelism `tp` and pipeline
+        parallelism `pp`, and replicated by data parallelism. Return the GB held by one GPU.
+      language: python
+      entry: state_per_gpu_gb
+      testCases:
+        - input: '{}'
+          expected: "35"
+          tolerance: 1e-6
+        - input: '{"params": 70000000000, "tp": 8, "pp": 8}'
+          expected: "17.5"
+          tolerance: 1e-6
+      solution: |
+        def state_per_gpu_gb(params=70e9, tp=8, pp=4, bytes_per_param=16):
+            return params * bytes_per_param / (tp * pp) / 1e9
+      solutionExplanation: >-
+        70e9 * 16 / (8 * 4) = 35 GB per GPU. Data parallelism does not divide state, it
+        replicates it, which is why the layout is chosen by what fits.
+      tags: [distributed, memory]

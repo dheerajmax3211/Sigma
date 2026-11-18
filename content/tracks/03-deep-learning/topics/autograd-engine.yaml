@@ -1,0 +1,1400 @@
+id: autograd-engine
+slug: autograd-engine
+title: "Building an Autograd Engine from Scratch"
+summary: >-
+  Build the data structure that differentiates arbitrary programs: one node per
+  value, each carrying its parents and a closure that turns one incoming
+  cotangent into one per parent — then walk the graph in reverse topological
+  order and accumulate. Under a hundred lines gets you a working engine; the
+  rest of the topic is knowing exactly where it silently lies to you.
+kind: lesson
+difficulty: hard
+position: 1
+estMinutes: 26
+prerequisites: [backpropagation, matrix-calculus, reading-papers]
+phase: deep-learning-foundations
+tags: [autograd, reverse-mode-ad, computation-graph, pytorch, micrograd, gradients]
+
+body:
+  big_idea: >-
+    An autograd engine is a data structure, not a formula: every value records
+    its parents and a closure that turns one incoming cotangent into one per
+    parent.
+
+  problem:
+    - >-
+      `backward()` raises *a variable needed for gradient computation has been
+      modified by an inplace operation*, and you cannot say what the graph was
+      holding.
+    - >-
+      You need a differentiable IoU or soft-argmax, and "write a custom
+      `autograd.Function`" explains nothing about what a node must record or
+      return.
+    - >-
+      Your trainer diverges because a value with two consumers had its
+      gradient assigned instead of accumulated, and Adam hid the scale error
+      for 4,000 steps.
+
+  analogy: |
+    A firm traces why profit missed by 1.0. Each department files one card:
+    its output on the front; on the back, which departments fed it and a table
+    turning "how far off am I?" into "how far off is each supplier?". Finance
+    starts at the profit card with 1.0 and walks the org chart backwards. No
+    department understands the firm, only its local rates. That is a VJP.
+
+  concept_points:
+    - >-
+      **A node is three fields: data, parents, and a closure.**
+      `Node(data, parents, backward)` where `backward` takes one cotangent and
+      returns one per parent. That is the whole engine: micrograd is about 100
+      lines, and PyTorch's `Node` is the same three fields with a C++ vtable
+      where the closure sits. Write `backward` as a no-argument mutator and it
+      breaks the moment a node has two consumers.
+    - >-
+      **The closure captures forward values, so memory, not arithmetic, is the bill.**
+      For `y = x * w` backward needs `w` at call time. One 4096-wide
+      activation at batch 8, sequence 2048, bf16 is
+      $8 \times 2048 \times 4096 \times 2 = 134{,}217{,}728$ bytes —
+      **128 MiB** — and a block keeps a dozen alive: **36 GiB** at 24 layers.
+    - >-
+      **Reverse topological order is the only order in which a cotangent is complete when its closure runs.**
+      Post-order DFS from the loss, then reverse it. Walk forwards instead and
+      $y = ((x \cdot 2) \cdot 3) \cdot 4$ gives **0.0 instead of 24.0** — a
+      dead gradient, not a crash. Forward mode is that wrong order, at one
+      pass per input.
+    - >-
+      **Fan-out means accumulate: a node used twice gets both payments.** For
+      $f = h + h$ with $h = ab$, $a = 2$, $b = 3$:
+      $\partial f/\partial a = 2b = 6$. Write `p.grad = ...` and you get 3.0 —
+      exactly half, with no error. Adam cannot see it: scaling every gradient
+      by a constant leaves $\hat m/(\sqrt{\hat v}+\epsilon)$ unchanged.
+    - >-
+      **In-place mutation corrupts the graph silently, because the closure holds a pointer, not a copy.**
+      In a scalar engine `data` is a float, so `x.data += 1` rebinds and you
+      are safe by accident. In a tensor engine `A *= 2` before `backward()`
+      makes the gradient **2x too large**; PyTorch's version counter is what
+      turns that into an error.
+    - >-
+      **Broadcasting is a sum in reverse.** A bias of shape $(h,)$ added to
+      $(n, h)$ has a VJP that sums over the batch axis. Skip it and at
+      $n = 64$, $h = 128$ you get **8,192 entries where 128 belong**, and
+      numpy broadcasts the update straight into the next add. The repair is
+      `unbroadcast`.
+
+  definitions:
+    - term: "Automatic differentiation"
+      meaning: >-
+        Computing exact derivatives of a program by applying the chain rule to
+        its elementary operations. Not symbolic differentiation (which
+        manipulates expressions and can blow up) and not numerical
+        differentiation (which costs one pass per input and loses half the
+        mantissa).
+    - term: "Reverse-mode AD"
+      meaning: >-
+        Autodiff that propagates cotangents from one scalar output back to all
+        inputs in a single pass, at the cost of storing the forward values. The
+        mode every deep-learning framework uses, because the loss is scalar and
+        the parameter count is enormous.
+    - term: "Computation graph"
+      meaning: >-
+        The DAG whose nodes are values and whose edges are the operations that
+        produced them. Built implicitly during the forward pass; for a 784→128→10
+        network on a batch of 64 it has about ten nodes if you store arrays, and
+        six million if you store scalars.
+    - term: "Node (tape entry)"
+      meaning: >-
+        One record in the graph: the forward value, pointers to the nodes it was
+        computed from, and a closure mapping an incoming cotangent to one per
+        parent. A "tape" is the same thing as a flat list instead of pointers.
+    - term: "Vector–Jacobian product (VJP)"
+      meaning: >-
+        $g_{\text{in}} = g_{\text{out}} J$ — contracting a row vector against a
+        Jacobian. This is what a backward closure computes. The transposed
+        cousin, $J g$, is a Jacobian–vector product and is what forward-mode AD
+        computes; it usually fails a shape check and always runs in the wrong
+        direction for a scalar loss.
+    - term: "Cotangent"
+      meaning: >-
+        The gradient of the final scalar with respect to an intermediate value,
+        $\partial L/\partial v$. Called a cotangent because it lives in the dual
+        space of the value's tangent space. Its defining invariant: it always has
+        the same shape as the value it belongs to.
+    - term: "Topological order"
+      meaning: >-
+        An ordering in which every node appears after all of its parents. The
+        backward pass needs the *reverse* of this: every consumer before its
+        producer. Post-order DFS from the loss produces it directly; reversing
+        that list gives the schedule.
+    - term: "Leaf and non-leaf"
+      meaning: >-
+        A leaf is a node with no parents — a parameter, an input, a constant. A
+        non-leaf is anything computed. Only leaves usually need their gradients
+        kept after a step; non-leaf buffers are exactly what `retain_graph=False`
+        frees.
+    - term: "Accumulation"
+      meaning: >-
+        Adding a new cotangent into `grad` rather than replacing it. Required
+        whenever a node has more than one consumer, and required across
+        micro-batches where several backward passes deliberately target the same
+        parameter buffer.
+    - term: "Detach / stop-gradient"
+      meaning: >-
+        Cutting an edge of the graph so gradients do not flow through it. Used
+        for frozen backbones and for targets in self-supervised losses, where the
+        target is computed from the same network but must not be differentiated.
+    - term: "Version counter"
+      meaning: >-
+        A per-tensor integer bumped on every in-place write, checked by the
+        autograd engine against the value saved at forward time. It is the only
+        mechanism that turns silent operand corruption into a loud error.
+    - term: "Rematerialisation (activation checkpointing)"
+      meaning: >-
+        Discarding a forward activation and recomputing it during the backward
+        pass. Trades about 33% more compute for $O(\sqrt{n})$ instead of $O(n)$
+        activation memory over $n$ layers.
+
+  diagrams:
+    - type: graph
+      title: "The diamond: one node, two consumers"
+      nodes:
+        - { id: a, label: "a = 2" }
+        - { id: b, label: "b = 3" }
+        - { id: c, label: "c = 5" }
+        - { id: h, label: "h = a*b = 6" }
+        - { id: k, label: "k = a*c = 10" }
+        - { id: f, label: "f = h + k = 16" }
+      edges:
+        - { from: a, to: h, label: "dh/da = b = 3" }
+        - { from: b, to: h, label: "dh/db = a = 2" }
+        - { from: a, to: k, label: "dk/da = c = 5" }
+        - { from: c, to: k, label: "dk/dc = a = 2" }
+        - { from: h, to: f, label: "df/dh = 1" }
+        - { from: k, to: f, label: "df/dk = 1" }
+
+    - type: mermaid
+      title: "Forward solid, backward dashed — and a receives two payments"
+      code: |
+        flowchart LR
+          f["f = 16, g = 1"] -.->|"g = 1"| h["h = 6"]
+          f -.->|"g = 1"| k["k = 10"]
+          h -.->|"g*b = 3"| a["a: 3 then +5 = 8"]
+          k -.->|"g*c = 5"| a
+          a -->|"x b"| h
+          b["b = 3"] -->|"x a"| h
+          a -->|"x c"| k
+          c["c = 5"] -->|"x a"| k
+          h -->|"add"| f
+          k -->|"add"| f
+
+    - type: pipeline
+      title: "One call to backward(), in five stages"
+      nodes:
+        - label: "Forward pass builds the graph"
+          note: "operators create nodes, no schedule is chosen yet"
+          detail: "Nothing is sorted here. The graph is whatever the Python expression tree produced, and a value used twice simply appears as a parent of two different nodes."
+        - label: "Post-order DFS from the loss"
+          note: "O(V + E), iterative in production"
+          detail: "Recursive in micrograd, which blows Python's 1,000-frame default at about 1,000 nodes deep — two layers of a real model. PyTorch uses an explicit stack."
+        - label: "Seed g = 1.0 on the loss"
+          note: "dL/dL"
+          detail: "The only free number. Everything else is a product of local derivatives with this root."
+        - label: "Walk the reversed order, calling closures"
+          note: "each contributes to parents with +="
+          detail: "Order among siblings is irrelevant precisely because of the +=; any topological order works. Assign instead of add and the order suddenly matters, which is one of the ways the bug hides."
+        - label: "Release the graph"
+          note: "default in PyTorch; opt-out with retain_graph"
+          detail: "The buffers die here unless something still references them. This is why calling backward twice on the same graph raises instead of quietly doubling your gradients."
+
+    - type: compare
+      title: "Scalar engine vs tensor engine: same algorithm, different constant"
+      left_label: "micrograd-style (one node per number)"
+      left_points:
+        - "94 lines of readable Python, and every op is a Python method call"
+        - "6,422,528 nodes for one MNIST layer at batch 64"
+        - "539 MiB of Python objects before any maths"
+        - "1.25 s forward vs 57 µs in numpy — 22,000x slower"
+        - "In-place ops are safe by accident: `data` is a float"
+        - "Perfect for learning, unusable for training"
+      right_label: "PyTorch-style (one node per array)"
+      right_points:
+        - "Same three fields, closure does the whole array at once"
+        - "One node per op, so ~10 nodes for the same network"
+        - "32-64 KiB per activation, not 539 MiB"
+        - "BLAS does the arithmetic; Python does one call per op"
+        - "In-place ops corrupt saved tensors, so a version counter guards them"
+        - "Same algorithm; the constant factor is the entire product"
+
+    - type: architecture
+      title: "Where the engine sits in a training step"
+      nodes:
+        - { id: user, x: 0, y: 1, label: "Model code", kind: client, detail: "Ordinary Python: `pred = x @ W + b`. No graph is mentioned. The graph is a side effect of the operators, which is why `torch.no_grad()` can switch it off without changing a line of the model." }
+        - { id: ops, x: 1, y: 0, label: "Operator layer", kind: server, detail: "matmul, add, relu. Each allocates an output node, records its parents, and installs a closure. This is the only place that knows any local derivative." }
+        - { id: graph, x: 1, y: 2, label: "Graph store", kind: storage, detail: "Nodes plus the forward arrays their closures captured. This is the 36 GiB. It lives exactly as long as something can still call backward through it." }
+        - { id: engine, x: 2, y: 1, label: "Backward engine", kind: worker, detail: "Topological sort, seed, reverse walk, accumulate. It never differentiates anything itself — it only calls the closures the operator layer installed." }
+        - { id: optim, x: 3, y: 1, label: "Optimizer", kind: database, detail: "Reads `.grad` on the leaves and writes `.data`. Note it writes *after* backward: an optimizer step placed between forward and backward mutates the operands every closure is about to read." }
+      edges:
+        - { from: user, to: ops, label: "expression" }
+        - { from: ops, to: graph, label: "records parents" }
+        - { from: graph, to: engine, label: "topo order" }
+        - { from: engine, to: optim, label: "leaf grads" }
+        - { from: user, to: engine, label: "loss.backward()", style: "async" }
+      caption: >-
+        The engine is a scheduler sitting between a graph it did not build and an
+        optimizer it does not control. Every performance and memory decision lives
+        on the edges, not in the walk itself.
+
+  markdown: |
+    The engine is smaller than the thing it differentiates. Every quantity the
+    forward pass touches becomes one object with three fields: `data`, the
+    forward value; `parents`, the nodes it was computed from; and `_backward`, a
+    function of one argument — the cotangent arriving from downstream — that
+    returns one cotangent per parent. That is the entire data structure.
+    `y = x * w` stores no formula for $\partial y/\partial w$; it stores the
+    closure `lambda g: (g * w.data, g * x.data)` and two parent pointers.
+
+    Everything else follows from one equation, the multivariate chain rule on a
+    DAG:
+
+    $$\frac{\partial L}{\partial v} \;=\; \sum_{c \,\in\, \text{consumers}(v)}
+      \frac{\partial L}{\partial c}\,\frac{\partial c}{\partial v}$$
+
+    Read it as a scheduling problem rather than a calculus identity. The sum is
+    over *edges*, not over paths, which is why the cost is linear in the graph
+    and why the same node appearing twice simply produces two terms. This is the
+    accumulation rule from *Backpropagation* and the VJP from *Matrix Calculus*,
+    now with an execution strategy attached.
+
+    ## The reverse walk, on six numbers
+
+    Take $h = ab$, $k = ac$, $f = h + k$, with $a = 2$, $b = 3$, $c = 5$. Then
+    $h = 6$, $k = 10$, $f = 16$, and the analytic answer is
+    $\partial f/\partial a = b + c = 8$.
+
+    | step | node | incoming $g$ | contributions written |
+    |---|---|---|---|
+    | 1 | $f$ | 1.0 | `h += 1.0`, `k += 1.0` |
+    | 2 | $k$ | 1.0 | `a += 5.0`, `c += 2.0` |
+    | 3 | $h$ | 1.0 | `a += 3.0`, `b += 2.0` |
+    | 4 | $a$ | 8.0 | — (leaf, nothing to propagate) |
+
+    Two things are worth staring at. Steps 2 and 3 can be swapped — *any*
+    topological order works, and the result is identical, but only because of the
+    `+=`. And the final 8.0 is the sum over the two paths $f \to h \to a$ and
+    $f \to k \to a$: the algorithm never enumerates paths, it enumerates edges
+    and lets addition do the bookkeeping. With `=` instead of `+=`, step 3 would
+    overwrite step 2 and $a$ would end at 3.0 — the $f \to k \to a$ route would
+    simply vanish.
+
+    ## The two invariants that matter
+
+    **Accumulate, always.** A gradient is not a value you compute; it is a total
+    you maintain. The moment a node has two consumers, `grad` is a running sum.
+    This is not a special case for "reused variables" — it is the general form,
+    and assignment is the special case that happens to be correct when fan-out is
+    1.
+
+    **Never mutate what the graph recorded.** The closure reads `w.data` at
+    backward time; it does not take a snapshot. In a scalar engine this is
+    invisible because `data` is a float and rebinding it cannot touch a captured
+    copy. In an array engine the closure holds a reference, and `W -= lr * dW`
+    executed before `loss.backward()` — an optimizer step in the wrong place
+    inside the loop — makes every downstream VJP read the *updated* weights. The
+    gradient you then compute is not the gradient of the loss you printed. It is
+    the gradient of a slightly different function, and it is wrong by
+    $\|\Delta W\| / \|W\|$, which at `lr = 0.01` is about 1% — small enough to
+    look like noise, large enough to matter over 10,000 steps.
+
+    ## Shapes: the repair nobody writes
+
+    Local derivatives have shapes, and the VJP has to restore them. The invariant
+    is that **every gradient has the shape of the thing it differentiates**, so
+    any operation whose forward pass changed a shape must undo it on the way
+    back. Broadcasting is where this bites, because the forward pass did it
+    silently:
+
+    | forward | shape | backward needs |
+    |---|---|---|
+    | `Z = X @ W` | $(n,h)$ | `X.T @ g` for $W$, `g @ W.T` for $X$ |
+    | `Z = Y + b` | $(n,h)$ from $(n,h)+(h,)$ | `g.sum(0)` for $b$ |
+    | `Z = c * Y` | any | `(g * Y).sum()` for a scalar $c$ |
+    | `Z = Y.sum()` | scalar | `np.full_like(Y, g)` |
+
+    Forget the `sum(0)` and `db` comes back as $(n,h)$. Nothing raises: numpy
+    broadcasts it into the next addition, and your bias quietly becomes a matrix
+    that happens to contain $n$ copies of the right answer added together.
+
+    ## What the graph costs
+
+    The walk is $O(V + E)$ and each closure does one array operation, so the
+    backward pass is roughly **two forward passes of compute**. That is the good
+    news, and it is why reverse mode beats the alternatives by absurd margins:
+    for $10^6$ parameters, forward-mode AD needs $10^6$ passes and finite
+    differences $2 \times 10^6$, against **3** total for reverse mode (one
+    forward, two backward).
+
+    The bad news is entirely memory:
+
+    | graph | nodes | retained |
+    |---|---|---|
+    | 784→128 layer, batch 64, scalar nodes | 6,422,528 | 539 MiB |
+    | the same layer, array nodes | 3 | 64 KiB |
+    | one 4096-wide activation, 8×2048, bf16 | 1 | 128 MiB |
+    | 24-layer transformer block stack | ~300 | ~36 GiB |
+
+    Training a 1.3B model needs roughly ten times its 2.6 GB of weights, and
+    essentially all of that factor is activations. Every memory technique you
+    will meet — checkpointing, fused kernels, offloading, `no_grad` — is a
+    statement about this table.
+
+    ## Knowing it is right
+
+    A wrong closure does not crash. It returns a plausible number, the loss goes
+    down, and the model is quietly worse. The only test that catches it is a
+    central-difference check on a *scalar* loss over a *small* graph, in float64,
+    with
+
+    $$\epsilon = \epsilon_{\text{mach}}^{1/3} = 6.055 \times 10^{-6}.$$
+
+    The two error terms cross there: truncation is $O(\epsilon^2) \approx
+    3.7\times10^{-11}$ and roundoff is $O(\epsilon_{\text{mach}}/\epsilon)
+    \approx 7.3\times10^{-11}$. Choose $10^{-8}$ instead and roundoff dominates
+    by four orders of magnitude; a correct engine then "fails" the check at
+    $10^{-8}$ and you debug the wrong thing for an afternoon.
+
+    ## Reproducing the claim, not the citation
+
+    Two sources deserve the three-pass treatment from *Reading Papers*. Paszke et
+    al. (2017) makes exactly one claim worth testing: define-by-run with a light
+    per-op overhead is fast enough to research with. Pass two is its overhead
+    table; pass three is yours to run — build the engine below, time forward
+    against backward on a small MLP, and check whether you reproduce the ~2x ratio
+    the whole design rests on. Griewank and Walther's *Evaluating Derivatives* is
+    the reference for why reverse mode costs what it costs; chapters 3 and 4, not
+    the whole book.
+
+    ## Where people stop
+
+    Most people write the scalar engine, watch it fit a line, and conclude they
+    understand autograd. The gap between that and PyTorch is four decisions:
+    nodes hold arrays, closures are registered per-op rather than per-value,
+    in-place writes are guarded by a version counter, and the graph is freed
+    after one backward pass. None of them is conceptually hard. All four are
+    where the bugs live.
+
+    ## The longer version
+
+    An autograd engine is a data structure, not a formula — every value records
+    the operands that produced it and a closure that converts one incoming
+    cotangent into one cotangent per operand, so a single reverse walk over the
+    graph differentiates any program you can write — and nearly every bug in one
+    is either an accumulator that was assigned instead of added, or a forward
+    value that was mutated after the graph recorded it.
+
+    A firm wants to know why the quarter's profit missed by 1.0. Each department
+    submits a single card. On the front: its own output. On the back: which
+    departments fed it, and a small table converting "how far off am I?" into
+    "how far off is each of my suppliers?". Finance starts at the profit card
+    with the number 1.0 and walks the org chart backwards. No department ever
+    needs to understand the whole firm — only its own local rates and the number
+    handed to it. That is exactly a VJP: the card is the node, the back-of-card
+    table is the `_backward` closure, the number handed down is the cotangent.
+
+    The analogy breaks in two useful places. First, the tables are computed from
+    *this quarter's* outputs, so every card has to be kept until the audit runs —
+    that stack of cards is activation memory, and it is why training needs
+    8-10x the memory of inference. Second, a supplier can appear on two cards.
+    Its total blame is then the **sum** of both payments, and the card-stack
+    metaphor actively suggests the wrong thing: you peel each card once, so the
+    natural bug is to let the second payment overwrite the first.
+
+    ### What goes wrong
+
+    - You call `.backward()` and get *one of the variables needed for gradient
+      computation has been modified by an inplace operation*, and you cannot
+      answer the obvious follow-up: what was the graph holding, and why did it
+      still need it?
+    - You need a loss the framework does not ship — a differentiable IoU, a
+      soft-argmax, a straight-through estimator — and every tutorial says
+      'just write a custom `autograd.Function`', which is meaningless until
+      you know what a node has to record and what it must return.
+    - Your 200-line trainer converges on the toy set and diverges on the real
+      one. One branch's gradient is exactly half what it should be because a
+      value with two consumers had its gradient assigned instead of
+      accumulated, and Adam hid the scale error for four thousand steps.
+    - You are asked to cut activation memory by 40%, and the only honest
+      levers — checkpointing, fused recomputation, offloading — are all
+      statements about which forward values the graph retains and when it is
+      allowed to drop them.
+    - Every ML-systems interview contains 'implement reverse-mode autodiff' or
+      'why does PyTorch need `retain_graph`'. The expected answer is a
+      topological sort and a closure, not a recital of the chain rule.
+
+    ### The full treatment
+
+    **A node is three fields: data, parents, and a closure.** `Node(data,
+    parents, backward)` where `backward` takes one cotangent and returns one
+    per parent. That is the whole engine — micrograd is about 100 lines of
+    Python, and PyTorch's `Node` is the same three fields with a C++ vtable
+    where the closure sits. The trap is writing `backward` as a function of no
+    arguments that mutates its parents directly: it works perfectly until a
+    node has two consumers, at which point there is no way to pass the two
+    contributions in, and you are forced to rewrite the engine.
+
+    **The closure must capture forward values, so memory — not arithmetic —
+    is the bill.** For `y = x * w` the backward needs `w` (or `x`) at call
+    time. Scale that up: one 4096-wide activation for a batch of 8 at sequence
+    length 2048 in bf16 is $8 \times 2048 \times 4096 \times 2 =
+    134{,}217{,}728$ bytes, exactly **128 MiB**, and a transformer block keeps
+    roughly a dozen such tensors alive. At 24 layers that is **36 GiB** of
+    activations for a model whose 1.3B bf16 weights are only **2.6 GB**. The
+    trap is believing backward costs "about one forward pass" — it costs one
+    forward pass of *compute* and the entire forward pass of *memory*.
+
+    **Reverse topological order is the only order in which a node's cotangent
+    is complete when its closure runs.** Build the order with a post-order DFS
+    from the loss and reverse it, so every consumer runs before its producer.
+    Put a number on getting it wrong: for the chain $y = ((x \cdot 2) \cdot
+    3) \cdot 4$, walking in forward order calls $x$'s closure while its
+    gradient is still the initial 0.0, so you get **0.0 instead of 24.0**. Not
+    a crash — a dead gradient, a model that trains at zero, and a loss curve
+    that is perfectly flat while every shape checks out. Forward-mode
+    differentiation is the order you just used, and it costs one pass per
+    input; that is why nobody uses it for networks.
+
+    **Fan-out means accumulate: a node used twice gets both payments.** For
+    $f = h + h$ with $h = ab$, $a = 2$, $b = 3$: $\partial f/\partial h = 2$,
+    so $\partial f/\partial a = 2b = 6$ and $\partial f/\partial b = 2a = 4$.
+    Write `p.grad = ...` instead of `p.grad += ...` and you get 3.0 and 2.0 —
+    **exactly half**, with no error and a loss that still descends. Adam
+    cannot see it either: the update is $\hat m/(\sqrt{\hat v}+\epsilon)$, and
+    scaling every gradient by a constant $c$ leaves that ratio unchanged, so a
+    uniformly-too-small gradient is invisible at steady state. The residual
+    connection is this same fact in disguise — $y = x + f(x)$ gives $x$ two
+    consumers, and the identity path contributes exactly $g$ at any depth.
+
+    **In-place mutation corrupts the graph silently, because the closure holds
+    a pointer, not a copy.** In a scalar engine `data` is a Python float, so
+    `x.data += 1` rebinds the attribute and the captured float is untouched —
+    you are safe by accident. In a tensor engine the closure captures the
+    *array*: `A *= 2` before `backward()` doubles the operand that $C = AB$
+    uses for $\partial C/\partial B = A^\top g$, and the gradient comes out
+    exactly **2x too large** with no warning. PyTorch's defence is a version
+    counter bumped on every in-place write; when a saved tensor's version no
+    longer matches, it raises instead of returning the wrong number. Your
+    engine has no counter, which is why the rule is absolute: never write into
+    a tensor the graph has recorded.
+
+    **Broadcasting is a sum in reverse.** A bias of shape $(h,)$ added to
+    $(n, h)$ broadcasts; the Jacobian of that broadcast is $n$ stacked
+    identities, so its VJP is a **sum over the batch axis**. Skip it and `db`
+    has shape $(n,h)$ with every entry $n$ times too large — at $n = 64$,
+    $h = 128$ that is **8,192 entries where 128 belong** — and numpy will
+    broadcast the update straight back into the next add, silently replacing
+    your vector bias with a matrix. The general repair is `unbroadcast`: sum
+    away leading axes, then sum any axis that was size 1 back to size 1 with
+    `keepdims=True`.
+
+    **One node per scalar is a teaching device; one node per array is the
+    design that ships.** A 64-sample MNIST batch through a 784→128 layer
+    creates $64 \times 128 \times 784 = 6{,}422{,}528$ multiply nodes, and
+    each `__slots__` node plus its float is 88 bytes — **539 MiB before you
+    have computed anything**. Measured on this machine, a
+    Python loop doing exactly that forward pass takes **1.25 s** where numpy
+    takes **57 µs**: **22,000x**. That gap is not a micro-optimisation; it is
+    the decision that a node holds an array and its closure does array algebra
+    once.
+
+    **Gradients accumulate across iterations unless something clears them —
+    the same `+=` rule one scope up.** `p.grad` is a persistent buffer, not a
+    return value. Run 100 SGD steps without clearing and the update at step
+    100 uses the **sum of 100** step-gradients, so the effective learning rate
+    grows linearly and the loss diverges, typically within 10-20 steps at a
+    sane `lr`. PyTorch makes this the user's job (`zero_grad`) because
+    accumulation across micro-batches is a feature; micrograd and the engine
+    below zero on every `backward()` and therefore cannot express gradient
+    accumulation at all. Both are defensible; not knowing which one you built
+    is not.
+
+    **The seed is 1.0 and it is the only number you get for free.**
+    `loss.backward()` starts from $\partial L/\partial L = 1$ and propagates
+    *upstream of the loss*. Everything downstream of the loss — the data, the
+    labels, the optimizer state — has no gradient and must not be asked for
+    one. That is what `requires_grad=False` and `detach()` mean: prune this
+    subtree from the graph before the walk, so its closures never run. On a
+    frozen 1.3B backbone with a 4M-parameter head, detaching turns a 2.6 GB
+    activation bill into a 4 MB one, because nothing behind the cut needs to
+    be retained.
+
+    **A gradient check is the only test that catches a wrong closure, and it
+    needs the right epsilon.** Central differences with $\epsilon =
+    \epsilon_{\text{mach}}^{1/3} = 6.06\times10^{-6}$ in float64 give
+    truncation error $O(\epsilon^2) \approx 3.7\times10^{-11}$ and roundoff
+    $O(\epsilon_{\text{mach}}/\epsilon) \approx 7.3\times10^{-11}$. Use
+    $\epsilon = 10^{-8}$ instead and roundoff dominates: a **correct** gradient
+    appears to disagree at the $10^{-8}$ level and you spend an afternoon
+    debugging arithmetic that was right. In float32 the floor is about
+    $10^{-3}$, so the check cannot separate right from wrong at all.
+
+
+  derivations:
+    - title: "The chain rule on a DAG is a sum over edges, not over paths"
+      latex: |
+        Let $v$ be a node with consumers $c_1, \dots, c_m$. Perturbing $v$ by
+        $\delta$ changes every consumer simultaneously, so the first-order change
+        in $L$ is the sum of the per-consumer changes:
+        $$L(v + \delta) - L(v)
+          = \sum_{j=1}^{m} \frac{\partial L}{\partial c_j}
+            \frac{\partial c_j}{\partial v}\,\delta + O(\delta^2).$$
+        Dividing by $\delta$ and taking $\delta \to 0$:
+        $$\frac{\partial L}{\partial v}
+          = \sum_{j=1}^{m} \frac{\partial L}{\partial c_j}
+            \frac{\partial c_j}{\partial v}.$$
+        For the diamond with $a = 2, b = 3, c = 5$ this gives
+        $$\frac{\partial f}{\partial a}
+          = \underbrace{1 \cdot 3}_{f \to h \to a}
+          + \underbrace{1 \cdot 5}_{f \to k \to a} = 8.$$
+      prose: >-
+        The sum is over consumers, which is a local, cheap object, and that is the
+        whole reason the algorithm is linear in the graph. Enumerating paths would
+        be exponential — a 50-block residual network has $2^{50}$ paths from the loss
+        to layer one — but the edge-sum computes exactly the same number in 50
+        steps. Assignment instead of accumulation silently drops all but one term,
+        which is why the tied-weight bug is always off by a factor equal to the
+        number of uses.
+
+    - title: "Why the broadcast VJP is a sum, and why keepdims matters"
+      latex: |
+        Adding $b \in \mathbb{R}^{h}$ to $Y \in \mathbb{R}^{n \times h}$
+        broadcasts $b$ to an $n \times h$ matrix. Writing that as a linear map,
+        $$Z = Y + \mathbf{1}_n b^\top, \qquad
+          \frac{\partial Z_{ij}}{\partial b_k} = \delta_{jk}.$$
+        The Jacobian of $Z$ with respect to $b$, flattened, is $n$ stacked copies
+        of $I_h$. Hence the VJP is
+        $$g_b = g_Z \cdot \frac{\partial Z}{\partial b}
+             = \sum_{i=1}^{n} g_{Z}[i, :] \;\;\in \mathbb{R}^{h},$$
+        a sum over the axis that was broadcast. If the bias had shape
+        $(1, h)$ instead, the identical derivation gives
+        $\sum_i g_Z[i, :]$ with the axis kept, i.e. shape $(1, h)$ — which is why
+        the repair is `sum(axis=0, keepdims=...)` and not an unconditional
+        `squeeze`.
+      prose: >-
+        Broadcasting is the only common operation whose forward pass silently
+        changes rank, so it is the only one where the backward pass must undo a
+        shape rather than merely transpose one. At n = 64 and h = 128 the wrong
+        answer has 8,192 entries instead of 128, every one of them 64x too large,
+        and numpy accepts it without a complaint.
+
+    - title: "Why reverse mode costs three forward passes regardless of parameter count"
+      latex: |
+        Let the graph have $V$ nodes and $E$ edges. The forward pass is $O(E)$.
+        The backward pass calls one closure per edge, each a single array
+        operation, so it is also $O(E)$ with a constant of about two — one
+        multiply and one add per edge, plus the transpose.
+        Total: $C_{\text{rev}} \approx 3\,C_{\text{fwd}}$, independent of the
+        number of inputs.
+
+        Forward mode instead propagates one tangent per input: with $P$
+        parameters,
+        $$C_{\text{fwd-mode}} = P \cdot C_{\text{fwd}}.$$
+        Central differences need two forward passes per parameter:
+        $$C_{\text{FD}} = 2P \cdot C_{\text{fwd}}.$$
+        For $P = 10^{9}$ that is $3$ passes versus $2 \times 10^{9}$ — a factor of
+        $6.7 \times 10^{8}$.
+      prose: >-
+        The asymmetry exists because the loss is a scalar: one output means one
+        seed, and the cost of the backward sweep is set by the graph, not by how
+        many parameters you want to differentiate. Flip it — many outputs, few
+        inputs — and forward mode wins by the same argument. The rule of thumb is
+        simply "sweep from the small side", and for training the small side is
+        always the scalar loss.
+
+  implementations:
+    - language: python
+      title: "The scalar engine: 94 lines that actually train"
+      note: >-
+        This is numerically WRONG in four ways, and all four are instructive.
+        (1) `exp` overflows to `inf` above 709 and every downstream value becomes
+        `nan`; the engine cannot detect it, so a model with large logits silently
+        produces garbage. Real frameworks use a log-sum-exp form instead.
+        (2) The DFS recurses once per node, so it hits Python's 1,000-frame limit
+        at about 1,000 nodes deep — two layers of a real model. Production tapes
+        iterate with an explicit stack. (3) Every node is a scalar, so a
+        width-4096 layer is 4,096 objects per sample and the whole thing runs
+        four orders of magnitude slower than numpy. (4) `x ** k` with a negative
+        base and a fractional `k` returns a complex number that then fails
+        silently at `float()`; and `backward()` zeroes every gradient on entry, so
+        gradient accumulation across micro-batches is impossible — the opposite
+        of PyTorch's choice, and a decision you have to make on purpose.
+      code: |
+        import math
+
+        class Value:
+            """One scalar node. `grad` is dL/d(self) and is always ACCUMULATED."""
+            __slots__ = ("data", "grad", "parents", "_backward")
+
+            def __init__(self, data, parents=(), backward=None):
+                self.data = float(data)
+                self.grad = 0.0
+                self.parents = parents
+                self._backward = backward or (lambda g: ())
+
+            # The graph is built by operator overloading -- that is the whole point.
+            def __add__(self, other):
+                other = other if isinstance(other, Value) else Value(other)
+                out = Value(self.data + other.data, (self, other))
+                out._backward = lambda g: (g, g)            # d(a+b)/da = 1
+                return out
+
+            def __mul__(self, other):
+                other = other if isinstance(other, Value) else Value(other)
+                out = Value(self.data * other.data, (self, other))
+                # The local Jacobian is the OTHER operand, captured now.
+                out._backward = lambda g: (g * other.data, g * self.data)
+                return out
+
+            def __pow__(self, k):
+                out = Value(self.data ** k, (self,))
+                out._backward = lambda g: (g * k * self.data ** (k - 1),)
+                return out
+
+            def tanh(self):
+                t = math.tanh(self.data)
+                out = Value(t, (self,))
+                # From the OUTPUT, not from self: one tanh instead of two.
+                out._backward = lambda g: (g * (1.0 - t * t),)
+                return out
+
+            def exp(self):
+                e = math.exp(self.data)          # inf above 709, silently
+                out = Value(e, (self,))
+                out._backward = lambda g: (g * e,)   # derivative is the output
+                return out
+
+            def __neg__(self):        return self * -1.0
+            def __sub__(self, o):     return self + (-o)
+            def __radd__(self, o):    return self + o
+            def __rmul__(self, o):    return self * o
+
+            def backward(self):
+                # Post-order DFS visits every parent before its child, so
+                # reversing it gives reverse topological order.
+                order, seen = [], set()
+
+                def build(v):
+                    if id(v) in seen:
+                        return
+                    seen.add(id(v))
+                    for p in v.parents:
+                        build(p)
+                    order.append(v)
+
+                build(self)
+                for v in order:
+                    v.grad = 0.0            # NOTE: breaks cross-batch accumulation
+                self.grad = 1.0             # dL/dL, the seed
+                for v in reversed(order):
+                    for p, g in zip(v.parents, v._backward(v.grad)):
+                        p.grad += g         # += not = : fan-out means sum
+                return self
+
+        if __name__ == "__main__":
+            # f = h + h with h = a*b. h has TWO consumers.
+            a, b = Value(2.0), Value(3.0)
+            h = a * b
+            f = h + h
+            f.backward()
+            print(f.data, a.grad, b.grad, h.grad)      # 12.0, 6.0, 4.0, 2.0
+            # Replace `+=` with `=` and you get 3.0 and 2.0: exactly half.
+
+            # Fit y = 3x + 2 -- an engine that cannot train is not an engine.
+            xs = [Value(i / 10.0) for i in range(-10, 11)]
+            ys = [3.0 * (i / 10.0) + 2.0 for i in range(-10, 11)]
+            w, b0 = Value(-1.0), Value(0.0)
+            for _ in range(200):
+                loss = Value(0.0)
+                for x, y in zip(xs, ys):
+                    loss = loss + (w * x + b0 - y) ** 2
+                loss = loss * (1.0 / len(xs))
+                loss.backward()
+                w.data -= 0.5 * w.grad
+                b0.data -= 0.5 * b0.grad
+            print(round(w.data, 6), round(b0.data, 6))  # 3.0, 2.0
+
+    - language: python
+      title: "The tensor engine: one node per array, plus the shape repair"
+      note: >-
+        Numerically WRONG in four ways that the scalar version does not have.
+        (1) There is no version counter, so any in-place write to `A.data`
+        between forward and backward silently changes the operand a saved closure
+        will read — the gradient is then wrong by exactly the mutation factor,
+        with no error. (2) `matmul` uses `g @ other.data.T`, which is correct only
+        for 2-D operands; for batched operands you need `swapaxes(-1, -2)`, and
+        for the batch dimension you need a sum as well. (3) `relu` at exactly 0
+        picks the subgradient 0, whereas PyTorch picks 0 too but a different
+        framework may pick 1 — a difference that matters only when a whole layer
+        dies. (4) It zeroes every gradient inside `backward()`, so it cannot
+        express gradient accumulation; PyTorch's `+=` into a persistent buffer is
+        the other choice and the one you need for micro-batching.
+      code: |
+        import numpy as np
+
+        def unbroadcast(g, shape):
+            """Undo a broadcast: sum away the axes that were stretched."""
+            while g.ndim > len(shape):
+                g = g.sum(axis=0)
+            for i, s in enumerate(shape):
+                if s == 1 and g.shape[i] != 1:
+                    g = g.sum(axis=i, keepdims=True)
+            return g
+
+        class Tensor:
+            """One node per ARRAY. That single decision is the performance story."""
+            __slots__ = ("data", "grad", "_parents", "_backward")
+
+            def __init__(self, data, parents=(), backward=None):
+                self.data = np.asarray(data, dtype=float)
+                self.grad = np.zeros_like(self.data)
+                self._parents = parents
+                self._backward = backward or (lambda g: ())
+
+            @property
+            def shape(self):
+                return self.data.shape
+
+            def _wrap(self, data, parents, fn):
+                out = Tensor(data, parents)
+                out._backward = fn
+                return out
+
+            def __add__(self, other):
+                other = other if isinstance(other, Tensor) else Tensor(other)
+                return self._wrap(
+                    self.data + other.data, (self, other),
+                    lambda g: (unbroadcast(g, self.shape),
+                               unbroadcast(g, other.shape)))
+
+            def __mul__(self, other):
+                other = other if isinstance(other, Tensor) else Tensor(other)
+                return self._wrap(
+                    self.data * other.data, (self, other),
+                    lambda g: (unbroadcast(g * other.data, self.shape),
+                               unbroadcast(g * self.data, other.shape)))
+
+            def __matmul__(self, other):
+                other = other if isinstance(other, Tensor) else Tensor(other)
+                return self._wrap(
+                    self.data @ other.data, (self, other),
+                    lambda g: (g @ other.data.T, self.data.T @ g))
+
+            __rmatmul__ = __matmul__
+            __radd__ = __add__
+            __rmul__ = __mul__
+
+            def relu(self):
+                mask = self.data > 0
+                return self._wrap(np.maximum(self.data, 0.0), (self,),
+                                  lambda g: (g * mask,))
+
+            def sum(self):
+                return self._wrap(self.data.sum(), (self,),
+                                  lambda g: (np.full_like(self.data, g),))
+
+            def backward(self):
+                order, seen = [], set()
+
+                def build(t):
+                    if id(t) in seen:
+                        return
+                    seen.add(id(t))
+                    for p in t._parents:
+                        build(p)
+                    order.append(t)
+
+                build(self)
+                for t in order:
+                    t.grad = np.zeros_like(t.data)
+                self.grad = np.ones_like(self.data)        # seed
+                for t in reversed(order):
+                    if t._parents:
+                        for p, g in zip(t._parents, t._backward(t.grad)):
+                            p.grad += g                # += not =
+                return self
+
+        if __name__ == "__main__":
+            rng = np.random.default_rng(0)
+            X = rng.normal(size=(64, 8))
+            true_w, true_b = rng.normal(size=(8, 1)), 0.7
+            Y = X @ true_w + true_b + 0.01 * rng.normal(size=(64, 1))
+
+            W = Tensor(rng.normal(size=(8, 1)) * 0.1)
+            b = Tensor(np.zeros((1, 1)))
+            for _ in range(300):
+                diff = Tensor(X) @ W + b + Tensor(-Y)
+                loss = (diff * diff).sum() * (1.0 / 64.0)
+                loss.backward()
+                W.data -= 0.5 * W.grad        # AFTER backward, never before
+                b.data -= 0.5 * b.grad
+            print(float(loss.data))           # 5.2e-05
+            print(float(np.abs(W.data - true_w).max()))   # 0.0032
+
+            # The broadcast trap, measured: a (1,3) bias added to a (4,3) batch.
+            b2 = Tensor(np.zeros((1, 3)))
+            (Tensor(np.ones((4, 3))) + b2).backward()
+            print(b2.grad.tolist())           # [[4.0, 4.0, 4.0]], not (4,3)
+
+  checkpoints:
+    - id: cp-fanout
+      question: >-
+        A node $h$ feeds two consumers. Its closure runs twice, delivering
+        cotangents 3.0 and 5.0. What is $\partial L/\partial h$, and what would a
+        `=` instead of `+=` produce?
+      answerKind: short_text
+      hint: "One of the two will run second. Which one survives an assignment?"
+      solution: >-
+        $\partial L/\partial h = 8.0$. With `=`, the node would end at whichever
+        contribution arrived last — 5.0 if the consumer delivering 5.0 ran
+        second — so the gradient is wrong by a factor of 8/5 and, worse, depends
+        on the topological order, which is otherwise irrelevant. This is exactly
+        the tied-weight bug, and for a weight used $k$ times the error is a factor
+        of at most $k$.
+    - id: cp-order
+      question: >-
+        Why must the walk run in reverse topological order rather than forward
+        order? Give the number for $y = ((x \cdot 2) \cdot 3) \cdot 4$.
+      answerKind: short_text
+      hint: "What does a node need before its closure can run?"
+      solution: >-
+        A closure converts an *incoming* cotangent into contributions for its
+        parents, so it must run only after every consumer has finished
+        contributing. In forward order $x$'s closure runs while `x.grad` is still
+        the initial 0.0, and it propagates that zero; the answer is 0.0 instead of
+        24.0. Nothing raises — you get a model whose parameters never move.
+    - id: cp-inplace
+      question: >-
+        Your engine is correct on every test, then you move the optimizer step
+        above `loss.backward()` inside the loop. What happens, and what is the
+        relative error?
+      answerKind: short_text
+      hint: "When the closure captured `W`, did it capture the values or a pointer?"
+      solution: >-
+        In a tensor engine the closures hold references to the weight array, so
+        the VJPs read the already-updated weights: you compute the gradient of
+        the loss at $W - \Delta W$, not at $W$. The relative error is
+        $\|\Delta W\|/\|W\| \approx \text{lr}$, about 1% at `lr = 0.01` — small
+        enough to look like noise, systematic enough to cost you accuracy over
+        thousands of steps. In a scalar engine the same code is harmless, because
+        `data` is a float and rebinding it does not touch the captured value.
+    - id: cp-memory
+      question: >-
+        A 24-layer transformer keeps about 12 activation tensors per layer alive.
+        At width 4096, batch 8, sequence 2048, bf16, how much is that, and where
+        does it go after `backward()`?
+      answerKind: short_text
+      hint: "One tensor is $8 \times 2048 \times 4096 \times 2$ bytes."
+      solution: >-
+        One tensor is 128 MiB. Twelve per layer times 24 layers is about 36 GiB.
+        After `backward()` those buffers are released by default — the graph is
+        consumed, which is why a second `backward()` raises instead of doubling
+        your gradients, and why `retain_graph=True` costs memory rather than
+        saving it.
+    - id: cp-broadcast
+      question: >-
+        `Z = Y + b` with `Y` of shape (64, 128) and `b` of shape (128,). What
+        shape must `db` have, and what goes wrong if you return `g` unchanged?
+      answerKind: short_text
+      hint: "The gradient has the shape of the thing it differentiates."
+      solution: >-
+        `db` must be (128,), so the VJP is `g.sum(axis=0)`. Return `g` unchanged
+        and you get (64, 128) with each entry 64x too large. Nothing raises: the
+        next `b -= lr * db` either errors on a non-broadcastable output or, in
+        functional style, silently turns the bias into a matrix of shape (64,128)
+        that still trains — badly.
+    - id: cp-gradcheck
+      question: >-
+        You write a gradient check with `eps = 1e-8` in float64 and a correct
+        engine fails at a relative error of 1e-8. What is happening, and what
+        epsilon should you use?
+      answerKind: short_text
+      hint: "Central differences trade truncation error against roundoff error."
+      solution: >-
+        Roundoff. The difference quotient's error is about
+        $2\epsilon_{\text{mach}}/\epsilon = 2.2\times10^{-16}/10^{-8} =
+        2.2\times10^{-8}$, which swamps the $O(\epsilon^2)$ truncation term. The
+        two balance at $\epsilon = \epsilon_{\text{mach}}^{1/3} = 6.06\times
+        10^{-6}$, giving an error floor near $10^{-10}$. In float32 the floor is
+        about $10^{-3}$ and the check cannot separate a correct closure from a
+        wrong one.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        You are not writing a formula for a derivative. You are writing a data
+        structure that can answer, for any value, "which values produced me, and
+        how sensitive am I to each of them?" — plus a scheduler that visits those
+        values in the one order where every answer is complete before it is used.
+      blocks:
+        - kind: checklist
+          body: |
+            - A node needs: the value, its parents, and a local-derivative rule
+            - The walk must go from the loss backwards, consumers before producers
+            - A node with two consumers receives two contributions, and they add
+            - A closure reads forward values, so those values must still be intact
+      checkpoint: >-
+        Before reading on: if a value feeds two later computations, what single
+        number should its `grad` hold after the backward pass — one of the two
+        contributions, or something else?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Build the scalar version first, because it makes the graph visible: one
+        Python object per number, closures as lambdas, a `print` of the topology
+        that you can actually read. Then port the same three fields to arrays and
+        discover that nothing about the algorithm changed — only the constant
+        factor and the shape arithmetic did. Reach for a recursive post-order DFS
+        for the ordering; an explicit stack only matters past a few thousand
+        nodes.
+      blocks:
+        - kind: checklist
+          body: |
+            - Represent: class with data / grad / parents / _backward
+            - Build: operator overloading, one closure per operation
+            - Order: post-order DFS from the loss, then reverse it
+            - Seed: 1.0 on the loss, zero everywhere else
+            - Propagate: p.grad += g, then call the closure once per node
+            - Verify: central differences, float64, eps = 6.05e-6
+      checkpoint: >-
+        Why is a closure per *operation* enough, when the thing you actually want
+        is a derivative per *parameter*?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The whole engine is one DFS plus one loop. Get the DFS to append on the
+        way *out*, not the way in — that single placement is the topological sort.
+      blocks:
+        - kind: pseudocode
+          body: |
+            class Node:
+                data, grad = 0.0, parents = (), backward = null
+
+                op(self, other, local_derivs):
+                    out = Node(value_of(self, other), parents=(self, other))
+                    out.backward = g -> [g * d for d in local_derivs]
+                    return out
+
+                def backward(root):
+                    order, seen = [], set()
+                    def visit(v):                # post-order
+                        if v in seen: return
+                        seen.add(v)
+                        for p in v.parents: visit(p)
+                        order.append(v)          # AFTER the parents
+                    visit(root)
+
+                    for v in order: v.grad = 0.0
+                    root.grad = 1.0
+                    for v in reversed(order):    # reverse topological
+                        for p, g in zip(v.parents, v.backward(v.grad)):
+                            p.grad += g          # never =
+      checkpoint: >-
+        If you moved `order.append(v)` to before the loop over parents, what would
+        `reversed(order)` produce, and which chain of gradients would break?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Everything the engine does is the multivariate chain rule with the sum
+        taken over consumers instead of over paths, plus one shape repair for
+        broadcasting.
+      blocks:
+        - kind: math
+          body: |
+            For a node $v$ with consumers $c_1 \dots c_m$:
+            $$\frac{\partial L}{\partial v}
+              = \sum_{j} \frac{\partial L}{\partial c_j}
+                \frac{\partial c_j}{\partial v}$$
+
+            Diamond, $a=2, b=3, c=5$:
+            $$h = ab = 6,\; k = ac = 10,\; f = h+k = 16$$
+            $$\frac{\partial f}{\partial a}
+              = \underbrace{1 \cdot 3}_{h} + \underbrace{1 \cdot 5}_{k} = 8$$
+
+            Broadcast bias $b \in \mathbb{R}^h$, $Z = Y + \mathbf{1}_n b^\top$:
+            $$g_b = g_Z \frac{\partial Z}{\partial b}
+                 = \sum_{i=1}^{n} g_Z[i,:] \in \mathbb{R}^h$$
+
+            Cost, with $P$ parameters and $E$ edges:
+            $$C_{\text{rev}} \approx 3 C_{\text{fwd}},
+              \qquad C_{\text{forward-mode}} = P\, C_{\text{fwd}}$$
+      checkpoint: >-
+        The diamond's answer 8 is the sum of two products. Where in your code is
+        that sum actually performed — and what would have to change for it to be
+        a max instead of a sum?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete scalar engine plus the two tests that decide whether it is
+        right: a fan-out case and a gradient check.
+      blocks:
+        - kind: warning
+          body: >-
+            Read this only after writing your own. The engine is short enough that
+            reading it substitutes for writing it, and the bugs it teaches are
+            exactly the ones you will not recognise later because you never
+            produced them.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+            class Value:
+                __slots__ = ("data", "grad", "parents", "_backward")
+
+                def __init__(self, data, parents=(), backward=None):
+                    self.data = float(data)
+                    self.grad = 0.0
+                    self.parents = parents
+                    self._backward = backward or (lambda g: ())
+
+                def __add__(self, o):
+                    o = o if isinstance(o, Value) else Value(o)
+                    r = Value(self.data + o.data, (self, o))
+                    r._backward = lambda g: (g, g)
+                    return r
+
+                def __mul__(self, o):
+                    o = o if isinstance(o, Value) else Value(o)
+                    r = Value(self.data * o.data, (self, o))
+                    r._backward = lambda g: (g * o.data, g * self.data)
+                    return r
+
+                def relu(self):
+                    r = Value(max(self.data, 0.0), (self,))
+                    r._backward = lambda g: (g * (1.0 if self.data > 0 else 0.0),)
+                    return r
+
+                __radd__ = __add__
+                __rmul__ = __mul__
+                def __neg__(self): return self * -1.0
+                def __sub__(self, o): return self + (-o)
+
+                def backward(self):
+                    order, seen = [], set()
+                    def build(v):
+                        if id(v) in seen:
+                            return
+                        seen.add(id(v))
+                        for p in v.parents:
+                            build(p)
+                        order.append(v)
+                    build(self)
+                    for v in order:
+                        v.grad = 0.0
+                    self.grad = 1.0
+                    for v in reversed(order):
+                        for p, g in zip(v.parents, v._backward(v.grad)):
+                            p.grad += g
+                    return self
+
+            def gradcheck(f, params, eps=6.055454452393343e-06):
+                """f() -> scalar Value built from params. Central differences."""
+                out = f()
+                out.backward()
+                analytic = [p.grad for p in params]
+                worst = 0.0
+                for p, a in zip(params, analytic):
+                    old = p.data
+                    p.data = old + eps
+                    hi = f().data
+                    p.data = old - eps
+                    lo = f().data
+                    p.data = old                       # restore: the graph reads it
+                    num = (hi - lo) / (2 * eps)
+                    worst = max(worst, abs(num - a) / max(1.0, abs(num), abs(a)))
+                return worst                           # want < ~1e-6
+
+            if __name__ == "__main__":
+                a, b = Value(2.0), Value(3.0)
+                (a * b + a * b).backward()
+                assert (a.grad, b.grad) == (6.0, 4.0), (a.grad, b.grad)
+
+                w, bb = Value(0.4), Value(-0.2)
+                err = gradcheck(lambda: (w * bb).relu() + w * w, [w, bb])
+                print("worst relative error", err)     # ~1e-11
+      checkpoint: >-
+        The gradcheck builds a *fresh* graph for every call to `f()`. What would
+        happen if it reused one graph and called `backward()` repeatedly — and why
+        does that make a version counter a better design than a comment saying
+        "do not mutate"?
+
+  problems:
+    - id: p-topo-order
+      title: "Topological order for a backward pass"
+      difficulty: easy
+      prompt: >-
+        Implement `topo_order(ids, parents, root)`. `ids` is a list of node
+        names; `parents[i]` lists the indices of node `i`'s parents (empty for a
+        leaf); `root` is the index of the node to start from. Return the list of
+        node indices in **topological order with parents before children** — the
+        order you would reverse to run the backward pass. Visit each node once,
+        and follow `parents[i]` in the order given, so the result is
+        deterministic. Only nodes reachable from `root` appear.
+      starter: |
+        def topo_order(ids, parents, root):
+            # your implementation here
+            pass
+      language: python
+      entry: topo_order
+      testCases:
+        - input: '{"ids": ["a", "b", "c", "h", "k", "f"], "parents": [[], [], [], [0, 1], [0, 2], [3, 4]], "root": 5}'
+          expected: "[0, 1, 3, 2, 4, 5]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"ids": ["a", "b", "c", "d"], "parents": [[], [0], [1], [2]], "root": 3}'
+          expected: "[0, 1, 2, 3]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"ids": ["a", "b", "h", "f"], "parents": [[], [], [0, 1], [2, 2]], "root": 3}'
+          expected: "[0, 1, 2, 3]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"ids": ["a", "b", "c", "d"], "parents": [[], [0], [0], [1, 2]], "root": 3}'
+          expected: "[0, 1, 2, 3]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def topo_order(ids, parents, root):
+            order, seen = [], set()
+
+            def visit(i):
+                if i in seen:          # already emitted, or in progress
+                    return
+                seen.add(i)
+                for p in parents[i]:
+                    visit(p)
+                # Post-order: append AFTER every parent, so parents come first.
+                order.append(i)
+
+            visit(root)
+            return order
+      solutionExplanation: >-
+        A post-order DFS emits a node only after everything it depends on, which
+        is exactly the topological property. Reversing this list gives the
+        backward schedule: every consumer before its producer. The `seen` set is
+        what makes it linear in the graph rather than exponential in the number of
+        paths — on the diamond it is the difference between visiting `a` once and
+        visiting it twice, and on a 50-block residual network it is the difference
+        between touching 50 nodes and enumerating $2^{50}$ paths. It also doubles
+        as cycle protection: a cycle would otherwise recurse forever, and here it
+        simply terminates and produces an order that omits the back-edge.
+      complexity: "O(V + E) time, O(V) space (plus O(V) recursion depth)"
+      tags: [topological-sort, dfs, autograd, dags]
+
+    - id: p-reverse-grads
+      title: "The backward pass over a graph"
+      difficulty: medium
+      prompt: >-
+        Implement `reverse_grads(ids, parents, local, root)`. As above, but
+        `local[i]` gives $\partial\,\text{node}_i / \partial\,\text{parent}_j$
+        for each entry of `parents[i]`, in the same order, evaluated at the
+        current point. Seed the root with 1.0 and return a dict mapping every
+        node name to its gradient. A node that appears as a parent of two
+        different nodes must receive both contributions.
+      starter: |
+        def reverse_grads(ids, parents, local, root):
+            # your implementation here
+            pass
+      language: python
+      entry: reverse_grads
+      testCases:
+        - input: >-
+            {"ids": ["a", "b", "c", "h", "k", "f"],
+             "parents": [[], [], [], [0, 1], [0, 2], [3, 4]],
+             "local": [[], [], [], [3.0, 2.0], [5.0, 2.0], [1.0, 1.0]],
+             "root": 5}
+          expected: '{"a": 8.0, "b": 2.0, "c": 2.0, "h": 1.0, "k": 1.0, "f": 1.0}'
+          mode: json
+          tolerance: 1e-9
+        - input: >-
+            {"ids": ["a", "b", "h", "f"],
+             "parents": [[], [], [0, 1], [2, 2]],
+             "local": [[], [], [3.0, 2.0], [1.0, 1.0]],
+             "root": 3}
+          expected: '{"a": 6.0, "b": 4.0, "h": 2.0, "f": 1.0}'
+          mode: json
+          tolerance: 1e-9
+        - input: >-
+            {"ids": ["a", "x", "y", "f"],
+             "parents": [[], [0], [1], [2]],
+             "local": [[], [2.0], [3.0], [4.0]],
+             "root": 3}
+          expected: '{"a": 24.0, "x": 12.0, "y": 4.0, "f": 1.0}'
+          mode: json
+          tolerance: 1e-9
+        - input: >-
+            {"ids": ["a", "b", "c", "d"],
+             "parents": [[], [0], [0], [1, 2]],
+             "local": [[], [2.0], [3.0], [0.5, 4.0]],
+             "root": 3}
+          expected: '{"a": 13.0, "b": 0.5, "c": 4.0, "d": 1.0}'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        def reverse_grads(ids, parents, local, root):
+            order, seen = [], set()
+
+            def visit(i):
+                if i in seen:
+                    return
+                seen.add(i)
+                for p in parents[i]:
+                    visit(p)
+                order.append(i)
+
+            visit(root)
+
+            grads = {name: 0.0 for name in ids}
+            grads[ids[root]] = 1.0                    # dL/dL
+            for i in reversed(order):                 # reverse topological
+                gi = grads[ids[i]]
+                for p, d in zip(parents[i], local[i]):
+                    grads[ids[p]] += gi * float(d)    # += not =
+            return grads
+      solutionExplanation: >-
+        The forward value of every node is already folded into `local`, so this
+        function is pure graph algebra: seed 1.0 at the root, then for each node
+        in reverse topological order multiply its cotangent by each local
+        derivative and add the result into the parent. The `+=` is the entire
+        correctness argument for case 2, where `h` is a parent of the same node
+        twice: it receives 1.0 twice, giving `h.grad = 2.0`, and therefore `a`
+        receives 2.0 * 3.0 = 6.0 rather than 3.0. Case 4 checks that the order is
+        genuinely topological: `b` is processed before `a` because `d` is
+        reachable through both `b` and `c`, and a forward walk would give `a`
+        only the 0.5 * 2 = 1.0 contribution from the first path.
+      complexity: "O(V + E) time, O(V) space"
+      tags: [autograd, chain-rule, accumulation, graphs]
+
+    - id: p-unbroadcast
+      title: "Undo a broadcast in the backward pass"
+      difficulty: medium
+      prompt: >-
+        Implement `unbroadcast(grad, shape)`. `grad` is a nested list (the
+        incoming cotangent) and `shape` is the shape of the operand it belongs
+        to. Sum away the leading axes that broadcasting added, then sum — with
+        the axis kept — any axis whose target size is 1. Return a list with
+        exactly the target shape.
+      starter: |
+        import numpy as np
+
+        def unbroadcast(grad, shape):
+            # your implementation here
+            pass
+      language: python
+      entry: unbroadcast
+      testCases:
+        - input: '{"grad": [[1, 2, 3], [4, 5, 6]], "shape": [3]}'
+          expected: "[5.0, 7.0, 9.0]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"grad": [[1, 2], [3, 4]], "shape": [2, 1]}'
+          expected: "[[3.0], [7.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"grad": [[[1, 2, 3], [4, 5, 6]], [[10, 20, 30], [40, 50, 60]]], "shape": [2, 3]}'
+          expected: "[[11.0, 22.0, 33.0], [44.0, 55.0, 66.0]]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"grad": [[1, 2, 3]], "shape": [3]}'
+          expected: "[1.0, 2.0, 3.0]"
+          mode: json
+          tolerance: 1e-9
+        - input: '{"grad": [[1, 2], [3, 4]], "shape": [2, 2]}'
+          expected: "[[1.0, 2.0], [3.0, 4.0]]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def unbroadcast(grad, shape):
+            g = np.asarray(grad, dtype=float)
+            target = tuple(shape)
+            # Broadcasting prepended axes; sum them away from the left.
+            while g.ndim > len(target):
+                g = g.sum(axis=0)
+            # Axes that were stretched from 1 need summing, and staying size 1.
+            for i, s in enumerate(target):
+                if s == 1 and g.shape[i] != 1:
+                    g = g.sum(axis=i, keepdims=True)
+            return g
+      solutionExplanation: >-
+        A broadcast is a copy: adding a (3,) bias to a (2,3) batch makes two
+        copies of it, so the VJP sums the two copies back together. That is case
+        1, [5, 7, 9]. The `keepdims=True` matters when the target axis is size 1
+        rather than absent: case 2 has a (2,1) column vector stretched to (2,2),
+        and the answer must stay (2,1) — `[[3.0], [7.0]]` — because the gradient
+        has the shape of the operand. Dropping `keepdims` gives `[3, 7]`, which
+        will then broadcast wrongly into the next operation. Case 3 does both at
+        once: the leading axis is summed away and no axis needs `keepdims`. Case
+        5 is the no-op path, and it must return the input unchanged, not a copy
+        with a different rank.
+      complexity: "O(size of grad) time and space"
+      tags: [broadcasting, shapes, autograd, numpy]
+
+  visualizers:
+    - id: vs-computation-graph
+      kind: computation_graph
+      title: "Walk the diamond backwards"
+      description: >-
+        Step through the forward build and the reverse sweep one node at a time.
+        Watch `a` accumulate 3.0 from `h` and then 5.0 from `k`: the second
+        payment adds, and the order of the two steps is irrelevant.
+      params:
+        nodes: ["a", "b", "c", "h = a*b", "k = a*c", "f = h + k"]
+        edges: [["a", "h"], ["b", "h"], ["a", "k"], ["c", "k"], ["h", "f"], ["k", "f"]]
+        root: "f"
+
+  try_it: >-
+    Implement a Node with three fields — data, parents, backward — then differentiate
+    $f = (a \cdot b + c) \cdot d$ at $a=2, b=3, c=4, d=5$ both by hand and with your engine.
+    Then reuse $b$ twice, $f = (a \cdot b + b) \cdot d$, and check that your engine returns
+    $\partial f/\partial b = 6.0$; if it returns 3.0 you assigned the gradient instead of adding it.
+  interview_questions:
+    - question: 'Why must the backward walk run in reverse topological order rather than any order?'
+      level: mid
+      key_points:
+        - 'A node cotangent is complete only after every consumer has contributed, so the closure must run after all of its children.'
+        - 'Build the order with a post-order DFS from the loss and reverse it: linear in V + E, and measured at 0.16-0.19 us per node.'
+        - 'Run out of order and the closure sees a partial cotangent: for a three-factor chain the gradient is short by exactly the missing factor.'
+        - 'Reverse order is also what makes one node carry the sum over all paths, which is the multivariate chain rule.'
+      follow_up: 'What is the difference between the topological order and the order in which you happened to build the graph?'
+    - question: 'Your scalar engine trains a 64-sample MNIST batch through a 784-to-128 layer and runs out of memory. What is the structural cause, and what redesign fixes it?'
+      level: senior
+      key_points:
+        - 'One node per scalar: 64 x 128 x 784 = 6,422,528 multiply nodes for a single layer.'
+        - 'Each node with its float is about 88 bytes, so that layer costs roughly 539 MiB before any arithmetic.'
+        - 'The closures also retain forward values, so the memory is a retention bill rather than an arithmetic one.'
+        - 'The fix is one node per array with a vectorised VJP that returns an array per parent, plus recomputation instead of storage where it pays.'
+      follow_up: 'When would you stop hand-rolling this and implement a torch.autograd.Function instead? Name the two methods you would have to write.'
+    - question: 'Why can in-place mutation break a tensor engine but not a scalar one?'
+      level: mid
+      key_points:
+        - 'The closure captures a pointer to the array, not a copy, so mutating the array after the forward pass changes what backward reads.'
+        - 'In a scalar engine data is a Python float and x.data += 1 rebinds the attribute, leaving the captured float untouched — safe by accident.'
+        - 'PyTorch detects it after the fact with a version counter and raises the modified-by-an-inplace-operation error.'
+        - 'The repair is to clone before mutating, or to express the update out of place so the saved tensor is never written.'
+  common_mistakes:
+    - 'Writing p.grad = ... instead of p.grad += ..., which silently halves the gradient of any value with fan-out: f = h + h at a=2, b=3 gives 3.0 instead of 6.0.'
+    - 'Forgetting to clear gradients between steps. p.grad is a persistent buffer, so step 100 applies the sum of 100 step-gradients and the effective learning rate grows linearly.'
+    - 'Gradient-checking with a fixed epsilon such as 1e-4 in float32, where roundoff swamps the central difference; the truncation and roundoff balance at epsilon_mach^(1/3) = 6.06e-6 in float64.'
+  further_reading:
+    - label: "Baydin, Pearlmutter, Radul & Siskind, Automatic Differentiation in Machine Learning: A Survey (JMLR 2018)"
+    - label: "PyTorch autograd mechanics"
+      url: "https://pytorch.org/docs/stable/notes/autograd.html"

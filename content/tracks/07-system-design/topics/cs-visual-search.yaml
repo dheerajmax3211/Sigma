@@ -1,0 +1,705 @@
+id: cs-visual-search
+slug: cs-visual-search
+title: "Case Study: Billion-Image Visual Search"
+summary: >-
+  Index a billion images so a query returns in 100 ms — and watch the storage
+  arithmetic force the architecture: 2.05 TB of fp32 vectors becomes 64 GB of
+  PQ codes, and the index that fits is not the index with the best recall.
+kind: lesson
+difficulty: expert
+position: 7
+estMinutes: 20
+prerequisites: [system-design-foundations]
+phase: system-design
+tags: [retrieval, ann, embeddings, vision, capacity, quantization]
+
+body:
+  big_idea: >-
+    Billion-scale visual search is an index-memory problem: a billion
+    512-dimensional vectors is 2.05 TB in fp32 and 64 GB as PQ codes, which
+    decides whether a query costs 30 ms or 300.
+  problem:
+    - "You size 512 dimensions x 4 bytes and get 2.05 TB, then find one node cannot hold it: compression was an architecture decision by accident."
+    - "You pick HNSW for recall: it needs full-precision vectors plus 32 edges per node; 2.05 TB becomes 2.8 TB and the graph does not compress."
+    - "You measure recall@10 on the 10,000 queries you tuned nprobe on, get 0.97, and ship 0.88: recall on a tuning set is a training metric."
+  analogy: >-
+    A library with a billion photographs and no captions. You cannot look at
+    all of them, so you sort them into 65,536 bins by coarse visual
+    similarity, look closely at the 64 bins nearest your query — about a
+    million photographs — and pull a thousand to examine properly. Each step
+    exists because the previous one could not afford to be more precise.
+  concept_points:
+    - "**The vector is 2 KB; a billion of them is 2 TB.** 1e9 x 512 x 4 bytes = **2.048 TB** fp32, 1.024 TB in fp16, 512 GB as int8. Nothing else in the design matters until you have chosen one of those three numbers, because each implies a different storage tier."
+    - "**PQ-64 buys a 32x reduction with a bounded, measurable distortion.** 512 dimensions split into 64 subspaces of 8, each quantised to 256 centroids: **64 bytes per vector**, so 1e9 vectors is **64 GB** and the codebook is 64 x 256 x 8 x 4 = **512 KiB** — small enough to stay in L2 while scanning."
+    - "**Scan cost is bytes, not vectors.** Probing 64 of 65,536 lists touches 1e9/65,536 x 64 = **976,562 vectors = 62.5 MB per query**. At 200 GB/s of random-read bandwidth that is ~310 us; the same probe against fp32 vectors would be 2 GB and 10 ms."
+    - "**Exhaustive search is bandwidth-impossible, not merely slow.** One query against 2.048 TB at 3.35 TB/s takes **611 ms**; at 5,787 mean qps the cluster would need 11.9 PB/s. Approximate retrieval is the precondition, exactly as in text retrieval, but here the ratio is enforced by memory bandwidth rather than FLOPs."
+    - "**Two-stage retrieval exists because codes cannot rank.** A PQ code is good at \\\"is this neighbourhood right\\\" and bad at \\\"which of these two is closer\\\". Scan 976K codes, take the top 1,000, then rerank those against fp16 vectors — 1,000 x 1 KB = **1 MB**, a rounding error against the 62.5 MB scan."
+    - "**Sharding is a latency decision, not a capacity one.** 64 GB of codes fits on one machine; the reason to shard 16 ways is that 17,361 peak qps x 62.5 MB = **1.09 TB/s** of scan bandwidth, or **68 GB/s per shard** at 16 shards. Capacity says one node; throughput says sixteen."
+  definitions:
+    - { term: "Embedding", meaning: "A fixed-length vector produced by an encoder; 512 floats here, compared by cosine or inner product." }
+    - { term: "ANN", meaning: "Approximate nearest neighbour. Trades exactness for a bounded scan; recall@k is the accounting of that trade." }
+    - { term: "IVF", meaning: "Inverted file index: k-means partitions the space, and a query scans only the nprobe nearest lists." }
+    - { term: "PQ", meaning: "Product quantisation: split the vector into subspaces, quantise each to 256 centroids, store the centroid IDs as bytes." }
+    - { term: "nprobe", meaning: "Number of IVF lists scanned per query. The single dial trading recall for latency." }
+    - { term: "Recall@k", meaning: "Fraction of true top-k neighbours returned. Must be measured against brute force on a held-out query sample." }
+    - { term: "Rerank", meaning: "Second-stage exact scoring of a shortlist using higher-precision vectors; fixes PQ's inability to order near-ties." }
+    - { term: "Centroid drift", meaning: "The mismatch that accumulates between k-means centroids and a growing dataset, degrading recall silently." }
+    - { term: "Tombstone", meaning: "A deletion marker that keeps the graph or list structure intact until a rebuild; queries filter it post hoc." }
+    - { term: "Fan-out", meaning: "Querying many shards in parallel and merging. p99 is set by the slowest shard, not the mean." }
+
+  diagrams:
+    - type: pipeline
+      title: "One query, four budgets"
+      nodes:
+        - label: "Encode"
+          note: "6 ms, ViT-B/16"
+          detail: "224-pixel image, patch 16, 196 patches plus CLS. A 448-pixel query quadruples the token count and 16x the attention."
+        - label: "IVF probe"
+          note: "28 ms, 64 of 65,536 lists"
+          detail: "976,562 codes at 64 bytes = 62.5 MB scanned per query. The dominant cost and the only real recall dial."
+        - label: "Rerank"
+          note: "9 ms, top 1,000"
+          detail: "1,000 fp16 vectors = 1 MB, scored exactly. Cheap because the first stage was aggressive."
+        - label: "Post-process"
+          note: "15 ms"
+          detail: "Dedupe near-identical images, apply policy filters, and merge results across shards — the stage that silently becomes the tail."
+    - type: architecture
+      title: "Codes, vectors, and a graph that does not compress"
+      nodes:
+        - { id: q, x: 0, y: 1, label: "Query encoder", kind: "gpu", detail: "ViT-B/16, 512-d projection. 6 ms of the 100 ms budget; batching helps throughput but adds queueing latency." }
+        - { id: sh, x: 1, y: 0, label: "Index shards", kind: "worker", detail: "16 shards x 62.5M vectors, 4 GB of PQ codes each. Scanned in parallel; p99 is the slowest shard." }
+        - { id: full, x: 1, y: 2, label: "Full vectors", kind: "storage", detail: "1.02 TB fp16 on local NVMe for reranking top-1,000. Not in RAM, and does not need to be." }
+        - { id: merge, x: 2, y: 1, label: "Merger", kind: "server", detail: "K-way merge by score across 16 shards, then dedupe. Fan-out tail latency lives here." }
+        - { id: ins, x: 0, y: 3, label: "Ingest", kind: "queue", detail: "1e7 inserts/day = 116/s. Assigned to nearest list, tombstoned on delete, rebuilt nightly into a shadow index." }
+      edges:
+        - { from: q, to: sh, label: "vector" }
+        - { from: sh, to: full, label: "top 1,000" }
+        - { from: full, to: merge, label: "rescore" }
+        - { from: ins, to: sh, label: "insert", style: "async" }
+    - type: plot
+      title: "Bytes scanned per query versus nprobe"
+      chart: "line"
+      xLabel: "nprobe (of 65,536 lists)"
+      yLabel: "MB scanned per query"
+      series:
+        - name: "PQ-64 codes"
+          points:
+            - { x: 8, y: 7.8 }
+            - { x: 16, y: 15.6 }
+            - { x: 32, y: 31.3 }
+            - { x: 64, y: 62.5 }
+            - { x: 128, y: 125.0 }
+            - { x: 256, y: 250.0 }
+    - type: compare
+      title: "FP32 brute force versus IVF-PQ-64"
+      left_label: "Exhaustive fp32"
+      left_points:
+        - "2.048 TB read per query"
+        - "611 ms at 3.35 TB/s — before any compute"
+        - "11.9 PB/s needed at 5,787 mean qps"
+        - "Recall 1.0, and zero feasibility"
+      right_label: "IVF-PQ, nprobe 64"
+      right_points:
+        - "62.5 MB read per query, 32x less"
+        - "~310 us of scan at 200 GB/s per node"
+        - "1.09 TB/s at peak, 68 GB/s per shard"
+        - "Recall measured, not assumed"
+
+  problem_statement: >-
+    Design a reverse-image search service over one billion images: a user
+    submits a photo and receives the ten nearest catalogue images in under
+    100 ms at p99, including re-ranking for duplicates. The catalogue grows by 1%
+    a day and deletions must take effect within an hour. The index must fit a
+    fixed hardware budget of sixteen nodes with 256 GB of RAM and local NVMe
+    each, and recall@10 must be measurable and contractual.
+
+  requirements:
+    functional:
+      - "Return the ten nearest catalogue images to a query image, with near-duplicate suppression."
+      - "Absorb 1e7 new images per day and honour deletions within one hour."
+      - "Expose recall@10 measured against brute force on a held-out query set."
+      - "Support filtered search by catalogue partition (e.g. marketplace, editorial) without collapsing recall."
+    non_functional:
+      - "p99 100 ms end to end at 17,361 peak qps; p50 under 40 ms."
+      - "Recall@10 at least 0.95 on the contractual evaluation set."
+      - "Index available during rebuilds: no nightly window where recall silently degrades."
+      - "Per-node RAM under 256 GB and NVMe under 4 TB, with 30% headroom."
+
+  clarifying_questions:
+    - question: "Is the query an image, a text description, or both?"
+      why_it_matters: "Image-to-image uses a single tower and one index; text-to-image needs a joint embedding space and a second index, which changes both the memory budget and the partition strategy."
+    - question: "What is the contractual recall target, and on which query distribution?"
+      why_it_matters: "Recall determines nprobe, which determines bytes scanned, which determines shard count. A 0.95 target and a 0.99 target can differ by 4x in hardware."
+    - question: "How fresh must new images be, and how are deletions handled?"
+      why_it_matters: "Hourly freshness forbids nightly rebuild-only designs; deletions force tombstones plus a filter, which costs latency and must be budgeted."
+    - question: "Are there hard filters, e.g. only images the user may see?"
+      why_it_matters: "Post-filtering an ANN shortlist destroys recall when the filter is selective; pre-filtering by partition means per-partition indexes and a different shard layout."
+    - question: "Is exactness ever required, for example for copyright matching?"
+      why_it_matters: "If a subset of queries must be exact, that subset needs brute force over a much smaller candidate set or a hash-based near-duplicate path — a second system, not a parameter change."
+
+  capacity_estimation:
+    assumptions:
+      - "1e9 catalogue images, 512-dimensional embeddings, 500M queries per day with a 3x peak factor."
+      - "PQ with 64 subquantisers of 8 bits each; fp16 full vectors retained for reranking."
+      - "16 index shards, 256 GB RAM and local NVMe per node."
+      - "IVF with nlist = 65,536 and nprobe = 64."
+      - "100 ms p99 budget split as encode 6, ANN 28, rerank 9, network 22, post 15, slack 20."
+    arithmetic:
+      - label: "Vector storage in three precisions"
+        calculation: "1e9 x 512 x 4 B = 2.048e12 B = 2.048 TB fp32; x 2 for fp16 = 1.024 TB; x 1 for int8 = 512 GB"
+        conclusion: "Precision alone spans a 4x range. fp32 does not fit sixteen 256 GB nodes with headroom; int8 does, but loses ranking fidelity that reranking has to recover."
+      - label: "PQ code size and compression"
+        calculation: "512 dims / 64 subquantisers = 8 dims each; 8 bits per subquantiser = 1 B; 64 x 1 B = 64 B per vector; 2,048 B / 64 B = 32x; 1e9 x 64 B = 6.4e10 B"
+        conclusion: "64 GB total for the codes, a 32x reduction. The codebook is 64 x 256 x 8 x 4 = 512 KiB and stays resident while scanning."
+      - label: "Bytes scanned per query"
+        calculation: "1e9 / 65,536 lists = 15,259 vectors per list; x 64 probes = 976,562 vectors; x 64 B = 6.25e7 B"
+        conclusion: "62.5 MB per query at nprobe 64. At 200 GB/s of effective random-read bandwidth that is about 310 us of scan — three orders of magnitude below the 611 ms fp32 brute force."
+      - label: "Exhaustive baseline"
+        calculation: "2.048 TB per query / 3.35 TB/s = 6.11e-1 s; x 5,787 mean qps = 1.19e16 B/s"
+        conclusion: "611 ms per query and 11.9 PB/s of aggregate bandwidth at mean traffic. Exhaustive search is excluded by arithmetic before any model choice."
+      - label: "Aggregate scan bandwidth at peak"
+        calculation: "17,361 qps x 62.5 MB = 1.085e12 B/s; / 16 shards = 6.78e10 B/s"
+        conclusion: "1.09 TB/s aggregate and 68 GB/s per shard. This, not the 64 GB of codes, is why the index is sharded sixteen ways."
+      - label: "Centroid assignment cost"
+        calculation: "1e9 vectors x 65,536 centroids x 512 dims x 2 FLOP = 6.71e16 FLOP; / 1e14 FLOP/s = 671 s"
+        conclusion: "One full assignment pass is ~11 minutes of dedicated compute. Training centroids on a 10M sample costs 6.7 s per iteration, so k-means training is cheap and assignment is the bill."
+
+  architecture_summary: >-
+    Queries are encoded by a ViT-B/16 tower into 512 dimensions and fanned out
+    to 16 index shards, each holding 62.5M PQ-64 codes in RAM and fp16 vectors on
+    local NVMe. Each shard probes 64 of its 65,536 lists, scans ~62.5 MB of codes,
+    and returns its local top 100. The merger performs a k-way merge, requests
+    exact scores for the global top 1,000 from the NVMe tier, dedupes near
+    identical images, and returns ten. Ingest is a stream of 116 vectors per
+    second: each is encoded, assigned to its nearest list, and appended; deletes
+    write tombstones that the merger filters. A nightly job retrains centroids on
+    a 10M sample, rebuilds into a shadow index, and swaps atomically.
+
+  deep_dives:
+    - topic: "Choosing the index family"
+      explanation: >-
+        IVF-PQ minimises memory: 64 bytes per vector, a scan that is pure
+        sequential byte reads, and a recall dial (nprobe) that maps directly onto
+        latency. HNSW maximises recall per byte scanned but stores a graph with
+        roughly M = 32 links per node at 4 bytes each — 128 bytes per vector on
+        top of the vectors themselves — and the graph's random-access pattern is
+        hostile to the memory system at a billion scale. DiskANN keeps the graph
+        on SSD and the compressed vectors in RAM, trading a page fault budget for
+        capacity. The choice is really "what is your RAM budget per vector",
+        and at 1e9 vectors the answer decides everything else.
+      tradeoffs:
+        - option: "IVF-PQ with fp16 rerank"
+          pros: "64 B per vector fits a billion in 64 GB; scan is bandwidth-friendly and predictable; recall is a single dial."
+          cons: "Codes cannot order near-ties, so a second stage is mandatory; recall degrades as lists grow unevenly under insert."
+        - option: "HNSW on full-precision vectors"
+          pros: "Best recall at low latency for a given nprobe; no rerank stage needed; excellent for 1e6-1e8 scales."
+          cons: "2.8 TB of vectors plus graph at 1e9, and the graph does not compress; random access pattern makes p99 unstable under memory pressure."
+        - option: "DiskANN with SSD-resident graph"
+          pros: "Capacity scales with SSD rather than RAM; strong recall at moderate latency; cheaper per vector than RAM-resident graphs."
+          cons: "Tail latency includes page faults, so p99 depends on cache hit rate and SSD queue depth; harder to reason about under fan-out."
+
+    - topic: "Recall is a contract, not a metric"
+      explanation: >-
+        Recall@10 must be defined against a reference: brute force over a sample
+        of queries, or an exact ground truth built offline. The trap is measuring
+        it on the queries used to tune nprobe, or on a sample drawn from the same
+        catalogue slice as the index build. A second trap is distribution shift:
+        queries from mobile cameras are noisier than the catalogue images the
+        encoder was tuned on, so the embedding neighbourhood itself is worse.
+        The contractual number should be measured on held-out queries, at
+        production nprobe, against exact search on the live index's snapshot.
+      tradeoffs:
+        - option: "Raise nprobe to hit recall"
+          pros: "Immediate, monotone improvement with no retraining; trivially reversible."
+          cons: "Costs linearly in bytes scanned: 64 to 128 probes doubles scan bandwidth and therefore shard count."
+        - option: "Rerank more candidates"
+          pros: "Recovers ordering errors cheaply — 1,000 fp16 vectors is 1 MB — without touching the scan."
+          cons: "Cannot recover a true neighbour that was never in the scanned lists; fixes ranking, not recall."
+        - option: "Retrain the encoder on query-like images"
+          pros: "Improves the neighbourhood itself, so every probe becomes more informative."
+          cons: "Requires a full re-embed of 1e9 images and a full index rebuild; a multi-week project with a recall cliff during migration."
+
+    - topic: "Fan-out and the tail"
+      explanation: >-
+        Sixteen shards means the query waits for the slowest. If per-shard p99 is
+        28 ms and the shards are independent, the probability that at least one
+        exceeds 28 ms is 1 - 0.99^16 = 0.148 — so the fan-out p99 is roughly the
+        per-shard p99.9. That is why shard count raises tail latency and why
+        hedged requests (send to a replica after p95) exist. The arithmetic also
+        explains why 16 shards is a throughput decision that must be paid for in
+        tail budget, not a free scaling knob.
+      tradeoffs:
+        - option: "More shards for throughput"
+          pros: "Linear scan-bandwidth scaling; smaller per-shard working set improves cache behaviour."
+          cons: "Tail latency worsens with fan-out, and the merger becomes a coordination point; 32 shards makes p99 the p99.97 of a shard."
+        - option: "Replicate shards and hedge"
+          pros: "Cuts the tail directly: a second copy answers when the first is slow, at the cost of duplicated storage."
+          cons: "Doubles RAM for the codes, and hedging adds 5-15% extra load precisely when the system is already under stress."
+        - option: "Fewer, larger shards"
+          pros: "Better tail behaviour and a simpler merger; fewer connections per query."
+          cons: "Each shard must hold more codes and serve more bandwidth, so a single node becomes a throughput ceiling."
+
+    - topic: "Incremental indexing and deletion"
+      explanation: >-
+        Ten million inserts a day at 116/s cannot wait for a nightly rebuild, and
+        a rebuild that doubles memory is exactly what a 256 GB budget forbids.
+        The workable pattern is append-to-list: assign each new vector to its
+        nearest existing centroid, append the code, and keep fp16 vectors on
+        NVMe. Deletes become tombstones filtered at merge time, which costs a
+        small amount of latency and a growing amount of wasted scan. The signal
+        to rebuild is list-size skew and tombstone ratio, not the calendar —
+        rebuild when the largest list is some multiple of the median, because
+        that is when a fixed nprobe stops covering the true neighbourhood.
+      tradeoffs:
+        - option: "Append-only with tombstones"
+          pros: "No downtime, no double memory, inserts are O(1) plus an assignment; simple to operate."
+          cons: "Tombstones waste scan bandwidth and lists skew over time; recall decays gradually and invisibly."
+        - option: "Periodic full rebuild into a shadow index"
+          pros: "Restores balanced lists and fresh centroids; recall is a known quantity after each rebuild."
+          cons: "Needs 2x index memory or a disk-resident shadow, and the swap is a hard cutover with a rollback story to design."
+        - option: "Split hot lists online"
+          pros: "Targets the actual pathology — a list that has outgrown its nprobe coverage — without a global rebuild."
+          cons: "Requires rebalancing logic and a temporary dual-read; complexity that only pays if skew is severe."
+
+  bottlenecks:
+    - failure: "Index rebuild competes with serving for memory and IO"
+      symptom: "Nightly recall dip and a p99 spike between 02:00 and 03:00; node memory climbs to 95% and the kernel starts reclaiming page cache, which slows the mmap'd vectors."
+      mitigation: "Build the shadow index on dedicated nodes and stream it in, or rebuild one shard at a time behind a read-only replica; cap the builder's memory and throttle its IO. Never rebuild in place on a serving node."
+    - failure: "PQ codes stop discriminating after centroid drift"
+      symptom: "Recall@10 falls from 0.95 to 0.88 over six weeks with no code change; list-size distribution becomes heavy-tailed and nprobe 64 covers a shrinking fraction of true neighbours."
+      mitigation: "Track list-size skew and tombstone ratio as first-class metrics, retrain centroids quarterly on a fresh sample, and alert on recall measured continuously against a sampled brute-force reference."
+    - failure: "Fan-out tail latency exceeds the budget"
+      symptom: "Median latency is 35 ms but p99 is 180 ms; one shard per query is slow and the merger waits for it. Retries make it worse because they add load to the slow shard."
+      mitigation: "Budget per-shard deadlines with partial results, hedge to a replica at p95, and cap fan-out. If p99 still misses, reduce shard count and accept a larger per-shard working set."
+
+  what_to_steal:
+    - "Do the compression arithmetic first: 512 x 4 bytes versus 64-byte PQ codes is 2.05 TB versus 64 GB, and that single ratio chooses RAM versus SSD."
+    - "Size shards by scan bandwidth, not by capacity: 62.5 MB per query x 17,361 qps is 1.09 TB/s, which no single node can serve."
+    - "Make recall a measured contract on held-out queries against brute force — the only number that survives a distribution shift."
+    - "Keep fp16 vectors for reranking so the cheap stage can be aggressive: 1,000 x 1 KB is 1 MB against a 62.5 MB scan."
+
+  markdown: |
+    ## Start with bytes per vector
+
+    A 512-dimensional fp32 embedding is 2 KB. A billion of them:
+
+    $$10^{9} \times 512 \times 4\ \text{B} = 2.048\times10^{12}\ \text{B}
+    = 2.048\ \text{TB}.$$
+
+    In fp16 that is 1.024 TB, in int8 512 GB. Product quantisation with 64
+    subquantisers of 8 bits stores one byte per 8 dimensions:
+
+    $$10^{9} \times 64\ \text{B} = 6.4\times10^{10}\ \text{B} = 64\ \text{GB},$$
+
+    a **32x** reduction. That is the whole architectural fork: 2 TB does not fit
+    a sixteen-node cluster with headroom, 64 GB fits on one machine.
+
+    | Encoding | Bytes/vector | 1e9 vectors | Where it lives |
+    |---|---|---|---|
+    | fp32 | 2,048 | 2.05 TB | Sharded NVMe, not RAM |
+    | fp16 | 1,024 | 1.02 TB | NVMe, for reranking |
+    | int8 | 512 | 512 GB | RAM, borderline |
+    | **PQ-64** | **64** | **64 GB** | **RAM, comfortably** |
+
+    ## Why brute force is excluded by bandwidth
+
+    One exhaustive query reads 2.048 TB. At 3.35 TB/s that is **611 ms** — before
+    any distance is computed. At mean traffic of 5,787 queries per second the
+    cluster would need **11.9 PB/s**. This is the same argument as text
+    retrieval, but with a different bottleneck: text retrieval runs out of FLOPs,
+    image retrieval runs out of memory bandwidth.
+
+    Probing 64 of 65,536 lists instead:
+
+    $$\frac{10^{9}}{65{,}536} \times 64 = 976{,}562\ \text{vectors}
+    \quad\Rightarrow\quad 976{,}562 \times 64\ \text{B} = 62.5\ \text{MB}.$$
+
+    At 200 GB/s of effective random-read bandwidth that is roughly **310 us**.
+    The factor between the two designs is about 2,000.
+
+    ## The 100 ms waterfall
+
+    | Stage | p99 |
+    |---|---|
+    | Query encode (ViT-B/16) | 6 ms |
+    | IVF probe, 64 lists | 28 ms |
+    | Rerank top 1,000 in fp16 | 9 ms |
+    | Network in/out | 22 ms |
+    | Dedupe and policy | 15 ms |
+    | Slack | 20 ms |
+    | **Total** | **100 ms** |
+
+    The 20 ms of slack is not generosity. Sixteen shards means the query waits
+    for the slowest, and if each shard's p99 is 28 ms then the probability that
+    at least one of sixteen exceeds it is $1-0.99^{16} = 0.148$ — the fan-out p99
+    is approximately a single shard's p99.9. Sharding is how you buy bandwidth
+    and how you lose tail latency, in the same move.
+
+    ## Tokens before you tune anything
+
+    A 224-pixel image at patch size 16 gives $224/16 = 14$ patches per side:
+
+    $$14 \times 14 = 196\ \text{patch tokens} + 1\ \text{CLS} = 197.$$
+
+    ViT-L/14 at the same resolution gives $16 \times 16 = 256$. Doubling input
+    resolution to 448 quadruples the token count to 784 and multiplies attention
+    cost by sixteen. That is why visual-search encoders ship at 224 and why the
+    embedding, not the encoder, is where the system's money goes.
+
+    ## Build, insert, delete
+
+    A full re-embed of the catalogue is 24 GPU-hours:
+
+    $$10^{9} \times 34\ \text{GFLOP} = 3.4\times10^{19}\ \text{FLOP}
+    \quad\Longrightarrow\quad 85{,}000\ \text{GPU-s} = 23.6\ \text{GPU-hours}$$
+
+    at 400 TFLOP/s, assuming IO keeps up. That is cheap enough that "retrain the
+    encoder" is a monthly option rather than a quarterly project — and expensive
+    enough that the index rebuild around it, not the encoding, sets the schedule.
+
+    Inserts are 116/s at 1% daily growth, and encoding them is 3.9 TFLOP/s of
+    aggregate compute: one percent of one GPU. **The ingest path is never the
+    problem.** The problem is that every insert has to be assigned to a list, and
+    list sizes drift. A list that began at 15,259 vectors can double in a quarter
+    if its region of space is where new content happens to land. Once a list is
+    twice the median, a fixed nprobe covers proportionally less of the true
+    neighbourhood, and recall falls without any single request getting slower.
+
+    Deletes are worse than inserts because they leave holes. A tombstone keeps the
+    structure valid and costs scan bandwidth forever; at a 10% tombstone ratio, a
+    tenth of the 62.5 MB you read per query is dead weight. So the rebuild trigger
+    is two numbers, not one: largest-list-to-median above roughly 2x, or
+    tombstone ratio above 10%.
+
+    ## What recall costs in hardware
+
+    Recall is bought with nprobe, and nprobe is bought with bandwidth. Doubling
+    probes doubles the 62.5 MB per query and therefore doubles the shard count at
+    the same qps — sixteen nodes become thirty-two, and the fan-out tail gets worse
+    in the same move.
+
+    Reranking deeper is the cheap half of the trade. A thousand fp16 vectors is
+    1 MB, so widening the rerank list from 100 to 1,000 costs 1.6% of the scan it
+    depends on. That asymmetry is the design rule: spend on rerank depth until
+    ordering stops improving, and spend on nprobe only when the true neighbour is
+    missing from the scanned lists entirely. The two failures look identical on a
+    dashboard and have completely different fixes, which is why recall and NDCG
+    have to be measured separately.
+
+    The 100 ms budget is where those choices meet: encode 6, probe 28, rerank 9,
+    network 22, post 15, slack 20. Only the 28 ms probe is elastic. Everything
+    else is the fixed cost of being a service, so a recall target that needs more
+    than about 40 ms of probing is a target that needs a better encoder, not a
+    bigger cluster.
+
+    ## Where the analogy breaks
+
+    The bin assignment is lossy and silent. Each image is replaced by a 64-byte
+    sketch, so a true neighbour can be assigned to a list you did not probe, and
+    the result set looks perfectly reasonable while missing it. Recall does not
+    announce itself; it has to be measured against brute force on held-out
+    queries.
+
+    And the library grows while you search it. Ten million images a day at 116
+    per second is nothing in rate and corrosive in effect: lists skew, centroids
+    drift, and a fixed nprobe covers a shrinking share of the true neighbourhood.
+    The rebuild trigger is list-size skew, not the calendar.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Billion-scale visual search is an **index-memory problem disguised as a model problem**. A billion 512-dimensional vectors is 2.05 TB in fp32 and 64 GB as 64-byte PQ codes — a 32x compression that decides whether the index lives in RAM or on disk, and therefore whether a query costs 30 ms or 300. Recall is the price you negotiate for that compression, and it is measured, never assumed.
+
+    ### The analogy, in full
+
+    A library with a billion photographs and no captions. You cannot look at all of them, so you sort them into 65,536 bins by coarse visual similarity, then look closely at the 64 bins nearest your query — about a million photographs — and finally pull a thousand out of those to examine properly. The bins are the IVF lists; the close look is the code scan; the thousand is the rerank. Each step exists because the previous one could not afford to be more precise. Two ways the analogy breaks. First, the bin assignment is lossy: each photo is replaced by a 64-byte sketch, so a photo can sit near the wrong bin and the true match is silently absent from the bins you scanned. That is the recall you traded, and it does not announce itself. Second, the library is growing while you search it — ten million new photographs a day — so the bins keep filling and the coarse structure slowly stops matching the data.
+
+    ### Failure modes, in full
+
+    - You size the index at 512 dimensions x 4 bytes and get 2.05 TB, then discover a single node cannot hold it and the shard fan-out doubles your p99. The compression choice was an architecture decision and you made it by accident.
+    - You pick HNSW because it has the best recall, then find it needs the full-precision vectors plus a graph with roughly 32 edges per node — 2.05 TB becomes 2.8 TB, and the graph does not compress.
+    - You measure recall@10 on the same 10,000 queries you tuned nprobe on, get 0.97, and ship 0.88. Recall on a tuning set is a training metric; production recall is a different distribution.
+    - You rebuild the index nightly to absorb new uploads, and for 40 minutes every night the service serves from a stale index while the rebuild doubles memory. Ten million daily inserts deserved an incremental path, not a rebuild.
+    - You compare two ANN libraries on a laptop with 1e6 vectors and the ranking reverses at 1e9, because the graph's memory traffic and the centroid table's cache behaviour scale differently.
+
+    ### The mechanisms, in full
+
+    - **The vector is 2 KB; a billion of them is 2 TB.** 1e9 x 512 x 4 bytes = **2.048 TB** fp32, 1.024 TB in fp16, 512 GB as int8. Nothing else in the design matters until you have chosen one of those three numbers, because each implies a different storage tier.
+    - **PQ-64 buys a 32x reduction with a bounded, measurable distortion.** 512 dimensions split into 64 subspaces of 8, each quantised to 256 centroids: **64 bytes per vector**, so 1e9 vectors is **64 GB** and the codebook is 64 x 256 x 8 x 4 = **512 KiB** — small enough to stay in L2 while scanning.
+    - **Scan cost is bytes, not vectors.** Probing 64 of 65,536 lists touches 1e9/65,536 x 64 = **976,562 vectors = 62.5 MB per query**. At a per-node random-read bandwidth of 200 GB/s that is ~310 us; the same probe against fp32 vectors would be 2 GB and 10 ms.
+    - **Exhaustive search is bandwidth-impossible, not merely slow.** One query against 2.048 TB at 3.35 TB/s takes **611 ms**; at 5,787 mean qps the cluster would need 11.9 PB/s. Approximate retrieval is the precondition, exactly as in text retrieval, but here the ratio is enforced by memory bandwidth rather than FLOPs.
+    - **ViT token count is arithmetic, not magic.** A 224-pixel image at patch 16 is 14 x 14 = **196 patches**, plus the CLS token = 197 tokens; ViT-L/14 gives 16 x 16 = 256. Attention cost is quadratic in that count, which is why 224 is the default and 448 costs 4x the tokens and 16x the attention.
+    - **Two-stage retrieval exists because codes cannot rank.** PQ codes are good at "is this neighbourhood right" and bad at "which of these two is closer": the 64-byte code has, in effect, 64 coarse comparisons. Scan 976K codes, take the top 1,000, then rerank those against fp16 vectors — 1,000 x 1 KB = **1 MB**, a rounding error against the 62.5 MB scan.
+    - **Sharding is a latency decision, not a capacity one.** 64 GB of codes fits on one machine; the reason to shard 16 ways is that 17,361 peak qps x 62.5 MB = **1.09 TB/s** of scan bandwidth, or **68 GB/s per shard** at 16 shards. Capacity says one node; throughput says sixteen.
+    - **Index build is a batch job with a real bill.** Assigning 1e9 vectors to 65,536 centroids costs 1e9 x 65,536 x 512 x 2 = **6.7e16 FLOP**, which is ~671 s at 1e14 FLOP/s — and that is one pass. Train centroids on a 10M sample (6.7 s per iteration), then assign once and maintain incrementally.
+    - **Incremental insertion has to preserve the coarse structure.** At 1% daily growth that is 1e7 inserts/day = 116/s, trivial in rate and corrosive in effect: lists grow unevenly, centroid drift accumulates, and the only honest fix is periodic retraining with a shadow index and an atomic swap.
+  derivations:
+    - title: "Compression ratio and code size"
+      latex: |
+        With dimension $d$, $m$ subquantisers of $b$ bits each, code size is
+        $m b / 8$ bytes, against $4d$ bytes for fp32, so
+        $$\rho = \frac{4d}{mb/8}.$$
+        At $d = 512$, $m = 64$, $b = 8$:
+        $$\rho = \frac{2048}{64} = 32.$$
+      prose: >-
+        The ratio is linear in $m$, so halving subquantisers halves memory and
+        roughly doubles distortion — which is why $m = 64$ at $d = 512$ (8
+        dimensions per subspace) is the common operating point: below that, the
+        subspaces are too wide for 256 centroids to represent.
+    - title: "Scan bytes at a given nprobe"
+      latex: |
+        With $n$ vectors, $n_{\text{list}}$ lists and code size $c$ bytes, a probe
+        of $n_{\text{probe}}$ lists scans
+        $$S = \frac{n}{n_{\text{list}}}\, n_{\text{probe}}\, c.$$
+        At $n = 10^{9}$, $n_{\text{list}} = 65{,}536$, $n_{\text{probe}} = 64$,
+        $c = 64$:
+        $$S = 15{,}259 \times 64 \times 64 = 6.25\times10^{7}\ \text{B}.$$
+      prose: >-
+        62.5 MB. The relation is linear in nprobe and in code size, so the two
+        ways to buy recall — more probes, more bytes per code — cost the same
+        resource and are chosen by which one preserves more neighbours.
+    - title: "Fan-out tail probability"
+      latex: |
+        If each of $S$ independent shards exceeds its p99 with probability
+        $q = 0.01$, the probability that at least one does is
+        $$P_{\text{slow}} = 1 - (1-q)^{S}.$$
+        At $S = 16$:
+        $$P_{\text{slow}} = 1 - 0.99^{16} = 0.148.$$
+      prose: >-
+        So a 16-way fan-out turns a per-shard p99 into roughly a per-query p85 —
+        the number you actually measure. It is also why hedged requests, which
+        re-issue to a replica after p95, buy tail latency more cheaply than
+        adding capacity.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        It is a memory-bandwidth problem. Decide bytes per vector first (2 KB or
+        64 B), because that decides RAM versus SSD and therefore latency. Then
+        size shards by scan bandwidth, and make recall a measured contract.
+      blocks:
+        - kind: checklist
+          body: |
+            - 1e9 x 512 x 4 = 2.05 TB; x 64 B PQ = 64 GB
+            - 62.5 MB scanned per query at nprobe 64
+            - 17,361 qps x 62.5 MB = 1.09 TB/s, so shard by bandwidth
+            - Fan-out makes p99 the slowest shard's p99.9
+            - Recall measured against brute force on held-out queries
+      checkpoint: >-
+        If you drop from PQ-64 to PQ-32, what happens to memory and to the
+        rerank stage's importance?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Four numbers in order: vectors, bytes per vector, bytes scanned per
+        query, aggregate scan rate. Only then choose IVF versus HNSW, because the
+        choice is a consequence of the RAM budget, not a preference.
+      blocks:
+        - kind: checklist
+          body: |
+            - Vector count and dimension from the catalogue
+            - Encoding: fp32, fp16, int8, PQ — pick by RAM budget
+            - nprobe from the recall contract, measured not guessed
+            - Shards from aggregate scan bandwidth
+            - Rebuild trigger from list skew, not the calendar
+      checkpoint: >-
+        Why does a 16-way fan-out make your measured p99 worse than a single
+        shard's p99?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The capacity model plus the query path.
+      blocks:
+        - kind: pseudocode
+          body: |
+            bytes_fp32 = n * d * 4
+            bytes_pq   = n * m                     # m bytes per code
+            scan_bytes = (n / nlist) * nprobe * m
+            agg_bw     = peak_qps * scan_bytes
+            shards     = ceil(agg_bw / node_bw)
+
+            query(img):
+              v      = encoder(img)                 # 6 ms
+              lists  = centroids.top(nprobe)
+              codes  = scan(lists)                  # 62.5 MB
+              top1k  = rerank_exact(codes.top(1000))
+              return dedupe(top1k)[:10]
+      checkpoint: >-
+        Which variable in that pseudocode would you change to hit 0.97 recall,
+        and what does it cost?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Compression, scan bytes, fan-out tail.
+      blocks:
+        - kind: math
+          body: |
+            **Compression.** $\rho = 4d / (mb/8)$; at $d=512$, $m=64$, $b=8$:
+            32x.
+
+            **Scan.** $S = (n/n_{\text{list}})\,n_{\text{probe}}\,c = 62.5$ MB.
+
+            **Tail.** $P_{\text{slow}} = 1-(1-q)^S$; at $S=16$, $q=0.01$: 0.148.
+      checkpoint: >-
+        At 32 shards instead of 16, what is P_slow, and what does that imply for
+        the p99 budget?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The sizing model, the query path, and the metric you contract on.
+      blocks:
+        - kind: warning
+          body: >-
+            The failure that ships is recall measured on the tuning set. Hold out
+            queries, keep a brute-force reference over a snapshot, and measure at
+            production nprobe — otherwise the number is a training metric wearing
+            a production label.
+        - kind: code
+          language: python
+          body: |
+            import math
+
+            def visual_search_capacity(n=1e9, d=512, m=64, nlist=65536,
+                                       nprobe=64, peak_qps=17361,
+                                       node_bw_gbs=200):
+                scan_b = (n / nlist) * nprobe * m
+                return {
+                    "fp32_tb": n * d * 4 / 1e12,
+                    "pq_gb": n * m / 1e9,
+                    "scan_mb": scan_b / 1e6,
+                    "aggregate_tb_s": peak_qps * scan_b / 1e12,
+                    "shards_by_bw": math.ceil(peak_qps * scan_b / (node_bw_gbs * 1e9)),
+                }
+      checkpoint: >-
+        The function returns shards by bandwidth. What second calculation would
+        you run before ordering hardware?
+  try_it: >-
+    Compute 1e9 x 512 x 4 bytes (2.05 TB), then the PQ-64 size (1e9 x 64 bytes =
+    64 GB) and the 32x ratio. Then work out bytes scanned per query at nprobe 64:
+    (1e9/65,536) x 64 x 64 B = 62.5 MB, and multiply by 17,361 peak qps to see
+    whether one node can serve the aggregate.
+  interview_questions:
+    - question: "Why can you not just brute-force a billion vectors?"
+      level: senior
+      key_points:
+        - "One query reads 2.048 TB of fp32 vectors; at 3.35 TB/s that is 611 ms before any arithmetic."
+        - "At 5,787 mean queries per second the cluster would need 11.9 PB/s of bandwidth, which is not a hardware configuration that exists."
+        - "IVF-PQ scans 62.5 MB by touching 64 of 65,536 lists — a factor of roughly 32,000 fewer bytes."
+        - "The bottleneck in image retrieval is memory bandwidth, not FLOPs, which is why compression is the primary lever."
+      follow_up: "What does that tell you about the relative value of a faster GPU versus a better quantiser?"
+    - question: "You need 0.97 recall@10. Walk me through what that costs."
+      level: staff
+      key_points:
+        - "Recall is bought with nprobe, and bytes scanned rise linearly: 64 to 128 probes doubles the 62.5 MB per query."
+        - "At 17,361 peak qps, doubling scan bytes means doubling shards from 16 to 32, which also worsens fan-out tail latency."
+        - "Reranking more candidates is cheap and fixes ordering, but cannot recover a neighbour that was never in a scanned list."
+        - "The durable fix is encoder quality on query-like images, which requires re-embedding a billion images and a full rebuild."
+      follow_up: "How would you measure recall continuously in production without running brute force on live traffic?"
+    - question: "Why is p99 worse than your per-shard p99 suggests?"
+      level: staff
+      key_points:
+        - "With 16 independent shards each exceeding p99 with probability 0.01, at least one does so with probability 1 - 0.99^16 = 0.148."
+        - "The query waits for the slowest shard, so fan-out p99 is roughly a single shard's p99.9."
+        - "Retries amplify the problem by adding load precisely when a shard is already slow."
+        - "Mitigations are hedged requests to replicas, per-shard deadlines with partial results, or fewer larger shards."
+      follow_up: "What is the cost of hedging, and when would you turn it off?"
+    - question: "How do you handle ten million new images a day without a nightly outage?"
+      level: senior
+      key_points:
+        - "1e7 inserts/day is 116/s: assign to the nearest existing centroid, append the code, keep fp16 vectors on NVMe."
+        - "Deletes become tombstones filtered at merge time, which costs scan bandwidth and grows over time."
+        - "Rebuild into a shadow index and swap atomically; the trigger is list-size skew and tombstone ratio, not the calendar."
+        - "A full rebuild needs roughly 2x index memory or a disk-resident shadow, which must be in the capacity plan from day one."
+      follow_up: "What metric tells you a rebuild is urgent rather than merely due?"
+  common_mistakes:
+    - "Sizing the index in vectors rather than bytes: 1e9 x 512 x 4 B is 2.05 TB, and the cluster you drew cannot hold it."
+    - "Choosing HNSW for recall and then discovering the graph adds ~128 B per vector that does not compress."
+    - "Measuring recall@10 on the queries used to tune nprobe, then shipping a number that production does not reproduce."
+    - "Sharding for capacity when the constraint is aggregate scan bandwidth: 1.09 TB/s at peak, 68 GB/s per shard."
+  further_reading:
+    - label: "Jegou, Douze, Schmid, Product Quantization for Nearest Neighbor Search, IEEE TPAMI 2011"
+    - label: "Johnson, Douze, Jegou, Billion-scale Similarity Search with GPUs, IEEE Transactions on Big Data 2019"
+    - label: "Subramanya, Devvrit, Kadekodi, Krishnaswamy, Simhadri, DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node, NeurIPS 2019"
+  implementations:
+    - language: python
+      title: "Scan bytes and tail amplification across sixteen shards"
+      note: >-
+        PQ-64 is 64 GB for a billion vectors and a 64-list probe reads 62.5 MB, which at 17,361 QPS is 1.09 TB/s cluster-wide. The latency simulation draws lognormal shard service times with a 5 ms mean and shows the cluster p99 is the p99 of the maximum, about 1.21x a single shard's p99. It assumes independent shards; a shared bottleneck would couple them.
+      code: |
+        import numpy as np
+
+        N, D, PQ_BYTES, NLIST, NPROBE = 1_000_000_000, 512, 64, 65_536, 64
+        SHARDS, QPS, READ_GBPS = 16, 17_361, 200
+
+
+        def index_bytes():
+            return {"fp32": N * D * 4, "int8": N * D, "pq": N * PQ_BYTES}
+
+
+        def scan_bytes(nlist=NLIST, nprobe=NPROBE, code_bytes=PQ_BYTES):
+            return nprobe * (N / nlist) * code_bytes
+
+
+        def shard_latency(seed=3, shards=SHARDS):
+            """Lognormal shard service times; the cluster waits for the slowest shard."""
+            rng = np.random.default_rng(seed)
+            n, sigma = 20_000, 0.22
+            mu = np.log(5e-3) - 0.5 * sigma**2          # 5 ms mean
+            lat = rng.lognormal(mu, sigma, size=(n, shards))
+            return np.percentile(lat, 99, axis=0), np.percentile(lat.max(1), 99)
+
+
+        def main():
+            b = index_bytes()
+            print(f"index: fp32 {b['fp32']/1e12:.2f} TB; int8 {b['int8']/1e9:.0f} GB; "
+                  f"PQ-64 {b['pq']/1e9:.0f} GB")
+
+            s = scan_bytes()
+            print(f"scan: {s/1e6:.1f} MB/query -> {s*QPS/1e12:.2f} TB/s cluster-wide; "
+                  f"{s/READ_GBPS/1e9*1e3:.2f} ms on one node")
+
+            per_shard, cluster = shard_latency()
+            print(f"p99 per shard ~{per_shard.mean()*1e3:.1f} ms; cluster p99 "
+                  f"~{cluster*1e3:.1f} ms ({cluster/per_shard.mean():.2f}x tail amplification)")
+
+            assert b["fp32"] == 2.048e12 and b["pq"] == 64e9
+            assert abs(s / 1e6 - 62.5) < 0.1
+            assert cluster > per_shard.mean()
+            assert 8 < cluster * 1e3 < 15
+
+
+        if __name__ == "__main__":
+            main()
+  problems:
+    - id: cs-visual-scan-bytes
+      title: "Bytes scanned per query"
+      difficulty: easy
+      prompt: >-
+        Return the MB read by probing `nprobe` lists of `n / nlist` vectors, each `code_bytes`
+        long.
+      language: python
+      entry: scan_mb
+      testCases:
+        - input: '{}'
+          expected: "62.5"
+          tolerance: 1e-6
+        - input: '{"nprobe": 32}'
+          expected: "31.25"
+          tolerance: 1e-6
+        - input: '{"code_bytes": 8}'
+          expected: "7.8125"
+          tolerance: 1e-6
+      solution: |
+        def scan_mb(n=1e9, nlist=65536, nprobe=64, code_bytes=64):
+            return nprobe * (n / nlist) * code_bytes / 1e6
+      solutionExplanation: >-
+        64 probes over 15,259 vectors at 64 bytes is 62.5 MB. The same probe against fp32 would
+        be 8x larger, which is the entire argument for codes.
+      tags: [vector-search, bandwidth]

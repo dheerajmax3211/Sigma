@@ -1,0 +1,395 @@
+id: kimi-k3
+title: "Kimi K3: engineering a 2.8T sparse model that a startup can actually serve"
+summary: >-
+  Moonshot shipped a 2.8-trillion-parameter mixture-of-experts model with 896
+  experts, 16 active per token, a 1M-token window and open weights under a
+  revenue-threshold licence. The interesting part is not the parameter count. It
+  is that every architectural choice — sparse routing, MLA, linear attention —
+  was made to keep the serving bill attached to 104B active parameters while the
+  capability came from 2.8T.
+kind: case_study
+date: "2026-10-24"
+actors: [Moonshot AI, Kimi]
+key_facts:
+  - "Kimi K3 shipped 16 July 2026: 2.8T total parameters, sparse MoE with 896 experts and 16 active per token, roughly 104B active parameters."
+  - "The architecture is not a vanilla transformer. It pairs Kimi Delta Attention with Attention Residuals, adds native image understanding, and exposes a 1M-token context window."
+  - "Weights went public on 27 July 2026 under a custom licence: companies above $20M annual revenue must negotiate before reselling the model as a service."
+  - "K3.1 Pro followed on 24 October 2026 as a post-trained upgrade, scoring 65.7% on Terminal-Bench 4.0 against Claude Opus 5.5 at 66.4% and GPT-6 Astra at 58.2% — all self-reported."
+  - "Full K3.1 Pro weights were scheduled for 4 November 2026, with API pricing at $2 per 1M input tokens and $10 per 1M output tokens."
+  - "At FP8, the weights alone are 2.8 TB before any KV cache, which is the single number that decides whether you can self-host."
+timeline:
+  - when: Nov 2025
+    what: "K2 Thinking — the reasoning-model generation, shipped under a modified MIT licence."
+  - when: Jan 2026
+    what: "K2.5, then K2.6 in April adding multimodal input and a 256K window."
+  - when: Jun 2026
+    what: "K2.7 Code — a coding-specialised model, 256K context, multi-step tool use, no non-thinking mode."
+  - when: 16 Jul 2026
+    what: "K3: 2.8T MoE, 896 experts, 1M context, native vision."
+  - when: 27 Jul 2026
+    what: "Weights released under a revenue-threshold licence rather than an OSI licence."
+  - when: 24 Oct 2026
+    what: "K3.1 Pro — more post-training compute, RL across hundreds of downstream domains, 33% cheaper API."
+  - when: 4 Nov 2026
+    what: "Full K3.1 Pro weights scheduled for release, making the frontier checkpoint downloadable."
+decisions:
+  - choice: "Sparse MoE at 896 experts with only 16 active per token"
+    why: "Total parameters buy capability; active parameters set inference cost. You get the quality of a 2.8T model at roughly the FLOP cost of a 104B one, because a token touches 1.8% of the expert pool."
+    cost: "Every expert must be resident in memory, so VRAM scales with total parameters, not active ones. Serving becomes a memory and interconnect problem rather than a FLOPs problem, and a single 8-GPU node cannot hold the model."
+  - choice: "Multi-head latent attention instead of multi-head attention"
+    why: "MLA compresses keys and values into a low-rank latent before caching, so the KV cache scales with a few hundred bytes per token per layer instead of a few thousand. At 1M context that is the difference between a request that fits on a node and one that does not."
+    cost: "The up-projection has to run on every decode step, adding compute to a phase that is bandwidth-bound, and the absorbed weight matrices complicate tensor-parallel sharding and kernel fusion."
+  - choice: "Hybrid linear attention (Kimi Delta Attention) rather than pure softmax attention"
+    why: "A delta-rule linear attention keeps a fixed-size state per channel, so the per-token cost of long context stops growing linearly with sequence length. Most layers can be linear; only a minority need full attention."
+    cost: "Fixed-size state is lossy — exact retrieval over a long document degrades relative to full attention, and the hybrid ratio becomes a quality knob you have to tune per workload."
+  - choice: "Release weights under a custom licence rather than open source"
+    why: "It captures adoption from researchers and startups while preventing a hyperscaler from reselling the model as a competing service without a commercial agreement."
+    cost: "Not OSI-approved, so it is open weight, not open source. The revenue threshold is a legal review for every commercial user, and it makes the model unusable for some enterprises on procurement policy alone."
+  - choice: "Post-train a better version instead of training a new base"
+    why: "K3.1 Pro is K3 with heavier post-training and RL across downstream domains. The base was already competitive, so marginal return sat in alignment and agentic training rather than another pretrain."
+    cost: "The base-model ceiling stays fixed. Improvements are bounded by what the base can already represent, and each post-training round risks drift on the capabilities the base was good at."
+lessons:
+  - "MoE decouples capability from inference FLOPs but not from memory. Active parameters set your bill per token; total parameters set your GPU count."
+  - "At long context, the KV cache is the model. Every architectural decision that touches K and V is a capacity decision, not a modelling preference."
+  - "The open-weight licence is now a competitive instrument. A revenue threshold wins developers without handing a hyperscaler your margin."
+  - "Post-training is where the last ten points live, and it is an order of magnitude cheaper than a new pretrain."
+  - "Agent benchmarks such as Terminal-Bench measure multi-step execution, which is the number that predicts whether a model is usable in a product."
+mistakes:
+  - "Reading 2.8T parameters as 2.8T of compute per token. Sixteen of 896 experts fire; the active budget is about 104B."
+  - "Assuming open weights means you can serve it. At 2.8T the binding constraint is 2.8 TB of FP8 weights, not the licence."
+  - "Comparing benchmark scores across labs without checking who ran them. The 65.7% is self-reported by the model's own author."
+  - "Sizing a cluster from active parameters. The all-to-all fabric has to move activations for every routed expert, and that traffic does not shrink with sparsity."
+problem_statement: >-
+  Moonshot's problem was not how to train a frontier model; it was how to ship
+  one whose serving economics did not require hyperscaler capital. A dense 2.8T
+  model would need roughly 2.8 TB of weights read per token, putting a single
+  stream at a few tokens per second on an entire node. The team instead had to
+  build a model where capability scales with total parameters while cost scales
+  with active ones, and where a 1M-token window does not blow up the KV cache.
+  Every design decision — 896-way routing, MLA, hybrid linear attention, the
+  revenue-threshold licence — follows from that constraint. This case study is
+  the capacity plan behind those decisions: how much memory the model needs, how
+  fast it decodes, what the interconnect has to carry, and where the plan breaks
+  at ten times the load.
+requirements:
+  functional:
+    - "Serve text and native image input through one model, with a 1M-token context window available to every request."
+    - "Expose an OpenAI-compatible chat completions API plus a native tool-calling loop for agent workloads."
+    - "Support multi-step agentic execution where a single task can issue dozens of tool calls and re-read its own transcript."
+    - "Allow self-hosting of the full weights by third parties, including fine-tuning and distillation."
+    - "Provide a reasoning mode and a non-reasoning mode behind the same endpoint so latency-sensitive and accuracy-sensitive callers share a model."
+  non_functional:
+    - "Decode throughput per replica high enough that API pricing of $2 and $10 per million tokens covers GPU cost at 40% utilisation."
+    - "Time to first token under 2 seconds for a 4K-token prompt, which rules out serialising prefill across the whole cluster."
+    - "Prefill a 1M-token document in under two minutes on one serving unit, because longer makes document workflows unusable."
+    - "Survive the loss of a single node mid-generation without failing the request, which requires the KV cache to be reconstructible or replicated."
+    - "Keep the licence auditable: a customer must be able to determine from public terms whether the revenue threshold applies to them."
+clarifying_questions:
+  - question: "What is the expected prompt-to-output ratio?"
+    why_it_matters: "A 1M-token window makes prefill dominate the bill. If the median request is 200K in and 500 out, the cluster is a prefill machine and the optimisation target is attention FLOPs; if it is 2K in and 4K out, decode bandwidth dominates and the expert weights are the bottleneck."
+  - question: "Is the 1M window used by many requests or by a few?"
+    why_it_matters: "Capacity planning by mean context length is how you build a cluster that falls over. One 1M-token request holds 25 to 40 GB of KV cache for its whole lifetime, so the tail, not the mean, sets the memory floor."
+  - question: "Does the workload need exact retrieval over the full window, or is a compressed summary acceptable?"
+    why_it_matters: "This decides the linear-attention to full-attention layer ratio. More linear layers cut per-token cost but lose exact needle-in-a-haystack recall, and that trade is a product decision, not a kernel decision."
+  - question: "Are we self-hosting, or reselling, or just calling the API?"
+    why_it_matters: "The licence's $20M revenue threshold attaches to reselling the model as a service. An internal deployment and a hosted product have completely different legal and capacity profiles."
+  - question: "What latency SLO applies to the reasoning mode?"
+    why_it_matters: "Reasoning mode generates thousands of hidden tokens. At 100 tokens per second a 4,000-token trace is 40 seconds of decode, which changes both the batching strategy and the GPU-hour budget by an order of magnitude."
+capacity_estimation:
+  assumptions:
+    - "All arithmetic is at FP8 for weights and KV cache unless stated; one byte per parameter."
+    - "An H200 node is 8 GPUs with 141 GB of HBM each, so 1.128 TB of usable HBM per node, and roughly 4.8 TB/s of bandwidth per GPU."
+    - "Serving overhead of 20% on weights covers CUDA context, fragmentation, and the router and embedding tables."
+    - "The published figures are 2.8T total, 896 experts, 16 active, about 104B active. Per-expert size is derived, not published."
+    - "KV cache per token per layer is 576 bytes for MLA at FP8: a 512-dimension latent plus a 64-dimension rope component."
+    - "A representative request is 8K prompt tokens and 1K output tokens; the p95 request is 200K prompt tokens."
+  arithmetic:
+    - label: "Weight memory at FP8"
+      calculation: "2.8e12 params x 1 byte = 2.8 TB; x 1.2 for overhead = 3.36 TB; per H200 node 8 x 141 GB = 1.128 TB; 3.36 / 1.128 = 2.98, so 3 nodes minimum for weights alone"
+      conclusion: "One replica does not fit on a node and barely fits on three. Add KV cache and you need four nodes, or 32 H200s, per replica before any redundancy."
+    - label: "Weight memory at BF16"
+      calculation: "2.8e12 x 2 bytes = 5.6 TB; x 1.2 = 6.72 TB; 6.72 / 1.128 = 5.96, so 6 nodes; with KV headroom 8 nodes"
+      conclusion: "BF16 doubles the floor to 64 GPUs per replica. This is why the release is FP8-first and why anyone serving BF16 is paying twice for the same tokens."
+    - label: "Derived per-expert size and active budget"
+      calculation: "2.8e12 / 896 = 3.125e9 params per expert; 16 x 3.125e9 = 5.0e10 routed params active; 104e9 - 50e9 = 5.4e10 shared and attention params"
+      conclusion: "The 104B active figure is consistent with 16 routed experts of about 3.1B plus roughly 54B of always-on attention, embedding and shared-expert weights. Treat the 54B as derived, not published."
+    - label: "MLA KV cache at 1M tokens"
+      calculation: "576 bytes/token/layer x 61 layers = 35.1 KB/token; 35.1 KB x 1e6 tokens = 35.1 GB per sequence"
+      conclusion: "A single full-window request holds 35 GB of KV. That is a quarter of a node's HBM for one conversation, so context length — not batch size — sets the admission limit."
+    - label: "The same cache with multi-head attention"
+      calculation: "128 heads x 128 dim x 2 for K and V x 1 byte x 61 layers = 2.0 MB/token; x 1e6 = 2.0 TB per sequence"
+      conclusion: "Full MHA would need 2 TB of KV for one request, 57x more than MLA. The architectural choice is worth more than any kernel optimisation in the serving stack."
+    - label: "Theoretical decode rate, single stream"
+      calculation: "104e9 active params x 1 byte = 104 GB read per token; 32 H200 x 4.8 TB/s = 153.6 TB/s aggregate; 153.6e12 / 104e9 = 1,477 tokens/s at batch 1, before all-to-all"
+      conclusion: "The memory-bandwidth ceiling is not the problem; the fabric is. Real single-stream decode is one to two orders of magnitude below this because every token crosses 32 GPUs of all-to-all."
+    - label: "Training compute and wall clock"
+      calculation: "6 x N_active x D = 6 x 104e9 x 15e12 = 9.36e24 FLOPs; 8,192 H100 at 40% MFU = 8,192 x 9.89e14 x 0.4 = 3.24e18 FLOP/s; 9.36e24 / 3.24e18 = 2.89e6 s = 33.5 days"
+      conclusion: "A pretrain of this class is roughly a month on 8K GPUs, about 6.4M GPU-hours, or $13M at $2 per GPU-hour. Training is cheap relative to serving, which is the whole reason the model exists."
+    - label: "Replicas per 1,000 requests per minute"
+      calculation: "1,000 requests/min / 60 = 16.7 requests/s; at 1K output tokens each that is 16,700 output tokens/s; one replica at a realistic 800 tokens/s = 21 replicas; x 4 nodes = 84 nodes = 672 H200s"
+      conclusion: "Serving at consumer scale needs hundreds of GPUs even at 104B active. The pricing of $10 per million output tokens only works if the cluster runs above 40% utilisation."
+    - label: "Prefill cost for the p95 request"
+      calculation: "200K tokens x 104e9 active x 2 FLOPs = 4.16e16 FLOPs; at 400 TFLOPS effective per node = 104 s for one node; spread over 4 nodes = 26 s"
+      conclusion: "A 200K-token prompt costs about 26 seconds of a four-node unit. You cannot prefill at the mean and hope the tail is rare: one long prompt occupies a replica for half a minute."
+architecture_summary: >-
+  The serving unit is not a GPU; it is a pod of roughly 32 H200s spanning four
+  nodes, and the model is sharded across it in three dimensions at once. Expert
+  parallelism distributes the 896 experts across the pod, so each GPU owns
+  between 3 and 4 experts per layer on average. Tensor parallelism splits the
+  attention projections within a node, where NVLink bandwidth is cheap. Sequence
+  parallelism handles the rare 1M-token request by splitting the KV cache along
+  the token axis, which turns attention into a ring exchange. A router at the top
+  of every MoE layer picks 16 experts per token and issues an all-to-all so each
+  token lands on the GPU that owns its experts; the result is a token-level
+  shuffle that has to complete twice per MoE layer, once outbound and once back.
+  Above the model sits a cache-aware scheduler: requests sharing a prefix are
+  routed to the same pod so the prefill is amortised, long-context requests are
+  batched separately because they cannot share a batch with short ones without
+  wasting HBM, and the API gateway enforces a token budget that maps to a KV
+  reservation. The whole design accepts that the model is memory-heavy and
+  FLOP-light, and optimises the thing that actually binds: bytes moved per
+  generated token.
+deep_dives:
+  - topic: "Routing 896 experts: the all-to-all is the model"
+    explanation: >-
+      A sparse MoE layer replaces one feed-forward network with 896 of them plus a
+      router. Each token computes a score over 896 logits, takes the top 16, and
+      is dispatched to whichever GPUs own those experts. With 32 GPUs in a pod and
+      896 experts per layer, each GPU owns 28 experts. A token's 16 selections
+      will therefore land on 8 to 12 distinct GPUs, and every one of those needs
+      the token's hidden state. The outbound all-to-all carries 16 copies of each
+      token's activation, and the return all-to-all carries 16 expert outputs that
+      must be weighted and summed. At hidden size 8,192 and FP8, one token's
+      activation is 8 KB; 16 copies is 128 KB per token per MoE layer. With 60
+      MoE layers and a batch of 4,096 tokens, that is 31 GB of activation traffic
+      per forward pass, and it crosses the pod fabric twice. The router's top-16
+      choice is therefore a network-traffic decision as much as a quality
+      decision: raising the active count from 16 to 24 would improve quality and
+      increase fabric load by 50%. The engineering consequence is that MoE
+      efficiency is set by the ratio of compute to communication, and the only
+      levers are expert locality, placing frequently co-activated experts on the
+      same GPU, and larger batches that amortise the fixed per-token cost.
+    tradeoffs:
+      - option: "Expert parallelism across the pod"
+        pros: "Scales to 896 experts without replicating them; each GPU holds a slice and memory is balanced by construction."
+        cons: "Every MoE layer becomes two all-to-alls; latency is set by the slowest straggler GPU and by fabric congestion, not by arithmetic."
+      - option: "Expert replication with local routing"
+        pros: "Hot experts can be duplicated on every node, so the majority of tokens are served locally and all-to-all traffic drops."
+        cons: "Replication costs memory you do not have; a 2.8T model leaves no headroom, and the router has to be trained or biased to prefer local copies."
+      - option: "Fewer, larger experts"
+        pros: "Fewer routing decisions, fewer distinct destination GPUs per token, less fabric traffic for the same active parameter count."
+        cons: "Coarser granularity wastes capacity: a 24B expert firing for a token that needs 2B of it is 22B of dead compute, and load balance across experts gets worse."
+  - topic: "MLA versus GQA: what the KV cache really costs"
+    explanation: >-
+      Multi-head latent attention compresses keys and values through a low-rank
+      projection and caches only the latent. In the DeepSeek-V2 formulation the
+      cache holds a 512-dimension compressed latent plus a 64-dimension decoupled
+      rope component, so 576 values per token per layer instead of one key and one
+      value vector per head. At 128 heads and head dimension 128, multi-head
+      attention caches 2 x 128 x 128 = 32,768 values per token per layer, which is
+      57 times more. Grouped-query attention sits in between: with 8 KV heads it
+      caches 2 x 8 x 128 = 2,048 values, about 3.6 times MLA. The reason this
+      matters more at 1M context than at 8K is arithmetic. At 8K tokens an MHA
+      cache is 16 GB and you can absorb it by shrinking the batch; at 1M tokens it
+      is 2 TB and no batch size saves you. The cost of MLA is paid on the compute
+      side. Because K and V are reconstructed by up-projection from the latent, the
+      decode step multiplies the latent by the absorbed key and value matrices.
+      In a bandwidth-bound decode loop that extra arithmetic is often free, since
+      you were waiting on HBM anyway, but it complicates tensor parallelism because
+      the latent is shared across heads and cannot be sharded the way per-head K
+      and V can.
+    tradeoffs:
+      - option: "MLA"
+        pros: "Smallest cache per token by a wide margin, which is what makes a 1M window economically possible; quality is preserved because the compression is learned, not a fixed pooling."
+        cons: "Up-projection on every decode step; harder to shard; kernels are custom and less portable across accelerators."
+      - option: "GQA with 8 KV heads"
+        pros: "Native support in every inference stack, simple tensor parallelism, well-understood quality cost of about 1 to 2 points on long-context retrieval."
+        cons: "3.6x the cache of MLA, which at 1M tokens is the difference between 35 GB and 125 GB per sequence."
+      - option: "Sliding-window attention with a summary"
+        pros: "Constant cache regardless of context; cheapest possible serving."
+        cons: "The model genuinely cannot retrieve from outside the window; a summary is not an index, and exact-recall tasks fail silently rather than degrading visibly."
+  - topic: "A 1M window is a memory-hierarchy problem, not an attention problem"
+    explanation: >-
+      The naive framing of long context is that attention is quadratic, so 1M
+      tokens is a million squared. That is true for prefill and mostly irrelevant
+      for decode. Prefill over 1M tokens at 104B active parameters is about 2 x
+      1e6 x 104e9 = 2.1e17 FLOPs, roughly 520 seconds of one node at 400 TFLOPS
+      effective, or 65 seconds across eight. That is tolerable. Decode is where
+      the window bites, because every generated token must attend to 1M cached
+      keys, and with MLA that is a 35 GB read per token if you materialise the
+      whole cache. The solution is hierarchical: chunk the cache, attend within a
+      chunk, and carry a compressed state across chunks, which is exactly what a
+      delta-rule linear attention layer does with its fixed-size state. The hybrid
+      design lets most layers run at constant cost per token and reserves full
+      attention for the layers that need exact recall. This is also why a 1M
+      context claim and a 1M context claim at usable speed are different product
+      statements: the first is a positional-encoding and memory question, the
+      second is a bandwidth question, and only the second one shows up in a user's
+      latency.
+    tradeoffs:
+      - option: "Full attention at every layer, sharded by sequence"
+        pros: "Exact recall everywhere; no quality cliff; simplest to reason about and to evaluate."
+        cons: "KV traffic per decoded token grows linearly with context; at 1M tokens the ring exchange dominates and throughput collapses."
+      - option: "Hybrid linear plus full attention"
+        pros: "Constant per-token cost for most layers; a 1M window becomes affordable to decode, not just to prefill."
+        cons: "Lossy state; exact needle retrieval depends on the few full-attention layers, and the ratio is a quality knob that has to be re-tuned per task."
+      - option: "Retrieval-augmented context instead of a long window"
+        pros: "Cost scales with the number of retrieved chunks, not with corpus size; cheaper by orders of magnitude."
+        cons: "Recall is bounded by the retriever; multi-hop questions that need the whole document fail, and the promise of pasting in an entire repository is lost."
+  - topic: "Serving a 2.8T model: what the fabric has to carry"
+    explanation: >-
+      The counter-intuitive property of a sparse model this large is that it is
+      bandwidth-bound in a way a dense model is not. A dense 104B model reads 104
+      GB of weights per token and does 208 GFLOPs, so arithmetic intensity is
+      about 2 FLOPs per byte, deep in the memory-bound regime. K3 reads the same
+      104 GB of active weights but also moves 128 KB of activations per token per
+      MoE layer across the pod. That activation traffic is comparable in volume to
+      the weight reads, and unlike weight reads it cannot be cached because it is
+      different every token. The practical consequence is that the interconnect,
+      not the HBM, sets the achievable batch size. On a pod with 400 GB/s of
+      east-west bandwidth per GPU, one GPU can sustain 400e9 / 128e3 = 3,125
+      token-layer dispatches per second, which at 60 MoE layers is 52 tokens per
+      second per GPU of routing capacity. Multiply by 32 GPUs and the
+      fabric-imposed ceiling is about 1,660 tokens per second for the pod, the
+      same order as the 1,477 tokens per second that HBM bandwidth allows, which
+      is why neither can be ignored. The mitigation is overlap: DualPipe-style
+      scheduling runs the dispatch for layer N+1 while layer N computes, so the
+      all-to-all hides behind arithmetic instead of serialising in front of it.
+    tradeoffs:
+      - option: "Large pods with full expert parallelism"
+        pros: "One replica of the full model; best quality per token; no expert replication cost."
+        cons: "All-to-all crosses node boundaries; a single slow link stalls every token, and failure of one node kills the replica."
+      - option: "Smaller pods with expert replication"
+        pros: "Most routing stays on-node over NVLink; far more robust to a single node failure."
+        cons: "You need memory for duplicated hot experts, which a 2.8T model does not have to spare; capacity per GPU drops."
+      - option: "Overlap communication with compute"
+        pros: "Hides most of the all-to-all latency; effectively raises the fabric ceiling by 30 to 50% in practice."
+        cons: "Requires micro-batching the sequence and a scheduler that understands dependencies; doubles activation memory because two micro-batches are in flight."
+  - topic: "The licence is a capacity decision"
+    explanation: >-
+      A revenue threshold at $20M sounds like a legal detail. It is an
+      architecture constraint, because it determines who is allowed to build the
+      serving layer. Below the threshold, a startup can host K3 as a product
+      feature and compete on application quality. Above it, reselling the model as
+      a service requires negotiation, which means the only parties who can offer
+      K3 as an API at scale are Moonshot and firms that have signed. The effect on
+      capacity planning is direct: the addressable self-hosting market is
+      companies small enough to fall under the threshold, and those companies
+      cannot afford 32 H200s. So the licence and the hardware requirement point in
+      opposite directions. The model is legally available to exactly the
+      organisations that cannot physically run it. That gap is what the API price
+      of $2 and $10 per million tokens is designed to fill, and it explains why
+      the open-weight release is a distribution strategy rather than a gift.
+    tradeoffs:
+      - option: "Permissive open source such as Apache 2.0 or MIT"
+        pros: "Maximum adoption; cloud providers host it, which makes it the default and starves competitors of pricing power."
+        cons: "A hyperscaler can resell it at cost and capture the margin; the lab trains the model and someone else sells the tokens."
+      - option: "Revenue-threshold licence"
+        pros: "Keeps startups and researchers; blocks the one class of competitor that can undercut on price."
+        cons: "Not OSI-approved, so procurement in regulated enterprises may reject it outright; every commercial user needs legal review."
+      - option: "API only, no weights"
+        pros: "Full control of pricing, safety and the roadmap; no one can fork the model."
+        cons: "No ecosystem, no fine-tuning community, no credibility with researchers, which is the thing that made the K2 series matter."
+bottlenecks:
+  - failure: "All-to-all congestion at high batch sizes"
+    symptom: "Throughput plateaus as batch grows, GPU utilisation sits near 60% while the NIC counters are saturated, and time per token rises with concurrency instead of falling."
+    mitigation: "Cap the batch per pod at the fabric's measured knee, use hierarchical all-to-all with intra-node NVLink first, and enable communication-compute overlap so the dispatch for layer N+1 runs under layer N."
+  - failure: "Expert load imbalance"
+    symptom: "A handful of GPUs run hot while others idle; step time is set by the hottest, so the whole pod runs at the speed of the worst-balanced layer."
+    mitigation: "Auxiliary load-balancing loss during training, capacity factors on the router, and a token bucket that drops overflow to the second-best expert rather than blocking."
+  - failure: "KV cache fragmentation at 1M context"
+    symptom: "The server reports plenty of free HBM but rejects new requests; utilisation drops over hours until a restart, which is the signature of external fragmentation in a paged cache."
+    mitigation: "Paged attention with fixed-size blocks, a preemption policy that recomputes or swaps the longest-running sequences, and separate pools for short and long context so a 1M request cannot fragment the short-request pool."
+  - failure: "Cold start and weight loading"
+    symptom: "A new replica takes many minutes to become ready; after a node failure the replacement cannot absorb traffic before the surviving replicas time out."
+    mitigation: "Stream weights from local NVMe rather than object storage, keep a warm standby with weights resident but no KV, and pre-warm the router and kernels before accepting traffic."
+  - failure: "Router drift after post-training"
+    symptom: "An RL pass changes the token distribution, so expert utilisation that was balanced in the base model becomes skewed and the same hardware serves 20% fewer tokens."
+    mitigation: "Measure the expert histogram after every post-training run, re-balance with a short router-only fine-tune, and keep a per-version capacity profile rather than assuming the base model's balance carries over."
+interview_questions:
+  - question: "You are told a model has 2.8T total parameters and 104B active. How much GPU memory do you need, and why is the active number not the answer?"
+    level: senior
+    key_points:
+      - "Weights must be resident for every expert, so memory scales with total parameters: 2.8 TB at FP8, 5.6 TB at BF16."
+      - "Add 20% for overhead, then divide by 141 GB per H200 to get roughly 3 nodes per replica at FP8."
+      - "Active parameters set FLOPs and per-token bandwidth, not footprint; sizing from 104B and concluding it fits on one node is the classic error."
+      - "KV cache and activations come on top, and at 1M context the cache is tens of GB per sequence."
+    follow_up: "Now suppose the customer wants BF16 for numerical fidelity. What happens to the replica count and to the cost per million tokens?"
+  - question: "Explain MLA. Why does it beat GQA at long context but not necessarily at 8K?"
+    level: staff
+    key_points:
+      - "MLA caches a low-rank latent plus a rope component, about 576 bytes per token per layer, instead of per-head K and V."
+      - "The ratio to MHA is roughly 57x and to 8-head GQA roughly 3.6x at these dimensions."
+      - "At 8K the absolute saving is small enough that batch size can absorb it; at 1M it is the difference between 35 GB and 2 TB per sequence."
+      - "The cost is up-projection on every decode step and a latent that is awkward to shard across tensor-parallel ranks."
+    follow_up: "How would you shard an MLA model across 8 GPUs? Which dimension do you split, and what breaks first?"
+  - question: "Design the serving pod for a 2.8T MoE with 896 experts. How many GPUs, and how do you lay out the experts?"
+    level: staff
+    key_points:
+      - "Start from memory: 3.36 TB at FP8 means at least 3 nodes, 4 with KV headroom, so 32 H200s per replica."
+      - "Expert parallel across the pod at 28 experts per GPU; tensor parallel within a node for the attention projections."
+      - "Sequence parallel only for the long-context tail, because it adds a ring exchange that short requests do not need."
+      - "Separate pools for short and long context, and cache-aware routing so shared prefixes hit the same pod."
+    follow_up: "A node dies mid-generation. What happens to the in-flight requests, and what would you have to change to make the failure invisible?"
+  - question: "The all-to-all is saturating. Give three mitigations ordered by how much they buy."
+    level: senior
+    key_points:
+      - "Overlap: run dispatch for the next layer under the current layer's compute, which hides 30 to 50% of the latency."
+      - "Locality: place co-activated experts on the same GPU or node so more routing stays on NVLink."
+      - "Batch shaping: cap concurrency at the fabric knee; beyond it, more requests only add queueing."
+      - "A weaker last resort is reducing active experts, which costs quality and should not be the first lever."
+    follow_up: "How would you measure the fabric knee rather than guessing it?"
+  - question: "Why does a 1M-token context window change your capacity plan more than your model architecture?"
+    level: senior
+    key_points:
+      - "Prefill is a one-off quadratic cost; decode pays linear KV traffic on every generated token."
+      - "A single 1M request pins 35 to 40 GB of cache for its lifetime, so admission control is a memory-reservation problem."
+      - "Mean context length is the wrong planning input; the tail sets the memory floor."
+      - "Hybrid linear attention reduces per-token cost but trades away exact recall, which is a product decision."
+    follow_up: "How would you price a 1M-token request so it does not subsidise a 2K-token one?"
+  - question: "Is a revenue-threshold open-weight licence good for the ecosystem? Argue both sides with numbers."
+    level: staff
+    key_points:
+      - "It lets sub-threshold companies self-host and fine-tune, which builds tooling and talent around the model."
+      - "It blocks the only actors who can undercut on price, namely hyperscalers reselling at cost, which protects the lab's margin."
+      - "But the companies legally allowed to self-host are largely the ones that cannot afford 32 H200s, so adoption is API-shaped anyway."
+      - "Non-OSI terms create procurement friction and make the model a poor dependency for regulated enterprises."
+    follow_up: "Where would you set the threshold if you wanted maximum ecosystem growth and still wanted to protect a $10-per-million-token API business?"
+  - question: "Estimate the GPU-hours to pretrain this model and defend your assumptions."
+    level: mid
+    key_points:
+      - "Use 6 x N_active x D, not total parameters, because sparse experts only see their routed tokens."
+      - "6 x 104e9 x 15e12 is about 9.4e24 FLOPs."
+      - "At 40% MFU on H100 that is roughly 33 days on 8,192 GPUs, about 6.4M GPU-hours."
+      - "State that the estimate excludes ablations, restarts and data pipeline overhead, which typically add 30 to 50%."
+    follow_up: "Your estimate is 6.4M GPU-hours but the actual run used 9M. Give three plausible reasons for the gap."
+what_to_steal:
+  - "Decide the serving bill before the architecture. Active parameter count is a contract with your own pricing page."
+  - "Treat the KV cache as a first-class design surface. At long context it is the model's real memory footprint."
+  - "Use hybrid attention rather than promising exact recall everywhere: constant-cost layers for most tokens, full attention for the few that need it."
+  - "Make the licence part of the product strategy, not an afterthought bolted on by legal."
+  - "Post-train the base you already paid for. A large RL pass is a fraction of a pretrain and moves the metric users feel."
+  - "Publish the active-parameter number next to the total, every time. The confusion is expensive and it is yours to prevent."
+further_reading:
+  - label: "Moonshot AI — Kimi K3.1 Pro announcement"
+    url: "https://www.kimi.ai/blog/kimi-k3-1-pro"
+  - label: "DeepSeek-V2 — Multi-head Latent Attention and the KV cache argument"
+    url: "https://arxiv.org/abs/2405.04434"
+  - label: "DeepSeek-V3 technical report — auxiliary-loss-free load balancing and DualPipe"
+    url: "https://arxiv.org/abs/2412.19437"
+  - label: "Switch Transformers — the original MoE routing and capacity-factor analysis"
+    url: "https://arxiv.org/abs/2101.03961"
+  - label: "vLLM — PagedAttention and KV cache fragmentation"
+    url: "https://arxiv.org/abs/2309.06180"
+  - label: "Kimi model-version history (Wikipedia)"
+    url: "https://en.wikipedia.org/wiki/Kimi_K3"
+sources:
+  - label: "Moonshot AI — Kimi K3.1 Pro announcement"
+    url: "https://www.kimi.ai/blog/kimi-k3-1-pro"
+  - label: "Kimi model-version history (Wikipedia)"
+    url: "https://en.wikipedia.org/wiki/Kimi_K3"
+  - label: "Economic Times, 24 Oct 2026 — K3.1 Pro launch and Terminal-Bench figures"
+    url: "https://economictimes.indiatimes.com/"
+  - label: "DeepSeek-V2 paper — MLA dimensions used in the cache arithmetic"
+    url: "https://arxiv.org/abs/2405.04434"
+tags: [moe, open-weights, long-context, pretraining, serving]

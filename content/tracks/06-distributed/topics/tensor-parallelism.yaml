@@ -1,0 +1,1351 @@
+id: tensor-parallelism
+slug: tensor-parallelism
+title: "Tensor Parallelism (Megatron-LM)"
+summary: >-
+  Split the matrix, not the batch: an eight-way split of a 7B block moves
+  469.76 MB per rank per layer, which is 49.8% of that block's compute on
+  300 GB/s NVLink and 16.6% on 900 GB/s, because the column-parallel half is
+  free until the backward and the row-parallel half costs one all-reduce in
+  the forward. The parts that are never sharded decide the rest: 8.59 GB of
+  duplicated LayerNorm and residual activations against 1.65 GB of sharded
+  weights, so t=8 to t=16 saves 8.1% of memory and doubles the traffic, and
+  sequence parallelism takes that 8.59 GB to 1.07 GB for the same bytes.
+  The split changes nothing but accumulation order: 5.93e-16 relative in fp64
+  and 3.19e-07 in fp32 against a single device, and bit-identical when the
+  partial sums are added in the same order.
+kind: lesson
+difficulty: expert
+position: 3
+estMinutes: 28
+prerequisites: [fsdp-zero, transformer-block]
+phase: distributed-training
+tags: [tensor-parallelism, megatron, column-parallel, row-parallel, all-reduce, sequence-parallelism, 2d-tensor-parallelism, nvlink, model-parallelism, distributed-training]
+
+body:
+  big_idea: >-
+    Tensor parallelism splits the weight matrix rather than the batch, so a
+    collective lands inside every forward pass — making the TP degree a number
+    set by the interconnect's FLOP-per-byte ratio, not the model size.
+  problem:
+    - "A 70B model will not fit on 80 GB, and the alternative to gathering each layer is a rendezvous inside the forward pass."
+    - "You split the MLP across eight GPUs, the loss is correct, and the step is barely faster: 128 dependent collectives cannot hide behind anything."
+    - "Someone moves the GELU before the all-reduce to shrink the tensor; training still converges, every activation is 23.65% wrong, and the bug survives three weeks."
+  analogy: >-
+    A kitchen with eight cooks and one pass. Every cook takes the same full
+    tray and prepares a different eighth of the components; then each turns
+    their eighth into a partial sauce and the eight are poured together. That
+    pour is the all-reduce — a rendezvous that costs the slowest cook, and it
+    cannot run later, because the next dish needs the poured sauce.
+  concept_points:
+    - "**Column-parallel has no forward communication at all, and that is the whole trick.** Split $W = [W_1 \\ldots W_t]$ by its output dimension and rank $i$ computes $Y_i = XW_i$ from the full input. At $d = 4096$, $d_{ff} = 11008$, $t = 8$ the first MLP matrix is 4096 x 1376 — **5,636,096 parameters, 11.27 MB fp16** against 90.18 MB whole. TP pays in the backward."
+    - "**Row-parallel is the mirror image: one all-reduce in the forward, nothing in the backward.** Split by the input dimension, take the sharded input $X_i$, and $Y = \\sum_i X_iW_i$ must be summed. Given $Y$, both $\\partial L/\\partial W_i = X_i^\\top \\partial L/\\partial Y$ and $\\partial L/\\partial X_i = \\partial L/\\partial Y\\, W_i^\\top$ are local. The pairing is forced: column-parallel's output shard is row-parallel's input shard."
+    - "**Per transformer block that is four collectives: two forward, two backward, 128 per step at 32 blocks.** **469.76 MB per rank per block** at 8,192 tokens, $d = 4096$, fp16 — **15.032 GB per rank per step**, 50.1 ms at 300 GB/s against 100.6 ms of compute. Data parallelism moves 23.13 GB in one all-reduce: TP moves less and costs more, because its collectives sit inside the layer dependency chain."
+    - "**The nonlinearity goes between the two halves, on the shard; moving it costs the answer.** $f$ is elementwise, so $f$ applied to a slice of the hidden dimension is that slice of $f$ of the whole thing. Put $f$ before the sum and you compute $\\sum_i f(\\text{partial}_i)$ where the maths wants $f(\\sum_i \\text{partial}_i)$: measured, **max absolute error 1.3873 and 23.65% relative**, with a loss curve that still descends."
+    - "**Per-rank communication is flat in $t$ while per-rank compute falls as $1/t$, so overhead grows as $(t-1)$.** Measured at 300 GB/s, 8,192 tokens: **7.12% at t = 2, 21.35% at t = 4, 49.82% at t = 8, 106.75% at t = 16**. Holding 25% at $t = 8$ needs **597.8 GB/s**; NVLink's 900 GB/s gives **16.61%**, which is why the TP group is pinned inside a node."
+    - "**The memory you buy is mostly not the weights.** At $t = 8$ the sharded weights are **1.65 GB**, but the replicated region — four full-width tensors per block — is **8.59 GB**, 5.2x the part that shrank: 10.24 GB against 21.80 GB, only **2.13x** for eight devices, and $t = 16$ gives **8.06%** less for double the traffic. Sequence parallelism takes it to **2.73 GB, 8.00x**."
+  definitions:
+    - term: "Tensor parallelism (TP)"
+      meaning: >-
+        Splitting each weight matrix across ranks so that every rank computes a
+        slice of every layer for every token. It reduces per-rank memory and
+        per-rank FLOPs but not the number of tokens processed, so it buys
+        capacity rather than throughput, and it puts a collective inside the
+        forward pass.
+    - term: "Column-parallel linear"
+      meaning: >-
+        A linear layer whose weight is split along its output dimension, so
+        rank i owns columns [i*d_out/t, (i+1)*d_out/t) and produces a shard of
+        the output from the full input. Zero communication in the forward;
+        one all-reduce on the input gradient in the backward, because
+        dL/dX = sum over all column blocks.
+    - term: "Row-parallel linear"
+      meaning: >-
+        A linear layer whose weight is split along its input dimension, so rank
+        i owns rows [i*d_in/t, (i+1)*d_in/t) and consumes the matching shard of
+        the input. One all-reduce of the partial outputs in the forward;
+        nothing in the backward, because both weight and input gradients are
+        local once the output gradient is replicated.
+    - term: "f and g operators"
+      meaning: >-
+        Megatron's names for the pair. f is the column-parallel operator applied
+        after the identity path (it takes the full input and returns a shard);
+        g is the row-parallel operator that sums the partial products and
+        returns a full tensor. Every transformer block is f-attention-g followed
+        by f-MLP-g, which is two g's, which is two all-reduces per forward.
+    - term: "TP degree"
+      meaning: >-
+        The number of ranks in a tensor-parallel group, written t. It divides
+        the weight matrices and the attention heads, so it is bounded by
+        min(head count, KV head count for GQA) before bandwidth is even
+        considered, and it multiplies the per-layer communication by roughly
+        (t-1)/t while dividing the compute by t.
+    - term: "Head-parallel attention"
+      meaning: >-
+        The specific tensor-parallel layout inside attention: heads are dealt
+        out to ranks, each rank runs the full attention computation for its own
+        heads over the full sequence, and the output projection is row-parallel
+        so the per-head results are summed back together. It requires
+        n_heads divisible by t and is why TP=16 works on a 32-head model and
+        fails on a 12-head one.
+    - term: "Sequence parallelism (SP)"
+      meaning: >-
+        Sharding the activations that tensor parallelism leaves replicated —
+        LayerNorm, dropout, the residual add — along the sequence dimension.
+        It replaces each all-reduce with a reduce-scatter plus an all-gather of
+        the same total size, so it is byte-neutral and time-neutral, and it is
+        the only thing that makes memory scale linearly with t.
+    - term: "2D tensor parallelism"
+      meaning: >-
+        Arranging the TP group as a sqrt(t) x sqrt(t) grid and splitting the
+        matmul over both dimensions, so per-rank volume falls as
+        (sqrt(t)-1)/t instead of (t-1)/t and every collective spans sqrt(t)
+        ranks. At 64 devices it costs what 1D costs at 8, which is why it is
+        the only way to go past a node.
+    - term: "2.5D parallelism"
+      meaning: >-
+        A 2D TP grid composed with a third axis — pipeline stages or data
+        replicas — so that the TP group itself never crosses a node boundary.
+        It is the standard large-model layout: TP inside a node, pipeline across
+        nodes, data replicas on the outermost axis.
+    - term: "Replicated region"
+      meaning: >-
+        The set of tensors 1D TP leaves unsharded: LayerNorm weights and their
+        inputs and outputs, dropout masks, and the residual stream. It is
+        measured in full-width activation tensors — four per block here — and at
+        t = 8 it is 8.59 GB per rank against 1.65 GB of sharded weights, which
+        makes it the thing that decides whether more TP actually helps.
+
+  diagrams:
+    - type: architecture
+      title: "One block, two splits, four collectives"
+      nodes:
+        - { id: x, x: 0, y: 0, label: "residual stream: full width, replicated", kind: gpu, detail: "8192 tokens x 4096 features x 2 bytes = 67.11 MB, held identically on all 8 ranks. Nothing shards it in 1D tensor parallelism, which is the subject of the sequence-parallel section." }
+        - { id: qkv, x: 1, y: 0, label: "QKV: column-parallel, 4 heads/rank", kind: model, detail: "4096 x 1536 per rank instead of 4096 x 12288. Zero communication: the full input times a shard of the columns is a shard of the output." }
+        - { id: attn, x: 2, y: 0, label: "attention: per head, local", kind: gpu, detail: "Each rank owns 4 of 32 heads and the full sequence, so the softmax never needs another rank's data. This is why the TP degree cannot exceed the head count." }
+        - { id: oproj, x: 3, y: 0, label: "out proj: row-parallel + all-reduce", kind: server, detail: "12288 x 4096 split by rows; each rank produces a partial output of 67.11 MB and the sum is one all-reduce of 2*(7/8)*67.11 = 117.44 MB per rank." }
+        - { id: ln2, x: 0, y: 1, label: "LayerNorm: full width, replicated", kind: cache, detail: "The LayerNorm before the MLP reads the full 67.11 MB tensor on every rank. It is 67.11 MB of duplicated activation per block per rank, and with three more tensors like it per block it is 8.59 GB over 32 blocks." }
+        - { id: w1, x: 1, y: 1, label: "W1: column-parallel, 1376 of 11008", kind: model, detail: "4096 x 1376, 11.27 MB in fp16. The GELU is applied to this rank's 1376 hidden units, which is legal only because the split is along the output dimension." }
+        - { id: gelu, x: 2, y: 1, label: "GELU on the shard: no gather first", kind: worker, detail: "f is elementwise, so f of a contiguous slice is the slice of f. Apply it before the sum instead and the block computes a different function: 23.65% relative error, measured." }
+        - { id: w2, x: 3, y: 1, label: "W2: row-parallel + all-reduce", kind: server, detail: "1376 x 4096 per rank; 117.44 MB per rank of all-reduce. Two of these per block in the forward, two in the backward, 128 per step at 32 blocks." }
+      edges:
+        - { from: x, to: qkv, label: "full 67.11 MB" }
+        - { from: qkv, to: attn, label: "1536 features" }
+        - { from: attn, to: oproj, label: "4 heads" }
+        - { from: x, to: ln2, label: "replicated" }
+        - { from: ln2, to: w1, label: "full 67.11 MB" }
+        - { from: w1, to: gelu, label: "1376 units" }
+        - { from: gelu, to: w2, label: "1376 units" }
+        - { from: oproj, to: ln2, label: "all-reduce 117.44 MB", style: async }
+      caption: "Column-parallel layers cost nothing in the forward; row-parallel layers cost one all-reduce each. The pair is forced because the column shard is the row shard, so exactly two all-reduces per block in each direction."
+
+    - type: compare
+      title: "Column-parallel against row-parallel: where the collective lands"
+      left_label: "Column-parallel (split the output dim)"
+      left_points:
+        - "W = [W_1 ... W_t], rank i holds d_in x d_out/t columns"
+        - "Forward: no communication at all — full X times a column shard"
+        - "Output is a shard on the feature dim, exactly what the next layer wants"
+        - "Backward: one all-reduce of dL/dX, because it sums over all t column blocks"
+        - "Weight gradient dL/dW_i = X^T dL/dY_i is local"
+        - "Carries the nonlinearity: f(Z_i) is the i-th shard of f(Z)"
+      right_label: "Row-parallel (split the input dim)"
+      right_points:
+        - "W = [W_1; ...; W_t], rank i holds d_in/t x d_out rows"
+        - "Forward: one all-reduce of the partial products, 2(t-1)/t A bytes per rank"
+        - "Backward: nothing — dL/dW_i and dL/dX_i are both local"
+        - "Requires the input already sharded, which is why it must follow a column-parallel layer"
+        - "Cannot carry the nonlinearity: f(sum) is not sum(f)"
+        - "The pair is forced; any other arrangement buys a collective you did not need"
+
+    - type: plot
+      title: "All-reduce time as a percentage of block compute, by TP degree and link"
+      chart: line
+      xLabel: "TP degree (t)"
+      yLabel: "communication as % of compute"
+      series:
+        - name: "900 GB/s (NVLink class)"
+          points:
+            - { x: 2, y: 2.37 }
+            - { x: 4, y: 7.12 }
+            - { x: 8, y: 16.61 }
+            - { x: 16, y: 35.58 }
+        - name: "300 GB/s (this track's reference NVLink)"
+          points:
+            - { x: 2, y: 7.12 }
+            - { x: 4, y: 21.35 }
+            - { x: 8, y: 49.82 }
+            - { x: 16, y: 106.75 }
+        - name: "50 GB/s (400 Gb/s InfiniBand)"
+          points:
+            - { x: 2, y: 42.7 }
+            - { x: 4, y: 128.1 }
+            - { x: 8, y: 298.9 }
+            - { x: 16, y: 640.5 }
+
+    - type: sequence
+      title: "Where the 128 collectives sit in one step at t=8, 32 blocks"
+      items:
+        - "Step begins. Every rank holds 1.65 GB of weights and 8.59 GB of activations, and no collective has run yet."
+        - "Layer 0 forward: QKV column-parallel, no communication. 4 heads out of 32 stay on this rank."
+        - "Attention runs per head over the full sequence, locally. Still no communication."
+        - "Output projection is row-parallel: 117.44 MB per rank of all-reduce, and layer 0's residual add cannot start until it lands."
+        - "MLP: W1 column-parallel, GELU on the shard, W2 row-parallel. A second 117.44 MB all-reduce. Layer 1's first kernel waits on both."
+        - "Repeat 32 times: 64 all-reduces in the forward, each on the critical path, none overlapping a gradient as data parallelism's does."
+        - "Backward replays the same 64 in reverse — one on each column-parallel input gradient, one per sublayer — for 128 collectives and 15.032 GB per rank."
+        - "Step total: 50.1 ms of transfer at 300 GB/s against 100.6 ms of compute, 49.8% overhead. Data parallelism moves more bytes and pays 9%."
+
+    - type: mermaid
+      title: "Choosing a TP degree for a model that does not fit on one card"
+      code: |
+        graph LR
+          A[Does one layer fit on a card?] -->|yes| B[Data parallel or FSDP]
+          A -->|no| C{heads divisible by t?}
+          C -->|no| D[Reduce t or split head_dim, adding a collective inside attention]
+          C -->|yes| E{per-layer all-reduce under budget?}
+          E -->|yes, NVLink| F[1D TP inside the node]
+          E -->|no| G{need t above 8?}
+          G -->|yes| H[2D TP, sqrt-t by sqrt-t grid]
+          G -->|no| I[1D TP plus sequence parallelism]
+          H --> J[Compose with pipeline across nodes: 2.5D]
+
+  markdown: |
+    ## The split that needs no communication
+
+    A linear layer is $Y = XW$ with $X \in \mathbb{R}^{b s \times d_{in}}$ and
+    $W \in \mathbb{R}^{d_{in} \times d_{out}}$. There are exactly two ways to cut
+    $W$ across $t$ ranks.
+
+    **Column-parallel** splits the output dimension: $W = [W_1 \ldots W_t]$ with
+    $W_i \in \mathbb{R}^{d_{in} \times d_{out}/t}$. Rank $i$ computes
+
+    $$Y_i = X W_i \in \mathbb{R}^{b s \times d_{out}/t}$$
+
+    from the *whole* $X$: a shard of the columns times the full input is a shard
+    of the output, so nothing is needed from any other rank.
+
+    **Row-parallel** splits the input dimension: $W = [W_1; \ldots; W_t]$ with
+    $W_i \in \mathbb{R}^{d_{in}/t \times d_{out}}$, consuming the matching shard
+    of $X$:
+
+    $$Y = \sum_{i=1}^{t} X_i W_i$$
+
+    which is a partial product per rank and therefore one all-reduce in the
+    forward. The backward is free: with the summed $Y$ gradient in hand,
+    $\partial L/\partial W_i = X_i^\top \partial L/\partial Y$ and
+    $\partial L/\partial X_i = \partial L/\partial Y\, W_i^\top$ both only touch
+    local tensors.
+
+    | | forward | backward |
+    |---|---|---|
+    | column-parallel | nothing | one all-reduce on $\partial L/\partial X$ |
+    | row-parallel | one all-reduce on $Y$ | nothing |
+
+    ## Why the pair is forced
+
+    Megatron's whole architecture is the observation that column-parallel's
+    output shard is row-parallel's input shard. Put them in that order and the
+    boundary between them costs nothing — rank $i$'s $d_{out}/t$ columns of the
+    first matrix are exactly the $d_{in}/t$ rows of the second that rank $i$
+    needs. Put them in the other order and you pay a collective at the seam.
+
+    So a transformer block is
+
+    $$h = x + \operatorname{Attn}_{\text{row}}(\operatorname{Attn}_{\text{local}}
+      (\operatorname{QKV}_{\text{col}}(\operatorname{LN}(x))))$$
+
+    $$y = h + W_{2,\text{row}}\,\bigl(f(W_{1,\text{col}}\,\operatorname{LN}(h))\bigr)$$
+
+    and both $g$ operators — the row-parallel sums — are the only collectives in
+    the forward. Two per block, two more in the backward, 128 per step at 32
+    blocks.
+
+    The nonlinearity has to sit on the shard. $f$ is elementwise, so for a
+    contiguous slice $S_i$ of the hidden dimension,
+    $f(Z)_{S_i} = f(Z_{S_i})$: applying the GELU to rank $i$'s 1376 hidden units
+    produces exactly the right 1376 units of the activated tensor. Apply it
+    before the sum and you compute $\sum_i f(\text{partial}_i)$ where the
+    mathematics asks for $f(\sum_i \text{partial}_i)$. Measured on a
+    256-wide block with 1024 hidden units at $t = 4$: **1.3873 maximum
+    absolute, 23.65% relative**, on a loss curve that still goes down.
+
+    ## What it costs, and the shape of the cost
+
+    One all-reduce of an activation tensor $A = b\,s\,d \cdot 2$ bytes costs
+    $2\frac{t-1}{t}A$ per rank. Four per block per step:
+
+    $$V_{\text{block}} = 8\frac{t-1}{t}\,b\,s\,d \cdot 2
+      = 8 \cdot \frac{7}{8} \cdot 67.11\ \text{MB} = 469.76\ \text{MB}$$
+
+    at $t = 8$, 8192 tokens, $d = 4096$, fp16. Over 32 blocks that is
+    **15.032 GB per rank per step**, and at 300 GB/s it is **50.1 ms**.
+
+    | t | MB per block per rank | GB per step | % of compute, 300 GB/s | 900 GB/s | 50 GB/s |
+    |---|---|---|---|---|---|
+    | 2 | 268.44 | 8.590 | 7.12% | 2.37% | 42.7% |
+    | 4 | 402.65 | 12.885 | 21.35% | 7.12% | 128.1% |
+    | 8 | 469.76 | 15.032 | 49.82% | 16.61% | 298.9% |
+    | 16 | 503.32 | 16.106 | 106.75% | 35.58% | 640.5% |
+    | 64 | 528.48 | 16.911 | 448.36% | 149.45% | 2690.2% |
+
+    The bytes barely move — 268 MB to 528 MB across a 32x range of $t$ — while
+    the compute per rank falls as $1/t$. A data-parallel step moves a constant
+    number of bytes against a *constant* amount of compute, so its overhead is
+    the same at every scale; this one grows as $t-1$.
+
+    ## Why the group is a node
+
+    Solve for the bandwidth that keeps overhead at a budget:
+
+    $$B \ge \frac{8\frac{t-1}{t} A}{\beta \cdot 6 P_{\text{block}} b s / t}
+      = \frac{16(t-1)\,d\,F}{6 \beta P_{\text{block}}}$$
+
+    with $F$ the achieved FLOP/s. At $t = 8$, a 25% budget is 597.8 GB/s and a
+    10% budget is 1494.5 GB/s, which no single GPU link delivers. A 400 Gb/s
+    InfiniBand port is 50 GB/s — twelve times short — and puts $t = 8$ at 298.9%
+    overhead, 25.1% efficiency. That is why the TP group is drawn inside a node
+    and why everything above 8 devices is pipeline or data rather than more TP.
+
+    ## The part nobody shards
+
+    At $t = 8$ a rank holds 1.65 GB of weights and **8.59 GB of activations**.
+    The weights shrank by 8; the activations did not shrink at all, because
+    LayerNorm, dropout and the residual add each read the full $b \times s
+    \times d$ tensor, and there are four such tensors per block.
+
+    | t | weights | replicated activations | total | vs single device |
+    |---|---|---|---|---|
+    | 1 | 13.21 GB | 8.59 GB | 21.80 GB | 1.00x |
+    | 8 | 1.65 GB | 8.59 GB | 10.24 GB | 2.13x |
+    | 16 | 0.83 GB | 8.59 GB | 9.42 GB | 2.32x |
+    | 8 + SP | 1.65 GB | 1.07 GB | 2.73 GB | 8.00x |
+    | 16 + SP | 0.83 GB | 0.54 GB | 1.36 GB | 16.00x |
+
+    Going from 8 to 16 devices buys **8.06%** of memory for double the
+    communication. Sequence parallelism turns the curve back into a straight
+    line: shard the unsharded region along the sequence dimension, gather it
+    before each column-parallel projection and scatter it after each
+    row-parallel one. The all-reduce becomes a reduce-scatter plus an
+    all-gather — $2\frac{t-1}{t}A$ either way, 234.88 MB per block per rank at
+    $t = 8$ — so only the layout changes, not the bytes.
+
+    ## Above 8: the grid
+
+    A 2D TP group of $t_1 \times t_2$ splits the matmul on both axes, and
+    per-rank volume becomes
+
+    $$V_{\text{2D}} = 8\frac{\sqrt{t}-1}{t}A \quad\text{against}\quad
+      V_{\text{1D}} = 8\frac{t-1}{t}A$$
+
+    At $t = 64$ on an $8 \times 8$ grid: 58.72 MB against 528.48 MB, 9.0x less,
+    with every collective spanning 8 ranks instead of 64. Same compute, so the
+    overhead is 49.8% on 300 GB/s and 16.6% on 900 — exactly what 1D costs at
+    $t = 8$. That equivalence is the reason 2D exists: it lets the TP degree
+    grow while the *communication group* stays inside a node.
+
+    ## Accuracy
+
+    Tensor parallelism does not change the function being computed, only the
+    order the partial sums are added in. Measured against a single-device block
+    of identical shape: **6.22e-15 maximum, 5.93e-16 relative in fp64**;
+    **3.70e-06 / 3.19e-07 in fp32**; and after 20 training steps in fp32 the
+    parameters differ by **7.45e-09 maximum, 4.20e-09 relative**, with the
+    LayerNorm gain identical to the last bit. When both paths accumulate the
+    hidden units in the same block order, the outputs are `array_equal` — True,
+    zero difference. The split is exact; the float arithmetic is not.
+
+    The one decision that does cost accuracy is the dtype of the all-reduce.
+    Summing the partial products in bf16 injects **5.72e-03 maximum, 8.81e-04
+    relative** into every block — 2760x the fp32 figure — because the sum of
+    eight partials is exactly where the low mantissa bits live. Keep the
+    collective in fp32 even when the GEMM accumulates in bf16.
+
+    ## The longer version
+
+    ### The idea, stated at length
+
+    Tensor parallelism splits the weight matrix rather than the batch, so a collective lands inside every forward pass — which makes the TP degree a number set by the interconnect's FLOP-per-byte ratio, not by the size of the model.
+
+    ### The analogy, in full
+
+    A kitchen with eight cooks and one pass. The dish has two stages. In the first stage every cook takes the *same* full tray of ingredients — the recipe says so, and there is no reason for eight copies not to be identical — and prepares a different eighth of the components. Nobody coordinates, because cook 3's eighth is a different eighth of the same thing, not a partial version of somebody else's. In the second stage each cook turns their own eighth into a partial sauce, and the eight partial sauces have to be poured together into one. That pour is the all-reduce: it is the only coordination in the dish, it happens once, and it produces the full sauce that the garnish station then works on. Three things map exactly. The pour is a rendezvous, so it costs the slowest cook, not the average, and it cannot run "later" — the next dish's first stage needs the poured sauce, which is why TP communication cannot be hidden the way a gradient all-reduce can. The garnish station works on the whole plate, so every cook keeps a full copy of the garnish tray: that is the LayerNorm and dropout region, and it is why the pantry does not get eight times smaller. And if a cook seasons their own eighth *before* the pour, the dish is seasoned eight times — that is the GELU before the all-reduce, and it is the bug that still converges. The analogy breaks where the arithmetic does: a cook's eighth of the components is contiguous, while a tensor-parallel shard is a slice of a matrix and the "pour" is a sum over ranks, not a union. It also has no room for the fact that the pour's cost is proportional to the *size of the tray* and the number of cooks only enters as (t-1)/t — which is the single fact that decides how far tensor parallelism scales.
+
+    ### Failure modes, in full
+
+    - A 70B model does not fit on an 80 GB card and FSDP-3's answer is to gather every layer before using it. You want the alternative — each rank holds a permanent slice of every matrix and multiplies it — and the moment you do, the forward pass stops being a sequence of kernels and becomes a sequence of kernels with a rendezvous in the middle of it.
+    - You split the MLP across eight GPUs, the loss is correct, and the step is barely faster than one GPU doing the same tokens. The collectives are the same size as the FSDP all-gathers you just removed, so the obvious explanation — "too many bytes" — is wrong, and the real one, that 128 dependent collectives per step cannot hide behind anything, is not visible in any profiler summary you have looked at.
+    - Someone moves the GELU before the all-reduce because "the tensor is smaller that way". Training still converges. Every activation in the model is 23.65% wrong, the loss curve looks merely mediocre, and the bug survives three weeks of tuning.
+    - You go from eight-way to sixteen-way to halve the memory and get 8.1%. The weights halved correctly; the activations did not move, because LayerNorm, dropout and the residual add are not on anybody's shard.
+    - Your model has 32 heads, so TP stops at 32 — and your GQA variant has 8 KV heads, so it stops at 8. Nobody mentions this until the config fails to launch, and the launcher's error is about a tensor shape.
+
+    ### The mechanisms, in full
+
+    - **Column-parallel has no forward communication at all, and that is the whole trick.** Split the weight by its output dimension, $W = [W_1 \ldots W_t]$, and rank $i$ computes $Y_i = X W_i$ from the *full* input. At $d = 4096$ and $d_{ff} = 11008$ with $t = 8$, the MLP's first matrix is 4096 x 1376 per rank — **5,636,096 parameters, 11.27 MB in fp16** against 90.18 MB whole — and the block as a whole is **25,297,920 parameters, 50.60 MB** against 404.77 MB. Nothing crosses the wire: the output is sharded along exactly the dimension the next layer wants sharded, so the boundary between the two halves is free. The trap is believing the forward is where TP pays; it pays in the backward, on the input gradient, which is a sum over all $t$ column blocks.
+    - **Row-parallel is the mirror image: one all-reduce in the forward, nothing in the backward.** Split by the input dimension, $W = [W_1; \ldots; W_t]$, take the *sharded* input $X_i$, and $Y = \sum_i X_i W_i$ — a partial product per rank that must be summed. Given the summed $Y$, the weight gradient $\partial L/\partial W_i = X_i^\top\, \partial L/\partial Y$ is local and the input gradient $\partial L/\partial X_i = \partial L/\partial Y\, W_i^\top$ is local, so the backward is communication-free. Two halves, two opposite profiles; the pairing is forced because column-parallel's output shard is exactly row-parallel's input shard, and splitting any other way costs a collective you did not need.
+    - **Per transformer block that is exactly four collectives: two forward, two backward, 128 per step at 32 blocks.** Attention's QKV projection is column-parallel (4 heads per rank at $t = 8$, 32 heads over 8 ranks), the attention itself is per-head and therefore local, and the output projection is row-parallel. The MLP is the same shape: $W_1$ column-parallel, $W_2$ row-parallel, $f$ in between. **469.76 MB per rank per block** at 8192 tokens, $d = 4096$, fp16 — **15.032 GB per rank per step**, 50.1 ms at 300 GB/s against 100.6 ms of compute. Compare data parallelism, which moves 23.13 GB per step in *one* all-reduce: TP moves less and costs more, because its 128 collectives are inside the layer dependency chain and data parallelism's single one is not.
+    - **The nonlinearity goes between the two halves, on the shard, and moving it costs you the answer.** $f$ is elementwise, so $f$ applied to a contiguous slice of the hidden dimension *is* the corresponding slice of $f$ applied to the whole thing — $f(Z_i)$ is the $i$-th shard of $f(Z)$. That is why the MLP can be $f(XW_1)W_2$ with $f$ applied locally and no gather first. Put $f$ before the sum instead and you compute $\sum_i f(\text{partial}_i)$ where the mathematics wants $f(\sum_i \text{partial}_i)$: measured on a 256-wide, 1024-hidden block with $t = 4$, **max absolute error 1.3873 and 23.65% relative**, with a loss curve that still descends. The rule is one line: $f$ goes after the column-parallel layer and before the row-parallel one, never before a gather.
+    - **Per-rank communication is flat in $t$ while per-rank compute falls as $1/t$, so overhead grows linearly in $(t-1)$.** Bytes per block per rank are $8\frac{t-1}{t}\,b\,s\,d\,\cdot 2$, which saturates at $8A$ however far you scale; compute per rank is $6 P_{\text{block}} b s / t$, which does not saturate. The ratio is $16(t-1)d\,F / (6 P_{\text{block}} B)$ and has no batch size in it. Measured on 300 GB/s at 8192 tokens: **7.12% at t=2, 21.35% at t=4, 49.82% at t=8, 106.75% at t=16, 448.36% at t=64.** Doubling the TP degree doubles the relative cost — the opposite of every other parallelism in this track, where more devices buy efficiency. Invert it and the group has a size: holding overhead to 25% at $t = 8$ needs **597.8 GB/s** per GPU and holding it to 10% needs **1494.5 GB/s**, while a 400 Gb/s InfiniBand port is 50 GB/s and puts $t = 8$ at **298.9% — efficiency 1/(1+2.99) = 25.1%**, a quarter of the FLOPs you paid for. On that link even $t = 2$ at 25% is out of reach. NVLink at 900 GB/s gives **16.61%**, which is the entire reason the TP group is pinned inside a node and everything above 8 goes to pipeline or data parallelism.
+    - **The memory you are buying is mostly not the weights.** At $t = 8$ the sharded weights are **1.65 GB**, but the replicated region — four full-width tensors per block for the LayerNorm input, the LayerNorm output, the attention output and the MLP output — is **8.59 GB**, 5.2x the part that shrank. Total per rank 10.24 GB against 21.80 GB single-device, a **2.13x** reduction for eight devices. Going to $t = 16$ takes it to 9.42 GB: **8.06% less memory for double the traffic**. The asymptote of 1D TP is the activation set, and it is reached at $t \approx 4$ in practice.
+    - **Sequence parallelism fixes exactly that, and costs nothing in bytes.** Shard the LayerNorm, dropout and residual along the sequence dimension so each rank holds $b\,s/t$ tokens instead of $b\,s$, and replace each all-reduce with a reduce-scatter plus an all-gather. Same bytes — $2\frac{t-1}{t}A$ either way, **234.88 MB per block per rank at $t = 8$** — same time, but the replicated 8.59 GB becomes **1.07 GB**, and the per-rank total falls from 10.24 GB to **2.73 GB: 8.00x against a single device, which is the number you thought you were buying.** The constraint is that attention needs the whole sequence, so the all-gather happens before each column-parallel projection and the shard is only ever the non-attention region.
+    - **The TP degree is capped by the head count before it is capped by bandwidth.** 32 heads divide 4 ways at $t = 8$, 2 at $t = 16$, 1 at $t = 32$; $t = 64$ requires splitting $d_{\text{head}} = 128$ into two 64s, and the softmax needs the full head dimension, so that split puts an extra collective *inside* attention. A GQA model with 8 KV heads caps the KV projection at 8 regardless of how many query heads it has. Neither limit appears in a FLOP count, and both are hard launch-time failures.
+    - **Above $t = 8$, 2D is how you keep the overhead — 64 devices at the price of 8.** On a $\sqrt{t} \times \sqrt{t}$ grid the per-rank volume is $8\frac{\sqrt{t}-1}{t}A$ instead of $8\frac{t-1}{t}A$: at $t = 64$ that is **58.72 MB against 528.48 MB, 9.0x less**, and every collective spans 8 ranks instead of 64. Measured against the same compute, 2D-64 costs **49.8% on 300 GB/s and 16.6% on 900** — identical to 1D at $t = 8$ on the same links. The price is twice the collectives, an extra layout change between the two halves, and divisibility constraints on both dimensions; 2.5D composes that grid with pipeline or data parallelism so no single group leaves a node.
+    - **The arithmetic is exact, and the residual error is accumulation order, not the split.** Against a single-device block of the same shape the tensor-parallel version differs by **6.22e-15 maximum, 5.93e-16 relative in fp64** and **3.70e-06 / 3.19e-07 in fp32**; after 20 training steps in fp32 the parameters are **7.45e-09 maximum, 4.20e-09 relative** apart, and the LayerNorm gain is **0.0 exactly**. When both paths accumulate the hidden units in the same block order the results are **bit-identical** — `array_equal` returns True. What is *not* free is a narrow all-reduce: doing the sum in bf16 injects **5.72e-03 maximum, 8.81e-04 relative** into every block, which is 2760x the fp32 figure and is the only numerical decision in this topic that matters.
+  derivations:
+    - title: "Which split needs the all-reduce, from the chain rule"
+      latex: |
+        Write a linear layer as $Y = XW$ and give each rank a slice of $W$. The
+        forward is fixed by the slice; the question is what the backward needs.
+
+        Column-parallel, $W = [W_1 \ldots W_t]$, $Y_i = XW_i$. The loss depends
+        on $X$ only through all $t$ shards:
+
+        $$\frac{\partial L}{\partial X}
+          = \sum_{i=1}^{t} \frac{\partial L}{\partial Y_i} W_i^\top
+          \qquad\text{(all-reduce over } t \text{ ranks)}$$
+
+        and the weight gradient $\partial L/\partial W_i = X^\top
+        \partial L/\partial Y_i$ touches only $X$ and this rank's own shard, so
+        it is local. Column-parallel: 0 forward, 1 backward.
+
+        Row-parallel, $W = [W_1; \ldots; W_t]$, $Y = \sum_i X_i W_i$. The
+        forward is a sum of $t$ partial products, so
+
+        $$Y = \sum_{i=1}^{t} X_i W_i \qquad\text{(all-reduce over } t
+          \text{ ranks)}$$
+
+        and once $Y$ is summed, $\partial L/\partial W_i = X_i^\top
+        \partial L/\partial Y$ and $\partial L/\partial X_i = \partial L/
+        \partial Y\, W_i^\top$ are both local. Row-parallel: 1 forward, 0
+        backward.
+
+        Pairing them gives one all-reduce per sublayer in each direction, and
+        the seam between the two is free because the column shard of the first
+        matrix is the row shard of the second:
+
+        $$Y_i^{\text{col}} \in \mathbb{R}^{bs \times d_{out}/t}
+          \;\equiv\; X_i^{\text{row}} \in \mathbb{R}^{bs \times d_{in}/t} .$$
+      prose: >-
+        The asymmetry is the entire design. A column split defers its cost to
+        the backward, where it can overlap with the next layer's work; a row
+        split pays in the forward, where nothing can overlap it. Alternating
+        them is what keeps the bill at two collectives per block instead of
+        four, and the identity at the end is why the alternation costs nothing
+        at the seam.
+
+    - title: "Bytes per block, and why the overhead grows as (t - 1)"
+      latex: |
+        One all-reduce of $n$ bytes across $t$ ranks moves
+        $2\frac{t-1}{t}n$ per rank: $t-1$ chunks down, $t-1$ chunks up, each
+        $n/t$ bytes.
+
+        A block has two sublayers, each with one row-parallel all-reduce in the
+        forward and one column-parallel all-reduce in the backward, on an
+        activation of $A = b\,s\,d\cdot 2$ bytes:
+
+        $$V = 4 \cdot 2\frac{t-1}{t}A = 8\frac{t-1}{t}A .$$
+
+        Compute per rank per block, at 6 FLOPs per parameter per token:
+
+        $$C = \frac{6 P_{\text{block}}\, b s}{t} .$$
+
+        Their ratio is the overhead, and both the batch and one factor of $t$
+        cancel:
+
+        $$\frac{V/B}{C/F}
+          = \frac{8\frac{t-1}{t} b s d \cdot 2 \, F}{B \cdot 6 P_{\text{block}} b s / t}
+          = \frac{16(t-1)\, d\, F}{6 P_{\text{block}}\, B} .$$
+
+        With $d = 4096$, $P_{\text{block}} = 202{,}383{,}360$, $F = 395.6$
+        TFLOP/s (989 peak at 40% MFU) and $B = 300$ GB/s:
+
+        $$\text{overhead}(t) = 0.0712\,(t-1) \;\Longrightarrow\;
+          7.12\%,\ 21.35\%,\ 49.82\%,\ 106.75\%$$
+
+        at $t = 2, 4, 8, 16$. Inverting for the bandwidth that holds a budget
+        $\beta$ at $t = 8$:
+
+        $$B \ge \frac{16 \cdot 7 \cdot 4096 \cdot 3.956\times10^{14}}
+          {6 \cdot 0.25 \cdot 202383360}
+          = 597.8\ \text{GB/s} \quad (\beta = 0.25).$$
+      prose: >-
+        The absence of $b$ and $s$ from the final expression is the point: this
+        is not a large-batch problem or a long-context problem, it is a property
+        of the model's width against the machine's FLOP-per-byte ratio. It also
+        explains why the same 8-way split is 7% on one generation of GPU and 50%
+        on the next — the FLOPs doubled and the link did not.
+
+    - title: "Memory: what shards, what does not, and what sequence parallelism fixes"
+      latex: |
+        Per-rank memory is the sharded weights plus the unsharded activations:
+
+        $$M(t) = \frac{S}{t} + L \cdot r \cdot b\,s\,d \cdot 2 ,$$
+
+        with $S = 13.21$ GB of fp16 weights, $L = 32$ blocks and $r = 4$
+        full-width tensors per block. At $t = 8$:
+
+        $$M(8) = 1.652 + 8.590 = 10.24\ \text{GB}
+          \qquad\text{against}\qquad M(1) = 21.80\ \text{GB},$$
+
+        a 2.13x reduction for eight devices. The asymptote as $t \to \infty$ is
+        $L r b s d \cdot 2 = 8.59$ GB — the activation set — so the marginal
+        return has already collapsed at $t = 8$:
+
+        $$\frac{M(16)}{M(8)} = \frac{0.826 + 8.590}{1.652 + 8.590} = 0.919,$$
+
+        an 8.06% saving for double the communication.
+
+        Sequence parallelism shards the same tensors along the sequence
+        dimension:
+
+        $$M_{\text{SP}}(t) = \frac{S}{t} + \frac{L r b s d \cdot 2}{t}
+          = \frac{21.80}{t},$$
+
+        so $M_{\text{SP}}(8) = 2.73$ GB, 8.00x against a single device. The cost
+        is zero in bytes: one all-reduce of $A$ is $2\frac{t-1}{t}A$, and one
+        reduce-scatter plus one all-gather of the same tensor is
+        $\frac{t-1}{t}A + \frac{t-1}{t}A$, the same number.
+      prose: >-
+        This is the derivation that decides whether tensor parallelism is worth
+        running at all. Below t = 8 the weights dominate and the split behaves
+        as advertised; above it the replicated region dominates, every extra
+        rank buys single-digit percentages, and the only way to keep scaling is
+        to shard the thing you were told was not shardable.
+
+  implementations:
+    - language: python
+      title: "A tensor-parallel block that is bit-identical to a single device, with the ring counting its own bytes"
+      note: >-
+        Correct, and the output is the proof: the eight-way block reproduces the
+        single-device block to **6.44e-15 maximum, 5.97e-16 relative** in fp64,
+        and is **bit-identical** when both paths accumulate the hidden units in
+        the same block order. The byte counter is a real ring —
+        $(t-1)$ chunks down and $(t-1)$ up, each $n/t$ elements — not the formula
+        typed twice, and it matches $2\frac{t-1}{t}A$ to the byte at every $t$.
+        The scaled line is the one that matters: at $t = 8$ with 8192 tokens and
+        $d = 4096$ a block costs 469.76 MB per rank and a 32-block step 15.032 GB.
+        Single-process caveat: each "rank" is an array in one interpreter, so
+        this measures the algorithm and its bytes, never the interconnect's
+        latency or its achieved bandwidth.
+      code: |
+        import numpy as np
+
+        D, DFF, T = 256, 1024, 512
+        A = T * D * 8                       # one activation tensor, counted in fp64
+
+
+        def ln(x, g, b, eps=1e-5):
+            mu, var = x.mean(-1, keepdims=True), x.var(-1, keepdims=True)
+            return (x - mu) / np.sqrt(var + eps) * g + b
+
+
+        def ring_bytes(n, tp, itemsize=8):
+            """Bytes one rank sends in a ring all-reduce of n elements."""
+            return 2 * (tp - 1) * (n // tp) * itemsize
+
+
+        rng = np.random.default_rng(4)
+        p = dict(g=np.ones(D), b=np.zeros(D),
+                 W1=rng.standard_normal((D, DFF)) / np.sqrt(D),
+                 W2=rng.standard_normal((DFF, D)) / np.sqrt(DFF),
+                 x=rng.standard_normal((T, D)))
+
+
+        def block_single(p):
+            h = ln(p["x"], p["g"], p["b"])
+            return p["x"] + np.tanh(h @ p["W1"]) @ p["W2"]
+
+
+        def block_tp(p, tp, order="segmented"):
+            h = ln(p["x"], p["g"], p["b"])              # replicated, identical everywhere
+            W1s = np.array_split(p["W1"], tp, axis=1)   # column-parallel: split the hidden dim
+            W2s = np.array_split(p["W2"], tp, axis=0)   # row-parallel: the matching rows
+            parts = []
+            for i in range(tp):
+                z_i = h @ W1s[i]                        # local pre-activation
+                parts.append(np.tanh(z_i) @ W2s[i])     # f on the shard, then the partial sum
+            if order == "segmented":                    # same accumulation order as the reference
+                out = np.concatenate([q[:, None, :] for q in parts], 1).sum(1)
+            else:
+                out = np.zeros_like(parts[0])
+                for q in parts:
+                    out = out + q
+            return p["x"] + out, ring_bytes(T * D, tp, 8)
+
+
+        ref = block_single(p)
+        print("tp  max|d|      rel        bytes/rank/block   2(t-1)/t * A")
+        for tp in (2, 4, 8, 16):
+            out, sent = block_tp(p, tp)
+            print("%2d  %.3e  %.3e  %10d  %10d"
+                  % (tp, np.max(np.abs(out - ref)),
+                     np.linalg.norm(out - ref) / np.linalg.norm(ref),
+                     sent, int(2 * (tp - 1) / tp * A)))
+
+        h = ln(p["x"], p["g"], p["b"])
+        z = h @ p["W1"]
+        seg = np.zeros((T, D))
+        for i in range(8):
+            sl = slice(i * DFF // 8, (i + 1) * DFF // 8)
+            seg += np.tanh(z[:, sl]) @ p["W2"][sl]
+        out, _ = block_tp(p, 8)
+        print("same accumulation order identical:", np.array_equal(out, p["x"] + seg))
+
+        tokens, d, blocks = 8192, 4096, 32
+        Ab = tokens * d * 2
+        print("per block per rank at tp=8: %.2f MB; per step: %.3f GB; collectives: %d"
+              % (8 * 7 / 8 * Ab / 1e6, 8 * 7 / 8 * Ab * blocks / 1e9, 4 * blocks))
+
+        # tp  max|d|      rel        bytes/rank/block   2(t-1)/t * A
+        #  2  6.661e-15  5.444e-16     1048576     1048576
+        #  4  6.439e-15  5.946e-16     1572864     1572864
+        #  8  6.439e-15  5.970e-16     1835008     1835008
+        # 16  6.661e-15  5.909e-16     1966080     1966080
+        # same accumulation order identical: True
+        # per block per rank at tp=8: 469.76 MB; per step: 15.032 GB; collectives: 128
+
+    - language: python
+      title: "Two ways to get a plausible loss curve and a wrong model — numerically WRONG"
+      note: >-
+        Both bugs are real, both are here on purpose, and neither raises. The
+        first applies the nonlinearity to each partial sum instead of to the sum:
+        **1.3873 maximum absolute, 23.65% relative** against the correct
+        row-parallel placement, and because tanh is monotone the trained model
+        still fits something — it is simply a different function than the one
+        that was specified. The second keeps the collectives in a narrow dtype:
+        fp32 costs **9.85e-08 / 1.35e-08**, bf16 costs **5.72e-03 / 8.81e-04**,
+        which is 2760x worse, and the bf16 version is the one that ships because
+        it halves the link time. Neither shows up as a failed assertion anywhere;
+        the first is caught by comparing against a single-device reference, the
+        second only by comparing dtypes on the same numbers.
+      code: |
+        import numpy as np
+
+        rng = np.random.default_rng(11)
+        D, DFF, T, TP = 256, 1024, 512, 4
+
+
+        def ln(x, g, b, eps=1e-5):
+            mu, var = x.mean(-1, keepdims=True), x.var(-1, keepdims=True)
+            return (x - mu) / np.sqrt(var + eps) * g + b
+
+
+        def bf16(x):
+            """Round to bfloat16: 8 mantissa bits, fp32 exponent."""
+            u = x.astype(np.float32).view(np.uint32)
+            return ((u + 0x8000) & 0xFFFF0000).view(np.float32).astype(np.float64)
+
+
+        p = dict(g=np.ones(D), b=np.zeros(D),
+                 W1=rng.standard_normal((D, DFF)) / np.sqrt(D),
+                 W2=rng.standard_normal((DFF, D)) / np.sqrt(DFF),
+                 x=rng.standard_normal((T, D)))
+        h = ln(p["x"], p["g"], p["b"])
+        ref = p["x"] + np.tanh(h @ p["W1"]) @ p["W2"]
+
+        # BUG 1: the split is by input feature, and f is applied to each partial sum.
+        W1r = np.array_split(p["W1"], TP, axis=0)
+        hs = np.array_split(h, TP, axis=1)
+        partial = [hs[i] @ W1r[i] for i in range(TP)]
+        right = p["x"] + np.tanh(sum(partial)) @ p["W2"]
+        wrong = p["x"] + sum(np.tanh(q) for q in partial) @ p["W2"]
+        print("f after the gather : max|d| %.3e" % np.max(np.abs(right - ref)))
+        print("f before the gather: max|d| %.4f   rel %.4f"
+              % (np.max(np.abs(wrong - ref)),
+                 np.linalg.norm(wrong - ref) / np.linalg.norm(ref)))
+
+        # BUG 2: the all-reduce is done in a narrow dtype.
+        a = np.tanh(h @ p["W1"])
+        parts = [a[:, i * DFF // TP:(i + 1) * DFF // TP]
+                 @ p["W2"][i * DFF // TP:(i + 1) * DFF // TP] for i in range(TP)]
+        for name, q in (("fp32", lambda v: v.astype(np.float32).astype(np.float64)),
+                        ("bf16", bf16)):
+            acc = np.zeros_like(parts[0])
+            for r in parts:
+                acc = acc + q(r)
+            out = p["x"] + acc
+            print("%s all-reduce: max|d| %.4e  rel %.4e"
+                  % (name, np.max(np.abs(out - ref)),
+                     np.linalg.norm(out - ref) / np.linalg.norm(ref)))
+
+        # f after the gather : max|d| 3.553e-15
+        # f before the gather: max|d| 1.3873   rel 0.2365
+        # fp32 all-reduce: max|d| 9.8532e-08  rel 1.3452e-08
+        # bf16 all-reduce: max|d| 5.7188e-03  rel 8.8114e-04
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A colleague splits the MLP by putting $W_1$ row-parallel and $W_2$
+        column-parallel, then all-reduces after $W_1$ before applying the GELU.
+        It produces the right answer. What did it cost, and what would you
+        change?
+      answerKind: short_text
+      hint: >-
+        Count the collectives per block for their arrangement and for the
+        Megatron one. Both are correct; only one of them puts the all-reduce
+        where it can be avoided.
+      solution: >-
+        Their arrangement costs two forward all-reduces instead of one: the
+        row-parallel $W_1$ needs a sum before $f$, and the column-parallel $W_2$
+        then needs another sum after it, because a column split's output is
+        sharded and must be assembled before the residual add. It also
+        materialises the full 11008-wide activation on every rank, which is the
+        memory the split was supposed to save. The Megatron arrangement —
+        $W_1$ column-parallel, $f$ on the shard, $W_2$ row-parallel — has
+        exactly one all-reduce per sublayer because the column shard is the row
+        shard, so the seam is free and the wide activation exists only as a
+        $11008/t$ slice per rank. At $t = 8$ that is one 117.44 MB all-reduce
+        per sublayer instead of two, and 8.59 GB of activations becomes 1.07 GB
+        once sequence parallelism shards the rest.
+    - id: cp-2
+      question: >-
+        You are told to run a 32-head, 32-layer 7B model at TP=64 across eight
+        nodes to fit it in memory. Give two independent reasons this does not
+        work as specified, with numbers.
+      answerKind: short_text
+      hint: >-
+        One reason is a hard divisibility constraint in attention; the other is
+        the $(t-1)$ law and the link that would have to carry it.
+      solution: >-
+        First, 32 heads cannot be dealt 64 ways. TP=64 requires splitting
+        $d_{\text{head}} = 128$ into two 64s, and the softmax needs the full
+        head dimension, so that split puts an extra collective inside attention
+        on top of the four per block — and a GQA variant with 8 KV heads would
+        stop at 8 regardless. Second, at $t = 64$ the per-block all-reduce is
+        528.48 MB per rank against 0.393 ms of compute per rank: 448% overhead
+        on 300 GB/s and 149% on 900. Across nodes the link is 50 GB/s, which
+        makes it 2690%. The configuration is not slow, it is 27x slower than the
+        arithmetic. The answers that work are 2D TP (8x8, 58.72 MB per block,
+        49.8% on 300 GB/s, then composed with pipeline across nodes) or TP=8
+        with sequence parallelism, which gets the memory to 2.73 GB per rank
+        without moving the TP group off the node.
+    - id: cp-3
+      question: >-
+        Why does sequence parallelism cost no extra communication, when it looks
+        like it adds an all-gather?
+      answerKind: short_text
+      hint: >-
+        Write the bytes for one all-reduce of $A$ and for one reduce-scatter
+        plus one all-gather of $A$. They are the same expression.
+      solution: >-
+        An all-reduce is a reduce-scatter followed by an all-gather — that is
+        what a ring all-reduce is. Each half moves $\frac{t-1}{t}A$ per rank, so
+        the pair moves $2\frac{t-1}{t}A$, identical to the all-reduce it
+        replaces. Sequence parallelism does not add a collective; it *splits*
+        the existing one, and uses the reduce-scatter half as the point where the
+        activation becomes sequence-sharded and the all-gather half as the point
+        where it becomes full again for the next column-parallel projection.
+        The measured figure is 234.88 MB per block per rank at $t = 8$ either
+        way, and the reward is that the 8.59 GB of replicated activations
+        becomes 1.07 GB.
+    - id: cp-4
+      question: >-
+        Someone proposes running the TP group at 8 across two nodes connected by
+        400 Gb/s InfiniBand because "the all-reduce is only 470 MB, and the link
+        does 50 GB/s, so it takes 9 ms out of a 100 ms step". What is wrong with
+        the arithmetic?
+      answerKind: short_text
+      hint: >-
+        470 MB is per block. How many blocks, and how much compute is left per
+        rank once the work has been divided eight ways?
+      solution: >-
+        Both halves of the sentence are wrong. The 9.4 ms is per *block*, not
+        per step: 32 blocks make it 300.6 ms. And the step's compute is not
+        100 ms at that point — dividing the block's work across 8 ranks leaves
+        each rank 3.143 ms of compute per block, 100.6 ms per step, so the
+        transfer is **298.9%** of it. Efficiency is $1/(1+2.99) = 25.1\%$: three
+        quarters of the machine is waiting on a rendezvous. Holding a 25% budget
+        at $t = 8$ needs 597.8 GB/s, twelve times the port. This is the entire
+        argument for keeping the TP group intra-node, and it is decided by one
+        formula rather than by a benchmark.
+    - id: cp-5
+      question: >-
+        Your 7B training run at TP=8 fits at 10.24 GB per rank for weights and
+        activations, but you still run out of memory once the optimizer state is
+        added. Do you raise TP to 16 or turn on sequence parallelism, and what
+        does each cost?
+      answerKind: short_text
+      hint: >-
+        Compute what each one does to 8.59 GB, and what each one does to the
+        469.76 MB per block.
+      solution: >-
+        Sequence parallelism, without hesitation. TP=16 takes the weights from
+        1.65 GB to 0.83 GB and the total from 10.24 GB to 9.42 GB — 8.06% for
+        double the traffic, which at 300 GB/s also doubles the overhead from
+        49.8% to 106.8%. SP takes the *activations* from 8.59 GB to 1.07 GB,
+        leaving 2.73 GB total, 8.00x against a single device, for exactly the
+        same 469.76 MB per block. In practice you run both: SP for the
+        activations inside the node, and FSDP-3 across nodes for the optimizer
+        state, which is 16 bytes per parameter and shards to nothing — the
+        subject of the previous topic, unchanged by anything here.
+    - id: cp-6
+      question: >-
+        A reviewer claims tensor parallelism is "numerically unsafe because the
+        partial sums are added in a different order". What is the measured
+        answer, and where does the real risk live?
+      answerKind: short_text
+      hint: >-
+        Compare the block against a single-device reference in fp64 and in
+        fp32, then compare an fp32 all-reduce against a bf16 one.
+      solution: >-
+        The measured difference from a single-device block is 6.22e-15 maximum
+        and 5.93e-16 relative in fp64, 3.70e-06 and 3.19e-07 in fp32, and after
+        20 fp32 training steps 7.45e-09 / 4.20e-09 on the parameters — with an
+        exact `array_equal` result when both paths accumulate in the same block
+        order. Reassociation at these magnitudes is not a correctness risk. The
+        real risk is the dtype of the collective: an fp32 all-reduce costs
+        9.85e-08 / 1.35e-08 and a bf16 one costs 5.72e-03 / 8.81e-04, a factor
+        of 2760, because bf16 keeps 8 mantissa bits and the eight-way sum is
+        precisely where the low bits are. Keep the reduce in fp32 even when the
+        GEMM accumulates in bf16.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        Data parallelism gives every rank the whole model and a different slice
+        of the batch. Tensor parallelism does the opposite: every rank sees every
+        token and holds a slice of every matrix. Nothing about the batch changes,
+        so the step processes the same number of tokens on eight GPUs as on one —
+        what changes is that each rank does an eighth of the arithmetic and holds
+        an eighth of the weights.
+
+        That trade is only interesting because of where the arithmetic has to be
+        recombined. A matrix split by its columns produces a slice of the output
+        with no coordination at all; a matrix split by its rows produces a
+        partial sum that has to be added to seven others before anything else can
+        use it. Alternate the two splits and each sublayer needs exactly one
+        addition — but that addition sits in the middle of the forward pass,
+        between two layers, with nothing to hide behind. Every property of this
+        topic follows from that one placement.
+      blocks:
+        - kind: checklist
+          body: |
+            - TP splits the weight matrix; the batch is untouched
+            - Column-parallel: no forward communication, one backward all-reduce
+            - Row-parallel: one forward all-reduce, no backward communication
+            - The pair is forced, because the column shard is the row shard
+            - Four collectives per block, 128 per step at 32 blocks
+            - Per-rank bytes are flat in t; per-rank compute falls as 1/t
+            - The nonlinearity belongs on the shard, never before a gather
+      checkpoint: >-
+        Before reading on: if a column split needs no communication in the
+        forward, where does its cost go — and why can that cost be hidden while
+        a row split's cannot?
+
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Answer four questions in order.
+
+        *Does it divide?* The TP degree must divide the head count, and for GQA
+        it must also divide the KV head count. This is a launch-time constraint,
+        not a performance one, and it bounds $t$ before any bandwidth argument
+        applies.
+
+        *What does one block cost?* $8\frac{t-1}{t}$ times the activation tensor
+        in bytes, per rank, forward and backward together. That number is flat in
+        $t$ — 268 MB at $t = 2$, 470 MB at $t = 8$, 528 MB at $t = 64$ — and that
+        flatness is the trap, because the compute next to it is falling as $1/t$.
+
+        *What fraction of the compute is it?* Divide by the block's compute at
+        your achieved FLOP/s. The answer is proportional to $t-1$, so it doubles
+        when you double the degree. Compare it against the link, and remember
+        that the link is whatever the *slowest* hop in the group is.
+
+        *What is not sharded?* Multiply the full-width activation by four
+        tensors per block and by the block count. If that term is larger than
+        $S/t$, more TP is not buying memory — sequence parallelism is.
+      blocks:
+        - kind: checklist
+          body: |
+            - Divisibility first: heads, and KV heads for GQA
+            - One block: 8(t-1)/t * b*s*d*2 bytes per rank, flat in t
+            - Overhead = that / (6 * P_block * b*s / t), grows as (t-1)
+            - 25% budget at t=8 needs 598 GB/s; IB gives 50
+            - Replicated activations: 4 tensors per block, 8.59 GB at t=8
+            - If replicated > sharded, add sequence parallelism before more TP
+            - Above 8 devices: 2D, so the collective group stays a node
+      checkpoint: >-
+        You have 32 heads, a 900 GB/s link, and a 25% communication budget.
+        What is the largest TP degree you can use, and which of the two numbers
+        decided it?
+
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        One block, written as the two operators Megatron names f and g, plus the
+        four numbers that price it. Write the collective placement first; the
+        performance analysis is only arithmetic on top of it.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # the two operators
+            f(X, W_cols):                 # column-parallel
+                return X @ W_cols         # full X, shard of the output, no comm
+
+            g(partials):                  # row-parallel
+                return all_reduce_sum(partials)      # 2(t-1)/t * A bytes/rank
+
+            # one block
+            h = LN(x)                     # replicated, full width
+            qkv = f(h, W_qkv)             # no comm
+            a = attention_per_head(qkv)   # local: this rank owns 4 of 32 heads
+            x = x + g(a @ W_out_rows)     # all-reduce #1
+
+            h = LN(x)                     # replicated
+            z = f(h, W_1)                 # 4096 -> 1376 on this rank
+            x = x + g(tanh(z) @ W_2_rows) # all-reduce #2
+
+            # pricing
+            A = b*s*d*2
+            per_block = 8*(t-1)/t * A
+            per_step = per_block * n_blocks
+            overhead = per_block / (6 * P_block/t * b*s / F)
+
+            # the two answers people forget
+            replicated = n_blocks * 4 * A          # 8.59 GB at t=8
+            max_t = min(n_heads, n_kv_heads if gqa else n_heads,
+                        floor(1 + budget*6*P_block*B / (16*d*F)))
+      checkpoint: >-
+        The last line takes a minimum of three things. Which of them is a hard
+        constraint that no amount of bandwidth fixes, and which two trade off
+        against each other?
+
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The chain rule decides the placement; the pass count decides the bytes;
+        the ratio decides the scaling.
+      blocks:
+        - kind: math
+          body: |
+            Column split, $W = [W_1 \ldots W_t]$, $Y_i = XW_i$:
+
+            $$\frac{\partial L}{\partial X} = \sum_i \frac{\partial L}{\partial
+              Y_i} W_i^\top, \qquad \frac{\partial L}{\partial W_i} =
+              X^\top \frac{\partial L}{\partial Y_i}$$
+
+            so the input gradient needs an all-reduce and the weight gradient
+            does not.
+
+            Row split, $W = [W_1; \ldots; W_t]$, $Y = \sum_i X_i W_i$:
+
+            $$Y = \sum_i X_i W_i, \qquad \frac{\partial L}{\partial W_i} =
+              X_i^\top \frac{\partial L}{\partial Y}, \qquad
+              \frac{\partial L}{\partial X_i} = \frac{\partial L}{\partial Y}
+              W_i^\top$$
+
+            so the forward needs the all-reduce and the backward needs nothing.
+
+            One all-reduce of $n$ bytes across $t$ ranks moves
+            $2\frac{t-1}{t}n$ per rank. Four per block (two forward, two
+            backward) on $A = b\,s\,d \cdot 2$:
+
+            $$V = 8\frac{t-1}{t}A, \qquad C = \frac{6 P_{\text{block}} b s}{t},
+              \qquad \frac{V/B}{C/F} = \frac{16(t-1)dF}{6 P_{\text{block}} B}.$$
+
+            With $d = 4096$, $P_{\text{block}} = 202{,}383{,}360$, $F = 395.6$
+            TFLOP/s, $B = 300$ GB/s: overhead $= 0.0712(t-1)$, i.e. 7.12%,
+            21.35%, 49.82%, 106.75% at $t = 2, 4, 8, 16$.
+
+            Invert for bandwidth at a 25% budget, $t = 8$:
+
+            $$B \ge \frac{16 \cdot 7 \cdot 4096 \cdot 3.956\times10^{14}}
+              {6 \cdot 0.25 \cdot 202383360} = 597.8\ \text{GB/s}.$$
+      checkpoint: >-
+        The overhead expression has no $b$ and no $s$ in it. What does that tell
+        you about the two knobs — batch size and sequence length — that everyone
+        reaches for first when TP is slow?
+
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        The complete picture: the placement, the price, the memory that does not
+        shard, and the two dtypes that decide whether the numbers are right.
+      blocks:
+        - kind: warning
+          body: >-
+            Three of these failures are silent. A nonlinearity before the
+            all-reduce costs 23.65% of every activation and produces a loss curve
+            that descends. A bf16 collective injects 8.81e-04 per block, which is
+            invisible in a loss printed to three decimals. A TP degree that
+            exceeds the head count fails loudly at launch, which is the good
+            case — the bad case is a rank that computes a different function from
+            its peers because a shard boundary was drawn on the wrong axis, and
+            that one shows up as divergence at step 4,000.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+
+            def block_bytes(t, tokens, d_model, blocks, dtype_bytes=2):
+                """Per rank, forward and backward, for one block and one step."""
+                A = tokens * d_model * dtype_bytes
+                per_block = 8 * (t - 1) / t * A
+                return per_block, per_block * blocks, 4 * blocks
+
+
+            def overhead(t, tokens, d_model, block_params, bandwidth_gbs,
+                         tflops_effective, dtype_bytes=2):
+                A = tokens * d_model * dtype_bytes
+                comm = 8 * (t - 1) / t * A / (bandwidth_gbs * 1e9)
+                compute = 6 * block_params / t * tokens / (tflops_effective * 1e12)
+                return 100 * comm / compute
+
+
+            def max_tp(tokens, d_model, block_params, bandwidth_gbs,
+                       tflops_effective, budget_pct=25.0):
+                """Largest t whose all-reduce stays inside the budget."""
+                return int(1 + (budget_pct / 100) * 6 * block_params *
+                           bandwidth_gbs * 1e9 / (16 * d_model * tflops_effective * 1e12))
+
+
+            def memory(t, params, blocks, tokens, d_model, replicated=4, dtype_bytes=2):
+                w = params * dtype_bytes / t
+                act = blocks * replicated * tokens * d_model * dtype_bytes
+                return {"weights": w, "activations": act, "total": w + act,
+                        "total_sp": w + act / t}
+
+
+            if __name__ == "__main__":
+                P = 202383360
+                for t in (2, 4, 8, 16, 64):
+                    pb, ps, nc = block_bytes(t, 8192, 4096, 32)
+                    print("t=%2d  %.2f MB/block  %.3f GB/step  %d collectives  "
+                          "%.2f%% @300  %.2f%% @900"
+                          % (t, pb / 1e6, ps / 1e9, nc,
+                             overhead(t, 8192, 4096, P, 300.0, 395.6),
+                             overhead(t, 8192, 4096, P, 900.0, 395.6)))
+                print("max t at 25%: 300 GB/s ->", max_tp(8192, 4096, P, 300.0, 395.6),
+                      " 900 ->", max_tp(8192, 4096, P, 900.0, 395.6),
+                      " 50 ->", max_tp(8192, 4096, P, 50.0, 395.6))
+                for t in (8, 16):
+                    m = memory(t, 6.607339520e9, 32, 8192, 4096)
+                    print("t=%2d  %.2f GB -> %.2f GB with SP"
+                          % (t, m["total"] / 1e9, m["total_sp"] / 1e9))
+      checkpoint: >-
+        `max_tp(8192, 4096, P, 900.0, 395.6)` returns 11 and
+        `max_tp(8192, 4096, P, 300.0, 395.6)` returns 4. If your model has eight
+        KV heads, which of those two numbers can you actually use?
+
+  problems:
+    - id: p-tp-bytes
+      title: "What one tensor-parallel block moves"
+      difficulty: medium
+      prompt: >-
+        Implement `tp_block_bytes(tp, tokens, d_model, num_blocks,
+        dtype_bytes=2)` returning a dict with exactly four keys, all describing
+        **one rank**:
+
+        `bytes_per_collective` — one all-reduce of the block's activation,
+        $2\frac{t-1}{t} \cdot \text{tokens} \cdot d_{\text{model}} \cdot
+        \text{dtype\_bytes}$, and `0.0` when `tp == 1` because there is nothing
+        to talk to;
+
+        `bytes_per_block` — four of those: one in the forward and one in the
+        backward for each of the block's two sublayers;
+
+        `bytes_per_step` — `bytes_per_block` times `num_blocks`;
+
+        `collectives_per_step` — an integer, four per block, regardless of
+        `tp` (a single rank still issues them, they just move nothing).
+
+        All byte counts are floats.
+      starter: |
+        def tp_block_bytes(tp, tokens, d_model, num_blocks, dtype_bytes=2):
+            # your implementation here
+            pass
+      language: python
+      entry: tp_block_bytes
+      testCases:
+        - input: '[8, 8192, 4096, 32]'
+          expected: '{"bytes_per_collective": 117440512.0, "bytes_per_block": 469762048.0, "bytes_per_step": 15032385536.0, "collectives_per_step": 128}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4, 2048, 4096, 32]'
+          expected: '{"bytes_per_collective": 25165824.0, "bytes_per_block": 100663296.0, "bytes_per_step": 3221225472.0, "collectives_per_step": 128}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[1, 8192, 4096, 32]'
+          expected: '{"bytes_per_collective": 0.0, "bytes_per_block": 0.0, "bytes_per_step": 0.0, "collectives_per_step": 128}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[16, 4096, 8192, 24, 4]'
+          expected: '{"bytes_per_collective": 251658240.0, "bytes_per_block": 1006632960.0, "bytes_per_step": 24159191040.0, "collectives_per_step": 96}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[64, 8192, 4096, 32]'
+          expected: '{"bytes_per_collective": 132120576.0, "bytes_per_block": 528482304.0, "bytes_per_step": 16911433728.0, "collectives_per_step": 128}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        def tp_block_bytes(tp, tokens, d_model, num_blocks, dtype_bytes=2):
+            tp, tokens = int(tp), int(tokens)
+            d_model, num_blocks = int(d_model), int(num_blocks)
+            A = tokens * d_model * dtype_bytes
+            coll = 0.0 if tp == 1 else 2.0 * (tp - 1) / tp * A
+            per_block = 4.0 * coll
+            return {"bytes_per_collective": coll,
+                    "bytes_per_block": per_block,
+                    "bytes_per_step": per_block * num_blocks,
+                    "collectives_per_step": 4 * num_blocks}
+      solutionExplanation: >-
+        Two things vary and one does not. The variable part is
+        $2\frac{t-1}{t}A$: at $t = 8$ that is $\frac{7}{8}$ of twice 67.11 MB,
+        117.44 MB, and at $t = 64$ it is $\frac{63}{64}$ of the same thing,
+        132.12 MB — a 13% increase for an eightfold increase in degree, which is
+        the entire reason TP's cost is described as flat in $t$. The invariant
+        part is the count: four collectives per block, 128 per step at 32
+        blocks, because the block has two sublayers and each has one
+        row-parallel all-reduce in the forward and one column-parallel
+        all-reduce in the backward. The $t = 1$ case is the guard that catches
+        an implementation which divides by $t$ before checking it, and the last
+        case shows why byte counts alone do not decide anything: 16.91 GB at
+        $t = 64$ is barely more than 15.03 GB at $t = 8$, but it sits against
+        one eighth of the compute.
+      complexity: "O(1) time and space"
+      tags: [tensor-parallelism, all-reduce, communication, bytes]
+
+    - id: p-tp-roofline
+      title: "The (t-1) law, and the degree it allows"
+      difficulty: hard
+      prompt: >-
+        Implement `tp_roofline(tp, tokens, d_model, block_params, bandwidth_gbs,
+        tflops_effective, budget_pct=25.0, dtype_bytes=2)` returning a dict with
+        exactly four keys.
+
+        `comm_ms` — the block's four all-reduces, per rank, in milliseconds:
+        $8\frac{t-1}{t} \cdot \text{tokens} \cdot d_{\text{model}} \cdot
+        \text{dtype\_bytes}$ bytes at `bandwidth_gbs` **gigabytes** per second
+        ($10^9$ bytes/s), and `0.0` at `tp == 1`.
+
+        `compute_ms` — the block's compute on this rank:
+        $6 \cdot \text{block\_params} / t \cdot \text{tokens}$ FLOPs at
+        `tflops_effective` **teraflops** per second ($10^{12}$ FLOP/s).
+
+        `overhead_pct` — `100 * comm_ms / compute_ms`.
+
+        `max_tp_within_budget` — the largest integer $t \ge 1$ whose overhead is
+        at most `budget_pct`, found by inverting
+        $\frac{16(t-1)\,d\,F}{6 P B} \le \frac{\text{budget}}{100}$ rather than
+        by searching. It does not depend on the `tp` argument.
+      starter: |
+        def tp_roofline(tp, tokens, d_model, block_params, bandwidth_gbs,
+                        tflops_effective, budget_pct=25.0, dtype_bytes=2):
+            # your implementation here
+            pass
+      language: python
+      entry: tp_roofline
+      testCases:
+        - input: '[8, 8192, 4096, 202383360, 300.0, 395.6]'
+          expected: '{"comm_ms": 1.5658734933333334, "compute_ms": 3.143183427300303, "overhead_pct": 49.81807551327892, "max_tp_within_budget": 4}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 8192, 4096, 202383360, 900.0, 395.6]'
+          expected: '{"comm_ms": 0.5219578311111112, "compute_ms": 3.143183427300303, "overhead_pct": 16.606025171092973, "max_tp_within_budget": 11}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 8192, 4096, 202383360, 50.0, 395.6]'
+          expected: '{"comm_ms": 9.39524096, "compute_ms": 3.143183427300303, "overhead_pct": 298.9084530796735, "max_tp_within_budget": 1}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[4, 2048, 4096, 202383360, 300.0, 395.6]'
+          expected: '{"comm_ms": 0.33554432, "compute_ms": 1.5715917136501516, "overhead_pct": 21.35060379140525, "max_tp_within_budget": 4}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[64, 8192, 4096, 202383360, 300.0, 395.6]'
+          expected: '{"comm_ms": 1.76160768, "compute_ms": 0.3928979284125379, "overhead_pct": 448.36267961951023, "max_tp_within_budget": 4}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[8, 8192, 4096, 202383360, 300.0, 395.6, 10.0]'
+          expected: '{"comm_ms": 1.5658734933333334, "compute_ms": 3.143183427300303, "overhead_pct": 49.81807551327892, "max_tp_within_budget": 2}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        import math
+
+
+        def tp_roofline(tp, tokens, d_model, block_params, bandwidth_gbs,
+                        tflops_effective, budget_pct=25.0, dtype_bytes=2):
+            tp, tokens, d_model = int(tp), int(tokens), int(d_model)
+            A = tokens * d_model * dtype_bytes
+            comm = (0.0 if tp == 1 else 8.0 * (tp - 1) / tp * A)
+            comm_ms = comm / (bandwidth_gbs * 1e9) * 1e3
+            compute_ms = (6.0 * block_params / tp * tokens
+                          / (tflops_effective * 1e12) * 1e3)
+            overhead = 100.0 * comm_ms / compute_ms
+            max_tp = 1 + (budget_pct / 100.0) * 6.0 * block_params * bandwidth_gbs * 1e9 \
+                / (16.0 * d_model * tflops_effective * 1e12)
+            return {"comm_ms": comm_ms,
+                    "compute_ms": compute_ms,
+                    "overhead_pct": overhead,
+                    "max_tp_within_budget": max(1, int(math.floor(max_tp)))}
+      solutionExplanation: >-
+        The three cases at 300, 900 and 50 GB/s are the same model on three
+        links, and they are the argument for the whole architecture: 1.5659 ms,
+        0.5220 ms and 9.3952 ms of transfer against an identical 3.1432 ms of
+        compute, so 49.82%, 16.61% and 298.91%. Nothing about the model changed —
+        only the machine's FLOP-per-byte ratio. The fourth case is the least
+        obvious: halving the tokens to 2048 and the degree to 4 keeps the
+        overhead at 21.35% rather than dropping it, because both the bytes and
+        the compute halve, which is exactly why the final expression has no
+        $b$, $s$ or $1/t$ in it. The fifth case is the one to read twice: at
+        $t = 64$ the transfer is 1.7616 ms against 0.3929 ms of compute, 448%,
+        and the reported `max_tp_within_budget` of 4 says the same thing from
+        the other side — the configuration is 16x over its own budget. The last
+        case shows the budget doing work on an otherwise-fine configuration: at
+        $t = 8$ on 300 GB/s the 49.82% overhead is inside a 25% budget but
+        outside a 10% one, which permits only $t = 2$.
+      complexity: "O(1) time and space"
+      tags: [tensor-parallelism, roofline, bandwidth, scaling]
+
+    - id: p-tp-memory
+      title: "The memory that shards and the memory that does not"
+      difficulty: medium
+      prompt: >-
+        Implement `tp_memory(params, num_blocks, tokens, d_model, tp,
+        dtype_bytes=2, replicated_tensors=4)` returning a dict with exactly six
+        keys, all in bytes, all per rank.
+
+        `weight_bytes` — `params * dtype_bytes / tp`: the weights are fully
+        sharded by TP.
+
+        `activation_bytes` — `num_blocks * replicated_tensors * tokens *
+        d_model * dtype_bytes`: the LayerNorm, dropout and residual tensors,
+        which 1D TP does **not** shard, so they are the same on every rank.
+
+        `total_bytes` — their sum.
+
+        `total_bytes_with_sp` — the same total with sequence parallelism, which
+        shards that activation term by `tp`, so `weight_bytes +
+        activation_bytes / tp`.
+
+        `speedup_vs_single` — `(params*dtype_bytes + activation_bytes) /
+        total_bytes`, i.e. against one device holding the whole model and the
+        same activations.
+
+        `speedup_with_sp` — the same ratio against `total_bytes_with_sp`.
+      starter: |
+        def tp_memory(params, num_blocks, tokens, d_model, tp,
+                      dtype_bytes=2, replicated_tensors=4):
+            # your implementation here
+            pass
+      language: python
+      entry: tp_memory
+      testCases:
+        - input: '[6607339520, 32, 8192, 4096, 8]'
+          expected: '{"weight_bytes": 1651834880.0, "activation_bytes": 8589934592.0, "total_bytes": 10241769472.0, "total_bytes_with_sp": 2725576704.0, "speedup_vs_single": 2.1289889107162283, "speedup_with_sp": 8.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6607339520, 32, 8192, 4096, 16]'
+          expected: '{"weight_bytes": 825917440.0, "activation_bytes": 8589934592.0, "total_bytes": 9415852032.0, "total_bytes_with_sp": 1362788352.0, "speedup_vs_single": 2.315734524915695, "speedup_with_sp": 16.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6607339520, 32, 8192, 4096, 1]'
+          expected: '{"weight_bytes": 13214679040.0, "activation_bytes": 8589934592.0, "total_bytes": 21804613632.0, "total_bytes_with_sp": 21804613632.0, "speedup_vs_single": 1.0, "speedup_with_sp": 1.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[6607339520, 32, 8192, 4096, 64]'
+          expected: '{"weight_bytes": 206479360.0, "activation_bytes": 8589934592.0, "total_bytes": 8796413952.0, "total_bytes_with_sp": 340697088.0, "speedup_vs_single": 2.478807131063038, "speedup_with_sp": 64.0}'
+          mode: json
+          tolerance: 1e-09
+        - input: '[70000000000, 80, 4096, 8192, 8]'
+          expected: '{"weight_bytes": 17500000000.0, "activation_bytes": 21474836480.0, "total_bytes": 38974836480.0, "total_bytes_with_sp": 20184354560.0, "speedup_vs_single": 4.14305359723218, "speedup_with_sp": 8.0}'
+          mode: json
+          tolerance: 1e-09
+      solution: |
+        def tp_memory(params, num_blocks, tokens, d_model, tp,
+                      dtype_bytes=2, replicated_tensors=4):
+            P, L, T, D, t = float(params), int(num_blocks), int(tokens), int(d_model), int(tp)
+            w = P * dtype_bytes / t
+            act = float(L * replicated_tensors * T * D * dtype_bytes)
+            single = P * dtype_bytes + act
+            return {"weight_bytes": w,
+                    "activation_bytes": act,
+                    "total_bytes": w + act,
+                    "total_bytes_with_sp": w + act / t,
+                    "speedup_vs_single": single / (w + act),
+                    "speedup_with_sp": single / (w + act / t)}
+      solutionExplanation: >-
+        The three lines of this problem are 1.65 GB, 8.59 GB and 2.13x, and the
+        third is the one that surprises people: eight GPUs buy a little over two
+        devices' worth of memory because the thing that failed to shrink is five
+        times larger than the thing that shrank. The second case is the punch
+        line — doubling the degree to 16 takes the weights to 0.83 GB and the
+        total from 10.24 GB to 9.42 GB, an 8.06% saving, while the per-block
+        traffic goes from 469.76 MB to 503.32 MB and the overhead from 49.8% to
+        106.8% on 300 GB/s. The fourth case shows the asymptote: at $t = 64$ the
+        weights are 0.21 GB and the total is still 8.80 GB, so the last eightfold
+        increase in degree bought 3.6% of memory. Against that, the SP column is
+        exactly linear — 8.00x, 16.00x, 64.00x — because it divides the term that
+        was not dividing. The 70B case is the same shape at a scale where it is
+        not a curiosity: 17.5 GB of weights and 21.47 GB of activations per rank
+        at $t = 8$, which is 38.97 GB before the optimizer touches anything, and
+        20.18 GB with sequence parallelism.
+      complexity: "O(1) time and space"
+      tags: [tensor-parallelism, memory, sequence-parallelism, activations]
+
+  visualizers:
+    - id: vs-tp-split
+      kind: shape_flow
+      title: "One block, one split, eight ranks"
+      description: >-
+        Move the TP degree and watch the two halves separate: the weights fall
+        as 1/t to 1.65 GB at t=8 while the replicated activation set stays at
+        8.59 GB, so the total bottoms out at 8.59 GB no matter how many devices
+        you add. Turn sequence parallelism on and the same total falls as 21.80/t
+        — 2.73 GB at t=8, 1.36 GB at t=16 — for exactly the same 469.76 MB of
+        per-block all-reduce.
+      params:
+        params: 6607339520
+        num_blocks: 32
+        tokens: 8192
+        d_model: 4096
+        dtype_bytes: 2
+        replicated_tensors: 4
+        tp_degrees: [1, 2, 4, 8, 16, 32, 64]
+        bandwidths_gbs: [900.0, 300.0, 50.0]
+
+  try_it: >-
+    Cut a 4096×11008 MLP across t = 8 ranks: each rank holds a 4096×1376 slice, which is
+    5,636,096 parameters. Then count the collectives in one transformer block — attention's
+    output projection and the MLP's second matrix, two forward and two backward — and multiply
+    by 32 blocks to get 128 dependent collectives per step.
+  interview_questions:
+    - question: "Why does a column-parallel layer need no communication in the forward pass, and why is it always paired with a row-parallel one?"
+      level: mid
+      key_points:
+        - "Column-parallel splits the weight by its output dimension, so every rank reads the full input and produces a slice of the output — no rendezvous in the forward."
+        - "Row-parallel splits by the input dimension, takes the sharded input, and produces partial products that must be summed, so it needs one all-reduce in the forward."
+        - "Pairing them means the pair needs one all-reduce rather than two, and the gradient of the row-parallel weight needs no communication given the summed output."
+        - "The elementwise nonlinearity goes between the two halves on the shard, because f applied to a contiguous slice is the corresponding slice of f applied to the whole."
+      follow_up: "What goes numerically wrong if you move the GELU after the all-reduce instead?"
+    - question: "You double the tensor-parallel degree from 8 to 16 to halve memory and measure 8.1% more throughput. Why so little?"
+      level: senior
+      key_points:
+        - "Per-rank communication is flat in t while per-rank compute falls as 1/t, so the ratio grows linearly in (t − 1) — the overhead does not shrink with the model."
+        - "Only the weights shard: at t = 8 they are 1.65 GB, but the replicated region of LayerNorm inputs and outputs, attention output and MLP output is 8.59 GB, 5.2× larger."
+        - "Sequence parallelism shards exactly that region along the sequence axis and replaces each all-reduce with a reduce-scatter plus all-gather at identical bytes — 234.88 MB per block."
+        - "The degree is also capped by heads: 32 heads allow t up to 32, and a GQA model with 8 KV heads caps at 8."
+      follow_up: "At 64 devices, what does a 2D split buy over a 1D one?"
+    - question: "A block has four collectives. Which layers do they belong to, and why can none of them be hidden?"
+      level: mid
+      key_points:
+        - "Two in the forward and two in the backward, one pair from attention's row-parallel output projection and one from the MLP's row-parallel second matrix."
+        - "At 32 blocks that is 128 collectives per step, and each one is a dependency of the next layer rather than a side computation."
+        - "Column-parallel layers need no forward collective, which is why the count is four per block rather than eight."
+        - "Because they sit inside the forward pass rather than at the step boundary, they cannot be overlapped with a large independent batch of work."
+      follow_up: "Why is the backward all-reduce easier to overlap than the forward one?"
+  common_mistakes:
+    - "Moving the nonlinearity after the all-reduce, which leaves every activation 23.65% wrong while training still converges and the loss merely looks mediocre."
+    - "Expecting memory to halve when only the weights shard — at t = 8 the replicated region is 5.2× the size of the part that shrank."
+    - "Launching TP = 64 on a 32-head model, where the degree is capped by head count (or by KV heads under GQA) before bandwidth is ever the limit."
+  further_reading:
+    - label: "Shoeybi et al., Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism"
+    - label: "Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models"

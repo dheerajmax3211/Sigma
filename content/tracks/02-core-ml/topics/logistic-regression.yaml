@@ -1,0 +1,1156 @@
+id: logistic-regression
+slug: logistic-regression
+title: "Logistic Regression: A Line on the Log-Odds, a Probability by Distance"
+summary: >-
+  Derive the classifier from cross-entropy, fit it with a handful of Newton
+  steps, and read it as what it is — a hyperplane plus a distance-dependent
+  probability that you can rescale without moving the line at all.
+kind: lesson
+difficulty: medium
+position: 3
+estMinutes: 26
+prerequisites: [linear-regression, information-theory]
+phase: supervised-learning
+tags: [logistic-regression, classification, cross-entropy, irls, newton, decision-boundary, calibration, separation]
+
+body:
+  big_idea: >-
+    Logistic regression is linear on the log-odds, not the probability, so it puts a
+    hyperplane where evidence is even and reports confidence by distance — and you can
+    rescale it without moving the line.
+
+  problem:
+    - "You ship a churn model on 3% positives. It reaches 97% accuracy by predicting \"stays\" for everyone, and the dashboard is green."
+    - "You fit on a balanced sample and deploy into a 1.6% stream: every probability is off by 4.6 nats of log-odds, and retraining cannot fix the intercept."
+    - "Your small dataset is perfectly separable, the loss falls to $1.6\\times10^{-18}$, and someone declares the model excellent while the weights double every iteration."
+
+  analogy: |
+    Football's offside rule is a straight line across the pitch, and how far
+    offside a player is measures perpendicular to it: one metre beyond is one
+    metre. $w$ is the goal-ward normal, $b$ slides the line, and $w^\top x + b >
+    0$ is the call. A linesman has no notion of confidence, though — the
+    steepness of the probability comes from $\|w\|$.
+
+  concept_points:
+    - "**The model is linear in the log-odds.** $\\log\\frac{p}{1-p} = w^\\top x + b$, so $p = \\sigma(\\eta)$: $\\sigma(2) = 0.8808$, $\\sigma(5) = 0.9933$. A coefficient of $\\ln 2$ multiplies the odds by 2.0 per unit. The trap is reading $w_j$ as a change in probability: since $dp/d\\eta = p(1-p)$, the same coefficient moves probability 25 times less at $p = 0.99$ than at $0.5$."
+    - "**The loss is cross-entropy, which is exactly the Bernoulli negative log likelihood, and its floor is the entropy of the labels.** $L = \\frac1n\\sum_i[\\log(1+e^{\\eta_i}) - y_i\\eta_i]$. Measured floors: 10% positives gives 0.3251 nats $=$ 0.4690 bits; 1.58% gives 0.0812 nats. A loss that plateaus at the floor means the features are exhausted, not that the optimiser is stuck."
+    - "**The gradient is $X^\\top(\\hat p - y)$ with no sigmoid factor left over, because $\\sigma'(\\eta) = p(1-p)$ cancels the $1/(p(1-p))$ from the logarithm.** Per sample it is bounded: $\\max|\\hat p - y| = 1.0$ however wrong the model is. The bound is per sample, not per parameter: a feature of magnitude 1000 makes the update a thousand times larger, which is why unscaled inputs diverge."
+    - "**The Hessian is $X^\\top WX$ with $W = \\operatorname{diag}(\\hat p(1-\\hat p))$, so the problem is convex and Newton's method is iteratively reweighted least squares.** The Newton step solves $(X^\\top WX)\\delta = X^\\top(\\hat p - y)$ — linear regression's normal equation, reweighted each iteration. Measured: 5 iterations on a $300\\times2$ collinear design where gradient descent needs **55,483**."
+    - "**Rescaling $w$ leaves the boundary where it is and changes every probability.** For any $c>0$ the boundary set is unchanged: accuracy stayed 0.835 at every $c \\in \\{0.25,...,10\\}$ while log-loss went $0.4754, 0.3790, 0.3327, 0.3963, 0.6331, 1.4504$. And under perfect separation there is no finite maximiser: scaling by $t$ drives the loss to zero as $t\\to\\infty$, so $\\|\\beta\\|$ ran to 66.36."
+    - "**Calibration and discrimination are different properties, and only one survives a monotone transform.** Applying $p \\mapsto p^2$ leaves the ranking bit-identical — AUC $0.9263427109974425$ before and after — but raises log-loss from 0.3327 to 0.4074. The intercept is the calibration knob: training on a balanced sample and deploying at 1% means adding $\\log\\frac{0.01}{0.99} = -4.5951$. The 0.5 threshold is likewise a decision, not a property."
+
+  definitions:
+    - term: 'Log-odds (logit)'
+      meaning: >-
+        $\log\frac{p}{1-p}$, the scale on which logistic regression is linear.
+        It maps $(0,1)$ onto the whole real line, which is why a linear model
+        can be used for a probability without ever leaving the valid range.
+    - term: 'Sigmoid (logistic function)'
+      meaning: >-
+        $\sigma(\eta) = 1/(1+e^{-\eta})$, the inverse of the logit. Smooth,
+        monotone, bounded in $(0,1)$, with derivative $p(1-p)$ and maximum
+        slope $0.25$ at $\eta = 0$.
+    - term: 'Odds and odds ratio'
+      meaning: >-
+        Odds are $p/(1-p)$. A coefficient $w_j$ is an odds ratio
+        $e^{w_j}$: the factor by which the odds multiply per unit of feature
+        $j$, holding the others fixed. $w_j = \ln 2$ means a doubling.
+    - term: 'Log loss (cross-entropy)'
+      meaning: >-
+        $-\frac1n\sum[y\log p + (1-y)\log(1-p)]$, in nats when the log is
+        natural. Equal to the Bernoulli negative log likelihood, and equal to
+        $H(y) + D_{KL}(y \,\|\, p)$ — which is why its floor is the label
+        entropy.
+    - term: 'Linear predictor ($\eta$)'
+      meaning: >-
+        $w^\top x + b$: the score before the link function. It is the quantity
+        the model is linear in, the quantity the gradient is expressed through,
+        and the quantity whose sign defines the decision boundary.
+    - term: 'Decision boundary'
+      meaning: >-
+        The set $\{x : w^\top x + b = 0\}$, a hyperplane of dimension $p-1$
+        with normal $w$. It is where the log-odds are even, so $p = 0.5$ there.
+        Choosing a decision threshold other than $0.5$ moves the *decision*
+        surface to a parallel hyperplane without changing the model at all.
+    - term: 'Geometric margin'
+      meaning: >-
+        $|w^\top x + b| / \|w\|$, the perpendicular distance from a point to
+        the boundary. Unlike the raw score, this *is* comparable across models,
+        because it is invariant to rescaling $w$.
+    - term: 'IRLS (iteratively reweighted least squares)'
+      meaning: >-
+        Newton's method applied to a GLM: at each iteration, solve a weighted
+        least-squares problem whose weights are $\hat p(1-\hat p)$ and whose
+        response is the working residual. Convergence is quadratic near the
+        optimum, typically 5-8 iterations regardless of $n$.
+    - term: 'Complete separation'
+      meaning: >-
+        The existence of a hyperplane with $y_i(w^\top x_i + b) > 0$ for all
+        $i$. The likelihood has no finite maximiser, the fitted weights diverge,
+        and the Hessian becomes singular. Quasi-complete separation is the same
+        failure on a subset of points.
+    - term: 'Calibration'
+      meaning: >-
+        The property that predicted probabilities match observed frequencies:
+        among all cases scored $0.2$, about 20% should be positive. It is
+        orthogonal to ranking quality — a monotone transform preserves AUC and
+        destroys calibration.
+
+  diagrams:
+    - type: plot
+      title: "The sigmoid: linear in the log-odds, saturated in probability"
+      chart: "line"
+      xLabel: "score η = wᵀx + b"
+      yLabel: "p = σ(η)"
+      series:
+        - name: "σ(η)"
+          points:
+            - { x: -6, y: 0.002472623156634768 }
+            - { x: -5, y: 0.006692850924284843 }
+            - { x: -4, y: 0.01798620996209155 }
+            - { x: -3, y: 0.047425873177566746 }
+            - { x: -2, y: 0.11920292202211757 }
+            - { x: -1, y: 0.2689414213699951 }
+            - { x: 0, y: 0.5 }
+            - { x: 1, y: 0.7310585786300049 }
+            - { x: 2, y: 0.8807970779778824 }
+            - { x: 3, y: 0.9525741268224333 }
+            - { x: 4, y: 0.9820137900379085 }
+            - { x: 5, y: 0.9933071490757152 }
+            - { x: 6, y: 0.9975273768433652 }
+    - type: plot
+      title: "Twelve overlapping points and the best linear boundary (4 of 12 misclassified)"
+      chart: "scatter"
+      xLabel: "x₁"
+      yLabel: "x₂"
+      series:
+        - name: "y = 0"
+          points:
+            - { x: -0.88, y: -1.46 }
+            - { x: -0.27, y: 0.46 }
+            - { x: -0.61, y: -0.86 }
+            - { x: 0.82, y: 1.8 }
+            - { x: -1.05, y: 1.76 }
+        - name: "y = 1"
+          points:
+            - { x: 1.25, y: 0.12 }
+            - { x: 0.3, y: -1.36 }
+            - { x: 0.22, y: -1.91 }
+            - { x: -0.09, y: -1.28 }
+            - { x: -0.69, y: -0.54 }
+            - { x: -0.78, y: 0.61 }
+            - { x: -0.07, y: -0.65 }
+        - name: "boundary 1.306x₁ − 1.010x₂ + 0.326 = 0"
+          points:
+            - { x: -2.0, y: -2.2621135439975575 }
+            - { x: -1.5, y: -1.6158633819318822 }
+            - { x: -1.0, y: -0.969613219866207 }
+            - { x: -0.5, y: -0.3233630578005317 }
+            - { x: 0.0, y: 0.3228871042651435 }
+            - { x: 0.5, y: 0.9691372663308188 }
+            - { x: 1.0, y: 1.6153874283964942 }
+            - { x: 1.5, y: 2.261637590462169 }
+            - { x: 2.0, y: 2.907887752527844 }
+    - type: compare
+      title: "Squared error on a 0/1 target vs cross-entropy"
+      left_label: "Least squares on 0/1 labels"
+      left_points:
+        - "Costs (η − y)², so η = 6 with y = 1 is penalised 25 — it pays to be *less* confident"
+        - "Unbounded output: a least-squares fit on 0/1 labels produced scores from −0.352 to 1.498"
+        - "32 of 200 predictions left [0, 1] entirely — negative probabilities and 150% ones"
+        - "Assumes Gaussian errors for a Bernoulli target, so no likelihood justifies it"
+      right_label: "Logistic regression"
+      right_points:
+        - "Costs log(1+e^η) − yη, so η = 6 with y = 1 costs 0.00248 and with y = 0 costs 6.0025"
+        - "Output is bounded in (0,1) by the link function, not by clipping"
+        - "The loss *is* the Bernoulli likelihood, so every output is a probability with a model behind it"
+        - "The boundary is where the log-odds are even, which is a likelihood statement, not a heuristic"
+    - type: pipeline
+      title: "From score to decision: four stages, four different ways to be wrong"
+      nodes:
+        - label: "Linear score"
+          note: "η = wᵀx + b"
+          detail: "Unbounded and unitless. Comparable only within one model. A score of 3 means nothing until you divide by ‖w‖."
+        - label: "Link to probability"
+          note: "p = σ(η)"
+          detail: "Where saturation bites: σ(37) is exactly 1.0 in float64. Any loss computed downstream of a saturated p is infinite."
+        - label: "Threshold"
+          note: "Cfp / (Cfp + Cfn), not 0.5"
+          detail: "The only place the cost matrix enters. 1/11 = 0.0909 when a miss costs ten times a false alarm."
+        - label: "Decision"
+          note: "predict positive iff p > threshold"
+          detail: "Everything downstream — recall, precision, the confusion matrix — is a property of this pair (model, threshold), never of the model alone."
+    - type: graph
+      title: "Three prerequisites, three ingredients of one model"
+      nodes:
+        - { id: linreg, label: "Linear Regression" }
+        - { id: info, label: "Information Theory" }
+        - { id: hessian, label: "Hessian = weighted Gram" }
+        - { id: loss, label: "Cross-entropy loss" }
+        - { id: irls, label: "IRLS / Newton" }
+        - { id: lr, label: "Logistic regression" }
+      edges:
+        - { from: linreg, to: hessian, label: "XᵀWX is a normal equation" }
+        - { from: info, to: loss, label: "Bernoulli NLL = cross-entropy" }
+        - { from: hessian, to: irls, label: "quadratic step" }
+        - { from: loss, to: irls, label: "p̂ − y gradient" }
+        - { from: irls, to: lr, label: "5 iterations" }
+
+  markdown: |
+    ## Two quantities wearing one name
+
+    A logistic regression reports a score and a probability, and they are not
+    the same object:
+
+    $$\eta = w^\top x + b, \qquad p = \sigma(\eta) = \frac{1}{1+e^{-\eta}}
+      \quad\Longleftrightarrow\quad \log\frac{p}{1-p} = \eta.$$
+
+    The identity on the right is the model: logistic regression is **linear in
+    the log-odds**, not in $p$ and not in the label.
+
+    | $\eta$ | −2 | −1 | 0 | 1 | 2 | 3 | 5 |
+    |---|---|---|---|---|---|---|---|
+    | $p$ | 0.1192 | 0.2689 | 0.5000 | 0.7311 | 0.8808 | 0.9526 | 0.9933 |
+
+    Read the table in differences rather than values. Moving $\eta$ from $-1$ to
+    $0$ buys $0.231$ of probability; from $2$ to $3$, $0.072$; from $4$ to $5$,
+    $0.011$. Because $dp/d\eta = p(1-p)$ — $0.25$ at $p = 0.5$ and $0.0099$ at
+    $p = 0.99$ — the same coefficient moves the probability **25 times less** at
+    the extremes. A coefficient of $\ln 2 = 0.6931$ multiplies the *odds* by
+    $2.0$ per unit, wherever you start.
+
+    ## The loss, and why it is not a choice
+
+    The labels are Bernoulli, so the likelihood gives the loss directly:
+
+    $$L(w,b) = -\frac1n\sum_{i=1}^n \big[y_i\log p_i + (1-y_i)\log(1-p_i)\big]
+      = \frac1n\sum_{i=1}^n \big[\log(1+e^{\eta_i}) - y_i\eta_i\big].$$
+
+    This is precisely the cross-entropy from *Information Theory*, with $P$ the
+    empirical label distribution and $Q$ the model. Minimising it minimises
+    $D_{KL}(P\|Q)$, because $H(P)$ does not involve the parameters.
+
+    The floors are real. On 10% positives the entropy is
+    $0.3251$ nats $= 0.4690$ bits — the number that topic computed for a 90/10
+    Bernoulli — and on 1.58% positives it is $0.0812$ nats. A loss that stops
+    at the floor is finished, not stuck.
+
+    Differentiating is where the elegance is. The chain rule gives
+
+    $$\frac{\partial L}{\partial \eta_i} = \frac{1}{n}\Big(\frac{e^{\eta_i}}
+      {1+e^{\eta_i}} - y_i\Big) = \frac{1}{n}(\hat p_i - y_i),$$
+
+    so $\nabla_w L = X^\top(\hat p - y)/n$ and $\partial L/\partial b =
+    \overline{(\hat p - y)}$. The $\sigma'(\eta) = p(1-p)$ factor that
+    appears when you differentiate the sigmoid cancels exactly against the
+    $1/(p(1-p))$ from differentiating the log. **That cancellation is the
+    entire reason cross-entropy is the right loss**: the gradient is the
+    residual in probability units, bounded in $[-1,1]$ per sample however wrong
+    the model is. Put squared error through the same sigmoid and the gradient
+    picks up a factor $p(1-p)$: its maximum is $0.148$ at $p = 1/3$, and at
+    $p = 0.001$ with $y = 1$ it is $0.000998$ — a model that is maximally wrong
+    receives almost no signal.
+
+    ## The boundary is a hyperplane
+
+    The set where the model is undecided is $\{x : w^\top x + b = 0\}$. That is
+    a hyperplane with normal vector $w$; the sign of $w^\top x + b$ is the
+    predicted side, and
+
+    $$d(x) = \frac{|w^\top x + b|}{\|w\|}$$
+
+    is the perpendicular distance to it. With $w = (3,4)$ and $b = -2$, the
+    scores $(-2, 12, 1, 28)$ correspond to distances $(-0.4, 2.4, 0.2, 5.6)$
+    because $\|w\| = 5$: the point scoring 28
+    is 5.6 units from the line, and the one scoring 1 is 0.2 units away. Two
+    models producing scores of 3 and 30 may be the *same classifier* at
+    different scales. Raw scores are not comparable across models; distances
+    are.
+
+    It also explains what regularisation does. For any $c > 0$ the boundary of
+    $c(w^\top x + b)$ is unchanged — the same hyperplane, the same 0/1
+    predictions, the same accuracy. Only the probabilities move:
+
+    | scale $c$ | $\|w\|$ | accuracy | log-loss |
+    |---|---|---|---|
+    | 0.25 | 0.97 | 0.835 | 0.4754 |
+    | 0.5 | 1.94 | 0.835 | 0.3790 |
+    | **1.0** | **3.89** | **0.835** | **0.3327** |
+    | 2.0 | 7.77 | 0.835 | 0.3963 |
+    | 10.0 | 38.9 | 0.835 | 1.4504 |
+
+    Accuracy cannot see the difference at all. An $L_2$ penalty is therefore a
+    penalty on *confidence*; once the classes are separated it does almost
+    nothing to the line.
+
+    ## A handful of Newton steps, not fifty thousand gradient steps
+
+    The Hessian of the loss follows from the same cancellation:
+
+    $$H = \nabla^2 L = \frac1n X^\top W X, \qquad
+      W = \operatorname{diag}\big(\hat p_i(1-\hat p_i)\big),$$
+
+    with the intercept column appended. $H \succeq 0$, so
+    the loss is convex and the stationary point is the global minimum. The
+    Newton step solves $H\delta = \nabla L$ — which is exactly a **weighted
+    least-squares** normal equation, with weights that change each iteration.
+    That is why the algorithm is called IRLS, and why the numerical warning
+    from *Linear Regression* transfers without modification: never form and
+    invert the Gram matrix, because you square its condition number.
+
+    | design | $\kappa(H)$ | Newton | gradient descent at $1/L$ |
+    |---|---|---|---|
+    | well-conditioned, $n=200$ | 7.9 | 8 | 69 |
+    | two features 0.999 correlated, $n=300$ | $8.8\times10^3$ | 5 | 55,483 |
+
+    Five versus fifty-five thousand on the same problem, same loss, same
+    optimum. Gradient descent's iteration count scales with the condition
+    number; Newton's does not. On the collinear design the fitted coefficients
+    were $(-11.60, +11.71, 0.434)$ — two enormous numbers cancelling, which is
+    the same signature that made the linear-regression coefficients
+    uninterpretable.
+
+    ## What actually goes wrong
+
+    **Separation.** If a hyperplane splits the classes perfectly, the likelihood
+    has no finite maximiser: rescaling $w$ by $t$ drives the loss to zero as
+    $t\to\infty$. The optimiser does not fail loudly. It reports a loss of
+    $1.6\times10^{-18}$, weights of $66$, a Hessian whose smallest eigenvalue is
+    exactly $0.0$, and probabilities of $0$ and $1$ everywhere. An $L_2$ term
+    restores a finite answer, and early stopping is the same thing in
+    disguise.
+
+    **Overflow.** Compute the loss as `logaddexp(0, η) - y·η`, never as
+    `-log(sigmoid(η))`. The sigmoid saturates to exactly $1.0$ for
+    $\eta > 36.74$ in float64, so the naive form returns `inf` for a wrong
+    prediction at $\eta = 40$ where the true loss is $40.0$ nats. Clipping $p$
+    to $10^{-15}$ replaces the infinity with a hard ceiling of $34.54$ nats,
+    which is a different lie.
+
+    **The threshold.** With a 1.58% positive rate, AUC $0.938$, and a miss
+    costing ten times a false alarm, the cost-optimal threshold is
+    $1/11 = 0.0909$. At $0.5$ the model finds 24% of positives; at $0.0909$ it
+    finds 70%. Both are the same model. The all-negative baseline has 98.42%
+    accuracy, which is why accuracy is the wrong summary for a decision problem
+    with asymmetric costs.
+
+    **Calibration.** Squaring every probability preserves the ranking exactly —
+    AUC $0.9263427109974425$ before and after — while pushing the log-loss from
+    $0.3327$ to $0.4074$ and the mean prediction from $0.575$ (exactly right)
+    to $0.4687$. Discrimination and calibration are separate properties, and a
+    model fitted on a balanced sample and deployed at 1% prevalence needs its
+    intercept shifted by $\log\frac{0.01}{0.99} - \log\frac{0.5}{0.5} =
+    -4.5951$.
+
+    ## The one-line version
+
+    Cross-entropy gives the loss and, for free, the gradient $\hat p - y$; its
+    second derivative gives $X^\top W X$ and five-step convergence; and $\|w\|$
+    is a confidence knob that the boundary cannot see. Every failure in this
+    model is one of four: separable classes, a log of a saturated sigmoid, a
+    threshold nobody costed, or an intercept fitted at the wrong prevalence.
+
+    ## The longer version
+
+    The remaining mechanisms, verbatim: the geometry of $w^\top x + b$ as a
+    signed distance, how to set a threshold from a cost matrix, and the
+    log-space arithmetic that keeps the loss finite.
+
+    ### Failure modes, in full
+
+    - You ship a churn model on 3% positives. It reaches 97% accuracy by predicting "stays" for every single customer, and the dashboard is green. Accuracy was never the quantity you needed; the loss and the threshold are, and neither of them defaults to something sensible.
+    - You fit on a balanced sample and deploy into a stream that is 1.6% positive. Every probability is now wrong by roughly 4.6 nats of log-odds — a factor of 100 in odds — and retraining on the same data cannot fix it, because the defect is in the intercept, not in the coefficients.
+    - Your small dataset turns out to be perfectly separable, so the loss falls to $1.6 \times 10^{-18}$ and someone declares the model excellent. The weights are still doubling every iteration and the Hessian is exactly singular. The model has not converged; it has escaped.
+    - An interviewer asks why the gradient of log loss is $p - y$ and what happens to the Hessian when two features are 0.999 correlated. The first is a three-line derivation. The second decides whether your standard errors are inflated by $1\times$ or by $94\times$.
+
+    ### The mechanisms, in full
+
+    - **The model is linear in the log-odds, and that is the only scale on which it is linear.** $\log\frac{p}{1-p} = w^\top x + b$, so $p = \sigma(\eta) = 1/(1+e^{-\eta})$. Numbers worth memorising: $\sigma(2) = 0.8808$, $\sigma(-2) = 0.1192$, $\sigma(0) = 0.5$ exactly, and $\sigma(5) = 0.9933$. A coefficient of $\ln 2 \approx 0.6931$ multiplies the odds by exactly $2.0$ per unit; $-1.204$ multiplies them by $0.3000$. The trap is reading $w_j$ as a change in probability. Since $dp/d\eta = p(1-p)$, the derivative is $0.25$ at $p = 0.5$ and $0.0099$ at $p = 0.99$ — **the same coefficient moves the probability 25 times less at the extremes**, so "a coefficient of 0.7 adds 0.7 to the probability" is wrong by a factor that depends on where you started.
+    - **The loss is cross-entropy, which is exactly the Bernoulli negative log likelihood, and its floor is the entropy of the labels.** With $p_i = \sigma(\eta_i)$, $L = -\frac{1}{n}\sum_i [y_i \log p_i + (1-y_i)\log(1-p_i)] = \frac{1}{n}\sum_i [\log(1+e^{\eta_i}) - y_i \eta_i]$. This is the cross-entropy from *Information Theory* with $P$ the empirical label distribution and $Q$ the model — minimising it is minimising the KL divergence, since $H(P)$ does not depend on the parameters. Measured floors: 10% positives gives $0.3251$ nats $= 0.4690$ bits, the identical number that topic computed for a 90/10 Bernoulli; 1.58% positives gives $0.0812$ nats. A loss that plateaus at the floor means the features are exhausted, not that the optimiser is stuck.
+    - **The gradient is $X^\top(\hat p - y)$ with no sigmoid factor left over, because $\sigma'(\eta) = p(1-p)$ cancels the $1/(p(1-p))$ from the logarithm.** Per sample the gradient is bounded: $\max |\hat p - y| = 1.0$ however wrong the model is. The same model trained with squared error through a sigmoid has gradient $(\hat p - y)p(1-p)$, whose maximum is $0.148$ at $p = 1/3$ — a factor of $6.75$ — and which collapses to $0.000998$ at $p = 0.001$ where cross-entropy still returns $0.999$. This is the same $\hat p - y$ derived in *Information Theory* through softmax; the binary case is the two-class instance of it. The trap: the gradient is bounded *per sample*, not per parameter — with a feature of magnitude 1000 the update is a thousand times larger, which is why unscaled inputs diverge.
+    - **The Hessian is $X^\top W X$ with $W = \operatorname{diag}(\hat p(1-\hat p))$, so the problem is convex and Newton's method is iteratively reweighted least squares.** $H \succeq 0$, and positive definite exactly when $X$ has full rank and no fitted probability is $0$ or $1$. The Newton step solves $(X^\top W X)\,\delta = X^\top(\hat p - y)$ — which is *Linear Regression*'s normal equation with a weight per row that changes every iteration, on the working response $z_i = \eta_i + (y_i - p_i)/(p_i (1-p_i))$. Measured: 5 iterations on a $300 \times 2$ collinear design where gradient descent at its optimal fixed step needs **55,483**; 8 versus 69 on a well-conditioned design with $\kappa(H) = 7.93$. Newton's iteration count is independent of the conditioning; gradient descent's grows with it, so the gap widens from $8\times$ to $11{,}000\times$ as $\kappa$ goes from $7.9$ to $8.8 \times 10^3$. The trap is inherited verbatim from linear regression: forming and inverting $X^\top W X$ squares its condition number — the weighted design $\sqrt{W}X$ is conditioned at $94$, and the Gram matrix at $94^2 = 8.8 \times 10^3$ — so solve the least-squares problem and never call `inv`.
+    - **The decision boundary is the hyperplane $w^\top x + b = 0$, and $w$ is its normal vector — not a direction along it.** The sign of $w^\top x + b$ is the predicted side; the Euclidean distance to the line is $|w^\top x + b| / \|w\|$. With $w = (3,4)$, $\|w\| = 5$, and scores of $(-2, 12, 1, 28)$ the distances are $(-0.4, 2.4, 0.2, 5.6)$: a point with score 28 is 5.6 units away, not 28, and a point with score 1 is 0.2 units away — ten times closer than the score suggests. The trap is comparing raw scores across models: a score of 3 from a model with $\|w\| = 1$ and a score of 30 from one with $\|w\| = 10$ sit at the same distance and carry the same probability.
+    - **Rescaling $w$ leaves the boundary exactly where it is and changes every probability — which is why regularisation is not a numerical nicety.** For any $c > 0$, $\{x : c(w^\top x + b) = 0\}$ is the same set. Measured on a 200-row fit: accuracy $0.835$ at every $c \in \{0.25, 0.5, 1, 2, 4, 10\}$, while log-loss went $0.4754, 0.3790, 0.3327, 0.3963, 0.6331, 1.4504$. The minimum sits at the fitted $c = 1$, and the curve is asymmetric: quartering the confidence costs 43%, halving it 14%, doubling it 19%, ten-folding it $4.4\times$. So an $L_2$ penalty acts on **confidence**, not on the line, once the classes are separated. The trap is diagnosing "the boundary is wrong" when the boundary is fine and the probabilities are the problem.
+    - **Perfect separation has no finite maximum-likelihood answer, and it is common in small or wide data.** If some $w$ satisfies $y_i(w^\top x_i + b) > 0$ for every $i$, scaling it by $t$ drives the loss to $0$ as $t \to \infty$: there is no maximiser, only a direction that keeps improving. Measured on 20 points: unpenalised IRLS ran to $\|\beta\| = 66.36$ with loss $1.6 \times 10^{-18}$ and the smallest Hessian eigenvalue exactly $0.0$; started from $(8,-8,8)$ it reached $\|\beta\| = 2.3 \times 10^{14}$ in three iterations while the loss went *up* to $4.5 \times 10^{13}$. Fixes, in order of preference: an $L_2$ penalty ($\lambda = 1$ gives $\|w\| = 0.4897$ and loss $0.4828$ on the same data), early stopping (equivalent to a shrinking $L_2$ ball), or Firth's Jeffreys-prior correction. The trap is "loss $\to 0$, ship it": the fitted probabilities are $0$ and $1$, so the model is maximally confident about regions it has never seen, and one new point near the line flips the prediction.
+    - **The $0.5$ threshold is a decision you made, not a property of the model.** With a false positive costing $C_{fp}$ and a miss costing $C_{fn}$, predicting positive is optimal iff $p\,C_{fn} > (1-p)\,C_{fp}$, i.e. iff $p > C_{fp}/(C_{fp} + C_{fn})$. When a miss costs ten times a false alarm the threshold is $1/11 = 0.0909$, not $0.5$. Measured on a 1.58%-positive stream with AUC $0.938$: at threshold $0.5$, recall $0.241$ and precision $0.679$; at $0.0909$, recall $0.696$ and precision $0.282$. The all-negative baseline has $98.42\%$ accuracy, so accuracy cannot arbitrate between any of these. The trap is tuning the threshold on the training predictions — it must be set from the cost matrix and checked on held-out data.
+    - **Calibration and discrimination are different properties, and only one of them survives a monotone transform.** Applying $p \mapsto p^2$ to a fitted model leaves the ranking bit-identical, so the AUC is unchanged to the last digit: $0.9263427109974425$ before and after. But the log-loss rose from $0.3327$ to $0.4074$, and the mean predicted probability fell from $0.575$ to $0.4687$ against a true base rate of $0.575$. The intercept is the calibration knob: a null model's intercept is $\log\frac{\pi}{1-\pi} = -4.5951$ at $\pi = 0.01$, so training on a balanced sample and deploying at 1% requires subtracting exactly $4.5951$ from $b$. The trap is reporting an AUC as if it were a probability, or a probability as if it were a ranking — and "our model is well calibrated" as if it were implied by a high AUC.
+    - **The arithmetic must be done in log-space, and the failure is silent.** $-\log\sigma(\eta) = \log(1+e^{-\eta})$, so compute it as `logaddexp(0, eta)`, not as `log(sigmoid(eta))`. In float64 the sigmoid rounds to exactly $1.0$ for $\eta > 36.74$, so a confidently *wrong* prediction at $\eta = 40$ with $y = 0$ returns `inf` where the true loss is **40.0** nats; at $\eta = -800$ with $y = 1$ the naive form returns `inf` where the truth is **800.0**. Clipping $p$ to $[10^{-15}, 1 - 10^{-15}]$ "fixes" the infinity but caps the loss at $34.54$ nats, which silently forbids the model from ever expressing that it is badly wrong. Use `np.logaddexp(0, eta)` for the loss and $\sigma(\eta) = \tfrac12(1+\tanh(\eta/2))$ for the probability; both are exact for every finite input.
+
+
+  derivations:
+    - title: "From cross-entropy to the logistic gradient, with the sigmoid derivative cancelling"
+      latex: |
+        The labels are Bernoulli with parameter $p_i = \sigma(\eta_i)$ and
+        $\eta_i = w^\top x_i + b$. The negative log likelihood of $n$
+        independent observations is
+        $$L = -\frac1n\sum_i\big[y_i\log p_i + (1-y_i)\log(1-p_i)\big].$$
+        Differentiate one term with respect to $\eta_i$:
+        $$\frac{\partial L_i}{\partial \eta_i}
+          = -\Big[\frac{y_i}{p_i} - \frac{1-y_i}{1-p_i}\Big]\frac{\partial p_i}{\partial \eta_i}.$$
+        Since $p = \sigma(\eta)$ satisfies $\sigma'(\eta) = \sigma(\eta)(1-\sigma(\eta)) = p(1-p)$,
+        $$\frac{\partial L_i}{\partial \eta_i}
+          = -\Big[\frac{y_i(1-p_i) - (1-y_i)p_i}{p_i(1-p_i)}\Big]p_i(1-p_i)
+          = -\big[y_i - p_i\big] = p_i - y_i.$$
+        Chaining through $\eta_i = w^\top x_i + b$ gives
+        $$\nabla_w L = \frac1n X^\top(\hat p - y), \qquad
+          \frac{\partial L}{\partial b} = \frac1n\mathbf{1}^\top(\hat p - y).$$
+      prose: >-
+        Structurally this is the chain rule from *Matrix Calculus*: a scalar
+        loss of a vector parameter, differentiated through a nonlinearity and
+        then through the linear map $X$, which is why the answer comes out as
+        $X^\top(\text{something})$ rather than a per-coordinate sum. And the
+        something is clean because the $p(1-p)$ from the sigmoid and the
+        $1/(p(1-p))$ from the logarithm are the same factor: they cancel and
+        leave the residual in probability units. This is not a coincidence of
+        algebra — it happens because the logit is the canonical link for the
+        Bernoulli family, and it is the reason the gradient stays bounded at 1.0
+        even when the model is maximally wrong, the property squared error loses.
+    - title: "The Hessian, and why the Newton step is a weighted least-squares solve"
+      latex: |
+        Differentiate $\nabla_w L = \frac1n X^\top(\hat p - y)$ once more. Only
+        $\hat p$ depends on the parameters, and
+        $\partial \hat p_i/\partial \eta_i = p_i(1-p_i)$, so
+        $$\nabla^2_w L = \frac1n X^\top \operatorname{diag}\big(p_i(1-p_i)\big) X
+          = \frac1n X^\top W X.$$
+        With the intercept appended as a column of ones this is the full
+        $(p+1)\times(p+1)$ Hessian. It does not involve $y$ at all, which is the
+        defining property of a canonical link and the reason Newton's method and
+        Fisher scoring coincide here.
+
+        The Newton step solves $H\delta = \nabla L$. Substituting,
+        $$X^\top W X\,\delta = X^\top(\hat p - y),$$
+        which is the normal equation for the weighted least-squares problem
+        $$\min_\delta \sum_i w_i\big(z_i - x_i^\top\delta\big)^2,
+          \qquad z_i = \eta_i + \frac{y_i - p_i}{p_i(1-p_i)}.$$
+      prose: >-
+        Read the second line as a reweighted version of the linear-regression
+        normal equations: same $X^\top(\cdot)X$ shape, but each row's weight is
+        $p_i(1-p_i)$, largest for the points the model is unsure about and
+        vanishing for the ones it has already sorted. That is why IRLS needs
+        five iterations where gradient descent needs tens of thousands — it is
+        solving the exact quadratic model at every step rather than following
+        the gradient, and the weights re-centre on the decision boundary each
+        time.
+    - title: "The boundary is a hyperplane, and the margin is the signed distance"
+      latex: |
+        The predicted class changes where $\eta(x) = w^\top x + b$ changes sign,
+        so the boundary is $\mathcal{B} = \{x : w^\top x + b = 0\}$. For any
+        two points $u, v \in \mathcal{B}$,
+        $w^\top(u - v) = 0$, so $w$ is orthogonal to every direction inside
+        $\mathcal{B}$ — it is the normal, not a tangent.
+
+        For an arbitrary point $x_0$, decompose
+        $x_0 = x_\perp + t\,\hat w$ with $x_\perp \in \mathcal{B}$ and
+        $\hat w = w/\|w\|$. Then
+        $$w^\top x_0 + b = w^\top x_\perp + t\,w^\top\hat w + b = 0 + t\|w\|,$$
+        so $t = (w^\top x_0 + b)/\|w\|$ and the signed distance is
+        $$d(x_0) = \frac{w^\top x_0 + b}{\|w\|}.$$
+        Because $d$ depends on $w$ only through the ratio, replacing
+        $(w,b)$ by $(cw, cb)$ for $c>0$ leaves every distance unchanged — and
+        the boundary, being the zero set, unchanged as well.
+      prose: >-
+        The score is a distance multiplied by the norm of $w$, which is exactly
+        why scores from different models cannot be compared and distances can.
+        It also isolates what regularisation is allowed to touch: since $c$ does
+        not move the zero set, shrinking $\|w\|$ cannot move the classifier, it
+        can only soften the probabilities on either side of it.
+
+  implementations:
+    - language: python
+      title: "IRLS: Newton in a handful of steps, stable loss, no explicit inverse"
+      note: >-
+        This is the reference implementation and it is numerically correct for
+        every finite input: the loss uses `logaddexp`, so it never overflows;
+        the sigmoid uses `tanh`, so it never returns exactly 0 or 1 from an
+        intermediate subtraction; and the Newton step goes through `lstsq`, so a
+        rank-deficient weighted Gram matrix produces a minimum-norm step instead
+        of a `LinAlgError`. Standardising first is not cosmetic: on a design
+        whose columns spanned six orders of magnitude it took $\kappa(H)$ from
+        $3.0 \times 10^{13}$ down to $6.87$. With `lstsq` both parameterisations
+        still agreed to $1.1 \times 10^{-13}$ on that design, but solve the same
+        normal equations directly and $\kappa^2 = 9 \times 10^{26}$ means the
+        answer is noise — the identical failure measured in *Linear Regression*.
+      code: |
+        import numpy as np
+
+        def sigmoid(eta):
+            """Numerically stable logistic function for any finite eta."""
+            eta = np.asarray(eta, dtype=float)
+            # tanh form: bounded, no overflow, exact at the extremes.
+            return 0.5 * (1.0 + np.tanh(0.5 * eta))
+
+        def log_loss(eta, y):
+            """Mean Bernoulli NLL in nats. logaddexp(0, eta) - y*eta is exact."""
+            eta = np.asarray(eta, dtype=float)
+            y = np.asarray(y, dtype=float)
+            return float(np.mean(np.logaddexp(0.0, eta) - y * eta))
+
+        def fit_logistic(X, y, lam=0.0, max_iter=100, tol=1e-12):
+            """IRLS / Newton. Returns beta = [w..., b].
+
+            Minimises  mean NLL + (lam/2) * ||w||^2,  intercept not penalised.
+            """
+            X = np.asarray(X, dtype=float)
+            y = np.asarray(y, dtype=float)
+            n, p = X.shape
+
+            # Standardise: the Hessian's conditioning is the Hessian's, and
+            # this is the cheapest possible improvement to it.
+            mu = X.mean(axis=0)
+            sd = X.std(axis=0)
+            sd = np.where(sd > 0, sd, 1.0)
+            Z = (X - mu) / sd
+
+            beta = np.zeros(p + 1)
+            for _ in range(max_iter):
+                w, b = beta[:p], beta[p]
+                eta = Z @ w + b
+                p_hat = sigmoid(eta)
+                s = p_hat * (1.0 - p_hat)          # the IRLS weights
+
+                g = np.empty(p + 1)
+                g[:p] = Z.T @ (p_hat - y) / n + lam * w
+                g[p] = np.mean(p_hat - y)
+
+                H = np.empty((p + 1, p + 1))
+                H[:p, :p] = (Z * s[:, None]).T @ Z / n + lam * np.eye(p)
+                H[:p, p] = Z.T @ s / n
+                H[p, :p] = H[:p, p]
+                H[p, p] = np.mean(s)
+
+                # lstsq, never inv: on separable data H is singular and the
+                # minimum-norm step degrades gracefully instead of raising.
+                step = np.linalg.lstsq(H, g, rcond=None)[0]
+                beta = beta - step
+                if np.max(np.abs(step)) < tol:
+                    break
+
+            # Undo the standardisation: eta = w_s^T (x-mu)/sd + b_s
+            w_s, b_s = beta[:p], beta[p]
+            w = w_s / sd
+            b = b_s - float(mu @ w)
+            return np.concatenate([w, [b]])
+
+        if __name__ == "__main__":
+            X = np.array([[-2.0], [-1.6], [-0.9], [-0.3], [0.2], [0.8], [1.5], [2.1]])
+            y = np.array([0, 0, 1, 0, 1, 0, 1, 1])
+            beta = fit_logistic(X, y)
+            print(beta)                      # [1.02040709 0.03662258]
+            print(log_loss(X @ beta[:-1] + beta[-1], y))   # 0.523904687893455
+    - language: python
+      title: "The version everyone writes first — and exactly how it is wrong"
+      note: >-
+        **This implementation is numerically WRONG**, in three independent ways,
+        and all three fail silently on ordinary data. (1) `-np.log(sigmoid(eta))`
+        returns `inf` for any score beyond ±36.74 because the sigmoid saturates
+        to exactly 0 or 1; the true loss at $\eta = 40$ with $y = 0$ is 40.0
+        nats, and at $\eta = -800$ with $y = 1$ it is 800.0. (2) Clipping $p$ to
+        $[10^{-15}, 1-10^{-15}]$ turns that infinity into a hard ceiling of
+        34.54 nats, so the model can never report being badly wrong. (3) Fitting
+        by gradient descent on unstandardised features takes 55,483 steps on the
+        collinear design where IRLS took 5, and stops at a `1e-6` tolerance that
+        leaves the coefficients wrong in the fourth digit. Do not ship this. It
+        is here because recognising it is the actual skill.
+      code: |
+        import numpy as np
+
+        def sigmoid_naive(eta):
+            return 1.0 / (1.0 + np.exp(-eta))      # overflows in exp for eta << 0
+
+        def log_loss_naive(eta, y):
+            p = sigmoid_naive(eta)
+            p = np.clip(p, 1e-15, 1 - 1e-15)       # hides the inf, caps loss at 34.54
+            return -np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))
+
+        def fit_naive(X, y, lr=0.1, steps=2000):
+            X = np.asarray(X, dtype=float)
+            y = np.asarray(y, dtype=float)
+            n, p = X.shape
+            w = np.zeros(p)
+            b = 0.0
+            for _ in range(steps):                 # 2000 is not enough; 55483 is
+                eta = X @ w + b
+                err = sigmoid_naive(eta) - y
+                w -= lr * (X.T @ err) / n          # no Hessian, no reweighting
+                b -= lr * np.mean(err)
+            return np.concatenate([w, [b]])
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        A model on 90/10 data reports a log-loss of 0.3251 nats and stops
+        improving. Is it broken?
+      answerKind: short_text
+      hint: >-
+        What is the entropy of a Bernoulli with $p = 0.9$, and what does
+        cross-entropy decompose into?
+      solution: >-
+        No. $H(P) = -0.9\log 0.9 - 0.1\log 0.1 = 0.3251$ nats $= 0.4690$ bits,
+        and cross-entropy is $H(P) + D_{KL}(P\|Q)$. Since $H(P)$ does not depend
+        on the parameters, 0.3251 is the floor for any model on this label
+        distribution — reaching it means the model has learned the base rate
+        perfectly and the remaining KL is zero. If the features genuinely carry
+        no more signal, that is the correct answer. If you expected better, the
+        problem is the features, not the optimiser: no amount of training moves
+        a loss below the entropy of its own labels.
+    - id: cp-2
+      question: >-
+        You multiplied every weight and the intercept by 4. What happened to the
+        boundary, the accuracy, and the log-loss?
+      answerKind: short_text
+      hint: >-
+        The boundary is the zero set of $w^\top x + b$. What does multiplying
+        both sides of an equation by a positive constant do to its solutions?
+      solution: >-
+        Nothing at all happens to the boundary: $\{x : 4(w^\top x + b) = 0\}$ is
+        the same hyperplane, so every 0/1 prediction and the accuracy are
+        bit-identical. Measured on a 200-row fit, accuracy was 0.835 at every
+        scale from $c = 0.25$ to $c = 10$. The log-loss moves a lot: 0.4754 at
+        $c = 0.25$, 0.3327 at $c = 1$, 0.3963 at $c = 2$, 1.4504 at $c = 10$.
+        Multiplying by 4 makes the model systematically overconfident, and the
+        penalty is paid entirely in the probabilities. This is why an $L_2$
+        penalty on $\|w\|$ is a penalty on confidence, and why "the boundary
+        looks fine" and "the probabilities are wrong" are compatible statements.
+    - id: cp-3
+      question: >-
+        Newton converged in 5 iterations on data where gradient descent needed
+        55,483. What property of the problem explains a factor of 11,000?
+      answerKind: short_text
+      hint: >-
+        What number governs the convergence rate of gradient descent on a
+        quadratic, and what does Newton's method do with the curvature?
+      solution: >-
+        The conditioning of the Hessian. On that design two features were 0.999
+        correlated, giving $\kappa(H) = 8.8\times10^{3}$, and gradient descent's
+        iteration count scales linearly with $\kappa$ — with the optimal fixed
+        step $1/L$ it needs on the order of $\kappa\log(1/\epsilon)$ steps. On a
+        well-conditioned design the same comparison was 8 versus 69 iterations
+        at $\kappa(H) = 7.9$. Newton's method is invariant to the conditioning:
+        it solves the exact quadratic model at each step, so its convergence is
+        quadratic near the optimum and its iteration count barely moves as the
+        problem gets worse. The price is $O(np^2 + p^3)$ per step and the need
+        to solve a system whose condition number is $\kappa(H)$ — which is why
+        you use `lstsq` and not `inv`.
+    - id: cp-4
+      question: >-
+        On separable data the loss reaches $1.6\times10^{-18}$. Why is that a
+        failure, and what are two fixes?
+      answerKind: short_text
+      hint: >-
+        If a hyperplane separates the classes, what happens to the loss when you
+        scale that hyperplane by $t$, and does a minimum exist?
+      solution: >-
+        Because the loss is $0$ at every separating hyperplane and approaches
+        $0$ as $t\to\infty$ along any one of them, there is no finite maximiser:
+        the likelihood is monotonically increasing in $\|w\|$ and never
+        attains its supremum. The optimiser reports a tiny loss and enormous
+        weights — measured $\|\beta\| = 66.36$ with the smallest Hessian
+        eigenvalue exactly $0.0$; started from $(8,-8,8)$ it reached
+        $2.3\times10^{14}$. The fitted probabilities are 0 and 1, so the model is
+        maximally confident everywhere, including regions with no data. Fixes:
+        (a) an $L_2$ penalty, which makes the objective strictly convex —
+        $\lambda = 1$ gave $\|w\| = 0.4897$ and loss $0.4828$ on the same
+        points; (b) early stopping, which confines $\|w\|$ to a ball of radius
+        proportional to the step count and is equivalent to a shrinking ridge
+        penalty; (c) Firth's Jeffreys-prior penalty, which is the principled
+        small-sample answer. The one non-fix is more iterations.
+    - id: cp-5
+      question: >-
+        Your model has AUC 0.938, log-loss 0.0460 and the all-negative baseline
+        has 98.42% accuracy. Which number do you report, and what does each one
+        hide?
+      answerKind: short_text
+      hint: >-
+        AUC depends only on the ordering. Log-loss depends on the values.
+        Accuracy depends on a threshold you have not named.
+      solution: >-
+        Report all three, each with its caveat, and never accuracy alone. 98.42%
+        is what you get by predicting "negative" for everyone at a 1.58% base
+        rate — it is a property of the class balance, not of the model. AUC
+        0.938 says the ranking is good, but it is invariant to any monotone
+        transform: on the 200-row fit, squaring every probability left the AUC
+        at 0.9263427109974425 to the last digit while pushing the log-loss from
+        0.3327 to 0.4074, so it cannot tell you whether 0.9 means 90%. Log-loss
+        0.0460 against a null of 0.0812 says the probabilities are genuinely
+        better than the base rate, in the unit that a cost calculation needs.
+        The honest summary is: log-loss for probability quality, AUC for
+        ranking, precision/recall at the *chosen* threshold for the decision —
+        and the threshold comes from the cost matrix, not from 0.5.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        There are two questions hiding inside "fit a classifier": where does the
+        line go, and how confident is the model on each side of it? They are
+        coupled, but not in the way they look. The loss is convex, so there is
+        exactly one right answer and no local minima to worry about. But the
+        curvature is not constant — it is largest where the model is uncertain
+        and vanishes where it is sure — so any method that takes the same step
+        size everywhere will crawl through the part of the space where the data
+        actually disagrees, and overshoot where it does not.
+      blocks:
+        - kind: checklist
+          body: |
+            - Convex loss -> one optimum, no restarts, no seed sensitivity
+            - Curvature varies per row -> a fixed step size is the wrong tool
+            - The gradient is a residual in probability units
+            - The curvature is a weighted Gram matrix, and the weights are the
+              model's own uncertainty
+      checkpoint: >-
+        Before reading on: if the curvature is largest for the points the model
+        cannot classify, what does that imply about which points dominate the
+        fit — and why is that the behaviour you want?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Reach for Newton's method, not gradient descent. For a logistic model
+        the second derivative is available in closed form and is a weighted Gram
+        matrix, so each Newton step is a least-squares solve you already know how
+        to do from *Linear Regression* — and the number of steps barely depends
+        on how badly conditioned the problem is. Two implementation choices
+        matter as much as the algorithm: compute the loss with `logaddexp` so
+        that saturation cannot produce an infinity, and solve the Newton system
+        with `lstsq` rather than `inv`, because on separable data the matrix you
+        are inverting is singular by construction.
+      blocks:
+        - kind: checklist
+          body: |
+            - Newton / Fisher scoring, not vanilla gradient descent
+            - Hessian = X^T W X, with W = diag(p(1-p))
+            - Solve with lstsq or QR; never inv
+            - Loss via logaddexp(0, eta) - y*eta; sigmoid via tanh
+            - Standardise features, then transform the coefficients back
+      checkpoint: >-
+        Why does it matter that the Hessian depends only on the fitted
+        probabilities and not on the labels? What would change if it depended on
+        $y$ as well?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        The loop is short. The parts people omit are the two guards: the
+        convergence test on the *step* rather than the gradient, and the
+        un-standardisation at the end.
+      blocks:
+        - kind: pseudocode
+          body: |
+            standardise X -> Z, remembering mu and sd
+
+            beta = zeros(p + 1)                      # [w..., b]
+            repeat up to 100 times:
+                eta   = Z @ w + b
+                p     = stable_sigmoid(eta)
+                s     = p * (1 - p)                  # IRLS weights
+
+                g_w   = Z^T (p - y) / n + lam * w
+                g_b   = mean(p - y)
+
+                H_ww  = (Z * s).T @ Z / n + lam * I
+                H_wb  = Z^T s / n
+                H_bb  = mean(s)
+                H     = [[H_ww, H_wb], [H_wb^T, H_bb]]
+
+                step  = lstsq(H, [g_w, g_b])
+                beta  = beta - step
+                if max(|step|) < 1e-12: break
+
+            w = w_std / sd                           # undo standardisation
+            b = b_std - mu . w
+            return [w, b]
+      checkpoint: >-
+        The convergence test uses the step, not the gradient. Why is that the
+        safer test when the Hessian is nearly singular, and what would a
+        gradient-based test do on separable data?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Everything follows from differentiating the log-likelihood twice. The
+        first derivative is the residual in probability units; the second is a
+        weighted Gram matrix whose weights are the model's own variance.
+      blocks:
+        - kind: math
+          body: |
+            With $\eta_i = w^\top x_i + b$ and $p_i = \sigma(\eta_i)$:
+
+            $$L = \frac1n\sum_i\big[\log(1+e^{\eta_i}) - y_i\eta_i\big]$$
+
+            $$\frac{\partial L}{\partial \eta_i} = p_i - y_i
+              \quad\Longrightarrow\quad \nabla_w L = \frac1n X^\top(p - y)$$
+
+            The sigmoid's derivative $p(1-p)$ cancels the $1/(p(1-p))$ from the
+            log, which is why no such factor survives.
+
+            $$\frac{\partial^2 L}{\partial \eta_i^2} = p_i(1-p_i)
+              \quad\Longrightarrow\quad
+              H = \frac1n X^\top W X,\quad W = \operatorname{diag}(p_i(1-p_i))$$
+
+            The Newton step solves $H\delta = \nabla L$:
+
+            $$X^\top W X\,\delta = X^\top(p - y)$$
+
+            which is a weighted least-squares normal equation with working
+            response $z_i = \eta_i + (y_i - p_i)/(p_i(1-p_i))$.
+
+            Condition number: $\kappa(X^\top W X) = \kappa(X)^2$ when $W$ is
+            uniform, so the same rule as linear regression applies — never form
+            the Gram matrix explicitly if you can solve the least-squares
+            problem instead.
+      checkpoint: >-
+        $H$ does not contain $y$. What does that buy you when you want to know
+        the variance of the fitted coefficients, and why is it called the
+        *expected* Fisher information in that context?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete fitter with every guard in place, plus the diagnostics that
+        tell you whether to trust it.
+      blocks:
+        - kind: warning
+          body: >-
+            Read this only after writing your own. The two things most
+            implementations get wrong are not in the loop at all: the loss is
+            computed in a way that overflows above |η| = 36.74, and the
+            coefficients are returned on the standardised scale, which makes
+            every one of them wrong by a factor of sd_j while the predictions
+            look perfect.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def sigmoid(eta):
+                eta = np.asarray(eta, float)
+                return 0.5 * (1.0 + np.tanh(0.5 * eta))
+
+            def fit_logistic(X, y, lam=0.0, max_iter=100, tol=1e-12):
+                X = np.asarray(X, float); y = np.asarray(y, float)
+                n, p = X.shape
+
+                mu = X.mean(0); sd = X.std(0); sd[sd == 0] = 1.0
+                Z = (X - mu) / sd
+
+                beta = np.zeros(p + 1)
+                history = []
+                for _ in range(max_iter):
+                    w, b = beta[:p], beta[p]
+                    eta = Z @ w + b
+                    p_hat = sigmoid(eta)
+                    s = p_hat * (1.0 - p_hat)
+
+                    g = np.empty(p + 1)
+                    g[:p] = Z.T @ (p_hat - y) / n + lam * w
+                    g[p] = np.mean(p_hat - y)
+
+                    H = np.empty((p + 1, p + 1))
+                    H[:p, :p] = (Z * s[:, None]).T @ Z / n + lam * np.eye(p)
+                    H[:p, p] = Z.T @ s / n
+                    H[p, :p] = H[:p, p]
+                    H[p, p] = np.mean(s)
+
+                    step = np.linalg.lstsq(H, g, rcond=None)[0]
+                    beta = beta - step
+                    history.append(float(np.abs(g).max()))
+                    if np.abs(step).max() < tol:
+                        break
+
+                w = beta[:p] / sd
+                b = beta[p] - float(mu @ w)
+                return np.concatenate([w, [b]]), history
+
+            def diagnose(X, y, beta):
+                eta = np.asarray(X, float) @ beta[:-1] + beta[-1]
+                p = sigmoid(eta)
+                s = p * (1 - p)
+                return {
+                    "loss": float(np.mean(np.logaddexp(0, eta) - y * eta)),
+                    "null_loss": float(-(y.mean() * np.log(y.mean())
+                                         + (1 - y.mean()) * np.log(1 - y.mean()))),
+                    "min_weight": float(s.min()),   # ~0 => separation
+                    "max_abs_score": float(np.abs(eta).max()),
+                    "mean_p": float(p.mean()),
+                    "base_rate": float(y.mean()),
+                }
+      checkpoint: >-
+        `min_weight` near zero is the separation alarm. Why does that single
+        number detect the failure that the loss (which looks excellent) cannot
+        report?
+
+  problems:
+    - id: p-log-loss-and-gradient
+      title: "Log loss and its gradient, without overflow"
+      difficulty: medium
+      prompt: >-
+        Implement `log_loss_grad(X, y, w, b)` returning a flat list
+        `[loss, grad_w_1, ..., grad_w_p, grad_b]`.
+
+        `loss` is the **mean** negative log likelihood in nats,
+        $-\frac1n\sum_i[y_i\log p_i + (1-y_i)\log(1-p_i)]$ with
+        $p_i = \sigma(w^\top x_i + b)$. The gradients are of that same mean:
+        $\nabla_w = \frac1n X^\top(\hat p - y)$ and
+        $\partial/\partial b = \frac1n\sum_i(\hat p_i - y_i)$.
+
+        The third case has a score of 50 and must return the exact loss
+        (`50.0`) rather than `inf`, so compute the loss in log-space — the naive
+        `-log(sigmoid(eta))` overflows there.
+      starter: |
+        import numpy as np
+
+        def log_loss_grad(X, y, w, b):
+            # your implementation here
+            pass
+      language: python
+      entry: log_loss_grad
+      testCases:
+        - input: "[[[1.0], [2.0]], [1, 0], [1.5], -0.5]"
+          expected: "[1.4460757109053861, 0.7896711092937589, 0.32760019930438067]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[1.0, 0.5], [-1.0, 1.0], [0.5, -1.5], [2.0, 2.0]], [1, 0, 0, 1], [0.8, -1.2], 0.25]"
+          expected: "[1.047934275088108, -0.33634960517401447, -0.6739366358098333, 0.011278072946533102]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[1.0]], [0], [50.0], 0.0]"
+          expected: "[50.0, 1.0, 1.0]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[[1.0, 2.0], [3.0, 4.0]], [0, 1], [0.0, 0.0], 0.0]"
+          expected: "[0.6931471805599453, -0.5, -0.5, 0.0]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def log_loss_grad(X, y, w, b):
+            X = np.asarray(X, dtype=float)
+            y = np.asarray(y, dtype=float)
+            w = np.asarray(w, dtype=float)
+            n = X.shape[0]
+
+            eta = X @ w + b
+            # log(1+e^eta) - y*eta, evaluated without ever forming 1/(1+e^-eta).
+            loss = float(np.mean(np.logaddexp(0.0, eta) - y * eta))
+
+            # tanh form: no overflow, and exactly 0/1 only when it should be.
+            p = 0.5 * (1.0 + np.tanh(0.5 * eta))
+
+            grad_w = X.T @ (p - y) / n
+            grad_b = float(np.mean(p - y))
+            return [loss] + [float(v) for v in grad_w] + [grad_b]
+      solutionExplanation: >-
+        The loss is `mean(logaddexp(0, eta) - y*eta)`, which is algebraically
+        $-\log\sigma(\eta)$ for $y = 1$ and $-\log(1-\sigma(\eta))$ for $y = 0$
+        but never overflows. That matters on the third case: the score is 50, so
+        $\sigma(50)$ is exactly 1.0 in float64 and the naive loss is `inf`,
+        while the true value is 50.0 nats — the model is confidently wrong and
+        the loss should say so, loudly but finitely. The gradient has no sigmoid
+        factor because the $p(1-p)$ from $\sigma'$ cancels the $1/(p(1-p))$ from
+        the logarithm, so it is simply the residual in probability units: on
+        case three $p - y = 1.0$ and the gradient is exactly $(1.0, 1.0)$ even
+        though the model is saturated. On case four, $w = 0$ gives $p = 0.5$
+        everywhere, a loss of $\log 2$, and gradients of $-0.5$ on both features
+        because the two labels pull in opposite directions with equal force.
+      complexity: "O(np) time, O(p) extra space"
+      tags: [log-loss, cross-entropy, gradient, numerical-stability, sigmoid]
+
+    - id: p-irls-fit
+      title: "Fit by IRLS, with and without a ridge penalty"
+      difficulty: hard
+      prompt: >-
+        Implement `fit_logistic(X, y, lam=0.0)` returning `[w_1, ..., w_p, b]`.
+
+        Minimise $\frac1n\sum_i[\log(1+e^{\eta_i}) - y_i\eta_i] +
+        \frac{\lambda}{2}\|w\|_2^2$ where $\eta_i = w^\top x_i + b$. **The
+        intercept is not penalised.** Note the $1/n$: the data term is a mean,
+        so $\lambda$ is on the same scale as a per-sample loss.
+
+        Use Newton's method (IRLS): the step solves
+        $(X^\top W X/n + \lambda I)\,\delta = X^\top(\hat p - y)/n + \lambda w$,
+        with $W = \operatorname{diag}(\hat p(1-\hat p))$ and the intercept row
+        and column unpenalised. Iterate to a step norm below $10^{-12}$, or 300
+        iterations.
+
+        Cases 1 and 2 are overlapping data with a unique finite optimum. Case 3
+        is perfectly separable, so $\lambda = 0$ has no answer at all and
+        $\lambda = 1$ has a finite one — that difference is the point.
+      starter: |
+        import numpy as np
+
+        def fit_logistic(X, y, lam=0.0):
+            # your implementation here
+            pass
+      language: python
+      entry: fit_logistic
+      testCases:
+        - input: "[[[-2.0], [-1.6], [-0.9], [-0.3], [0.2], [0.8], [1.5], [2.1]], [0, 0, 1, 0, 1, 0, 1, 1]]"
+          expected: "[1.0204070914612047, 0.036622578086566326]"
+          mode: json
+          tolerance: 1e-6
+        - input: "[[[-0.88, -1.46], [-0.27, 0.46], [1.25, 0.12], [-0.61, -0.86], [0.82, 1.8], [0.3, -1.36], [-1.05, 1.76], [0.22, -1.91], [-0.09, -1.28], [-0.69, -0.54], [-0.78, 0.61], [-0.07, -0.65]], [0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1]]"
+          expected: "[1.305778481476035, -1.0102732332803153, 0.3262041988104648]"
+          mode: json
+          tolerance: 1e-6
+        - input: "[[[-2.0, -1.0], [-1.5, -0.6], [-1.0, -1.4], [-0.5, -0.2], [1.0, 0.6], [1.5, 1.2], [2.0, 0.8], [2.4, 1.6]], [0, 0, 0, 0, 1, 1, 1, 1], 1.0]"
+          expected: "[0.4159445259570142, 0.25837125791116194, -0.13069089258462915]"
+          mode: json
+          tolerance: 1e-6
+      solution: |
+        import numpy as np
+
+        def fit_logistic(X, y, lam=0.0, max_iter=300, tol=1e-12):
+            X = np.asarray(X, dtype=float)
+            y = np.asarray(y, dtype=float)
+            n, p = X.shape
+
+            beta = np.zeros(p + 1)                     # [w..., b]
+            for _ in range(max_iter):
+                w, b = beta[:p], beta[p]
+                eta = X @ w + b
+                p_hat = 0.5 * (1.0 + np.tanh(0.5 * eta))
+                s = p_hat * (1.0 - p_hat)
+
+                g = np.empty(p + 1)
+                g[:p] = X.T @ (p_hat - y) / n + lam * w
+                g[p] = np.mean(p_hat - y)
+
+                H = np.empty((p + 1, p + 1))
+                H[:p, :p] = (X * s[:, None]).T @ X / n + lam * np.eye(p)
+                H[:p, p] = X.T @ s / n
+                H[p, :p] = H[:p, p]
+                H[p, p] = np.mean(s)
+
+                # lstsq, not solve: the unpenalised Hessian is singular on
+                # separable data and we still want a defined step.
+                step = np.linalg.lstsq(H, g, rcond=None)[0]
+                beta = beta - step
+                if np.abs(step).max() < tol:
+                    break
+            return beta
+      solutionExplanation: >-
+        Each iteration is one weighted least-squares solve: the weights
+        $p(1-p)$ are the model's own variance, largest for the points it cannot
+        yet classify, which is why the fit concentrates where the classes
+        overlap and ignores the points it has already separated. Convergence is
+        quadratic, so case 1 takes 6 iterations and case 2 takes 7. The
+        unpenalised answers are genuine stationary points — case 1 misclassifies
+        2 of 8 points and case 2 misclassifies 4 of 12, with losses of 0.5239
+        and 0.5136 nats — so the linear model is not claiming perfection, which
+        is exactly what non-separable data should produce. Case 3 is separable:
+        with $\lambda = 0$ there is no finite optimum, $\|w\|$ grows without
+        bound and the smallest Hessian eigenvalue is 0.0, so `lstsq` returns a
+        minimum-norm step in a direction that never stops improving. Adding
+        $\lambda = 1$ makes the objective strictly convex, and the answer
+        $\|w\| = 0.4897$ with loss 0.4828 is unique and stable — the same
+        data, a completely different and *correct* problem.
+      complexity: "O(np² + p³) per iteration, 5-10 iterations"
+      tags: [irls, newton, logistic-regression, separation, ridge]
+
+    - id: p-boundary-distance
+      title: "Distance to the decision boundary"
+      difficulty: easy
+      prompt: >-
+        Implement `boundary_distance(w, b, X)` returning the **signed** Euclidean
+        distance from each row of `X` to the hyperplane $w^\top x + b = 0$, with
+        the sign of $w^\top x + b$ (positive on the positive-class side).
+
+        Return a list of floats, one per row. The answer is not the raw score:
+        a score of 28 from a model with $\|w\| = 5$ is 5.6 units from the line.
+      starter: |
+        import numpy as np
+
+        def boundary_distance(w, b, X):
+            # your implementation here
+            pass
+      language: python
+      entry: boundary_distance
+      testCases:
+        - input: "[[3.0, 4.0], -2.0, [[0.0, 0.0], [2.0, 2.0], [-1.0, 1.5], [10.0, 0.0]]]"
+          expected: "[-0.4, 2.4, 0.2, 5.6]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[1.0, 0.0], 0.0, [[-2.0, 5.0], [0.0, 0.0], [3.5, -1.0]]]"
+          expected: "[-2.0, 0.0, 3.5]"
+          mode: json
+          tolerance: 1e-9
+        - input: "[[2.0, -1.0, 2.0], 1.0, [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [-0.5, 2.0, 0.25]]]"
+          expected: "[0.3333333333333333, 1.3333333333333333, -0.5]"
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def boundary_distance(w, b, X):
+            w = np.asarray(w, dtype=float)
+            X = np.asarray(X, dtype=float)
+            # The score is distance times ||w||; divide it back out.
+            scores = X @ w + b
+            return (scores / np.linalg.norm(w)).tolist()
+      solutionExplanation: >-
+        $w$ is the normal to the boundary, so the component of $x$ along $w$ is
+        $(w^\top x)/\|w\|$; shifting by the offset and dividing by the norm
+        gives the signed perpendicular distance. The third case makes the
+        scaling concrete: $\|w\| = \sqrt{4+1+4} = 3$, so a raw score of 1 is
+        $1/3$ of a unit from the line and a score of 4 is $4/3$. Case two is the
+        sanity check that the sign is right — the point at $x_1 = 3.5$ is
+        positive-class side, the one at $x_1 = -2$ is not, and the origin sits
+        exactly on the line, which is what $b = 0$ means. Forgetting the
+        division by $\|w\|$ passes case two (where the norm is 1) and fails the
+        other two, which is exactly the bug this problem exists to catch.
+      complexity: "O(np) time, O(n) space"
+      tags: [decision-boundary, geometry, margin, linear-algebra]
+
+  visualizers:
+    - id: vs-logistic-boundary
+      kind: loss_surface
+      title: "Move the line, watch the loss"
+      description: >-
+        Drag $(w_1, w_2, b)$ for the twelve-point dataset and watch the loss
+        surface: the boundary is the set of parameters where the score is zero,
+        and the loss is flat along directions that do not move it. The counter
+        shows the misclassified count alongside the log-loss, so you can see
+        that the two minima need not coincide.
+      params:
+        dataset: "twelve-point-overlap"
+        showContours: true
+        metric: "log-loss"
+
+  try_it: >-
+    Fit logistic regression on 200 rows with one feature, then multiply $(w, b)$
+    by $c \in \{0.25, 1, 4, 10\}$ and record accuracy and mean predicted
+    probability at each. Accuracy will not move at all; the probabilities will —
+    and that gap is the reason regularisation is not a numerical nicety.
+  interview_questions:
+    - question: "Why cross-entropy rather than squared error for logistic regression?"
+      level: mid
+      key_points:
+        - "The gradient of the cross-entropy is $X^\\top(\\hat p - y)$ with no leftover sigmoid factor, because $\\sigma'(\\eta) = p(1-p)$ cancels the $1/(p(1-p))$ from the log."
+        - "That gradient is bounded — $\\max|\\hat p - y| = 1.0$ however wrong the model is — so a confidently wrong prediction still produces a large, usable step."
+        - "Squared error through a sigmoid multiplies by $\\sigma'(z) \\le 0.25$, so the gradient vanishes exactly when the model is most wrong."
+        - "The cross-entropy Hessian is $X^\\top W X$ with $W = \\operatorname{diag}(\\hat p(1-\\hat p))$, which is PSD — the problem is convex and Newton's method is IRLS."
+      follow_up: "Cross-entropy is convex but can still have no finite minimiser. When, and how do you detect it?"
+    - question: "You trained on a balanced sample and deploy into traffic that is 1.6% positive. What breaks, and what is the fix?"
+      level: senior
+      key_points:
+        - "Only the intercept: shifting prevalence changes the log-odds by $\\log(\\pi/(1-\\pi))$, which from balanced to 1.6% is about $-4.6$ nats — a factor of 100 in odds."
+        - "The coefficients are unaffected because they describe the slope in log-odds, which prevalence does not change."
+        - "So the repair is an intercept correction applied to the fitted model, not a retrain on the same data — retraining reproduces the same defect."
+        - "After correcting, verify calibration on a natural-prevalence slice rather than trusting accuracy, which is dominated by the majority class."
+      follow_up: "Deployment prevalence drifts month to month. How do you keep the intercept correct without retraining?"
+    - question: "Where is the decision boundary, and what is the geometric role of $w$?"
+      level: mid
+      key_points:
+        - "The boundary is the hyperplane $w^\\top x + b = 0$, and $w$ is its normal vector — not a direction along the boundary."
+        - "The signed distance from a point to that hyperplane is $(w^\\top x + b)/\\|w\\|$, so the score is a scaled distance."
+        - "With $w = (3, 4)$ we have $\\|w\\| = 5$, so raw scores of $-2, 12, 1, 28$ are distances $-0.4, 2.4, 0.2, 5.6$ from the boundary."
+        - "Rescaling $(w, b)$ by $c > 0$ leaves the boundary set identical while changing every predicted probability — confidence and location are separate objects."
+  common_mistakes:
+    - "Reporting 97% accuracy on a 3% positive rate — the constant-negative classifier scores 0.97 without looking at a single feature."
+    - "Rescaling $w$ and concluding the model is scale-invariant because accuracy held, when every probability it emits changed."
+    - "Computing log-loss as `log(sigmoid(eta))`, which returns `-inf` for $\\eta > 36.74$ in float64 — use `logaddexp(0, eta)` instead."
+  further_reading:
+    - label: "Hosmer, Lemeshow & Sturdivant, Applied Logistic Regression"
+    - label: "McCullagh & Nelder, Generalized Linear Models"

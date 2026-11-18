@@ -1,0 +1,1408 @@
+id: positional-encoding
+slug: positional-encoding
+title: "Positional Encoding: Absolute, Relative, and RoPE"
+summary: >-
+  Attention sees a bag of vectors, so order has to be written into the vectors
+  themselves — and the only version of that signal which survives every learned
+  projection is a rotation of queries and keys, because the angle between two
+  rotated vectors depends on the difference of their positions and nothing
+  else. Derive the sinusoidal clock, measure a learned table failing to leave
+  its training range, build RoPE's block-diagonal rotation, price ALiBi's
+  linear prior, and find the exact place where long-context extrapolation
+  breaks.
+kind: lesson
+difficulty: medium
+position: 3
+estMinutes: 29
+prerequisites: [attention-from-first-principles]
+phase: attention-core
+tags: [positional-encoding, rope, alibi, sinusoidal, relative-position, long-context, extrapolation, transformers]
+
+body:
+  big_idea: >-
+    Attention averages over a set, so order must be injected into the vectors
+    — and the only injection that stays relative after every learned
+    projection is a rotation, since $R_m^\top R_n = R_{n-m}$.
+
+  problem:
+    - >-
+      You shuffle a prompt and the answer changes, and nothing you can point
+      at in the architecture has an opinion about order.
+    - >-
+      You copy the sinusoidal encoding and never learn that its relative
+      property dies at the first learned $W_Q,W_K$: a score spread of 17.8.
+    - >-
+      You ship a 32k-context model and retrieval collapses past 8k, with 56%
+      of the attention matrix at offsets the model never trained on.
+
+  analogy: |
+    Give every musician in an orchestra a clock. A learned table is a
+    hand-written seating chart that ends at the last row. The sinusoidal
+    encoding is a clock with 32 hands running at geometrically spaced rates,
+    so reading all of them gives the time and the difference gives the
+    interval. RoPE bolts the clock to the question and the label rather than
+    to the musician.
+
+  concept_points:
+    - >-
+      **Attention is permutation-equivariant, and that is a theorem rather than a tendency.**
+      Permute the rows of $X$ and every score row permutes with them: measured
+      $\max|\operatorname{Attn}(\pi X) - \pi\operatorname{Attn}(X)| = 2.2\times10^{-16}$
+      on 8 tokens. Adding a position vector does not change the theorem —
+      permute tokens with their position rows and the output still permutes(
+      $8.9\times10^{-16}$); the *data* becomes order-aware, attention stays a
+      sum.
+    - >-
+      **The sinusoidal encoding is a rotation orbit, which is why its inner product sees only the offset.**
+      With $\omega_i = 10000^{-2i/d}$, advancing by $k$ rotates each 2D pair
+      by $k\omega_i$: $\|PE_{p+k} - R_k PE_p\|_\infty = 4.9\times10^{-14}$.
+      Hence $PE_p^\top PE_{p+k} = \sum_i \cos(k\omega_i)$, which contains no
+      $p$: at $d=64$, $k=7$ it is **23.264326** for $p=0$, 997 and 1999,
+      spread $2.5\times10^{-13}$.
+    - >-
+      **The first learned projection destroys the relative structure, and that is why RoPE exists.**
+      Apply random $W_Q,W_K$ to sinusoidal codes and score $W_Q PE_p$ against
+      $W_K PE_{p+7}$: the mean is **2.326** and the spread across $p$ is
+      **17.795**, rising to 20.290 against 3.642 at $k=64$. RoPE rotates
+      *after* $W_Q$ and $W_K$, so no linear map sits between the rotation and
+      the inner product.
+    - >-
+      **A learned absolute table is $n_{ctx} \times d$ free parameters with nothing tying row $p$ to row $p+1$.**
+      GPT-2's is $1024 \times 768 = 786{,}432$; at 32k context and $d=8192$ it
+      is $268{,}435{,}456$ (0.5 GiB in bf16). The boundary is hard: position
+      131,072 raises an index error, and there is no row to interpolate
+      toward, because any offset preference lives in the *pair* $(e_i, e_j)$.
+    - >-
+      **RoPE rotates Q and K by their own positions, and the inner product collapses to a function of $n-m$.**
+      With $q'_m = R_m q$, $k'_n = R_n k$:
+      ${q'}_m^\top {k'}_n = q^\top R_{n-m} k$. A single pair scores
+      **4.360102627621** at $(m,n) = (0,7)$, $(100,107)$, $(5000,5007)$ and
+      $(13,20)$ — spread $1.4\times10^{-12}$. The rotation costs $3d$
+      multiply-adds against attention's $4nd$: **0.018%** of the layer at
+      $n=4096$. Never rotate $V$.
+    - >-
+      **Long context fails at a computable place: 4x the training length puts 56.24% of the causal attention matrix at unseen offsets.**
+      For $n = 4L$ the fraction of causal pairs with $i-j > L$ is **56.24%**
+      at $L=4096$. Meanwhile the RoPE bands whose wavelength still exceeds
+      twice the offset fall to **11 of 32** at 1024, **7** at 4096 and **0**
+      at 32768.
+
+  definitions:
+    - term: "Positional encoding"
+      meaning: >-
+        Any signal added to, or applied to, a token's representation so that the
+        model can tell positions apart. It is necessary only because attention
+        is a sum over a set; a recurrent layer gets order from its recurrence.
+    - term: "Permutation equivariance"
+      meaning: >-
+        $f(\pi X) = \pi f(X)$ for every permutation $\pi$. Attention has it
+        exactly (measured $2.2\times10^{-16}$), which means attention can never
+        manufacture order — it can only consume a representation that already
+        contains it.
+    - term: "Absolute encoding"
+      meaning: >-
+        A code that identifies a position by itself: $PE_p$ depends on $p$ only.
+        Both the sinusoidal encoding and a learned table are absolute, and both
+        require the model to learn what to do with the code.
+    - term: "Relative encoding"
+      meaning: >-
+        A scheme in which the score depends on $i-j$ and not on $i$ or $j$
+        separately. RoPE and ALiBi are relative by construction; an absolute
+        encoding can only become relative after the model learns to subtract.
+    - term: "Frequency band / wavelength"
+      meaning: >-
+        One 2D plane of the encoding, rotating at $\omega_i$ with wavelength
+        $\lambda_i = 2\pi/\omega_i$. At $d=64$, base 10000, the 32 bands run from
+        6.283 to 47,117 tokens, spaced by a constant factor of 1.33352.
+    - term: "Base ($\theta$)"
+      meaning: >-
+        The constant in $\omega_i = \theta^{-2i/d}$. It sets the *range* of the
+        ladder, not its shape: 10000 is the original Transformer value, and
+        long-context models raise it (LLaMA-3 uses 500,000) to stretch the slow
+        bands without touching the fast ones.
+    - term: "Rotary position embedding (RoPE)"
+      meaning: >-
+        A per-position rotation applied to $Q$ and $K$ after projection, in
+        $d/2$ disjoint 2D planes: $q'_m = R_m q$, $k'_n = R_n k$. The inner
+        product becomes $q^\top R_{n-m} k$, so relative position is exact and
+        costs no parameters.
+    - term: "ALiBi"
+      meaning: >-
+        Attention with Linear Biases: add $-m_h(i-j)$ to the score, with one
+        geometric slope per head and no learned parameters. It encodes a fixed
+        prior — the further away, the less it matters — rather than a code.
+    - term: "Context extrapolation"
+      meaning: >-
+        Evaluating at a sequence length beyond the training length. It is not
+        one problem but three: parameters that do not exist (learned tables),
+        phases that were never trained (RoPE and sinusoidal), and a bias shape
+        that may or may not be defined at range (ALiBi is).
+    - term: "Aliasing"
+      meaning: >-
+        Two positions producing the same code for a band because their phases
+        differ by a whole turn: $p$ and $p + \lambda_i$ are indistinguishable to
+        band $i$. Aliasing is per-band, which is why a long-context model can
+        still tell 100 tokens from 101 while confusing 40,000 from 40,500.
+
+  diagrams:
+    - type: architecture
+      title: "Three families, three injection points: input embedding, Q/K, and the score"
+      nodes:
+        - { id: x, x: 0, y: 1, label: "tokens X (n, d_model)", kind: client, detail: "One row per token. Nothing in this matrix knows the order the rows arrived in." }
+        - { id: pe, x: 0, y: 0, label: "position table or formula", kind: storage, detail: "Learned: n_ctx x d parameters, 786,432 for GPT-2, and no row exists past the last one. Sinusoidal: zero parameters, a rotation orbit of a fixed vector." }
+        - { id: add, x: 1, y: 0, label: "X + PE_p (absolute)", kind: model, detail: "Intervenes BEFORE the projection. The relative structure of the sinusoidal code does not survive W_Q and W_K: measured score spread 17.8 at a fixed offset." }
+        - { id: proj, x: 1, y: 1, label: "W_Q, W_K, W_V", kind: storage, detail: "Three learned matrices. In RoPE models the position signal never touches these, which is exactly why RoPE's invariance is structural." }
+        - { id: qkv, x: 2, y: 1, label: "Q, K, V", kind: model, detail: "Q and K share d_k because they are dotted; V is unconstrained and must NOT be rotated." }
+        - { id: rot, x: 2, y: 0, label: "rotate Q and K (RoPE)", kind: worker, detail: "d/2 planes rotated by m*omega_i. Then q_m . k_n = q . R_(n-m) k: measured 4.360102627621 for four different absolute position pairs at offset 7." }
+        - { id: bias, x: 2, y: 2, label: "ALiBi bias -m_h(i-j)", kind: worker, detail: "No parameters, no code: a linear fee for distance, added to the score. Slopes 2^(-8h/H) give a 128x ladder of windows at H=8." }
+        - { id: score, x: 3, y: 1, label: "S = QK'/sqrt(d_k) + bias", kind: server, detail: "The only place all three families meet. Absolute changed the inputs, RoPE changed Q and K, ALiBi changes the score itself." }
+        - { id: out, x: 3, y: 2, label: "softmax, then P V", kind: client, detail: "Order has now been baked into which keys each query prefers. The mixture itself is still order-blind." }
+      edges:
+        - { from: x, to: add, label: "same X" }
+        - { from: pe, to: add, label: "one vector per position" }
+        - { from: add, to: proj, label: "n x d" }
+        - { from: proj, to: qkv, label: "project" }
+        - { from: qkv, to: rot, label: "Q and K only" }
+        - { from: qkv, to: bias, label: "scores", style: async }
+        - { from: rot, to: score, label: "relative by construction" }
+        - { from: bias, to: score, label: "prior, not a code" }
+        - { from: score, to: out, label: "weights" }
+
+    - type: plot
+      title: "The wavelength ladder is geometric: log10(wavelength in tokens) is linear in band index"
+      chart: line
+      xLabel: "band index i"
+      yLabel: "log10(wavelength)"
+      series:
+        - name: "d=64, base 10000 (32 bands, step 0.125)"
+          points:
+            - { x: 0, y: 0.7982 }
+            - { x: 2, y: 1.0482 }
+            - { x: 4, y: 1.2982 }
+            - { x: 6, y: 1.5482 }
+            - { x: 8, y: 1.7982 }
+            - { x: 10, y: 2.0482 }
+            - { x: 12, y: 2.2982 }
+            - { x: 14, y: 2.5482 }
+            - { x: 16, y: 2.7982 }
+            - { x: 18, y: 3.0482 }
+            - { x: 20, y: 3.2982 }
+            - { x: 22, y: 3.5482 }
+            - { x: 24, y: 3.7982 }
+            - { x: 26, y: 4.0482 }
+            - { x: 28, y: 4.2982 }
+            - { x: 30, y: 4.5482 }
+        - name: "d=128, base 500000 (64 bands, step 0.089 per band)"
+          points:
+            - { x: 0, y: 0.7982 }
+            - { x: 4, y: 1.1544 }
+            - { x: 8, y: 1.5106 }
+            - { x: 12, y: 1.8667 }
+            - { x: 16, y: 2.2229 }
+            - { x: 20, y: 2.5791 }
+            - { x: 24, y: 2.9353 }
+            - { x: 28, y: 3.2915 }
+            - { x: 32, y: 3.6477 }
+            - { x: 36, y: 4.0039 }
+            - { x: 40, y: 4.3600 }
+            - { x: 44, y: 4.7162 }
+            - { x: 48, y: 5.0724 }
+            - { x: 52, y: 5.4286 }
+            - { x: 56, y: 5.7848 }
+            - { x: 60, y: 6.1410 }
+
+    - type: plot
+      title: "Similarity of the same content against distance: a damped oscillation, not a decay"
+      chart: line
+      xLabel: "log2 of the offset in tokens"
+      yLabel: "similarity"
+      series:
+        - name: "sinusoidal, PE_p . PE_(p+k) / 32"
+          points:
+            - { x: 0, y: 0.966151 }
+            - { x: 1, y: 0.884496 }
+            - { x: 2, y: 0.747949 }
+            - { x: 3, y: 0.700435 }
+            - { x: 4, y: 0.605401 }
+            - { x: 5, y: 0.611062 }
+            - { x: 6, y: 0.434565 }
+            - { x: 7, y: 0.283853 }
+            - { x: 8, y: 0.353683 }
+            - { x: 9, y: 0.185369 }
+            - { x: 10, y: 0.262925 }
+            - { x: 11, y: -0.039701 }
+            - { x: 12, y: 0.003497 }
+            - { x: 13, y: 0.078562 }
+        - name: "RoPE, unit q = k at d=64"
+          points:
+            - { x: 0, y: 0.986098 }
+            - { x: 1, y: 0.949318 }
+            - { x: 2, y: 0.858053 }
+            - { x: 3, y: 0.806312 }
+            - { x: 4, y: 0.725380 }
+            - { x: 5, y: 0.512428 }
+            - { x: 6, y: 0.408626 }
+            - { x: 7, y: 0.186857 }
+            - { x: 8, y: 0.512992 }
+            - { x: 9, y: 0.419453 }
+            - { x: 10, y: 0.292355 }
+            - { x: 11, y: -0.306880 }
+            - { x: 12, y: -0.098227 }
+            - { x: 13, y: 0.099246 }
+
+    - type: plot
+      title: "ALiBi: one geometric ladder of windows, zero learned parameters (H=8)"
+      chart: bar
+      xLabel: "head index"
+      yLabel: "distance at which the bias reaches 1 nat (tokens)"
+      series:
+        - name: "window = 1 / slope"
+          points:
+            - { x: 0, y: 2 }
+            - { x: 1, y: 4 }
+            - { x: 2, y: 8 }
+            - { x: 3, y: 16 }
+            - { x: 4, y: 32 }
+            - { x: 5, y: 64 }
+            - { x: 6, y: 128 }
+            - { x: 7, y: 256 }
+
+    - type: compare
+      title: "Absolute versus relative: the decision, and what each one costs"
+      left_label: "Absolute (learned table, sinusoidal)"
+      left_points:
+        - "Position is a property of the row: PE_p depends on p alone"
+        - "Learned table: 786,432 parameters at GPT-2 scale, 1.07B at 128k x 8192"
+        - "Hard boundary: no row past n_ctx, and new rows start unrelated to their neighbours"
+        - "Sinusoidal: zero parameters, exact rotation orbit, dot product depends on offset to 2.5e-13"
+        - "But one random W_Q, W_K turns that exactness into a score spread of 17.8 at a fixed offset"
+        - "Extrapolation: impossible for the table, arbitrary for sinusoidal past one wavelength (dot = -9.17/32 at 16k)"
+      right_label: "Relative (RoPE, ALiBi)"
+      right_points:
+        - "Position is a property of the pair: the score depends on i-j"
+        - "RoPE: rotate Q and K, q_m . k_n = q . R_(n-m) k, spread 1e-12 across four absolute pairs"
+        - "Zero parameters, 0.018% extra FLOPs at n=4096, d=64"
+        - "Similarity decays with distance for free: 0.986 at offset 1, 0.292 at 1024"
+        - "ALiBi: no code at all, just -m_h(i-j); 8 slopes give windows from 2 to 256 tokens"
+        - "Extrapolation: ALiBi is defined at any distance; RoPE degrades but has known scalings (PI, NTK, YaRN)"
+        - "Cost: RoPE's rotation makes the score non-separable, so linear attention's kernel trick is off the table"
+
+  markdown: |
+    ## Order is nowhere in the architecture
+
+    Attention computes, for each query row, a convex combination of value rows.
+    A convex combination is a sum, and a sum does not know which term came
+    first. Formally, for any permutation matrix $P$,
+
+    $$\operatorname{Attn}(PX) = P\,\operatorname{Attn}(X),$$
+
+    measured at $2.2\times10^{-16}$ on an 8-token, 16-wide example. So "dog
+    bites man" and "man bites dog" are the same input to the layer, and the only
+    reason a trained model separates them is that the rows it received were
+    already different: token $i$ was paired with a position code $e_i$ before it
+    arrived.
+
+    Position is therefore not a feature of attention. It is a feature of the
+    representation attention is handed, or of the rotation applied to queries and
+    keys inside it. Every scheme in production is one of four:
+
+    | family | intervenes at | parameters | relative by construction |
+    |---|---|---|---|
+    | learned absolute | $x_i \leftarrow x_i + e_i$ | $n_{ctx}d$ | no |
+    | sinusoidal absolute | $x_i \leftarrow x_i + PE_i$ | 0 | only before $W_Q,W_K$ |
+    | RoPE | $q_i \leftarrow R_iq_i$, $k_j \leftarrow R_jk_j$ | 0 | yes |
+    | ALiBi | $s_{ij} \leftarrow s_{ij} - m_h(i-j)$ | 0 | yes |
+
+    ## The sinusoidal clock
+
+    With $d$ even, $i = 0,\ldots,d/2-1$ and
+
+    $$\omega_i = 10000^{-2i/d},\qquad
+      PE_{(p,2i)} = \sin(p\omega_i),\qquad
+      PE_{(p,2i+1)} = \cos(p\omega_i).$$
+
+    Each pair sits on the unit circle, so advancing $p$ by $k$ rotates pair $i$
+    by $k\omega_i$, and $PE_{p+k} = R_kPE_p$ with $R_k$ block-diagonal over
+    planes. Measured $\|PE_{p+k} - R_kPE_p\|_\infty = 4.9\times10^{-14}$ at
+    $k=1$ and $6.8\times10^{-13}$ at $k=5000$, with $R_k^\top R_k = I$ to
+    $2.2\times10^{-16}$. Because $R_k$ is orthogonal, the inner product depends
+    on the offset alone:
+
+    $$PE_p^\top PE_{p+k} = \sum_i \cos(k\omega_i).$$
+
+    At $d=64$ that sum is the whole story:
+
+    | offset $k$ | 1 | 2 | 7 | 64 | 1024 | 4096 | 16384 |
+    |---|---|---|---|---|---|---|---|
+    | $PE_p^\top PE_{p+k}$ | 30.917 | 28.304 | 23.264 | 13.906 | 8.414 | 0.112 | -9.168 |
+    | spread over 1000 positions | 1.7e-13 | 3.3e-13 | 2.5e-13 | 2.9e-13 | — | 9.4e-13 | 3.1e-12 |
+
+    Thirty-two is the maximum ($\|PE_p\|^2 = 32.0$ exactly), and everything below
+    it is a damped oscillation: the score is negative at 16,384. "The encoding
+    encodes distance" holds for about one wavelength of the slowest band and is
+    false beyond it.
+
+    The ladder has to be geometric because the requirement is constant *relative*
+    resolution: 32 bands covering 6.28 to 47,117 tokens is a factor of 7,500, so
+    the spacing is multiplicative, $\lambda_{i+1}/\lambda_i = 10000^{2/d} =
+    1.33352$ at $d=64$ — a constant 0.125 in $\log_{10}$ per band, which is the
+    straight line in the plot above. A linear ladder with the same finest
+    wavelength would stop at 207 tokens.
+
+    ### The first linear map destroys it
+
+    This is the fact that decides the architecture. Take the exact identity above
+    and apply random $W_Q$, $W_K$:
+
+    | | $k=7$ | $k=64$ |
+    |---|---|---|
+    | mean $\langle W_QPE_p, W_KPE_{p+k}\rangle$ | 2.326 | 3.642 |
+    | spread across $p$ | **17.795** | **20.290** |
+
+    A dense map mixes all $d/2$ frequencies into every output coordinate, and
+    mixed coordinates no longer form rotation orbits. A sinusoidal model can
+    recover relative position only by learning to un-mix its own encoding. RoPE
+    puts the rotation *after* the projection, so nothing learned sits between the
+    rotation and the inner product.
+
+    ## Learned absolute embeddings
+
+    One `nn.Embedding(n_ctx, d)`: rows are free parameters, nothing ties row $p$
+    to row $p+1$, and training only ever visits positions below $n_{ctx}$.
+
+    | config | parameters | bf16 |
+    |---|---|---|
+    | GPT-2, 1024 x 768 | 786,432 | 1.5 MiB |
+    | 32768 x 8192 | 268,435,456 | 0.5 GiB |
+    | 131072 x 8192 | 1,073,741,824 | 2.0 GiB |
+
+    At 128k that is a billion parameters spent on "where", and position 131,072
+    does not exist. Extending the table does not help: the score is bilinear in
+    $(e_i,e_j)$, so an offset preference is a property of the pair, and fresh
+    rows at $\mathcal{N}(0,0.02)$ carry no relation to the rows before them.
+
+    ## RoPE
+
+    Project as usual, then rotate each $q$ and $k$ in $d/2$ planes:
+
+    $$q'_m = R_mq,\qquad k'_n = R_nk,\qquad
+      {q'}_m^\top{k'}_n = q^\top R_m^\top R_nk = q^\top R_{n-m}k.$$
+
+    Measured: $4.360102627621$ at $(0,7)$, $(100,107)$, $(5000,5007)$ and
+    $(13,20)$ — four absolute positions, one number, spread $1.4\times10^{-12}$.
+    Per band, with $e_i$ the energy of $q$ in plane $i$ and $q=k$, $\|q\|=1$,
+
+    $$\text{sim}(k) = \sum_i e_i\cos(k\omega_i),\qquad \sum_i e_i = 1,$$
+
+    a weighted sum of cosines: 1.000 at 0, 0.986 at 1, 0.858 at 4, 0.725 at 16,
+    0.409 at 64, 0.292 at 1024, -0.307 at 2048. High-frequency planes give a head
+    local order, low-frequency planes give it reach — a decomposition a single
+    ALiBi slope cannot express.
+
+    Two traps. **Never rotate $V$**: a rotated value is expressed in a
+    position-dependent basis with nothing to cancel it. **Match the pairing
+    convention**: the paper interleaves $(2i,2i+1)$, most kernels split halves
+    $(i,i+d/2)$; either is correct, but $Q$ and $K$ must use the same one.
+    Rotating $Q$ only leaves a score that depends on the query's absolute index
+    and never on the offset: $0.979$, $-0.609$, $-2.330$ for $m = 0, 100, 5000$
+    against the same $K$.
+
+    ## ALiBi
+
+    $$\operatorname{score}_{ij} = \frac{q_i^\top k_j}{\sqrt{d_k}} - m_h(i-j),
+      \qquad m_h = 2^{-8h/H}.$$
+
+    At $H=8$ the slopes are $0.5,\ldots,0.0039$ and the one-nat windows are
+    $2,4,\ldots,256$ tokens: a 128x ladder of receptive fields from one formula,
+    no parameters, so an 8x context needs none. The cost is that the prior is
+    fixed — no head's slope is a function of the data. The window is also partly
+    a dtype fact: at $n=2048$ in float32 the $m=0.5$ head keeps 195.7 non-zero
+    weights per row on average (948.0 in float64), because
+    $\exp(-0.5\cdot4096)$ underflows at $\ln(1.4\times10^{-45}) = -103.28$.
+
+    ## Why RoPE won
+
+    | property | learned | sinusoidal | RoPE | ALiBi |
+    |---|---|---|---|---|
+    | parameters | $n_{ctx}d$ | 0 | 0 | 0 |
+    | relative after $W_Q,W_K$ | no | no (17.8) | yes (1e-12) | yes |
+    | distance prior | learned | oscillation | yes | linear, fixed |
+    | extrapolates | no | badly | with scaling | by construction |
+    | linear attention | yes | yes | **no** | yes |
+
+    The last row is the honest cost: the rotation is position-dependent, so the
+    score is not separable as $\phi(q)^\top\psi(k)$ and the kernel trick behind
+    $O(n)$ linear attention is unavailable. Every other row is why LLaMA, PaLM,
+    Mistral, Qwen and DeepSeek use it anyway, at 0.018% extra FLOPs.
+
+    ## Where long context breaks
+
+    At $n=4L$ the fraction of causal pairs with offset greater than the training
+    length is **56.24%** (at $L=4096$, of 134,225,920 pairs) — most of the matrix
+    is extrapolation. And the band budget shrinks: bands whose wavelength still
+    exceeds twice the offset number $(d/2)(1-\log_{\theta}(k/\pi))$, which at
+    $d=64$, base 10000 gives 11 of 32 at 1024, 7 at 4096, 0 at 32768 — 2.41 bands
+    lost per doubling. Bands that have wrapped carry local order and nothing
+    else, so at long offset the score is dominated by a few slow planes whose
+    phases were never trained.
+
+    The fixes are answers to "which bands do you sacrifice". Position
+    interpolation divides every position by the scale factor, pulling offsets
+    back into range and losing local resolution everywhere. NTK-aware scaling
+    raises the base: at $d=128$, 10,000 to 500,000 moves $\lambda_{\max}$ from
+    54,410 to 2,559,196 and raises the count of bands resolving 4,096 from 14 of
+    64 to 29 of 64. YaRN interpolates per band and adds an attention temperature.
+    *Long Context* derives each one; the point to carry out of here is that the
+    failure is a frequency-budget statement.
+
+    ## The longer version
+
+    Attention is a weighted average over a *set*, so it is permutation-
+    equivariant by construction and order must be injected as a property of the
+    vectors — and the only injection that stays relative after every learned
+    projection is a rotation, because $R_m^\top R_n = R_{n-m}$ depends on the
+    difference of the two positions and not on either one alone.
+
+    Give every musician in an orchestra a clock. A learned position table is a
+    hand-written seating chart: one line per seat, memorised, and it ends at the
+    last row of the hall. The sinusoidal encoding is a clock with 32 hands
+    running at rates spaced by a constant factor — the fastest completes a turn
+    every 6.3 beats, the slowest every 47,117 — so reading all 32 hands gives
+    the time, and the *difference* between two readings gives the interval
+    between two notes.
+
+    RoPE is the same clock, bolted to the question and the label rather than to
+    the musician: you rotate the query by its own clock angle and the key by
+    its own, and the comparison then sees only the angle between them, which is
+    the interval. ALiBi throws the clock away and simply charges a linearly
+    increasing fee for distance.
+
+    Where it breaks: clocks alias. A hand that has gone round 652 times cannot
+    tell you which turn you are on, and every hand is read with finite
+    precision. The sinusoidal clock is also read *before* the musicians are
+    handed their instruments — one transposition by a learned matrix and the
+    interval information is gone, which is exactly why RoPE moved the clock
+    onto the question and the label.
+
+    ### What goes wrong
+
+    - You shuffle a prompt and the model's answer changes, but nothing you can
+      point at in the architecture has an opinion about order. Attention is a
+      sum over tokens; a sum does not know which term came first. If you
+      cannot say *where* order enters, you cannot debug the case where it
+      fails to.
+    - You copy the sinusoidal encoding out of the paper because it is six
+      lines of NumPy, it works, and you never find out that its
+      relative-position property is destroyed by the first learned $W_Q$ and
+      $W_K$ it passes through — measured below as a score spread of 17.8
+      across positions at a *fixed* offset.
+    - You use a learned position table because it is one `nn.Embedding` line,
+      then your fine-tuning set turns out to have 4096-token documents and the
+      table has 1024 rows. There is no row 1024. There is no interpolation
+      scheme that invents one.
+    - Someone tells you RoPE "encodes relative position" and you read the code
+      and find a rotation by an *absolute* position index. Both statements are
+      true, and the reason is one line of linear algebra that also tells you
+      why the rotation must be applied after the projection rather than to the
+      input embedding.
+    - You ship a 32k-context model and retrieval collapses past 8k.
+      "Positional encoding" is the first suspect and the last thing anyone
+      measures, because the failure is not a shape error — it is 56% of your
+      attention matrix living at offsets the model never trained on.
+
+    ### The full treatment
+
+    **Attention is permutation-equivariant, and that is a theorem rather than
+    a tendency.** Permute the rows of $X$ and every score row permutes with
+    them, so the output permutes identically: measured
+    $\max|\operatorname{Attn}(\pi X) - \pi\operatorname{Attn}(X)| = 2.2\times
+    10^{-16}$ on an 8-token, 16-wide example. Adding a position vector does
+    not change that theorem — permute the tokens *together with* their
+    position rows and the output still permutes (measured $8.9\times10^{-16}$).
+    What changes is the input: "dog at slot 0, man at slot 1" and "man at
+    slot 0, dog at slot 1" are now different matrices, and the output differs
+    by $\| \cdot \|_F = 2.70$. The trap is believing position makes attention
+    order-aware. It makes the *data* order-aware; attention stays a sum.
+
+    **The sinusoidal encoding is a rotation orbit, which is why its inner
+    product sees only the offset.** With
+    $\omega_i = 10000^{-2i/d}$ and pairs
+    $(\sin p\omega_i, \cos p\omega_i)$, advancing the position by $k$ is a
+    rotation of each 2D pair by $k\omega_i$: measured
+    $\|PE_{p+k} - R_k PE_p\|_\infty = 4.9\times10^{-14}$ at $k=1$ and
+    $6.8\times10^{-13}$ at $k=5000$, with $R_k$ orthogonal to $2.2\times
+    10^{-16}$ and $\det R_k = 1.000000000$. Therefore
+    $PE_p^\top PE_{p+k} = \sum_i \cos(k\omega_i)$, which does not contain $p$:
+    at $d=64$ and $k=7$ the value is $23.264326$ for $p=0$, for $p=997$ and
+    for $p=1999$, with a spread of $2.5\times10^{-13}$ over 1000 positions.
+    The trap is thinking this survives the model. It is a property of the
+    encoding matrix, not of the network.
+
+    **The first learned projection destroys the relative structure, and that
+    is the whole reason RoPE exists.** Apply random $W_Q$ and $W_K$ to the
+    sinusoidal codes and score $W_Q PE_p$ against $W_K PE_{p+7}$: the mean is
+    $2.326$ and the spread across $p$ is $17.795$ — a relative spread of
+    7.65x the mean, because a dense linear map mixes coordinates across
+    frequency pairs and there is no reason for the mixed coordinates to keep
+    a clean rotation. At $k=64$ the spread is $20.290$ against a mean of
+    $3.642$. So a sinusoidal model *can* represent relative position only by
+    learning to un-mix what the encoding did — capacity spent undoing an
+    encoding choice. RoPE applies the rotation *after* $W_Q$ and $W_K$, so no
+    linear map can ever be applied between the rotation and the inner
+    product, and the invariance is structural.
+
+    **The frequencies are geometric, and the similarity profile they buy is a
+    damped oscillation.** 32 bands must cover offsets from 6.28 tokens to
+    47,117 — a factor of 7,500 — so the spacing has to be multiplicative:
+    $\lambda_{i+1}/\lambda_i = 10000^{2/d} = 1.33352$ at $d=64$, a constant
+    0.125 in $\log_{10}$ per band, measured as $\lambda_0 = 6.283$,
+    $\lambda_1 = 8.379$, $\lambda_{31} = 47{,}117.2$. A linear ladder with the
+    same finest wavelength would stop at 207 tokens and say nothing about a
+    4,000-token offset. What the ladder buys is a profile that decays locally
+    and then oscillates: the normalised inner product is $0.966$ at offset 1,
+    $0.701$ at 8, $0.435$ at 64, $0.263$ at 1024 — then $-0.040$ at 2048 and
+    $-9.168/32 = -0.287$ at 16,384, so identical content 16k tokens apart
+    scores *negative*. The trap is treating the base as a hyperparameter:
+    10000 is a *range* choice, and changing it slides the whole ladder without
+    changing its shape.
+
+    **A learned absolute table is $n_{ctx} \times d$ free parameters with
+    nothing tying row $p$ to row $p+1$.** GPT-2's is $1024 \times 768 =
+    786{,}432$ parameters — small. At 32k context and $d=8192$ it is
+    $268{,}435{,}456$ (0.5 GiB in bf16) and at 128k it is $1{,}073{,}741{,}824$
+    (2.0 GiB) — a parameter block that exists only to say "where", and that
+    has to be re-learned rather than extended. The boundary is hard: position
+    131,072 raises an index error, and there is no row to interpolate toward.
+    The trap is the phrase "just extend the table": new rows start at
+    $\mathcal{N}(0, 0.02)$ with no relation to their neighbours, and since the
+    score is a bilinear form in $(e_i, e_j)$, any offset preference lives in
+    the *pair* — so the model must relearn the whole geometry, not one row.
+
+    **RoPE rotates Q and K by their own positions, and the inner product
+    collapses to a function of $n-m$.** With $q'_m = R_m q$ and
+    $k'_n = R_n k$ and $R$ block-diagonal over $d/2$ planes,
+    ${q'}_m^\top {k'}_n = q^\top R_m^\top R_n k = q^\top R_{n-m} k$. Measured:
+    a single $q,k$ pair scores $4.360102627621$ at $(m,n) = (0,7)$, $(100,107)$,
+    $(5000,5007)$ and $(13,20)$ — four different absolute positions, one
+    number, spread $1.4\times10^{-12}$. Nothing is learned, nothing is added
+    to the embedding, and the rotation costs $3d$ multiply-adds per token
+    against attention's $4nd$: $0.018\%$ of the layer at $n=4096$, $d=64$.
+    Two traps. Never rotate $V$ — a rotated value vector is a value vector in
+    a different basis, and the output projection would have to un-rotate it
+    per position. And the pairing convention (interleaved $(2i, 2i+1)$ versus
+    split-half $(i, i+d/2)$) is a fixed permutation of coordinates: either is
+    correct, but $Q$ and $K$ must use the *same* one or the score is garbage
+    that still has the right shape.
+
+    **RoPE's per-band view is the useful mental model: the score is a weighted
+    sum of cosines.** Write $e_i$ for the energy of $q$ in plane $i$; for
+    $q = k$ with $\|q\| = 1$ the self-similarity is
+    $\sum_i e_i \cos((n-m)\omega_i)$ with $\sum_i e_i = 1$. Measured on a unit
+    vector at $d=64$: $1.000$ at offset 0, $0.986$ at 1, $0.858$ at 4, $0.725$
+    at 16, $0.409$ at 64, $0.292$ at 1024, $-0.307$ at 2048. The oscillations
+    are not noise — they are the individual bands beating against each other,
+    and they mean a head that wants "recent" must learn to weight the
+    high-frequency planes while a head that wants "same topic, anywhere" reads
+    the low-frequency ones. That separation is what ALiBi cannot express,
+    because a single slope is one fixed prior for the whole head.
+
+    **ALiBi buys extrapolation with a prior instead of a parameter.**
+    $\operatorname{score}_{ij} = q_i^\top k_j/\sqrt{d_k} - m_h(i-j)$ with
+    $m_h = 2^{-8h/H}$ geometric across heads. At $H=8$ the slopes run
+    $0.5, 0.25, \ldots, 0.0039$, and the distance at which the penalty reaches
+    one nat runs $2, 4, 8, \ldots, 256$ tokens — a 128x ladder of receptive
+    fields from one formula and zero parameters. Because $-m(i-j)$ is defined
+    at every distance, an 8x context needs no new parameters at all. The
+    measured price is that the window is partly a *dtype* fact: at $n=2048$
+    in float32, the $m=0.5$ head has on average **195.7** non-zero weights per
+    row (max 210), because $\exp(-0.5 \cdot 4096)$ underflows at the float32
+    subnormal floor $\ln(1.4\times10^{-45}) = -103.28$; the same head in
+    float64 keeps **948.0**. And a fixed linear prior cannot be reshaped by
+    data: if no head's slope covers 400 tokens, nothing in the model can
+    attend 400 tokens back with a preference.
+
+    **RoPE won on four measurable properties and lost on one.**
+    (i) Zero parameters, against 786,432 for GPT-2's table and 268M at 32k
+    context. (ii) Exact relative invariance that no learned projection can
+    break — spread $10^{-12}$, against a sinusoidal spread of $17.8$ after one
+    random $W_Q,W_K$. (iii) A distance-decaying similarity prior for free,
+    $0.986$ at offset 1 falling to $0.292$ at 1024. (iv) It composes with any
+    $W_Q, W_K$, including grouped-query and multi-query attention, because it
+    is a per-token rotation of already-projected vectors. The loss: the
+    rotation is position-dependent, so the score is no longer separable as
+    $\phi(q)^\top\psi(k)$ — RoPE is incompatible with the kernel trick that
+    makes linear attention $O(n)$. That is why linear-attention and
+    state-space hybrids use their own schemes (decay, convolution, or no
+    encoding at all) rather than RoPE.
+
+    **Long context fails at a computable place: 4x the training length puts
+    56.24% of the causal attention matrix at unseen offsets, and starves the
+    low-frequency bands.** For $n = 4L$, the fraction of causal pairs with
+    $i-j > L$ is $56.24\%$ at $L=4096$ (of 134,225,920 pairs) — a majority of
+    the matrix is extrapolation. Simultaneously, the number of RoPE bands
+    whose wavelength still exceeds twice the offset falls as
+    $(d/2)(1 - \log_{\text{base}}(k/\pi))$: at $d=64$, base 10000, that is 11
+    of 32 bands at 1024, 7 at 4096, 0 at 32768 — 2.41 bands lost per doubling
+    of the offset. A band whose wavelength is shorter than the offset has
+    wrapped many times, so it carries local order and nothing else. Position
+    interpolation divides all positions by the scale factor and pulls every
+    offset back into the trained range at the cost of local resolution;
+    NTK-aware scaling raises the base instead, which stretches the slow bands
+    while leaving the fast ones alone — measured for $d=128$: base 10000 gives
+    $\lambda_{\max} = 54{,}410$ and 14 of 64 bands resolving 4096, base
+    500,000 gives $\lambda_{\max} = 2{,}559{,}196$ and 29 of 64 resolving the
+    same offset, and 12 of 64 still resolving 131,072.
+
+  derivations:
+    - title: "Sinusoidal encoding is a rotation, so its inner product depends only on the offset"
+      latex: |
+        Write one 2D plane of the encoding at position $p$ as
+        $u_p = (\sin p\omega,\ \cos p\omega)^\top$. The addition formulas give
+
+        $$u_{p+k} = \begin{bmatrix} \cos k\omega & \sin k\omega \cr
+                                   -\sin k\omega & \cos k\omega \end{bmatrix} u_p
+                 = R(k\omega)\, u_p .$$
+
+        $R$ is orthogonal, $R^\top R = I$, so stacking the $d/2$ planes into a
+        block-diagonal $R_k$ preserves norms and gives $PE_{p+k} = R_k PE_p$.
+        Now the inner product:
+
+        $$PE_p^\top PE_{p+k}
+          = \sum_i \Big[\sin(p\omega_i)\sin((p+k)\omega_i)
+                     + \cos(p\omega_i)\cos((p+k)\omega_i)\Big]
+          = \sum_i \cos(k\omega_i),$$
+
+        using $\cos(a-b) = \cos a\cos b + \sin a\sin b$ with $a = (p+k)\omega_i$
+        and $b = p\omega_i$. Every $p$ cancels. Measured at $d=64$: the value is
+        $23.264326$ at $k=7$ for $p = 0, 997, 1999$, with a spread of
+        $2.5\times10^{-13}$ over a thousand positions; the rotation identity
+        itself is exact to $4.9\times10^{-14}$ at $k=1$ and $6.8\times10^{-13}$
+        at $k=5000$.
+      prose: >-
+        The construction is not a clever guess — it is the unique way to make
+        $d/2$ independent 2D codes whose comparison depends only on the
+        difference of the positions, because "advance by $k$" has to be an
+        orthogonal map that composes ($R_{k_1}R_{k_2} = R_{k_1+k_2}$) and the
+        only orientation-preserving maps in 2D that compose this way are
+        rotations. What the derivation also shows is
+        the limit: the property belongs to the *code*, and the moment a learned
+        matrix is inserted between the code and the inner product it is gone —
+        measured as a score spread of 17.795 across positions at a fixed offset
+        of 7.
+    - title: "RoPE: rotating Q and K turns the score into a function of n - m"
+      latex: |
+        Let $R_m \in \mathbb{R}^{d\times d}$ be block-diagonal with $d/2$ blocks
+
+        $$R_m^{(i)} = \begin{bmatrix} \cos m\omega_i & -\sin m\omega_i \cr
+                                      \sin m\omega_i & \cos m\omega_i \end{bmatrix},
+          \qquad \omega_i = \theta^{-2i/d},$$
+
+        acting on coordinates $(2i, 2i+1)$. Each block is orthogonal and
+        $R_m^\top R_n = R_{n-m}$, because rotations in a plane compose by adding
+        angles. Applying the rotation after projection:
+
+        $${q'}_m^\top {k'}_n = (R_m q)^\top (R_n k) = q^\top R_m^\top R_n k
+          = q^\top R_{n-m}\, k.$$
+
+        The right-hand side contains $n-m$ and no other function of the
+        positions. Expanding over planes, with $e_i$ the energy of $q$ in plane
+        $i$:
+
+        $$q^\top R_{k} k = \sum_i \Big[(q_{2i}k_{2i} + q_{2i+1}k_{2i+1})\cos(k\omega_i)
+          + (q_{2i+1}k_{2i} - q_{2i}k_{2i+1})\sin(k\omega_i)\Big],$$
+
+        and when $q = k$ the sine terms vanish and the score is
+        $\sum_i e_i\cos(k\omega_i)$. Measured: $4.360102627621$ at offset 7 for
+        $(m,n) \in \{(0,7),(100,107),(5000,5007),(13,20)\}$, spread
+        $1.4\times10^{-12}$; the self-similarity profile runs $1.000, 0.986,
+        0.858, 0.725, 0.409, 0.292$ at offsets $0, 1, 4, 16, 64, 1024$.
+      prose: >-
+        The asymmetry is the point. $R_m$ acts on $Q$ and $R_n$ acts on $K$; the
+        inner product can only see their product $R_m^\top R_n = R_{n-m}$, which
+        is why an *absolute* rotation produces an *exact* relative score. It also
+        explains the two constraints: rotating $V$ would leave the value in a
+        position-dependent basis with nothing to cancel it, and using different
+        pairing conventions for $Q$ and $K$ means the two rotations act on
+        different coordinate systems, so their product is not a rotation at all
+        and the score silently depends on absolute position again.
+    - title: "The band budget: how many frequencies can resolve an offset"
+      latex: |
+        Band $i$ has wavelength $\lambda_i = 2\pi\theta^{2i/d}$, so
+        $\log\lambda_i$ is affine in $i$ with slope $(2/d)\log\theta$ — a
+        geometric ladder. A band can still locate an offset $k$ only while its
+        wavelength exceeds a small multiple of it; take $\lambda_i > 2k$:
+
+        $$2\pi\theta^{2i/d} > 2k
+          \iff \frac{2i}{d}\log\theta > \log\frac{k}{\pi}
+          \iff i > \frac{d}{2}\cdot\frac{\log(k/\pi)}{\log\theta}.$$
+
+        So the number of usable bands is
+
+        $$N(k) = \frac{d}{2}\left(1 - \log_\theta \frac{k}{\pi}\right),$$
+
+        and it falls linearly in $\log k$ at a rate of
+        $\frac{d}{2}\log_\theta 2$ bands per doubling: $2.41$ at $d=64$,
+        $\theta=10^4$; $3.38$ at $d=128$, $\theta=5\times10^5$. Measured against
+        the count: 11 of 32 at $k=1024$, 7 of 32 at 4096, 0 of 32 at 32,768;
+        and for $d=128,\theta=5\times10^5$: 29 of 64 at 4096, 18 of 64 at
+        32,768, 12 of 64 at 131,072.
+      prose: >-
+        This is the long-context problem stated as arithmetic rather than
+        anecdote. Doubling the context costs a fixed number of bands, and the
+        cost per doubling is set by two knobs: wider heads buy more bands
+        (linear in $d$) and a larger base buys a slower ladder (inverse in
+        $\log\theta$). Position interpolation attacks it by shrinking every
+        $k$, which pulls offsets back into range but multiplies every wavelength
+        by the same factor and therefore destroys local resolution; NTK-aware
+        scaling raises $\theta$, which stretches the slow bands while leaving the
+        fast ones where they were. Neither creates information; both choose
+        which end of the ladder to sacrifice.
+
+  implementations:
+    - language: python
+      title: "Sinusoidal encoding and RoPE, with the two invariances checked numerically"
+      note: >-
+        Correct forward code, and deliberately incomplete: it has no backward
+        pass, it materialises the full $n \times n$ angle matrix when the cache
+        is rebuilt, and it uses the interleaved pairing convention rather than
+        the split-half one most fused kernels use. The diagnostics are the point
+        — run it and you should see the sinusoidal offset spread near $10^{-13}$
+        and the RoPE agreement near $10^{-13}$ too, which is float64 rounding
+        rather than a property of the formulas.
+      code: |
+        import numpy as np
+
+        def sinusoidal(n, d, base=10000.0):
+            """(n, d) with pairs (sin p w_i, cos p w_i). d must be even."""
+            assert d % 2 == 0
+            i = np.arange(0, d, 2, dtype=np.float64)
+            omega = base ** (-i / d)                 # geometric ladder
+            ang = np.arange(n, dtype=np.float64)[:, None] * omega[None, :]
+            pe = np.zeros((n, d))
+            pe[:, 0::2] = np.sin(ang)
+            pe[:, 1::2] = np.cos(ang)
+            return pe
+
+        def rope(x, positions, base=10000.0):
+            """Rotate each row of x by its own position. x is (n, d), d even."""
+            x = np.asarray(x, dtype=np.float64)
+            n, d = x.shape
+            assert d % 2 == 0 and len(positions) == n
+            i = np.arange(0, d, 2, dtype=np.float64)
+            omega = base ** (-i / d)
+            ang = np.asarray(positions, dtype=np.float64)[:, None] * omega[None, :]
+            c, s = np.cos(ang), np.sin(ang)
+            x1, x2 = x[:, 0::2], x[:, 1::2]      # the two halves of each plane
+            out = np.empty_like(x)
+            out[:, 0::2] = x1 * c - x2 * s       # 2x2 rotation, per plane
+            out[:, 1::2] = x1 * s + x2 * c
+            return out
+
+        if __name__ == "__main__":
+            d = 64
+            pe = sinusoidal(20000, d)
+            print("norm^2 per row   ", (pe ** 2).sum(1).min())        # 31.999999999999993
+
+            # 1. sinusoidal: the dot product does not depend on p
+            vals = np.array([pe[p] @ pe[p + 7] for p in range(1000)])
+            print("dot(p, p+7)      ", vals.mean(), "spread", vals.max() - vals.min())
+            # 23.264326..., spread ~2.5e-13
+
+            # 2. RoPE: the score depends only on n - m
+            rng = np.random.default_rng(1)
+            q = rng.standard_normal(d)
+            k = rng.standard_normal(d)
+            for m in (0, 100, 5000):
+                print("rope offset 7 at m=%5d" % m,
+                      rope(q[None], [m])[0] @ rope(k[None], [m + 7])[0])
+            # 4.360102627621 three times, agreeing to ~1e-13
+
+            # 3. rotation preserves the norm, so RoPE cannot blow up the logits
+            print("norm preserved   ", np.allclose(
+                np.linalg.norm(rope(pe, np.arange(len(pe))), axis=1),
+                np.linalg.norm(pe, axis=1)))
+    - language: python
+      title: "Three RoPE implementations that look right and are numerically WRONG"
+      note: >-
+        All three are **wrong**, and none of them raises, NaNs, or changes a
+        shape — which is why they survive code review. The reference point is
+        the correct score at offset 7 for this $q,k$ pair: 4.360103.
+        `rope_elementwise` drops the pair mixing, so each coordinate is scaled by
+        its own cosine: the same fixed offset gives 5.406896 at $m=0$, 2.181995
+        at $m=100$, $-0.158443$ at $m=5000$ and 4.141890 at $m=13$, and the row
+        norm has fallen from 6.865 to 5.232 by $m=1000$ because a cosine is not a
+        rotation. `rope_query_only` rotates just $Q$, so against a fixed $K$ the
+        score runs 0.9787, $-0.6091$, $-2.3302$ for $m = 0, 100, 5000$ — the
+        offset never enters.
+        `rope_after_softmax` rotates the attention *weights*, and their row sums
+        leave 1 by 0.483 because a probability row is not a set of 2D vector
+        pairs.
+      code: |
+        import numpy as np
+
+        def omega(d, base=10000.0):
+            return base ** (-np.arange(0, d, 2, dtype=np.float64) / d)
+
+        def rotate(x, positions, base=10000.0):
+            """The correct rotation, used here only as a reference."""
+            x = np.asarray(x, dtype=np.float64)
+            ang = np.asarray(positions, dtype=np.float64)[:, None] * omega(x.shape[-1], base)[None, :]
+            c, s = np.cos(ang), np.sin(ang)
+            a, b = x[..., 0::2], x[..., 1::2]
+            out = np.empty_like(x)
+            out[..., 0::2] = a * c - b * s
+            out[..., 1::2] = a * s + b * c
+            return out
+
+        def rope_elementwise(x, positions, base=10000.0):
+            """WRONG: cos/sin applied per coordinate. No pair is ever mixed."""
+            d = x.shape[-1]
+            om = base ** (-np.arange(d, dtype=np.float64) / d)   # and the wrong exponent
+            return x * np.cos(np.asarray(positions, dtype=np.float64)[:, None] * om[None, :])
+
+        def rope_query_only(Q, K, m):
+            """WRONG: K is never rotated, so the score sees absolute m."""
+            return rotate(Q, m) @ np.asarray(K, dtype=np.float64).T
+
+        def rope_after_softmax(P, positions):
+            """WRONG: rotating probabilities is not a positional encoding."""
+            return rotate(P, positions)
+
+        if __name__ == "__main__":
+            q, k = np.random.default_rng(1).standard_normal((2, 64))
+            print("correct, offset 7  ", rotate(q[None], [0])[0] @ rotate(k[None], [7])[0])
+            # 4.360102627620691
+
+            for m in (0, 100, 5000, 13):
+                bad = rope_elementwise(q[None], [m])[0]
+                print("elementwise m=%5d %+0.6f" % (m, bad @ rope_elementwise(k[None], [m + 7])[0]))
+            # +5.406896, +2.181995, -0.158443, +4.141890 : one offset, four answers
+
+            print("norm m=0 vs m=1000 ",
+                  np.linalg.norm(rope_elementwise(q[None], [0])),
+                  np.linalg.norm(rope_elementwise(q[None], [1000])))
+            # 6.865009 5.231773 : a scaling, not a rotation
+
+            print("Q-only, K fixed    ", [float(rotate(q[None], [m])[0] @ k) for m in (0, 100, 5000)])
+            # [0.9787279149302046, -0.6090963653222081, -2.330212991914685]
+
+            P = np.random.default_rng(0).random((8, 8))
+            P = P / P.sum(1, keepdims=True)
+            print("row sum error      ", np.abs(rope_after_softmax(P, np.arange(8)).sum(1) - 1).max())
+            # 0.48294580850970026 : a weighted average it is no longer
+
+  checkpoints:
+    - id: cp-1
+      question: "Attention is permutation-equivariant to $2.2\\times10^{-16}$. Does adding a sinusoidal position vector make attention order-aware?"
+      answerKind: short_text
+      hint: "Ask what happens if you permute the tokens and their position rows together."
+      solution: >-
+        No. Permute the tokens together with their position rows and the output
+        still permutes exactly — measured $8.9\times10^{-16}$. Attention
+        computes a weighted sum over rows and a sum has no order; the encoding
+        changes the *input*, so "dog at slot 0, man at slot 1" and "man at slot
+        0, dog at slot 1" are different matrices and the outputs differ (by
+        $\|\cdot\|_F = 2.70$ in the measured example). That distinction matters
+        operationally: position is a property of the data you feed, or of a
+        rotation inside attention — never of the aggregation step, which
+        provably cannot see it.
+    - id: cp-2
+      question: "At $d=64$ the sinusoidal encoding gives $PE_p^\\top PE_{p+7} = 23.264326$. What is the maximum possible value, at which offset does it occur, and why does that make the encoding useless at 16k without further work?"
+      answerKind: short_text
+      hint: "Compute $\\|PE_p\\|^2$ over the $d/2$ unit-circle pairs, then look at the sign of the sum at large $k$."
+      solution: >-
+        The maximum is $d/2 = 32$, at offset 0, because each of the 32 pairs is a
+        unit vector and the sum of 32 cosines peaks at 32 (measured
+        $31.999999999999993$ for the row norm squared). At $k=16{,}384$ the sum
+        is $-9.168$: negative, so identical content reads as *anti*-correlated.
+        The profile is a damped oscillation, not a decay — the sum is
+        $0.112$ at 4096, $-9.168$ at 16,384 and $+2.591$ at 32,768. Beyond
+        roughly one wavelength of the slowest band the value is an arbitrary
+        function of the offset, so a model trained at 2k has no basis for
+        interpreting phases it never saw.
+    - id: cp-3
+      question: "You want a 128k context with a learned absolute table at $d=8192$. How many position parameters, and what happens at token 131,072?"
+      answerKind: short_text
+      hint: "Multiply rows by columns, then think about what an `nn.Embedding` does with an index equal to its size."
+      solution: >-
+        $131{,}072 \times 8192 = 1{,}073{,}741{,}824$ parameters — 2.0 GiB in
+        bf16, for position alone. At token 131,072 the index is out of range and
+        the lookup raises. Extending the table is not a fix: new rows are
+        initialised at $\mathcal{N}(0, 0.02)$ with no relation to their
+        neighbours, and since the score is a bilinear form in $(e_i, e_j)$ the
+        offset preference lives in the pair, so the geometry has to be relearned
+        rather than appended to. This is the reason no long-context model uses a
+        learned absolute table.
+    - id: cp-4
+      question: "RoPE rotates $Q$ and $K$ by their absolute positions, yet the score is exactly relative. Where does the absolute position go, and why must $V$ not be rotated?"
+      answerKind: short_text
+      hint: "Write the score and use $R_m^\\top R_n = R_{n-m}$."
+      solution: >-
+        It cancels: ${q'}_m^\top {k'}_n = q^\top R_m^\top R_n k = q^\top R_{n-m}k$,
+        and $R_m^\top R_n = R_{n-m}$ because planar rotations compose by adding
+        angles. Measured $4.360102627621$ for four different absolute pairs at
+        offset 7, spread $1.4\times10^{-12}$. $V$ must not be rotated because
+        nothing cancels it — the output would be a value vector expressed in
+        $R_m$'s basis, different for every token position, and the output
+        projection would have to invert a per-position rotation it was never
+        told about. Position belongs in the *comparison*, not in the payload.
+    - id: cp-5
+      question: "A model trained at 4,096 tokens is evaluated at 16,384. What fraction of the causal attention matrix involves offsets it never saw, and which RoPE bands stop being informative?"
+      answerKind: short_text
+      hint: "Count causal pairs with $i-j > L$ for $n=4L$; then use $N(k) = (d/2)(1 - \\log_\\theta(k/\\pi))$."
+      solution: >-
+        **56.24%** of the causal pairs have an offset greater than $L$ (at
+        $L=4096$ that is 75.5M of 134,225,920 pairs), so a majority of the
+        matrix is extrapolation rather than interpolation. On the band side, the
+        number of bands with wavelength above twice the offset falls from 11 of
+        32 at 1024 to 7 of 32 at 4096 and 0 at 32,768 — 2.41 bands lost per
+        doubling at $d=64$, base 10000. The bands that remain are the slowest
+        few, and their phases over the trained range covered less than a full
+        cycle, so their behaviour at 4x is untrained. The measured consequence
+        is that the self-similarity score at offset 4096 is $-0.098$: the
+        "similar content" prior has inverted.
+    - id: cp-6
+      question: "ALiBi has zero parameters and is defined at any distance. Why is that not simply better than RoPE?"
+      answerKind: short_text
+      hint: "Compare what a fixed linear prior can express against what a learned, per-band weighting can express."
+      solution: >-
+        Because "defined at any distance" is not the same as "correct at any
+        distance", and because a fixed prior cannot be reshaped. ALiBi imposes
+        one shape — monotone, linear in distance, one slope per head — so a head
+        cannot learn "attend to the sentence boundary 400 tokens back but not to
+        the 10 tokens just before it". RoPE's per-band structure gives each head
+        a learnable mixture of $d/2$ cosines, which can express local order,
+        periodic structure, and long-range topic matching in the same head; its
+        measured similarity profile ($0.986$ at 1, $0.292$ at 1024, $-0.307$ at
+        2048) is an oscillation the model can shape. ALiBi's own measured cost is
+        narrower but real: the $m=0.5$ head keeps only 195.7 non-zero weights per
+        row at $n=2048$ in float32 (948.0 in float64), so its effective window is
+        partly a dtype artifact.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A weighted sum over a set cannot see order. So the order has to be in
+        the vectors before the sum happens — or in the geometry of the
+        comparison itself. There are only three places to put it: add something
+        to the input embedding, rotate the queries and keys, or bias the score.
+        Each choice decides a different question: what happens at a position the
+        model has never seen?
+      blocks:
+        - kind: checklist
+          body: |
+            - Attention is a sum. A sum is order-blind. This is a theorem, not a bug.
+            - "Absolute" means the code identifies a position by itself.
+            - "Relative" means the comparison depends only on the difference.
+            - A signal added before the projection will be mixed by the projection.
+            - A signal applied after the projection cannot be mixed by it.
+            - The question that separates the three families is not accuracy at
+              the training length. It is behaviour at 4x the training length.
+      checkpoint: >-
+        If attention is exactly permutation-equivariant, is there any weight
+        matrix that could let it distinguish two orderings of the same tokens
+        without a positional signal? Say why or why not before continuing.
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Build the encoding as a set of 2D rotations, one per frequency, because a
+        rotation is the only orientation-preserving 2D map that composes
+        additively in the position and preserves norms. Then insist on the
+        property you actually want: the
+        comparison of two positions must be a function of their difference. For
+        the sinusoidal code that property holds before any learned matrix and
+        fails after it — so move the rotation to the other side of the
+        projection, onto $Q$ and $K$. For ALiBi, skip the code entirely and put
+        the distance directly into the score as a linear penalty.
+      blocks:
+        - kind: checklist
+          body: |
+            - Spacing: geometric, so the resolution is constant in relative terms
+            - Sinusoidal: pair (sin, cos) per frequency, advance = rotate
+            - Check the property after the projection, not just on the raw code
+            - RoPE: rotate Q and K after projection, never V
+            - ALiBi: bias = -slope * distance, slopes geometric across heads
+            - Count the bands that still resolve your target offset
+      checkpoint: >-
+        Why is a *linear* frequency ladder wrong even though it also gives you
+        $d/2$ distinct wavelengths?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three short procedures. The only subtle line in any of them is which two
+        coordinates get rotated together.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # sinusoidal, d even
+            omega[i] = base ** (-2i / d)            for i in 0 .. d/2-1
+            PE[p, 2i]   = sin(p * omega[i])
+            PE[p, 2i+1] = cos(p * omega[i])
+
+            # RoPE, applied to Q and K AFTER projection
+            for each token with position m:
+                for each plane i:
+                    a, b = x[2i], x[2i+1]
+                    c, s = cos(m * omega[i]), sin(m * omega[i])
+                    x[2i], x[2i+1] = a*c - b*s, a*s + b*c
+            # never touch V; use the same plane pairing for Q and K
+
+            # ALiBi, added to the score
+            for h in heads:
+                slope[h] = 2 ** (-8 * (h+1) / n_heads)
+            score[h, i, j] -= slope[h] * abs(i - j)
+      checkpoint: >-
+        In the RoPE loop, what breaks if the pairing is $(i, i + d/2)$ for $Q$
+        but $(2i, 2i+1)$ for $K$? Both are legal conventions on their own.
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        Three lines of trigonometry, one matrix identity, one counting argument.
+      blocks:
+        - kind: math
+          body: |
+            Sinusoidal. With $u_p = (\sin p\omega, \cos p\omega)^\top$:
+
+            $$u_{p+k} = \begin{bmatrix}\cos k\omega & \sin k\omega\cr
+              -\sin k\omega & \cos k\omega\end{bmatrix} u_p = R(k\omega)u_p,$$
+
+            so $PE_{p+k} = R_k PE_p$ with $R_k$ orthogonal, and
+
+            $$PE_p^\top PE_{p+k} = \sum_i \cos(k\omega_i),$$
+
+            which contains no $p$. Measured $23.264326$ at $k=7$, spread
+            $2.5\times10^{-13}$ over 1000 positions.
+
+            RoPE.
+
+            $${q'}_m^\top {k'}_n = q^\top R_m^\top R_n k = q^\top R_{n-m}k,$$
+
+            because planar rotations add angles. For $q=k$ this is
+            $\sum_i e_i\cos((n-m)\omega_i)$ with $\sum_i e_i = 1$.
+
+            Band budget. $\lambda_i = 2\pi\theta^{2i/d}$ and
+            $\lambda_i > 2k$ gives
+
+            $$N(k) = \frac{d}{2}\left(1 - \log_\theta \frac{k}{\pi}\right),
+              \qquad \Delta N = \frac{d}{2}\log_\theta 2 \ \text{per doubling},$$
+
+            which is $2.41$ bands at $d=64$, $\theta=10^4$: 11 of 32 at 1024,
+            7 at 4096, 0 at 32768.
+      checkpoint: >-
+        The band count depends on $d$ and on $\log\theta$, but not on the
+        sequence length directly. What does that tell you about the difference
+        between making a model wider and making its base larger?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete, runnable check of all three families, plus the diagnostic
+        that tells you which one you are looking at. Read the printed numbers
+        against the ones quoted in the lesson before trusting anything.
+      blocks:
+        - kind: warning
+          body: >-
+            The most common silent failure here is a RoPE implementation that
+            uses the right cosines and forgets the pair mixing, or rotates $Q$
+            and not $K$. Both produce finite, well-shaped output whose score
+            depends on absolute position. The test that catches them is not a
+            shape assertion; it is scoring the same content at two different
+            absolute positions with the same offset and requiring the numbers to
+            be equal to about $10^{-12}$.
+        - kind: code
+          language: python
+          body: |
+            import numpy as np
+
+            def omega(d, base=10000.0):
+                return base ** (-np.arange(0, d, 2) / d)
+
+            def sinusoidal(n, d, base=10000.0):
+                ang = np.arange(n)[:, None] * omega(d, base)[None, :]
+                pe = np.zeros((n, d))
+                pe[:, 0::2], pe[:, 1::2] = np.sin(ang), np.cos(ang)
+                return pe
+
+            def rope(x, positions, base=10000.0):
+                x = np.asarray(x, dtype=np.float64)
+                ang = np.asarray(positions)[:, None] * omega(x.shape[1], base)[None, :]
+                c, s = np.cos(ang), np.sin(ang)
+                x1, x2 = x[:, 0::2], x[:, 1::2]
+                out = np.empty_like(x)
+                out[:, 0::2], out[:, 1::2] = x1 * c - x2 * s, x1 * s + x2 * c
+                return out
+
+            def alibi(n_heads, n):
+                slopes = 2.0 ** (-8.0 * np.arange(1, n_heads + 1) / n_heads)
+                dist = np.abs(np.arange(n)[:, None] - np.arange(n)[None, :])
+                return -slopes[:, None, None] * dist[None, :, :]
+
+            def check(d=64):
+                q, k = np.random.default_rng(0).standard_normal((2, d))
+                # 1. RoPE is exactly relative
+                base = rope(q[None], [0])[0] @ rope(k[None], [7])[0]
+                errs = [abs(rope(q[None], [m])[0] @ rope(k[None], [m + 7])[0] - base)
+                        for m in (100, 5000, 40000)]
+                # 2. sinusoidal is relative before projection, and not after
+                pe = sinusoidal(5000, d)
+                raw = max(abs(pe[p] @ pe[p + 7] - pe[0] @ pe[7]) for p in range(500))
+                W = np.random.default_rng(1).standard_normal((d, d)) / np.sqrt(d)
+                proj = [W @ pe[p] @ (W @ pe[p + 7]) for p in range(200)]
+                # 3. ALiBi ladder
+                slopes = 2.0 ** (-8.0 * np.arange(1, 9) / 8)
+                print("rope max deviation   ", max(errs))        # ~2e-13
+                print("sinusoidal raw       ", raw)              # ~6e-14
+                print("sinusoidal projected ", max(proj) - min(proj))  # ~16
+                print("alibi windows        ", 1 / slopes)       # 2 .. 256
+
+            check()
+      checkpoint: >-
+        `check` prints a projected-sinusoidal spread of order 16. Which line would
+        you change to make that number small, and what would it cost at inference
+        time?
+
+  problems:
+    - id: p-sinusoidal-encoding
+      title: "Build the sinusoidal positional encoding"
+      difficulty: easy
+      prompt: >-
+        Implement `sinusoidal_encoding(n, d, base=10000.0)` returning an
+        $(n, d)$ array as nested lists, where row $p$ is
+        $\big[\sin(p\omega_0), \cos(p\omega_0), \sin(p\omega_1), \cos(p\omega_1),
+        \ldots\big]$ and $\omega_i = \text{base}^{-2i/d}$. `d` is even; return
+        `float` values. Row 0 is therefore `[0, 1, 0, 1, ...]` for every `d`,
+        which is a cheap sanity check before you look at anything else.
+      starter: |
+        import numpy as np
+
+        def sinusoidal_encoding(n, d, base=10000.0):
+            # your implementation here
+            pass
+      language: python
+      entry: sinusoidal_encoding
+      testCases:
+        - input: '[4, 4]'
+          expected: '[[0.0, 1.0, 0.0, 1.0], [0.8414709848078965, 0.5403023058681398, 0.009999833334166664, 0.9999500004166653], [0.9092974268256817, -0.4161468365471424, 0.01999866669333308, 0.9998000066665778], [0.1411200080598672, -0.9899924966004454, 0.02999550020249566, 0.9995500337489875]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[1, 2]'
+          expected: '[[0.0, 1.0]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[5, 8]'
+          expected: '[[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0], [0.8414709848078965, 0.5403023058681398, 0.09983341664682815, 0.9950041652780258, 0.009999833334166664, 0.9999500004166653, 0.0009999998333333417, 0.9999995000000417], [0.9092974268256817, -0.4161468365471424, 0.19866933079506122, 0.9800665778412416, 0.01999866669333308, 0.9998000066665778, 0.0019999986666669333, 0.9999980000006666], [0.1411200080598672, -0.9899924966004454, 0.2955202066613396, 0.955336489125606, 0.02999550020249566, 0.9995500337489875, 0.002999995500002025, 0.999995500003375], [-0.7568024953079283, -0.6536436208636119, 0.3894183423086505, 0.9210609940028851, 0.03998933418663416, 0.9992001066609779, 0.003999989333341867, 0.9999920000106667]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[3, 2]'
+          expected: '[[0.0, 1.0], [0.8414709848078965, 0.5403023058681398], [0.9092974268256817, -0.4161468365471424]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[2, 6]'
+          expected: '[[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], [0.8414709848078965, 0.5403023058681398, 0.04639922346473128, 0.9989229760406304, 0.0021544330233656045, 0.9999976792064809]]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def sinusoidal_encoding(n, d, base=10000.0):
+            i = np.arange(0, d, 2, dtype=np.float64)   # 0, 2, 4, ... in the exponent
+            omega = base ** (-i / d)                   # one frequency per pair
+            ang = np.arange(n, dtype=np.float64)[:, None] * omega[None, :]
+            pe = np.zeros((n, d), dtype=np.float64)
+            pe[:, 0::2] = np.sin(ang)                  # even coordinates: sine
+            pe[:, 1::2] = np.cos(ang)                  # odd coordinates: cosine
+            return pe.tolist()
+      solutionExplanation: >-
+        Three details decide this. First, the exponent is $-2i/d$ with $i$ the
+        *pair index*, so the call is `np.arange(0, d, 2) / d`, not
+        `np.arange(d) / d` — the latter halves the ladder and gives $\omega_0 =
+        1$ only by accident while compressing all 32 bands into half the range.
+        Second, the interleaving is `[::2]` for sine and `[1::2]` for cosine, so
+        the pair $(2i, 2i+1)$ is one rotation plane; swapping them produces a
+        table where each pair is $(\cos, \sin)$ and the "advance by one" map is a
+        rotation in the other direction, which is still a valid encoding but no
+        longer matches the convention the rest of the lesson uses. Third, row 0
+        is exactly `[0, 1, 0, 1, ...]` because $\sin 0 = 0$ and $\cos 0 = 1$ for
+        every band — the first test case is there to catch an implementation
+        that starts its positions at 1 instead of 0.
+      complexity: "O(n d) time and space"
+      tags: [positional-encoding, sinusoidal, numpy]
+
+    - id: p-rope-rotate
+      title: "Rotary position embedding, applied to one set of vectors"
+      difficulty: medium
+      prompt: >-
+        Implement `rope_rotate(x, positions, base=10000.0)`. `x` has shape
+        $(n, d)$ with `d` even, and `positions` is a list of $n$ position
+        indices. Rotate row $r$ in each of the $d/2$ planes $(2i, 2i+1)$ by the
+        angle $\text{positions}[r] \cdot \omega_i$, with
+        $\omega_i = \text{base}^{-2i/d}$:
+
+        $$\begin{bmatrix} a' \cr b' \end{bmatrix} = \begin{bmatrix} \cos\theta & -\sin\theta \cr \sin\theta & \cos\theta \end{bmatrix} \begin{bmatrix} a \cr b \end{bmatrix}.$$
+
+        Return the rotated array as nested lists. Position 0 must be the
+        identity, and the rotation must preserve each row's norm exactly — those
+        two properties are what make the transform safe to apply inside every
+        layer of a deep network.
+      starter: |
+        import numpy as np
+
+        def rope_rotate(x, positions, base=10000.0):
+            # your implementation here
+            pass
+      language: python
+      entry: rope_rotate
+      testCases:
+        - input: '[[[1.0, 0.0, 0.0, 0.0]], [0]]'
+          expected: '[[1.0, 0.0, 0.0, 0.0]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0, 0.0, 0.0]], [1]]'
+          expected: '[[0.5403023058681398, 0.8414709848078965, 0.0, 0.0]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], [0, 2]]'
+          expected: '[[1.0, 0.0, 0.0, 0.0], [-0.4161468365471424, 0.9092974268256817, 0.0, 0.0]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[0.0, 1.0, 2.0, 3.0]], [3]]'
+          expected: '[[-0.1411200080598672, -0.9899924966004454, 1.9091135668904882, 3.0586411016519537]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]], [4]]'
+          expected: '[[0.8599613697522447, -2.064089737035152, 2.210047033237788, 4.485052074488863, 4.948108545032543, 6.042865365584106]]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def rope_rotate(x, positions, base=10000.0):
+            x = np.asarray(x, dtype=np.float64)
+            n, d = x.shape
+            i = np.arange(0, d, 2, dtype=np.float64)
+            omega = base ** (-i / d)
+
+            # one angle per (row, plane)
+            ang = np.asarray(positions, dtype=np.float64)[:, None] * omega[None, :]
+            c, s = np.cos(ang), np.sin(ang)
+
+            a, b = x[:, 0::2], x[:, 1::2]          # the two coords of each plane
+            out = np.empty_like(x)
+            out[:, 0::2] = a * c - b * s
+            out[:, 1::2] = a * s + b * c
+            return out.tolist()
+      solutionExplanation: >-
+        The failure mode this problem is built to catch is applying `cos` and
+        `sin` elementwise without mixing the pair: `x * cos(ang)` is the same
+        shape, has no NaNs, and preserves position 0, so it passes the first
+        test — and then fails every later one. The second test is the cleanest
+        discriminator: with $d=4$, $\omega = (1, 0.01)$, so at position 1 the
+        pair $(1,0)$ must rotate to $(\cos 1, \sin 1) = (0.5403, 0.8415)$, and
+        elementwise scaling gives $(0.5403, 0)$ — the sine term is simply
+        missing, which is the signature of the bug. The fourth case
+        checks signs on a pair with a negative first coordinate, and the last
+        checks that the second plane really does use a different frequency —
+        a bug that hard-codes one frequency shows up there and nowhere else.
+      complexity: "O(n d) time, O(n d) extra space"
+      tags: [rope, rotary-embedding, positional-encoding, numpy]
+
+    - id: p-alibi-bias
+      title: "ALiBi bias matrix with the geometric slope ladder"
+      difficulty: easy
+      prompt: >-
+        Implement `alibi_bias(n, slopes)` returning an array of shape
+        $(H, n, n)$ where `H = len(slopes)` and
+
+        $$\text{bias}[h, i, j] = -\,\text{slopes}[h] \cdot |i - j|.$$
+
+        The diagonal must be exactly `0.0` (not `-0.0`), and the matrix must be
+        symmetric. Nothing is learned here; the point of the exercise is the
+        ladder, so also check that for `slopes` generated as
+        $2^{-8h/H}$ the distance at which the penalty reaches one nat is
+        $1/\text{slope}$, giving the geometric sequence $2, 4, 8, \ldots$ for
+        $H=8$.
+      starter: |
+        import numpy as np
+
+        def alibi_bias(n, slopes):
+            # your implementation here
+            pass
+      language: python
+      entry: alibi_bias
+      testCases:
+        - input: '[3, [0.5, 0.25]]'
+          expected: '[[[0.0, -0.5, -1.0], [-0.5, 0.0, -0.5], [-1.0, -0.5, 0.0]], [[0.0, -0.25, -0.5], [-0.25, 0.0, -0.25], [-0.5, -0.25, 0.0]]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[4, [1.0]]'
+          expected: '[[[0.0, -1.0, -2.0, -3.0], [-1.0, 0.0, -1.0, -2.0], [-2.0, -1.0, 0.0, -1.0], [-3.0, -2.0, -1.0, 0.0]]]'
+          mode: json
+          tolerance: 1e-9
+        - input: '[2, [0.5, 0.125, 0.0625]]'
+          expected: '[[[0.0, -0.5], [-0.5, 0.0]], [[0.0, -0.125], [-0.125, 0.0]], [[0.0, -0.0625], [-0.0625, 0.0]]]'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def alibi_bias(n, slopes):
+            idx = np.arange(n, dtype=np.float64)
+            dist = np.abs(idx[:, None] - idx[None, :])          # |i - j|
+            m = np.asarray(slopes, dtype=np.float64)
+            # np.where keeps the diagonal exactly +0.0 instead of -0.0
+            return np.stack([np.where(dist == 0.0, 0.0, -s * dist) for s in m]).tolist()
+      solutionExplanation: >-
+        Two things are easy to get subtly wrong. The first is the sign: the bias
+        must be *negative* for distant pairs, so it is `-slope * |i - j|` and not
+        `slope * |i - j|`; the second test's `-3.0` in the corner is what
+        distinguishes them. The second is `-0.0`: writing
+        `-slope * dist` directly produces `-0.0` on the diagonal, which compares
+        equal to `0.0` numerically but serialises as `-0.0` and looks like a bug
+        in any diff. The `np.where` is cosmetic, not semantic — but a matrix
+        whose diagonal is a signed zero is the kind of thing that shows up in a
+        JSON golden file six months later. Note also what is *absent*: there is
+        no table, no cosines, and no base. The whole positional signal is one
+        subtraction.
+      complexity: "O(H n^2) time and space"
+      tags: [alibi, linear-bias, positional-encoding, numpy]
+
+
+  try_it: >-
+    Apply a random $W_Q$ and $W_K$ to sinusoidal codes and score position $p$ against $p+7$
+    across twenty values of $p$. The spread of those scores divided by their mean should be about
+    7.65 — the encoding is relative only until the first learned projection touches it.
+  interview_questions:
+    - question: 'Why can attention not see order, and what measurement proves it?'
+      level: mid
+      key_points:
+        - 'Attention is a weighted sum over positions, so permuting the rows of X permutes the output identically: measured max difference 2.2e-16 on an 8-token, 16-wide case.'
+        - 'That is permutation equivariance as a theorem, not a tendency, so order has to be written into the vectors themselves.'
+        - 'Any code added to the input survives the first layer only as the learned projection chooses to preserve it.'
+        - 'If you cannot say where order enters, you cannot debug the case where it fails to.'
+    - question: 'Why did RoPE replace both sinusoidal and learned absolute encodings? Give the properties it wins on and the one it loses.'
+      level: senior
+      key_points:
+        - 'Zero parameters: a learned table is n_ctx * d, which is 786,432 for GPT-2 at 1024 by 768 but 268,435,456 at 32k and d = 8192.'
+        - 'Exact relative invariance: q_m^T k_n = q^T R_{n-m} k, and the angle depends only on the difference, so no learned projection can break it.'
+        - 'A per-band view that is a weighted sum of cosines, sum_i e_i cos((n-m) omega_i), which explains both local contrast and long-range identity.'
+        - 'It loses length extrapolation: at four times the training length 56.24% of the causal attention matrix sits at unseen offsets, and the slow bands never complete a turn.'
+      follow_up: 'If relative invariance is exact, where does the long-context failure come from?'
+    - question: 'Why is the frequency spacing geometric rather than linear?'
+      level: mid
+      key_points:
+        - 'The bands must cover offsets from 6.28 tokens to 47,117, a factor of 7,500, so no linear spacing fits in 32 bands.'
+        - 'The ratio lambda_{i+1}/lambda_i is 10000^(2/d) = 1.33352 at d = 64, a constant 0.125 in log space.'
+        - 'Fast bands provide adjacent-token contrast and slow bands provide long-range identity, and one frequency cannot do both.'
+        - 'The profile they buy together is a damped oscillation: 0.620338 at offset 16, 0.204441 at 1,024, crossing zero near 1,706.'
+  common_mistakes:
+    - 'Assuming a sinusoidal encoding stays relative after the first linear layer: the score against a fixed offset has a mean of 2.326 and a spread of 17.795 across positions.'
+    - 'Using a learned position table beyond its training length, where the extra rows were never trained rather than merely extrapolated.'
+    - 'Treating 32k extrapolation as a configuration value when four times the training length puts 56.24% of the causal attention matrix at unseen offsets.'
+  further_reading:
+    - label: "Su, Lu, Pan, Murtadha, Wen & Liu, RoFormer: Enhanced Transformer with Rotary Position Embedding (2021)"
+    - label: "Press, Smith & Lewis, Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation (ICLR 2022)"

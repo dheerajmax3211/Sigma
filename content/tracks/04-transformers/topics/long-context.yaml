@@ -1,0 +1,1500 @@
+id: long-context
+slug: long-context
+title: "Long Context: Sliding Window, RoPE Scaling, and YaRN"
+summary: >-
+  A context window is a frequency budget, not a number you configure: at 128
+  dimensions and base 10,000 only 14 of RoPE's 64 bands can still resolve an
+  offset of 4,096 tokens and none can resolve 32,768, which is why the attention
+  score stops being a function of distance past the trained length. This topic
+  measures that collapse, prices the four ways out — sliding windows, position
+  interpolation, NTK-aware base scaling and YaRN — and separates extending a
+  window from actually using it.
+kind: lesson
+difficulty: expert
+position: 14
+estMinutes: 29
+prerequisites: [positional-encoding, kv-cache]
+phase: attention-core
+tags:
+  [long-context, rope-scaling, position-interpolation, ntk-aware, yarn, yarn,
+   sliding-window, effective-context, lost-in-the-middle, extrapolation,
+   frequency-bands, transformers]
+
+body:
+  big_idea: >-
+    Long context is two problems: past the training length the positional code
+    runs out of bands, and even with the window back, a softmax over 128k keys
+    has no reason to read the middle.
+
+  problem:
+    - >-
+      You set the scaling factor to 32 and the model gets worse: fluent, on
+      topic, and wrong on every answer in the middle.
+    - >-
+      128k of KV cache on a 7B with 32 KV heads is 64 GiB: one user per 80 GiB
+      card, at batch 1.
+    - >-
+      Your needle-in-a-haystack eval reports 98% and users still complain,
+      because NIAH measures one sentence, not the ten pages around it.
+
+  analogy: |
+    A radio receiver with 64 tuned circuits. The fastest rings every 6.3 units
+    of distance, the slowest every 54,410: to say how far back something
+    happened you read the whole bank and compare phases. Training at 4,096
+    units means 18 circuits never completed a single swing in front of the
+    calibration rig.
+
+  concept_points:
+    - >-
+      **A context window is a frequency budget, and at $d = 128$ the budget is 14 bands.**
+      The ladder $\lambda_i = 2\pi\theta^{2i/d}$ runs from 6.283 to 54,410
+      tokens, and bands whose wavelength still exceeds twice an offset $k$
+      number **14** at $k = 4{,}096$, **4** at 16,384 and **0** at 32,768.
+      `max_position_embeddings` is an output of the ladder, not a setting.
+    - >-
+      **28.1% of the ladder never completes one turn at a 4k training length.**
+      At $L = 4{,}096$, 18 of 64 bands have $\lambda_i > L$; the slowest
+      covers 27.1 degrees of its cycle across the whole training set — 0.0753
+      turns. At $L = 32{,}768$ only 4 bands remain. For a quarter of the
+      ladder the model saw a quarter of a period.
+    - >-
+      **What degrades is not the score's magnitude but its meaning — it scrambles rather than fades.**
+      With uniform band energies $r(\delta)$ is **0.620338** at offset 16,
+      **0.204441** at 1,024, crosses zero at 1,706 and reaches **-0.052853**
+      at 4,096. Beyond $L$ it is stationary noise: mean -0.0055, standard
+      deviation **0.0836**, and zero offsets above 0.3 between 4k and 128k.
+    - >-
+      **The per-query distribution over offsets is invariant to sequence length, to seven digits.**
+      With $\beta = 20$ and a target 16 tokens back, the mass on it is
+      **0.000288** at $n = 4{,}096$ and **0.000288** at $n = 131{,}072$. What
+      changes is the company: at 128k, **93.85%** of causal pairs sit beyond a
+      4,096 training length.
+    - >-
+      **Sliding-window attention caps the offset instead of stretching the ladder.**
+      With $w = 4{,}096$ and 32 layers no attention op sees an offset above
+      4,096, so no scaling method is needed and the cache is bounded at
+      **2.00 GiB** per sequence instead of 64.0 GiB at 128k. The price is
+      hopping: spanning $n$ tokens needs $n/w$ layers — 32 hops for 128k.
+    - >-
+      **Every stretch trades range against local resolution, and the three methods differ in where.**
+      Position interpolation divides offsets by $s$, so adjacent-token
+      contrast falls by $s^2$: **976x** at $s=32$ ($r(0)-r(1)$ from
+      $2.979\times10^{-2}$ to $3.050\times10^{-5}$). NTK-aware scaling raises
+      the base to **338,096.9**, buying 10 bands above 131,072 at a 24%
+      contrast cost. YaRN decides per band: 21 untouched, 25 ramped, 18
+      divided, buying **14** bands for **0.06%** contrast.
+
+  definitions:
+    - term: "Frequency budget"
+      meaning: >-
+        The number of RoPE bands whose wavelength still exceeds twice the offset
+        you care about. At $d = 128$, base 10,000 it is 14 at 4,096 tokens, 4 at
+        16,384 and 0 at 32,768; it falls by 4.82 bands per doubling.
+    - term: 'Wavelength (lambda_i)'
+      meaning: >-
+        $2\pi/\omega_i = 2\pi\theta^{2i/d}$, the distance over which band $i$
+        returns to the same phase. The ladder is geometric — 6.283 to 54,410 in
+        64 steps of 1.1548 at $d = 128$ — because resolution has to be constant
+        in relative terms.
+    - term: "Aliasing (near-recurrence)"
+      meaning: >-
+        Two offsets producing nearly the same score because their phases line up
+        again across many bands. It is why the maximum score beyond the trained
+        length *grows* with the window (0.2054 at 4k-8k to 0.3479 at 256k-512k)
+        instead of decaying: an almost-periodic function returns arbitrarily
+        close to any value, given enough chances.
+    - term: "Positional resolution"
+      meaning: >-
+        How much the score changes per token of offset: $r(\delta) - r(\delta+1)$.
+        It is $2.979\times10^{-2}$ at $\delta = 0$ for a uniform-energy head at
+        $d = 128$ and falls to $3.050\times10^{-5}$ after position interpolation
+        with $s = 32$. Resolution, not range, is what PI spends.
+    - term: "Position interpolation (PI)"
+      meaning: >-
+        Replacing position $p$ with $p/s$ so that every offset lands inside the
+        trained range. The score becomes $r(\delta/s)$: range grows by $s$,
+        local contrast falls by $s^2$ — 976x measured at $s = 32$ — because the
+        profile is even in $\delta$ and its leading term is second order.
+    - term: "NTK-aware scaling"
+      meaning: >-
+        Raising the RoPE base to $\theta\, s^{d/(d-2)}$ instead of dividing
+        positions. It stretches the slow bands (which carry range) more than the
+        fast ones (which carry resolution), but it is still one global constant,
+        so the fast bands move too.
+    - term: "YaRN"
+      meaning: >-
+        Yet another RoPE extension: a per-band interpolation factor, 0 on the
+        fastest bands and 1 on the slowest, ramped linearly between two rotation
+        thresholds, plus an attention temperature. It preserves short-range
+        contrast to 0.06% while lifting $r(4{,}096)$ from $-0.053$ to $+0.225$.
+    - term: "Correction range"
+      meaning: >-
+        The band indices where YaRN's ramp runs, computed by inverting a rotation
+        count: band $i$ turns $L/\lambda_i$ times inside the original context,
+        so the band that turns $\beta$ times sits at
+        $i = (d/2)\log_\theta(L/2\pi\beta)$. $\beta_{\text{fast}} = 32$ and
+        $\beta_{\text{slow}} = 1$ give bands 20 to 46 at $d = 128$, $L = 4{,}096$.
+    - term: "Attention temperature (mscale)"
+      meaning: >-
+        YaRN's second component: every logit is multiplied by
+        $0.1\ln s + 1$, which is 1.346574 at $s = 32$. Stretching wavelengths
+        flattens the attention distribution, and this puts the sharpness back —
+        entropy over 4,096 keys falls from 1.106 to 0.820 nats.
+    - term: "Sliding-window attention"
+      meaning: >-
+        Masking attention to the last $w$ positions. It removes long offsets from
+        the problem entirely rather than encoding them, bounds the KV cache at
+        $w$ tokens (2.00 GiB at $w = 4{,}096$ instead of 64.0 GiB at 128k) and
+        makes information travel by layer-hopping, $n/w$ hops end to end.
+    - term: "Effective context length"
+      meaning: >-
+        The length at which a model still performs, as opposed to the length it
+        accepts. RULER found that of 17 models claiming 32k or more, about half
+        hold quality at 32k; the rest degrade before their advertised limit.
+    - term: "Lost in the middle"
+      meaning: >-
+        The U-shaped accuracy curve over the position of relevant information:
+        best at the start, worst in the middle, partly recovered at the end.
+        75.8% / 53.8% / 63.2% for GPT-3.5-Turbo on 20 documents, with the middle
+        below the 56.1% closed-book baseline.
+
+  diagrams:
+    - type: plot
+      title: "The best score available in each octave, against the peak the model was trained to trust"
+      chart: line
+      xLabel: "log2 of the offset window (window starts at 2^x)"
+      yLabel: "best r(delta) in the window"
+      series:
+        - name: "max score in [2^x, 2^(x+1))"
+          points:
+            - { x: 12, y: 0.205442 }
+            - { x: 13, y: 0.175522 }
+            - { x: 14, y: 0.240291 }
+            - { x: 15, y: 0.265927 }
+            - { x: 16, y: 0.279702 }
+            - { x: 17, y: 0.307139 }
+            - { x: 18, y: 0.347983 }
+            - { x: 19, y: 0.377547 }
+            - { x: 20, y: 0.377059 }
+        - name: "trained-window peak, offset 16"
+          points:
+            - { x: 12, y: 0.620338 }
+            - { x: 20, y: 0.620338 }
+
+    - type: plot
+      title: "Four ladders, one measurement: PI flattens, NTK lifts everything, YaRN lifts only the slow bands"
+      chart: line
+      xLabel: "log2 of the offset in tokens"
+      yLabel: "similarity r(delta), uniform band energies"
+      series:
+        - name: "raw RoPE, base 10000"
+          points:
+            - { x: 0, y: 0.970214 }
+            - { x: 2, y: 0.759157 }
+            - { x: 4, y: 0.620338 }
+            - { x: 6, y: 0.476876 }
+            - { x: 8, y: 0.320701 }
+            - { x: 10, y: 0.204441 }
+            - { x: 12, y: -0.052853 }
+            - { x: 14, y: -0.142276 }
+            - { x: 16, y: -0.007480 }
+            - { x: 18, y: -0.087845 }
+        - name: "position interpolation, s=32"
+          points:
+            - { x: 0, y: 0.999969 }
+            - { x: 2, y: 0.999512 }
+            - { x: 4, y: 0.992283 }
+            - { x: 6, y: 0.896592 }
+            - { x: 8, y: 0.714383 }
+            - { x: 10, y: 0.557466 }
+            - { x: 12, y: 0.332794 }
+            - { x: 14, y: 0.219424 }
+            - { x: 16, y: 0.119284 }
+            - { x: 18, y: 0.024909 }
+        - name: "NTK-aware, base 338097"
+          points:
+            - { x: 0, y: 0.977354 }
+            - { x: 2, y: 0.822564 }
+            - { x: 4, y: 0.721617 }
+            - { x: 6, y: 0.608194 }
+            - { x: 8, y: 0.455620 }
+            - { x: 10, y: 0.346902 }
+            - { x: 12, y: 0.456189 }
+            - { x: 14, y: 0.195643 }
+            - { x: 16, y: 0.108225 }
+            - { x: 18, y: -0.098086 }
+        - name: "YaRN, s=32, ramp 20 to 46"
+          points:
+            - { x: 0, y: 0.970233 }
+            - { x: 2, y: 0.759463 }
+            - { x: 4, y: 0.625101 }
+            - { x: 6, y: 0.525231 }
+            - { x: 8, y: 0.415161 }
+            - { x: 10, y: 0.291982 }
+            - { x: 12, y: 0.225080 }
+            - { x: 14, y: 0.112171 }
+            - { x: 16, y: 0.067935 }
+            - { x: 18, y: -0.061878 }
+
+    - type: compare
+      title: "Extending the window versus using it"
+      left_label: "Extending (a frequency problem)"
+      left_points:
+        - "Asked for at load time: set factor, base, beta_fast, beta_slow"
+        - "Measured by bands that still resolve the offset — 14 of 64 at 4,096, 0 at 32,768"
+        - "Bought with resolution: PI costs 976x of adjacent-token contrast at s=32"
+        - "Bought with a temperature: mscale 1.3466, entropy 1.106 to 0.820 nats"
+        - "Fails loudly in perplexity: the score past L is noise with std 0.0836"
+        - "Costs memory, not training: 64 GiB of KV cache at 128k on a 7B"
+        - "You can verify it with one forward pass and a scoring script"
+      right_label: "Using (a training and evaluation problem)"
+      right_points:
+        - "Asked for at data time: what the model saw, and in what order"
+        - "Measured by accuracy versus the depth of the answer — 75.8% first, 53.8% middle, 63.2% last"
+        - "Bought with hard negatives placed in the middle of long prompts"
+        - "Bought with retrieval-shaped training, not with a scaling factor"
+        - "Fails quietly: fluent, plausible, and wrong, with no perplexity signal"
+        - "Costs training tokens: YaRN-style extension is a fine-tune, not a config edit"
+        - "You verify it with position-controlled evals, never with a single needle"
+
+    - type: pipeline
+      title: "Building a scaled RoPE: one decision per band, then one temperature"
+      nodes:
+        - label: "Measure the ladder"
+          note: "lambda_i = 2*pi*theta^(2i/d)"
+          detail: "64 bands at d=128, base 10000: 6.283 to 54410 tokens, ratio 1.1548 per band."
+        - label: "Count rotations in the original context"
+          note: "rotations_i = L / lambda_i"
+          detail: "This, not the index, is what decides a band's fate. The slowest band turns 0.0753 times in 4096 tokens."
+        - label: "Pick the thresholds"
+          note: "beta_fast = 32, beta_slow = 1"
+          detail: "Bands turning more than 32 times are fast enough to extrapolate; fewer than one turn are pure interpolate."
+        - label: "Ramp between them"
+          note: "gamma in [0, 1], linear in band index"
+          detail: "Bands 20 to 46 at d=128. 21 untouched, 25 ramped, 18 divided by the full factor."
+        - label: "Divide the slow bands by s"
+          note: "omega_i -> omega_i / s"
+          detail: "lambda_max 54410 becomes 1741125. Local contrast moves by 0.06% instead of NTK's 24%."
+        - label: "Restore the sharpness"
+          note: "logits *= 0.1*ln(s) + 1"
+          detail: "1.346574 at s=32. Entropy over 4096 keys: 1.106 to 0.820 nats. Skipping it costs 66%."
+        - label: "Verify against offsets, not loss"
+          note: "r(4096), r(131072), adjacent contrast"
+          detail: "A scaling config that improves validation loss and destroys r(1) is a regression you will find in production."
+
+    - type: stack
+      title: "The 128k budget on one 80 GiB card, 7B model, fp16"
+      layers:
+        - "Weights: 13.04 GiB — paid once, unchanged by context length"
+        - "KV cache, MHA: 64.00 GiB — 512 KiB per token, the reason batch size is 1"
+        - "KV cache, GQA-8: 16.00 GiB — the same context at a quarter of the bytes"
+        - "Attention scores if materialised: 68.72 GB per head per layer, 70.37 TB across 32 heads and 32 layers"
+        - "Activations and workspace: whatever is left, which at MHA is 2.96 GiB and at GQA-8 is 50.96 GiB"
+      reversed: false
+
+  markdown: |
+    ## Two problems wearing one name
+
+    *Positional Encoding* ended with a claim worth restating, because everything
+    here is a consequence of it: RoPE's score is exactly relative,
+    $q_m^\top k_n = q^\top R_{n-m} k$, for every pair of positions, trained or
+    not. So a 4k model does not become *undefined* at 8k. It becomes
+    *uncalibrated*: the function it evaluates there was never fitted, and the
+    bands that carry long offsets were never observed through a full cycle.
+
+    *The KV Cache* ended with the other half of the bill: 512 KiB per token for a
+    7B with 32 KV heads, so 128k is 64 GiB before you have generated a single
+    token. Both facts are about the same object — a window — and neither of them
+    is about whether the model can *use* what is in it.
+
+    ## The budget
+
+    With $d$ even, $i = 0,\ldots,d/2-1$ and $\omega_i = \theta^{-2i/d}$, band $i$
+    has wavelength $\lambda_i = 2\pi\theta^{2i/d}$. A band can still locate an
+    offset $k$ while $\lambda_i > 2k$, so
+
+    $$N(k) = \frac{d}{2}\left(1 - \log_\theta \frac{k}{\pi}\right),
+      \qquad \Delta N = \frac{d}{2}\log_\theta 2 \ \text{per doubling}.$$
+
+    At $d = 128$, $\theta = 10^4$ that is 4.82 bands per doubling and a ladder
+    from 6.283 to 54,410 tokens:
+
+    | offset $k$ | 1,024 | 4,096 | 16,384 | 32,768 | 131,072 |
+    |---|---|---|---|---|---|
+    | bands with $\lambda_i > 2k$ | 28 | 14 | 4 | **0** | **0** |
+
+    Zero is not a rounding error. Past 32,768 no band in a 128-dimensional head
+    completes less than two turns over the offset, which means every band has
+    wrapped and every reading is modulo something smaller than the distance you
+    are asking about.
+
+    ## What actually degrades
+
+    The tempting story is "the score decays with distance, and past the training
+    length it has decayed too far". The measurement says otherwise. With
+    uniform band energies,
+
+    $$r(\delta) = \frac{1}{d/2}\sum_i \cos(\delta\omega_i)$$
+
+    is 1.000000 at 0, 0.970214 at 1, 0.620338 at 16, 0.204441 at 1,024,
+    $-0.052853$ at 4,096. It is a damped *oscillation*: it crosses zero at 1,706
+    and comes back positive at 32,768. Past the training length it does not fade,
+    it flattens into noise with mean $-0.0055$ and standard deviation 0.0836 —
+    almost exactly the $1/\sqrt{2 \cdot 64} = 0.0884$ you get from 64
+    independent cosines — and then the maximum over a window creeps upward as the
+    window grows:
+
+    | window | 4k-8k | 16k-32k | 64k-128k | 256k-512k |
+    |---|---|---|---|---|
+    | max $r(\delta)$ | 0.2054 | 0.2403 | 0.2797 | 0.3479 |
+    | offsets with $r \ge 0.3$ | 0 | 0 | 0 | 37 |
+
+    Inside the trained window 377 offsets score above 0.3 and 57 above 0.5. This
+    is what almost-periodicity looks like: the profile is a sum of 64
+    incommensurate cosines, so it returns arbitrarily close to any value given
+    enough chances, and a 512k window has more chances than a 4k one. A head
+    whose rule is "attend where $r > 0.3$" fires 377 times in-distribution and on
+    essentially nothing out of it — or, worse, on the wrong two offsets once the
+    window passes 128k.
+
+    ## Sliding window: buy the window with depth
+
+    If the problem is the offset, one fix is to never have a large one. Mask
+    attention to the last $w$ positions and the model needs no scaling method at
+    all — no offset above $w$ ever reaches the ladder.
+
+    $$\text{mask}_{ij} = \mathbb{1}[\,0 \le i - j < w\,]$$
+
+    The cache becomes $w$ tokens per layer instead of $n$:
+    $4{,}096 \times 512\ \text{KiB} = 2.00$ GiB per sequence, 32x more users
+    than 128k MHA. The price is connectivity. A token reaches $w$ positions per
+    layer, so spanning $n$ needs $n/w$ layers: 32 hops for 128k with a 4,096
+    window, 8 hops for 32k. Mistral 7B is exactly this shape — 32 layers,
+    $w = 4{,}096$, 32k advertised — and the honest reading of "32k context" is
+    "32k of routing diameter", not "32k of receptive field in any one head".
+
+    ## Three ways to stretch the ladder
+
+    Position interpolation rescales the argument: $p \mapsto p/s$, so
+    $r_s(\delta) = r(\delta/s)$. Every offset is now inside the trained range,
+    and so is every *difference*: at $s = 32$ the model cannot tell 32 tokens
+    from 1. Measured, $r(0) - r(1)$ falls from $2.979\times10^{-2}$ to
+    $3.050\times10^{-5}$ — 976x, against the $s^2 = 1024$ the second-order
+    expansion predicts.
+
+    NTK-aware scaling changes the base instead:
+    $\theta' = \theta\,s^{d/(d-2)} = 338{,}096.9$ at $s = 32$. It is one
+    constant for the whole ladder, so it moves the fast bands too — $r(16)$ rises
+    from 0.620 to 0.722 and adjacent-token contrast drops 24% — but it buys real
+    range: $\lambda_{\max}$ to 1,741,125, 27 bands resolving 4,096, 10 resolving
+    131,072.
+
+    YaRN does the same thing per band. Bands turning more than
+    $\beta_{\text{fast}} = 32$ times inside the original context are left alone
+    (they are the ones that give local resolution); bands turning fewer than
+    $\beta_{\text{slow}} = 1$ time are divided by the full factor; the 25 bands
+    between are ramped. At $d = 128$, $L = 4{,}096$ that is bands 20 to 46:
+
+    | | raw | PI, s=32 | NTK, s=32 | YaRN, s=32 |
+    |---|---|---|---|---|
+    | $\lambda_0$ | 6.283 | 201.06 | 6.283 | 6.283 |
+    | $\lambda_{\max}$ | 54,410 | 1,741,125 | 1,741,125 | 1,741,125 |
+    | bands resolving 131,072 | 0 | 0 | 10 | **14** |
+    | $r(0)-r(1)$ | 2.979e-2 | 3.050e-5 | 2.265e-2 | **2.977e-2** |
+    | $r(4{,}096)$ | -0.053 | 0.333 | 0.456 | 0.225 |
+
+    PI keeps no band and spends all the resolution; NTK keeps 10 and spends 24%;
+    YaRN keeps 14 and spends 0.06%. Then YaRN adds the temperature the other two
+    do not have: logits are multiplied by $0.1\ln s + 1 = 1.346574$, because
+    stretching wavelengths flattens the distribution and something has to
+    re-sharpen it. Entropy over 4,096 candidate keys goes from 1.106 nats to
+    0.820; get the direction wrong and it goes to 1.839.
+
+    ## Memory at 128k
+
+    | item | 128k | 256k | 512k |
+    |---|---|---|---|
+    | KV cache, 7B MHA (32 KV heads, $d_h=128$) | 64.0 GiB | 128.0 GiB | 256.0 GiB |
+    | KV cache, 7B GQA-8 | 16.0 GiB | 32.0 GiB | 64.0 GiB |
+    | KV cache, 70B (80 layers, 8 KV heads) | 40.0 GiB | 80.0 GiB | 160.0 GiB |
+
+    The score matrix is the other number nobody quotes: $131{,}072^2 =
+    1.718\times10^{10}$ entries per head, 68.72 GB in fp32 for a single head in a
+    single layer, 70.37 TB if you materialise all 32 heads across all 32 layers.
+    That is why FlashAttention is not optional at this length — and why the
+    kernel's tiling, not the arithmetic, is the design constraint. Prefill cost
+    crosses over too: $2Nn$ for the linear parts against $4n^2dL$ for attention
+    crosses at $n^\star = 2N/(4dL) = 26{,}703$ tokens, and by 128k attention is
+    4.9x the linear term (9.0 PFLOP against 1.8).
+
+    ## Extending is not using
+
+    A 128k window that reads the first 4k and the last 4k is an 8k model with an
+    expensive cache. Liu et al. measured the gap: on 20-document QA,
+    GPT-3.5-Turbo scores 75.8% with the answer first, 53.8% with it tenth and
+    63.2% with it last, against 56.1% closed-book — the middle is worse than
+    having no documents at all. RULER found the same shape at the model level:
+    17 models claim 32k or more, about half hold quality at 32k, and almost all
+    fall below threshold before their claimed limit.
+
+    Both legs of that U are visible in the geometry, and neither is a bug in the
+    positional code. **Recency**: the final query puts 0.315636 of its mass on
+    the preceding token, 0.000289 on the token 16 back, $7.04\times10^{-8}$ on
+    the token 1,024 back. **Primacy**: summed over all queries, position 0
+    receives 6.75x a uniform share, position 1,024 receives 0.77x and the last
+    token 0.002x, because a causal query can only see what precedes it and early
+    tokens are visible to more queries. A position in the middle is far from the
+    end and late for the beginning. No scaling factor changes that; what changes
+    it is training on prompts where the answer is in the middle.
+
+    ## Choosing
+
+    Ask two questions in order. *What is the largest offset any attention op will
+    be asked about?* If the answer is bounded — a 4k window at any context
+    length — use a sliding window and stop; there is no ladder problem. *How much
+    adjacent-token contrast can I afford?* If the answer is "none", use YaRN with
+    the temperature, because it is the only method that leaves the fast bands
+    untouched. If you cannot fine-tune at all, prefer a smaller factor and a
+    sliding window over a large factor and hope: 4x with PI costs 15.3x of local
+    contrast, while 32x costs 976x, and the second number is not recoverable by
+    prompting.
+
+    ## The longer version
+
+    Long context is two problems wearing one name: past the training length the
+    positional code runs out of frequency bands, so the score stops being a
+    function of distance and becomes an almost-periodic noise process — and even
+    after you buy the window back, a softmax over 128k keys still has no reason
+    to read the middle of the prompt.
+
+    A long-context model is a radio receiver with 64 tuned circuits. Each circuit
+    rings at its own rate: the fastest completes a cycle every 6.3 units of
+    distance, the slowest every 54,410. To say how far back something happened
+    you do not read one circuit — you read the whole bank and compare the pattern
+    of phases, exactly as a spectrum analyser identifies a signal by the shape
+    across its filters. The fast filters give you resolution to one token; the
+    slow ones give you reach.
+
+    Training at 4,096 units means the receiver was only ever calibrated on
+    nearby signals. Eighteen of its 64 circuits never completed a single full
+    swing in front of the calibration rig, so their gain was set from a fraction
+    of a cycle. Turn the dial to 128,000 and the receiver is not lying to you —
+    it is reading filters whose full response it has never observed.
+
+    Where the analogy breaks: a real filter bank is noiseless and its readings
+    are independent. Here the 64 readings are summed with *learned* weights into
+    one scalar, so two very different distances can produce the same number
+    (aliasing), and the weights themselves were fitted at 4k. The receiver's
+    problem is calibration; the model's problem is calibration plus a weighted
+    sum that was never constrained outside the training range.
+
+    ### What goes wrong
+
+    - Product asks for 128k. You set the scaling factor to 32, load the
+      weights, and the model gets *worse* — fluent, on-topic, and wrong on
+      every question whose answer sits in the middle of the document. Nothing
+      raised, no shape changed, and the config value you set is the one the
+      model card recommended.
+    - You have a 4k model and a 16k document. Perplexity climbs steadily as
+      you feed it more tokens, which tells you something is wrong but not
+      what: the positional code, the attention budget, the cache, or the data.
+    - You price the memory before you price the quality. 128k of KV cache on a
+      7B with 32 KV heads is 64 GiB, so the "long context" feature is one user
+      per 80 GiB card, and the model you were going to serve at batch 32 now
+      serves at batch 1.
+    - Your needle-in-a-haystack eval reports 98% and users still complain.
+      NIAH measures whether one sentence survived; it does not measure whether
+      the model used the ten pages around it, and those are different numbers.
+    - You fine-tune at 32k with position interpolation and short prompts get
+      worse — because you divided every offset by 32, and two adjacent tokens
+      now look 0.03 tokens apart.
+
+    ### The full treatment
+
+    **A context window is a frequency budget, and at $d = 128$ the budget is
+    14 bands.** The ladder $\lambda_i = 2\pi\theta^{2i/d}$ runs from 6.283 to
+    54,410 tokens in 64 steps of 1.1548, and the number of bands whose
+    wavelength still exceeds twice an offset $k$ is 14 at $k = 4{,}096$, 4 at
+    16,384 and **0 at 32,768**. The closed form is
+    $N(k) = (d/2)(1 - \log_\theta(k/\pi))$, which costs 4.82 bands per
+    doubling at $d = 128$, $\theta = 10^4$ — measured as a fall of 10 bands
+    between 4,096 and 16,384, i.e. two doublings. The trap is treating
+    `max_position_embeddings` as a setting: the number is an *output* of the
+    ladder, and beyond it the ladder has nothing left to spend.
+
+    **28.1% of the ladder never completes one turn at a 4k training length.**
+    At $L = 4{,}096$, 18 of 64 bands have $\lambda_i > L$; the slowest covers
+    27.1 degrees of its cycle across the whole training set (0.0753 turns) and
+    108.4 degrees at 4x, still short of a full turn. At $L = 32{,}768$ only 4
+    bands remain in that state. The trap is reading "trained on 4k" as "has
+    seen 4,096 tokens of relative distance": for a quarter of the ladder it has
+    seen a quarter of a period, so the phase response past $L$ is an
+    extrapolation of a function nobody fitted.
+
+    **What degrades is not the score's magnitude but its meaning — it
+    scrambles rather than fades.** With uniform band energies the profile
+    $r(\delta) = \frac{1}{64}\sum_i \cos(\delta\omega_i)$ is 0.620338 at
+    offset 16, 0.204441 at 1,024, crosses zero at 1,706 and reaches
+    $-0.052853$ at 4,096. Beyond $L$ it is a stationary noise process: mean
+    $-0.0055$, standard deviation 0.0836 (the predicted floor
+    $1/\sqrt{2 \cdot 64} = 0.0884$), and a maximum that *grows* with the
+    window you look through — 0.2054 over $[4k, 8k)$, 0.2403 over
+    $[16k, 32k)$, 0.2797 over $[64k, 128k)$, 0.3479 over $[256k, 512k)$.
+    Inside the trained window 377 offsets score above 0.3; between 4,096 and
+    131,072 exactly **zero** do. The trap is expecting a decay you can
+    compensate with a temperature. A decay is monotone and correctable; this
+    is almost periodic, so the fix has to change the frequencies, not the
+    scale.
+
+    **The per-query distribution over offsets is invariant to sequence
+    length, to seven digits — so "extend the window" is cheap and "use the
+    window" is not.** With $\beta = 20$ and a target 16 tokens back, the
+    attention mass on that target is 0.000288 at $n = 4{,}096$ and 0.000288 at
+    $n = 131{,}072$; the ratio $p(1)/p(2{,}048)$ is $2.46\times10^{7}$ at both
+    lengths, identical. The softmax over offsets is a function of the profile
+    alone. What changes with $n$ is the *company*: at 128k, 93.85% of causal
+    pairs sit at offsets beyond a 4,096 training length (56.24% at 16k, 76.56%
+    at 32k). The trap is believing the model's position sense degrades with
+    length. It does not degrade; it was already ambiguous, and a longer window
+    gives the ambiguity more chances to matter.
+
+    **Sliding-window attention attacks a different variable: it caps the
+    offset instead of stretching the ladder.** With window $w = 4{,}096$ and
+    32 layers, no attention op ever sees an offset above 4,096, so no scaling
+    method is needed at all, and the cache is bounded at
+    $4{,}096 \times 512\ \text{KiB} = 2.00$ GiB per sequence instead of 64.0
+    GiB at 128k — 32x more users on the same card. The price is that
+    information must *hop*: a token can influence at most $w$ positions per
+    layer, so spanning $n$ tokens needs $n/w$ layers, which is 32 hops for 128k
+    and 8 for 32k. The trap is quoting the window as the context length:
+    4,096 is the receptive field of one layer, and 131,072 is the diameter of
+    the 32-layer graph — two different numbers that the marketing copy
+    conflates.
+
+    **Position interpolation divides every offset by the scale, which buys
+    range and spends resolution quadratically.** With $p \mapsto p/s$ the
+    profile becomes $r(\delta/s)$, so the adjacent-token contrast falls by
+    $s^2$ and the measured fall is 976x at $s = 32$:
+    $r(0) - r(1)$ goes from $2.979\times10^{-2}$ to $3.050\times10^{-5}$, with
+    $r(1) = 0.999969497$. At $s = 4$ the loss is 15.3x, at $s = 8$ it is 61.1x.
+    $\lambda_0$ moves 6.283 to 201.06 and $\lambda_{\max}$ 54,410 to
+    1,741,125. The trap is that PI is *exact*: 131,072 tokens really does look
+    like 4,096 — and 32 tokens really does look like 1, and 2 tokens look like
+    0.06. You did not lose range; you spent resolution, everywhere, forever.
+
+    **NTK-aware scaling raises the base instead, which stretches the slow
+    bands and leaves the fast one where it is.** With
+    $\theta' = \theta\, s^{d/(d-2)}$ the base goes 10,000 to **338,096.9** at
+    $s = 32$, $d = 128$; $\lambda_{\max}$ reaches 1,741,125, bands resolving
+    4,096 go 14 to **27**, bands resolving 131,072 go 0 to **10**, and
+    $r(4{,}096)$ goes $-0.053$ to $+0.456$. The cost is that the change is
+    global: $r(16)$ rises 0.620 to 0.722 and local contrast falls 24%
+    ($2.979\times10^{-2}$ to $2.265\times10^{-2}$), because every band above
+    the first is stretched, not just the slow ones. The trap is applying it as
+    $\theta \cdot s$ (320,000 instead of 338,097): a 5.4% error that changes
+    no band count and therefore passes every test you would think to write.
+
+    **YaRN decides per band, and that is why it dominates NTK at the same
+    factor.** With $\beta_{\text{fast}} = 32$, $\beta_{\text{slow}} = 1$ and
+    $L = 4{,}096$ the correction range is bands 20 to 46: 21 bands are left
+    exactly as they were ($\lambda_0$ stays 6.283185), 25 are ramped and 18
+    are divided by the full factor 32. $\lambda_{\max}$ still reaches
+    1,741,125, bands resolving 131,072 go 0 to **14** and resolving 262,144 go
+    0 to **9**, while local contrast is $2.9767\times10^{-2}$ against the raw
+    $2.9786\times10^{-2}$ — a 0.06% change, versus NTK's 24%. On top of that
+    comes a temperature: logits are multiplied by
+    $\text{mscale} = 0.1\ln s + 1 = 1.346574$, which drops the entropy over
+    4,096 candidate keys from 1.106 to 0.820 nats. The trap is shipping the
+    frequency change without the temperature — a 66% entropy *increase*
+    (1.839 nats) if you divide instead of multiply.
+
+    **Extending is not using, and the two are measured on different axes.**
+    Liu et al. (2023) put GPT-3.5-Turbo's 20-document accuracy at **75.8%**
+    when the answer document is first, **53.8%** when it is tenth and **63.2%**
+    when it is last, against 56.1% closed-book and 88.3% oracle — the middle is
+    worse than reading nothing. RULER (Hsieh et al., 2024) tested 17 models
+    that all claim 32k or more and found that about half hold quality at 32k;
+    almost all fall below threshold before their claimed length. The geometry
+    behind the recency leg is measurable: the final query puts **0.315636** of
+    its mass on the token immediately before it, 0.000289 on the token 16 back
+    and $7.04\times10^{-8}$ on the token 1,024 back — a 1,092x drop across 15
+    positions. The primacy leg is causal visibility: aggregating over all
+    queries, position 0 receives 6.75x a uniform share and the last token
+    0.002x. Middle positions get neither leg.
+
+    **Every scaling method is a choice of which bands to sacrifice, so the
+    decision is an arithmetic check, not a preference.** At $s = 32$,
+    $d = 128$: PI keeps 0 bands above 131,072 and costs 976x of local
+    contrast; NTK buys 10 bands and costs 24%; YaRN buys 14 bands and costs
+    0.06%; sliding window buys nothing and needs nothing, because it never
+    asks the ladder a question about 128k. The trap is choosing by reputation.
+    The correct first question is "what is the largest offset my attention op
+    will ever be asked about", and the second is "how much contrast at offset
+    1 can I afford to lose". Those two numbers pick the method; nothing else
+    does.
+
+
+  derivations:
+    - title: "Why the score becomes noise instead of decaying"
+      latex: |
+        Write the profile as a sum of $N = d/2$ unit cosines with weights $e_i$,
+        $\sum_i e_i = 1$:
+
+        $$r(\delta) = \sum_{i=0}^{N-1} e_i \cos(\delta\omega_i).$$
+
+        For $\delta$ large enough that each $\delta\omega_i$ is effectively
+        uniform on the circle, $\cos(\delta\omega_i)$ behaves like a zero-mean
+        random variable with variance $1/2$, independent across bands, so
+
+        $$\mathbb{E}[r] = 0, \qquad
+          \operatorname{Var}[r] = \frac{1}{2}\sum_i e_i^2
+          = \frac{1}{2N}\ \text{for uniform } e_i,$$
+
+        which at $N = 64$ gives a standard deviation of $1/\sqrt{128} = 0.0884$.
+        The measured value over $[4{,}096, 131{,}072)$ is 0.0836, and the measured
+        mean is $-0.0055$. The amplitude does not shrink with $\delta$; only the
+        *interpretation* does. Because the $\omega_i$ are incommensurate,
+        $r$ is almost periodic: for any $\epsilon$ there are arbitrarily large
+        $\delta$ with $r(\delta) > r(0) - \epsilon$, and the maximum over a
+        window of $m$ offsets rises monotonically with $m$ — 0.2054 over
+        $[4k,8k)$, 0.2403 over $[16k,32k)$, 0.2797 over $[64k,128k)$ and 0.3479
+        over $[256k,512k)$ — because near-recurrences accumulate the way the
+        extremes of any almost-periodic sequence do, and a longer window simply
+        contains more attempts at one.
+      prose: >-
+        This is the difference between a problem you can calibrate away and one
+        you cannot. A decaying score is monotone, so a temperature or a learned
+        scale can undo it. A zero-mean almost-periodic score has no monotone
+        structure to recover: at long range the ordering of offsets is assigned
+        by phase coincidence, so "closer" stops implying "more similar" —
+        measured as the fraction of one-token steps where the score decreases
+        falling from 0.70 near the origin to 0.499 past 32k, a coin flip. The
+        only real fix is to change the frequencies so that fewer bands are in
+        their wrapped regime.
+
+    - title: "Position interpolation divides the resolution by the scale factor"
+      latex: |
+        Replace each position $p$ by $p/s$; the score at token distance $\delta$
+        becomes
+
+        $$r_s(\delta) = r(\delta/s)
+          = \sum_i e_i \cos\!\left(\frac{\delta}{s}\omega_i\right).$$
+
+        The profile is even in $\delta$, so its first derivative vanishes at the
+        origin and the leading term is second order:
+
+        $$r(\delta) = 1 - \frac{\delta^2}{2}\sum_i e_i\omega_i^2 + O(\delta^4),
+          \qquad
+          r(0) - r(1) \approx \frac{1}{2}\sum_i e_i \omega_i^2 = 0.03124,$$
+
+        where the last number is the uniform 64-band ladder at $d = 128$ —
+        measured $0.02979$, with the 4.7% gap supplied by the quartic term.
+        Substituting $\delta \to \delta/s$ multiplies that difference by
+        $s^{-2}$:
+
+        $$r_s(0) - r_s(1) \approx \frac{1}{s^2}\big(r(0) - r(1)\big).$$
+
+        Measured at $s = 32$: $2.979\times10^{-2} \to 3.050\times10^{-5}$, a
+        factor of 976.5 against the predicted $s^2 = 1024$ — the 4.6% shortfall is
+        the quartic term. At $s = 4$ the measured loss is 15.3x (predicted 16) and
+        at $s = 8$ it is 61.1x (predicted 64).
+      prose: >-
+        PI is algebraically exact, which is exactly why it is dangerous: nothing
+        in the output looks wrong. The model is asked about 131,072 tokens and
+        receives a phase it recognises as 4,096, so perplexity on long documents
+        improves, and the same transformation has told it that 32 tokens is 1 and
+        2 tokens is 0.06. Any task that depends on order *within a sentence* now
+        depends on a phase difference of a few hundredths of a radian, which is
+        below the resolution the softmax can express at realistic logit scales.
+
+    - title: "NTK-aware scaling: the base that stretches the slowest band by s"
+      latex: |
+        The slowest band has $i = d/2 - 1$, so
+
+        $$\lambda_{\max} = 2\pi\theta^{(d-2)/d}.$$
+
+        Requiring the slowest wavelength to grow by exactly $s$ while leaving the
+        fastest band ($\lambda_0 = 2\pi$, independent of $\theta$) untouched
+        gives
+
+        $$\frac{\lambda_{\max}'}{\lambda_{\max}}
+          = \left(\frac{\theta'}{\theta}\right)^{(d-2)/d} = s
+          \quad\Longrightarrow\quad
+          \theta' = \theta\, s^{\,d/(d-2)}.$$
+
+        At $d = 128$, $s = 32$: $\theta' = 10^4 \cdot 32^{64/63} = 338{,}096.946$,
+        and $\lambda_{\max}' = 2\pi (338{,}096.946)^{126/128} = 1{,}741{,}124.6$.
+        The band count follows from the same formula:
+        $N'(k) = (d/2)(1 - \log_{\theta'}(k/\pi))$, which is 27 at $k = 4{,}096$
+        and 10 at $k = 131{,}072$ — against 14 and 0 for $\theta = 10^4$.
+      prose: >-
+        The exponent $d/(d-2)$ is not a fudge: it is the inverse of the exponent
+        that maps base to the slowest wavelength, and getting it wrong is the most
+        common silent error in this topic. Using $\theta \cdot s = 320{,}000$
+        instead of 338,097 is a 5.4% error that leaves every band count unchanged
+        — 27 bands still resolve 4,096 — so a test written against band counts
+        passes while the profile is subtly wrong. The deeper limitation is that
+        one constant cannot be right for both ends of the ladder: the same
+        multiplication stretches band 1 by 5% and band 63 by 3200%, which is why
+        adjacent-token contrast falls 24% even though nothing "broke".
+
+    - title: "YaRN's correction range is an inverted rotation count"
+      latex: |
+        Band $i$ has wavelength $\lambda_i = 2\pi\theta^{2i/d}$, so inside the
+        original context $L$ it completes
+
+        $$\text{rot}_i = \frac{L}{\lambda_i}
+          = \frac{L}{2\pi}\,\theta^{-2i/d}$$
+
+        turns. A band that turns many times is a *fast* band: its phase is
+        well sampled, it carries local resolution, and interpolating it would
+        destroy that resolution for nothing. A band that turns less than once was
+        never observed through a cycle and must be stretched. So pick two
+        thresholds, $\beta_{\text{fast}}$ and $\beta_{\text{slow}}$, and invert:
+
+        $$\text{rot}_i = \beta
+          \iff i = \frac{d}{2}\cdot\frac{\log(L/2\pi\beta)}{\log\theta},$$
+
+        with $\beta_{\text{fast}} = 32$ giving the lower index
+        ($\lfloor\cdot\rfloor$) and $\beta_{\text{slow}} = 1$ the upper
+        ($\lceil\cdot\rceil$). At $d = 128$, $L = 4{,}096$, $\theta = 10^4$
+        that is $i \in [20, 46]$, and the interpolation weight is
+
+        $$\gamma_i = \operatorname{clip}\!\left(
+          \frac{i - 20}{46 - 20},\, 0,\, 1\right), \qquad
+          \omega_i' = \frac{\omega_i}{s}\gamma_i + \omega_i(1 - \gamma_i).$$
+
+        Bands $0..20$ get $\gamma = 0$ and are untouched; bands $46..63$ get
+        $\gamma = 1$ and are divided by 32; the 25 between are ramped. Measured:
+        $\lambda_0$ stays 6.283185, $\lambda_{\max}$ becomes 1,741,124.6, 14
+        bands resolve 131,072 (from 0) and adjacent-token contrast moves from
+        $2.9786\times10^{-2}$ to $2.9767\times10^{-2}$.
+      prose: >-
+        This is the whole idea of YaRN in one line: it is NTK's intuition —
+        stretch the slow bands, protect the fast ones — but expressed per band
+        instead of through one global constant, which is why it can buy 14 bands
+        of range and spend 0.06% of the resolution where NTK buys 10 and spends
+        24%. The thresholds are the only free parameters, and they read as
+        physical statements: "a band that has turned 32 times is calibrated" and
+        "a band that has not turned once is not". The temperature is the second
+        half of the method and is not optional: dividing 18 wavelengths by 32
+        flattens the softmax, so the logits are multiplied by
+        $0.1\ln s + 1 = 1.346574$ to put the entropy back.
+
+  implementations:
+    - language: python
+      title: "Four ladders, measured: raw RoPE, PI, NTK-aware and YaRN on the same axes"
+      note: >-
+        Correct for what it does, and deliberately narrow: it builds frequency
+        vectors only — no rotation, no attention, no cache, no training — and it
+        uses uniform band energies, so the profile it prints is the one a head
+        with no learned band weighting would have. A trained head's profile is a
+        reweighting of these same 64 cosines, which is why the numbers here are a
+        floor on the ambiguity and not a prediction of any specific model. Run it
+        and check the three summary lines against the lesson: 14 bands at 4,096,
+        adjacent contrast $2.98\times10^{-2}$ for raw and YaRN, $3.05\times10^{-5}$
+        for PI.
+      code: |
+        import math
+        import numpy as np
+
+        D, BASE, SCALE, L = 128, 10_000.0, 32.0, 4_096
+
+
+        def raw_freqs(dim=D, base=BASE):
+            return base ** (-np.arange(0, dim, 2, dtype=np.float64) / dim)
+
+
+        def pi_freqs(dim=D, base=BASE, s=SCALE):
+            """Divide every angular frequency by s. Identical to p -> p/s."""
+            return raw_freqs(dim, base) / s
+
+
+        def ntk_freqs(dim=D, base=BASE, s=SCALE):
+            """One global base change: theta -> theta * s**(d/(d-2))."""
+            theta = base * s ** (dim / (dim - 2))
+            return theta ** (-np.arange(0, dim, 2, dtype=np.float64) / dim)
+
+
+        def _rot_index(rotations, dim, base, max_pos):
+            return (dim * math.log(max_pos / (rotations * 2 * math.pi))) / (2 * math.log(base))
+
+
+        def yarn_freqs(dim=D, base=BASE, s=SCALE, beta_fast=32.0, beta_slow=1.0, max_pos=L):
+            """Per-band: fast bands untouched, slow bands divided, linear ramp between."""
+            raw = raw_freqs(dim, base)
+            low = max(math.floor(_rot_index(beta_fast, dim, base, max_pos)), 0)
+            high = min(math.ceil(_rot_index(beta_slow, dim, base, max_pos)), dim - 1)
+            idx = np.arange(dim // 2, dtype=np.float64)
+            gamma = np.clip((idx - low) / (high - low), 0.0, 1.0)
+            return raw / s * gamma + raw * (1.0 - gamma), (low, high, gamma)
+
+
+        def profile(freqs, deltas):
+            """Uniform band energies: r(delta) = mean_i cos(delta * omega_i)."""
+            w = np.asarray(freqs, dtype=np.float64)
+            e = np.ones_like(w) / len(w)
+            return (e[None, :] * np.cos(np.outer(np.asarray(deltas, float), w))).sum(1)
+
+
+        def report(name, freqs):
+            lam = 2 * np.pi / freqs
+            n4k = int((lam > 2 * 4_096).sum())
+            n128k = int((lam > 2 * 131_072).sum())
+            r = profile(freqs, [0, 1, 4_096, 131_072])
+            print(f"{name:6s} lambda0={lam[0]:9.4f} lambda_max={lam[-1]:12.1f} "
+                  f"bands@4k={n4k:2d} bands@128k={n128k:2d} "
+                  f"contrast={r[0]-r[1]:.4e} r(4096)={r[2]:+.6f}")
+
+
+        if __name__ == "__main__":
+            yarn, (lo, hi, g) = yarn_freqs()
+            print(f"yarn correction range: bands {lo}..{hi}; "
+                  f"untouched={int((g == 0).sum())} ramped={int(((g > 0) & (g < 1)).sum())} "
+                  f"stretched={int((g == 1).sum())}")
+            for name, f in (("raw", raw_freqs()), ("PI", pi_freqs()),
+                            ("NTK", ntk_freqs()), ("YaRN", yarn)):
+                report(name, f)
+            # raw   lambda0=   6.2832 lambda_max=     54410.1 bands@4k=14 bands@128k= 0 contrast=2.9786e-02 r(4096)=-0.052853
+            # PI    lambda0= 201.0619 lambda_max=   1741124.6 bands@4k= 0 bands@128k= 0 contrast=3.0503e-05 r(4096)=+0.332794
+            # NTK   lambda0=   6.2832 lambda_max=   1741124.6 bands@4k=27 bands@128k=10 contrast=2.2646e-02 r(4096)=+0.456189
+            # YaRN  lambda0=   6.2832 lambda_max=   1741124.6 bands@4k=23 bands@128k=14 contrast=2.9767e-02 r(4096)=+0.225080
+
+    - language: python
+      title: "Three scaling configs that load, run, and are numerically WRONG"
+      note: >-
+        All three are **wrong**, and all three produce monotone frequency
+        ladders, finite logits and no exceptions — which is why they survive code
+        review and get shipped. Reference values from the correct builder:
+        $\lambda_0 = 6.283185$, $\lambda_{\max} = 1{,}741{,}124.6$, adjacent
+        contrast $2.9767\times10^{-2}$, 14 bands resolving 131,072.
+        `yarn_freqs_inverted` ramps the wrong way — it stretches the *fast* bands
+        and leaves the slow ones alone — so it buys no range at all
+        ($\lambda_{\max}$ stays 54,410, 0 bands resolve 131,072) while spending
+        875x of the local contrast ($3.406\times10^{-5}$). `pi_freqs_double`
+        divides twice, once in the position ids and once in the frequency cache,
+        which is the standard bug when two libraries each think they own the
+        scaling: contrast collapses to $2.979\times10^{-8}$, 1024x worse than
+        correct PI. `yarn_without_mscale` returns the right frequencies and
+        forgets the temperature, so the entropy over 4,096 keys rises to 1.839
+        nats instead of falling to 0.820 — the model is interpolated but not
+        re-sharpened, and reads every long prompt as a blur.
+      code: |
+        import math
+        import numpy as np
+
+        D, BASE, S, L = 128, 10_000.0, 32.0, 4_096
+
+
+        def raw():
+            return BASE ** (-np.arange(0, D, 2, dtype=np.float64) / D)
+
+
+        def profile(w, deltas):
+            w = np.asarray(w, float)
+            e = np.ones_like(w) / len(w)
+            return (e[None, :] * np.cos(np.outer(np.asarray(deltas, float), w))).sum(1)
+
+
+        def report(tag, w):
+            lam = 2 * np.pi / np.asarray(w)
+            print(f"{tag:22s} lambda0={lam[0]:9.4f} lambda_max={lam[-1]:12.1f} "
+                  f"bands@128k={int((lam > 2 * 131_072).sum()):2d} "
+                  f"contrast={profile(w, [0, 1])[0] - profile(w, [0, 1])[1]:.4e}")
+
+
+        def yarn_freqs_inverted(dim=D, base=BASE, s=S, beta_fast=32.0, beta_slow=1.0, max_pos=L):
+            """WRONG: gamma=0 on the slow bands, so only the fast bands get stretched."""
+            raw_w = base ** (-np.arange(0, dim, 2, dtype=np.float64) / dim)
+            rot = lambda b: (dim * math.log(max_pos / (b * 2 * math.pi))) / (2 * math.log(base))
+            low, high = max(math.floor(rot(beta_fast)), 0), min(math.ceil(rot(beta_slow)), dim - 1)
+            idx = np.arange(dim // 2, dtype=np.float64)
+            gamma = np.clip((idx - low) / (high - low), 0.0, 1.0)
+            return raw_w * gamma + raw_w / s * (1.0 - gamma)
+
+
+        def pi_freqs_double(dim=D, base=BASE, s=S):
+            """WRONG: scaling applied to positions AND to the frequency table."""
+            return base ** (-np.arange(0, dim, 2, dtype=np.float64) / dim) / (s * s)
+
+
+        def yarn_without_mscale(dim=D, base=BASE, s=S, beta_fast=32.0, beta_slow=1.0, max_pos=L):
+            """WRONG: correct frequencies, missing the 0.1*ln(s)+1 logit multiplier."""
+            raw_w = base ** (-np.arange(0, dim, 2, dtype=np.float64) / dim)
+            rot = lambda b: (dim * math.log(max_pos / (b * 2 * math.pi))) / (2 * math.log(base))
+            low, high = max(math.floor(rot(beta_fast)), 0), min(math.ceil(rot(beta_slow)), dim - 1)
+            idx = np.arange(dim // 2, dtype=np.float64)
+            gamma = np.clip((idx - low) / (high - low), 0.0, 1.0)
+            return raw_w / s * gamma + raw_w * (1.0 - gamma)   # frequencies are right
+
+
+        if __name__ == "__main__":
+            for tag, w in (("correct", None), ("yarn inverted", yarn_freqs_inverted()),
+                           ("PI double", pi_freqs_double())):
+                if w is None:
+                    rot = lambda b: (D * math.log(L / (b * 2 * math.pi))) / (2 * math.log(BASE))
+                    lo, hi = max(math.floor(rot(32.0)), 0), min(math.ceil(rot(1.0)), D - 1)
+                    idx = np.arange(D // 2, dtype=np.float64)
+                    g = np.clip((idx - lo) / (hi - lo), 0.0, 1.0)
+                    w = raw() / S * g + raw() * (1.0 - g)
+                report(tag, w)
+
+            # entropy of a 4096-key softmax, with and without the YaRN temperature
+            r = profile(raw() / S * np.clip((np.arange(D // 2) - 20) / 26, 0, 1)
+                        + raw() * (1 - np.clip((np.arange(D // 2) - 20) / 26, 0, 1)),
+                        np.arange(0, 4096))
+            for mult, tag in ((0.1 * math.log(S) + 1, "with mscale"), (1.0, "without mscale")):
+                lg = 20.0 * mult * r
+                lg -= lg.max()
+                p = np.exp(lg)
+                p /= p.sum()
+                print(f"{tag:14s} entropy={-(p * np.log(p + 1e-300)).sum():.4f} nats")
+            # with mscale    entropy=0.8201 nats
+            # without mscale entropy=1.8386 nats
+
+  checkpoints:
+    - id: cp-1
+      question: >-
+        RoPE's score is exactly relative for every pair of positions. So why does
+        a model trained at 4,096 tokens fail at 16,384?
+      answerKind: short_text
+      hint: >-
+        Separate the *function* the score computes from the *weights* that
+        combine the 64 bands into that function.
+      solution: >-
+        Because the invariance is a property of the rotation, not of the model.
+        The score at offset 40,000 is a well-defined number that the network never
+        received a gradient for: the band weights $e_i$ were fitted on offsets
+        below 4,096, so the profile past that point is whatever those weights
+        happen to produce. Measured, that profile has mean $-0.0055$ and standard
+        deviation 0.0836 — noise — and the number of offsets scoring above 0.3
+        drops from 377 inside the trained window to 0 between 4,096 and 131,072.
+        Meanwhile 93.85% of the causal pairs at 128k sit beyond 4,096. The
+        encoding did not break; it was never calibrated there, and the longer
+        window gives the uncalibrated region most of the matrix.
+    - id: cp-2
+      question: >-
+        At $L = 4{,}096$ and $d = 128$, 18 of 64 bands have a wavelength longer
+        than the training length. What does that mean concretely, and why is it
+        worse than "we did not train on long documents"?
+      answerKind: short_text
+      hint: >-
+        Turn the wavelength into a fraction of a cycle over the training set.
+      solution: >-
+        It means 28.1% of the frequency ladder was observed for less than one full
+        period. The slowest band has $\lambda = 54{,}410$, so across 4,096 tokens
+        it advanced 0.0753 turns — 27.1 degrees — and at 4x it reaches 108.4
+        degrees, still not a cycle. Two consequences. Across the trained range
+        its cosine moves only from 1.000 to 0.890, so the gradient it received
+        was small and dominated by the 46 bands that were sweeping through full
+        cycles; and past the training length it is extrapolating a sinusoid from
+        a quarter of a period, which is exactly the regime where a small phase
+        error becomes an arbitrary value. This is *worse* than a data
+        gap because you cannot fix it by adding documents: the band needs a
+        longer *sequence*, not more text, to complete a turn.
+    - id: cp-3
+      question: >-
+        You apply position interpolation with $s = 32$ to reach 128k. What does
+        the model see for token distances 1, 32 and 131,072, and which of those
+        three is the problem?
+      answerKind: short_text
+      hint: >-
+        The score becomes $r(\delta/s)$; evaluate the profile at the three
+        rescaled offsets.
+      solution: >-
+        Distance 1 reads as $r(0.031)$, distance 32 reads as $r(1)$ and distance
+        131,072 reads as $r(4{,}096)$ — which is the point: the long offset is now
+        inside the trained range. Measured, $r(1)$ after scaling is 0.999969497
+        and $r(0) - r(1)$ is $3.050\times10^{-5}$ against $2.979\times10^{-2}$
+        before, a 976x loss (theory: $s^2 = 1024$). The problem is the *small*
+        distances: adjacent tokens now differ by 0.03 of a tick, so anything
+        depending on local order — syntax, coreference, arithmetic on nearby
+        numbers — is being asked to resolve a phase difference below what the
+        softmax can express. Long-range retrieval improves; short-range precision
+        is what you paid.
+    - id: cp-4
+      question: >-
+        At the same factor $s = 32$, NTK-aware scaling and YaRN both reach
+        $\lambda_{\max} = 1{,}741{,}125$. Why is YaRN the better choice, in one
+        measured number?
+      answerKind: short_text
+      hint: >-
+        Compare what each does to the *fastest* band, not to the slowest.
+      solution: >-
+        Adjacent-token contrast: $2.9767\times10^{-2}$ for YaRN against
+        $2.265\times10^{-2}$ for NTK — a 24% loss versus 0.06%. NTK changes one
+        global constant, so every band moves: band 1 is stretched by 5%, band 63
+        by 3,200%, and $r(16)$ rises from 0.620 to 0.722, i.e. near distances are
+        compressed together. YaRN sets the interpolation weight to zero on the 21
+        fastest bands ($\lambda_0$ stays 6.283185) and to one on the 18 slowest,
+        so it buys *more* range — 14 bands resolving 131,072 against NTK's 10 —
+        while leaving local resolution essentially untouched. The remaining cost
+        is the fine-tune, plus the temperature that YaRN requires and NTK does
+        not.
+    - id: cp-5
+      question: >-
+        Your needle-in-a-haystack eval scores 98% at 128k and users still report
+        the model "ignores the document". What is the eval measuring, what is it
+        missing, and what would you run instead?
+      answerKind: short_text
+      hint: >-
+        NIAH places one sentence. What does a real prompt place in the middle?
+      solution: >-
+        NIAH measures single-needle retrieval at one position, and a model that
+        can copy one sentence from anywhere passes it while still failing to
+        *combine* material across the window. What it misses is position: Liu et
+        al. measured 75.8% with the answer first, 53.8% in the middle and 63.2%
+        last on 20 documents — the middle is below the 56.1% closed-book baseline,
+        so the passage actively hurts. RULER's finding is the aggregate version:
+        of 17 models claiming 32k or more, about half hold quality at 32k. Run
+        position-controlled multi-document QA, multi-needle and aggregation tasks,
+        and report accuracy *as a function of the depth of the answer*, not as a
+        single number.
+
+  hints:
+    - tier: 1
+      key: concept
+      title: "Concept"
+      content: >-
+        A context window is not a length you set; it is the range over which your
+        positional code still carries information. The code is a bank of
+        oscillators at geometrically spaced rates, and information about distance
+        lives in how their phases line up. Training at one length calibrates the
+        bank over that range and leaves the rest of it unobserved. So there are
+        two independent questions: can the code still address an offset of
+        128,000, and does the model have any reason to read the middle of a
+        128,000-token prompt? They have different fixes and different failure
+        modes.
+      blocks:
+        - kind: checklist
+          body: |
+            - Distance is encoded by phase across many frequencies, not by a counter.
+            - Range comes from the slowest band; resolution comes from the fastest.
+            - Past the training length the score is not small, it is meaningless.
+            - Extending the window is a change to frequencies (cheap, no training).
+            - Using the window is a change to data and evaluation (expensive).
+            - Sliding window avoids the question by never asking it.
+      checkpoint: >-
+        If the score past the training length is zero-mean noise rather than a
+        decay, what does that rule out as a fix?
+    - tier: 2
+      key: direction
+      title: "Direction"
+      content: >-
+        Work in wavelength space, not in position space. Compute
+        $\lambda_i = 2\pi\theta^{2i/d}$ for every band, compare each to the
+        largest offset you will ever serve, and count how many survive. That count
+        is your budget, and every method is a way of spending it: divide positions
+        (spends resolution everywhere), raise the base (spends a little
+        everywhere), or rescale per band (spends only on the bands that were
+        already useless). Then, separately, decide whether you are allowed to
+        fine-tune — because a frequency change without a fine-tune is a
+        calibration, and a calibration on an uncalibrated region is a guess.
+      blocks:
+        - kind: checklist
+          body: |
+            - Compute the ladder and the surviving-band count first, before any config.
+            - If the window is small enough that no offset is large, use a sliding window.
+            - If you can fine-tune: YaRN (ramp plus temperature) is the best ratio.
+            - If you cannot fine-tune: prefer a smaller factor and a larger window count.
+            - Never apply scaling twice — check position ids and the frequency cache separately.
+            - Verify with r(delta), not with validation loss: loss hides resolution loss.
+      checkpoint: >-
+        Why does raising the base preserve $\lambda_0$ exactly while changing
+        every other band?
+    - tier: 3
+      key: pseudocode
+      title: "Pseudocode"
+      content: >-
+        Three procedures. The only one with a decision in it is the third, and the
+        decision is a threshold on rotations, not on index.
+      blocks:
+        - kind: pseudocode
+          body: |
+            # 1. budget
+            for i in 0 .. d/2-1:
+                lambda[i] = 2*pi*theta**(2*i/d)
+            budget(k) = count(lambda[i] > 2*k)
+
+            # 2. position interpolation (either form; they are identical)
+            p' = p / s                    # positions
+            omega[i] = omega[i] / s       # frequencies -- same angle
+
+            # 3. YaRN
+            for i in 0 .. d/2-1:
+                rot = L / lambda[i]                   # turns inside the original context
+                if rot >= beta_fast: gamma[i] = 0     # fast: leave alone
+                elif rot <= beta_slow: gamma[i] = 1   # slow: divide by s
+                else: gamma[i] = (i - low) / (high - low)
+                omega[i] = omega[i]/s*gamma[i] + omega[i]*(1-gamma[i])
+            logits *= 0.1*log(s) + 1                  # do not skip this
+      checkpoint: >-
+        The ramp is linear in the band index but the wavelengths are geometric.
+        Why is that the right choice rather than a ramp in $\log\lambda$?
+    - tier: 4
+      key: derivation
+      title: "Derivation"
+      content: >-
+        The budget, the noise floor, and the two scalings, in the order they
+        matter.
+      blocks:
+        - kind: math
+          body: |
+            Budget. $\lambda_i = 2\pi\theta^{2i/d} > 2k$ gives
+
+            $$N(k) = \frac{d}{2}\left(1 - \log_\theta\frac{k}{\pi}\right),
+              \qquad \Delta N = \frac{d}{2}\log_\theta 2 = 4.82$$
+
+            bands per doubling at $d = 128$, $\theta = 10^4$: 14 bands at 4,096,
+            4 at 16,384, 0 at 32,768.
+
+            Noise floor. For large $\delta$ each $\cos(\delta\omega_i)$ is
+            effectively uniform, so with $\sum_i e_i = 1$,
+
+            $$\operatorname{Var}[r] = \frac{1}{2}\sum_i e_i^2 = \frac{1}{2N}
+              \ \Rightarrow\ \sigma = 0.0884 \text{ at } N = 64,$$
+
+            measured 0.0836 — the score does not fade, it randomises.
+
+            PI. $r_s(\delta) = r(\delta/s)$, so
+            $r_s(0) - r_s(1) \approx s^{-2}(r(0) - r(1))$: $2.979\times10^{-2}$
+            to $3.050\times10^{-5}$, a factor of 976.5 against $s^2 = 1024$.
+
+            NTK. $\lambda_{\max} = 2\pi\theta^{(d-2)/d}$, so
+            $\theta' = \theta\,s^{d/(d-2)} = 338{,}096.9$ at $d = 128$, $s = 32$,
+            and $\lambda_{\max}' = 1{,}741{,}124.6$.
+
+            YaRN. $\text{rot}_i = L/\lambda_i$, inverted:
+
+            $$i = \frac{d}{2}\cdot\frac{\log(L/2\pi\beta)}{\log\theta}
+              \ \Rightarrow\ i \in [20, 46] \text{ for } \beta \in [32, 1].$$
+      checkpoint: >-
+        The noise floor depends on $N = d/2$ but not on $\theta$. What does that
+        tell you about buying a longer window by making heads wider rather than
+        by rescaling?
+    - tier: 5
+      key: solution
+      title: "Full Solution"
+      content: >-
+        A complete, runnable diagnostic. It builds all four ladders, reports the
+        four numbers that decide between them, and includes the three checks that
+        catch the silent errors: the $s^2$ contrast law, the NTK exponent, and the
+        YaRN temperature direction.
+      blocks:
+        - kind: warning
+          body: >-
+            The three silent failures, in order of frequency. (1) Scaling applied
+            twice — the position ids are divided and the frequency cache is
+            divided, so the effective factor is $s^2$ and contrast falls by
+            1,024x more than intended. (2) The NTK exponent written as
+            $\theta \cdot s$ rather than $\theta\,s^{d/(d-2)}$: a 5.4% error
+            that changes no band count. (3) YaRN's ramp inverted, which stretches
+            the fast bands, buys zero range and costs 875x of local contrast. All
+            three load, run, and produce plausible text.
+        - kind: code
+          language: python
+          body: |
+            import math
+            import numpy as np
+
+            D, BASE, S, L = 128, 10_000.0, 32.0, 4_096
+
+
+            def ladder(dim=D, base=BASE):
+                return base ** (-np.arange(0, dim, 2, dtype=np.float64) / dim)
+
+
+            def yarn(dim=D, base=BASE, s=S, bf=32.0, bs=1.0, max_pos=L):
+                raw = ladder(dim, base)
+                rot = lambda b: (dim * math.log(max_pos / (b * 2 * math.pi))) / (2 * math.log(base))
+                lo, hi = max(math.floor(rot(bf)), 0), min(math.ceil(rot(bs)), dim - 1)
+                g = np.clip((np.arange(dim // 2) - lo) / (hi - lo), 0.0, 1.0)
+                return raw / s * g + raw * (1.0 - g)
+
+
+            def prof(w, k):
+                w = np.asarray(w, float)
+                e = np.ones_like(w) / len(w)
+                return (e[None, :] * np.cos(np.outer(np.asarray(k, float), w))).sum(1)
+
+
+            def check():
+                raw = ladder()
+                ntk = (BASE * S ** (D / (D - 2))) ** (-np.arange(0, D, 2) / D)
+                pi = raw / S
+                y = yarn()
+
+                # 1. the s^2 law
+                c0 = prof(raw, [0, 1])[0] - prof(raw, [0, 1])[1]
+                c1 = prof(pi, [0, 1])[0] - prof(pi, [0, 1])[1]
+                print("contrast loss / s^2      ", (c0 / c1) / (S ** 2))        # 0.954
+
+                # 2. YARN keeps the fastest band and buys range
+                print("lambda0 raw / yarn       ", 2 * np.pi / raw[0], 2 * np.pi / y[0])
+                print("bands 131k raw / yarn    ",
+                      int((2 * np.pi / raw > 2 * 131_072).sum()),
+                      int((2 * np.pi / y > 2 * 131_072).sum()))                # 0 / 14
+
+                # 3. the temperature direction: sharpening must lower entropy
+                r = prof(y, np.arange(0, 4096))
+                for m in (0.1 * math.log(S) + 1, 1.0):
+                    lg = 20.0 * m * r
+                    lg -= lg.max()
+                    p = np.exp(lg)
+                    p /= p.sum()
+                    print("entropy, mscale=%.3f    " % m, -(p * np.log(p + 1e-300)).sum())
+                # 0.8201 with, 1.8386 without
+
+            check()
+      checkpoint: >-
+        The first diagnostic prints 0.954, not 1.000. Is that a bug in the check
+        or the quartic term in the expansion, and what would you do to tell the
+        difference?
+
+  problems:
+    - id: p-band-budget
+      title: "Count the bands that can still resolve an offset"
+      difficulty: easy
+      prompt: >-
+        Implement `band_budget(dim, base, offset)` returning how many of RoPE's
+        `dim / 2` bands have a wavelength greater than `2 * offset`, where band
+        `i` has `omega_i = base ** (-2i / dim)` and `lambda_i = 2*pi/omega_i`.
+
+        Return a plain `int`. This is the arithmetic that decides whether a
+        context length is reachable at all: at `dim=128, base=10000` it must give
+        14 for an offset of 4,096 and 0 for 32,768.
+      starter: |
+        import numpy as np
+
+        def band_budget(dim, base, offset):
+            # your implementation here
+            pass
+      language: python
+      entry: band_budget
+      testCases:
+        - input: '[128, 10000.0, 4096]'
+          expected: '14'
+          mode: json
+          tolerance: 1e-9
+        - input: '[128, 10000.0, 32768]'
+          expected: '0'
+          mode: json
+          tolerance: 1e-9
+        - input: '[64, 10000.0, 1024]'
+          expected: '11'
+          mode: json
+          tolerance: 1e-9
+        - input: '[128, 338096.94598244346, 131072]'
+          expected: '10'
+          mode: json
+          tolerance: 1e-9
+        - input: '[256, 500000.0, 131072]'
+          expected: '24'
+          mode: json
+          tolerance: 1e-9
+        - input: '[128, 10000.0, 2048]'
+          expected: '18'
+          mode: json
+          tolerance: 1e-9
+      solution: |
+        import numpy as np
+
+        def band_budget(dim, base, offset):
+            i = np.arange(0, dim, 2, dtype=np.float64)     # pair index 0 .. dim/2-1
+            lam = 2.0 * np.pi * base ** (i / dim)          # 2*pi / omega_i
+            return int((lam > 2.0 * offset).sum())
+      solutionExplanation: >-
+        Two exponent details decide this. The pair index is `arange(0, dim, 2)`,
+        so the exponent is `i / dim` and the slowest band sits at
+        `(dim - 2) / dim` — writing `arange(dim)` instead halves the ladder and
+        turns the 14-band answer into something else entirely. And the test is
+        `lambda > 2 * offset`, not `> offset`: a band whose wavelength is only
+        slightly longer than the offset has wrapped less than once but is already
+        near the end of its useful range, so the factor two is the difference
+        between "can measure this" and "can just barely see it". The fourth case
+        is the interesting one — it is the same 128-dimensional head after NTK
+        scaling to base 338,097, and it resolves 10 bands at 131,072 where the
+        raw ladder resolves none. The fifth shows that width is the other currency:
+        256 dimensions at base 500,000 buys 24 bands at the same offset.
+      complexity: "O(dim) time, O(dim) space"
+      tags: [long-context, rope, frequency-bands, numpy]
+
+    - id: p-ntk-base
+      title: "The NTK-aware base, and why the exponent is d/(d-2)"
+      difficulty: medium
+      prompt: >-
+        Implement `ntk_base(base, dim, factor)` returning the RoPE base that
+        stretches the slowest band's wavelength by exactly `factor` while leaving
+        the fastest band at `2*pi`. The slowest band has
+        `lambda_max = 2*pi*base**((dim-2)/dim)`, so the answer is
+        `base * factor ** (dim / (dim - 2))`.
+
+        Return a `float`. `factor=1` must return `base` exactly, and the answer
+        must be monotonically increasing in `factor`.
+      starter: |
+        def ntk_base(base, dim, factor):
+            # your implementation here
+            pass
+      language: python
+      entry: ntk_base
+      testCases:
+        - input: '[10000.0, 128, 8]'
+          expected: '82684.62264056221'
+          mode: json
+          tolerance: 1e-12
+        - input: '[10000.0, 64, 4]'
+          expected: '41829.36592889948'
+          mode: json
+          tolerance: 1e-12
+        - input: '[10000.0, 128, 32]'
+          expected: '338096.94598244346'
+          mode: json
+          tolerance: 1e-12
+        - input: '[500000.0, 128, 2]'
+          expected: '1011063.0844868955'
+          mode: json
+          tolerance: 1e-12
+        - input: '[10000.0, 128, 1]'
+          expected: '10000.0'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        def ntk_base(base, dim, factor):
+            return float(base) * float(factor) ** (float(dim) / (dim - 2))
+      solutionExplanation: >-
+        The exponent comes from inverting the wavelength formula, not from a
+        paper's notation: `lambda_max = 2*pi*base**((dim-2)/dim)`, so requiring
+        `lambda_max' = factor * lambda_max` gives
+        `(base'/base)**((dim-2)/dim) = factor`, hence `base' = base * factor**(dim/(dim-2))`.
+        The trap is `base * factor`. At `dim=128, factor=32` that gives 320,000
+        against the correct 338,097 — a 5.4% error, small enough that every band
+        count is unchanged (27 still resolve 4,096) and large enough that the
+        profile's local contrast and long-range lift are both off. Since `dim/(dim-2)`
+        decreases toward 1 as `dim` grows, narrow heads need a bigger multiplier
+        for the same stretch: at `dim=64`, `factor=4` the base must go to 41,829
+        rather than 40,000. Note also that the exponent is not a free parameter —
+        it is fixed by the same geometry that makes the ladder geometric.
+      complexity: "O(1)"
+      tags: [long-context, ntk-aware, rope-scaling, numpy]
+
+    - id: p-yarn-inv-freq
+      title: "YaRN's per-band inverse frequencies"
+      difficulty: hard
+      prompt: >-
+        Implement `yarn_inv_freq(dim, base, factor, beta_fast, beta_slow, max_position)`
+        returning the `dim/2` inverse angular frequencies after YaRN's per-band
+        correction, as a list of floats.
+
+        Work in this order. The raw ladder is
+        `inv[i] = base ** (-2*i/dim)` for `i = 0 .. dim/2-1`. Band `i` completes
+        `rot_i = max_position / (2*pi/inv[i])` turns inside the original context.
+        The correction range is
+        `low = max(floor(dim*ln(max_position/(beta_fast*2*pi)) / (2*ln(base))), 0)`
+        and `high = min(ceil(dim*ln(max_position/(beta_slow*2*pi)) / (2*ln(base))), dim-1)`.
+        The interpolation weight is
+        `gamma[i] = clip((i - low) / (high - low), 0, 1)`, and the corrected
+        frequency is `inv[i]/factor * gamma[i] + inv[i] * (1 - gamma[i])`.
+
+        So `gamma = 0` (fast bands) leaves the band untouched and `gamma = 1`
+        (slow bands) divides it by the full factor. `factor=1` must return the raw
+        ladder exactly.
+      starter: |
+        import math
+        import numpy as np
+
+        def yarn_inv_freq(dim, base, factor, beta_fast, beta_slow, max_position):
+            # your implementation here
+            pass
+      language: python
+      entry: yarn_inv_freq
+      testCases:
+        - input: '[8, 10000.0, 1.0, 32.0, 1.0, 4096]'
+          expected: '[1.0, 0.1, 0.01, 0.001]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[16, 10000.0, 4.0, 8.0, 1.0, 1024]'
+          expected: '[1.0, 0.31622776601683794, 0.1, 0.023717082451262847, 0.005000000000000001, 0.0007905694150420947, 0.00025, 7.905694150420948e-05]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[32, 10000.0, 8.0, 32.0, 1.0, 2048]'
+          expected: '[1.0, 0.5623413251903491, 0.31622776601683794, 0.17782794100389226, 0.1, 0.04920486595415555, 0.023717082451262844, 0.011114246312743268, 0.005, 0.002108779969463809, 0.000790569415042095, 0.00022228492625486537, 0.000125, 7.029266564879364e-05, 3.952847075210474e-05, 2.2228492625486534e-05]'
+          mode: json
+          tolerance: 1e-12
+        - input: '[64, 10000.0, 32.0, 32.0, 1.0, 4096]'
+          expected: '[1.0, 0.7498942093324559, 0.5623413251903491, 0.4216965034285823, 0.31622776601683794, 0.23713737056616555, 0.17782794100389226, 0.1333521432163324, 0.1, 0.07498942093324558, 0.056234132519034905, 0.039027200437501, 0.02690976662739438, 0.018412348724247945, 0.012482153551234746, 0.008366564754678549, 0.005528846153846153, 0.0035872343186817003, 0.0022709938132687174, 0.0013887601194643214, 0.0008057726730236733, 0.00042753131712650034, 0.0001880872452925783, 4.167254475510388e-05, 3.125e-05, 2.3434194041639242e-05, 1.757316641219841e-05, 1.3178015732143197e-05, 9.882117688026186e-06, 7.410542830192673e-06, 5.5571231563716334e-06, 4.167254475510387e-06]'
+          mode: json
+          tolerance: 1e-12
+      solution: |
+        import math
+        import numpy as np
+
+        def yarn_inv_freq(dim, base, factor, beta_fast, beta_slow, max_position):
+            inv = 1.0 / (float(base) ** (np.arange(0, dim, 2, dtype=np.float64) / dim))
+
+            def rot_index(rotations):
+                return (dim * math.log(max_position / (rotations * 2 * math.pi))) / (2 * math.log(base))
+
+            low = max(math.floor(rot_index(beta_fast)), 0)
+            high = min(math.ceil(rot_index(beta_slow)), dim - 1)
+            if low == high:
+                high = low + 1
+
+            idx = np.arange(dim // 2, dtype=np.float64)
+            gamma = np.clip((idx - low) / (high - low), 0.0, 1.0)
+            return (inv / float(factor) * gamma + inv * (1.0 - gamma)).tolist()
+      solutionExplanation: >-
+        The direction of the ramp is the whole problem, and it is easy to get
+        backwards because both ends look like "scaling". `gamma` is one on the
+        *slow* bands — the ones that turn fewer than `beta_slow` times inside
+        `max_position` — and that is where the division by `factor` goes, because
+        those are the bands whose phase was never observed through a cycle. The
+        fast bands get `gamma = 0` and are untouched, which is why `lambda_0`
+        stays at `2*pi` and adjacent-token resolution survives. Reverse it and you
+        stretch the fast bands, buy no range at all, and destroy local contrast;
+        that is the failure mode in the second implementation above.
+        Two details matter for exactness. `floor` on the lower threshold and
+        `ceil` on the upper are not cosmetic — they widen the ramp by one band at
+        each end, and HF's implementation uses exactly this convention, so
+        matching it is what makes a checkpoint load. And the first test case is
+        the identity check: with `factor = 1` the gamma terms cancel algebraically
+        and the output must equal the raw ladder, which catches a sign error in
+        the blend before any of the long cases run.
+      complexity: "O(dim) time, O(dim) space"
+      tags: [long-context, yarn, rope-scaling, numpy]
+
+
+  try_it: >-
+    Compute the RoPE ladder for $d = 128$, base 10,000, and count how many bands have
+    $\lambda_i > 2 \times 4{,}096$. You should get 14. Then divide every offset by 32 and measure
+    $r(0) - r(1)$: the adjacent-token contrast falls 976x, which is what position interpolation
+    costs.
+  interview_questions:
+    - question: 'Why does a context window run out? Answer in frequency bands, not tokens.'
+      level: mid
+      key_points:
+        - 'The ladder lambda_i = 2 pi theta^(2i/d) runs from 6.283 to 54,410 tokens in 64 steps of 1.1548 at d = 128 and base 10,000.'
+        - 'The number of bands whose wavelength still exceeds twice an offset k is 14 at k = 4,096, 4 at 16,384 and none at 32,768.'
+        - 'At a 4,096 training length, 18 of 64 bands never complete a turn — 28.1% of the ladder — so those bands carry no usable phase information.'
+        - 'Past the trained length the score stops being a function of distance and becomes an almost-periodic noise process.'
+    - question: 'Sliding window, position interpolation, NTK-aware scaling, YaRN. Pick one for 32x extension and defend it with numbers.'
+      level: senior
+      key_points:
+        - 'Position interpolation divides every offset by s: it keeps zero bands above 131,072 and costs 976x of adjacent-token contrast at s = 32, which is why short prompts degrade.'
+        - 'NTK-aware scaling raises the base to 338,096.9 at s = 32 and d = 128, recovering 27 bands that resolve 4,096, at about 24% local cost.'
+        - 'YaRN decides per band: 21 bands untouched, 25 ramped and 18 divided, buying 14 bands at 0.06% cost.'
+        - 'Sliding window needs no scaling at all because no attention op sees an offset above the window, and it bounds the cache at w times 512 KiB per token.'
+      follow_up: 'Why does YaRN dominate NTK-aware scaling at the same factor, and what does per-band correction actually preserve?'
+    - question: 'Extending the window is not the same as using it. What was measured, and on which axis?'
+      level: mid
+      key_points:
+        - 'On twenty-document QA, GPT-3.5-Turbo scored 75.8% when the answer document was first, 53.8% when it was tenth and 63.2% when it was last.'
+        - 'Closed-book was 56.1% and oracle 88.3%, so the middle of the context is worse than not reading at all.'
+        - 'On the other axis, the per-query distribution over offsets is invariant to sequence length to seven digits: 0.000288 at both 4,096 and 131,072.'
+        - 'So buying the window is cheap and training the model to attend across it is the expensive part.'
+  common_mistakes:
+    - 'Setting the scale factor to 32 and expecting 32x context, when position interpolation divides every offset and two adjacent tokens now look 0.03 tokens apart.'
+    - 'Assuming degradation is a fade in score magnitude, when the profile crosses zero at offset 1,706 and comes back negative.'
+    - 'Buying the window and assuming the model reads the middle, where the measured accuracy is 53.8% against 75.8% for the first document.'
+  further_reading:
+    - label: "Peng, Quesnelle, Fan & Shippole, YaRN: Efficient Context Window Extension of Large Language Models (ICLR 2024)"
+    - label: "Liu, Lin, Hewitt, Paranjape, Bevilacqua, Petroni & Liang, Lost in the Middle: How Language Models Use Long Contexts (TACL 2024)"
